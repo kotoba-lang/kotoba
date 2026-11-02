@@ -1,7 +1,8 @@
 # Flash probe: diagnostic core (JUN-766)
 
-This is a source-level first slice, not an installed Itonami dapp or an
-alternative to `f3probe` yet. It contains a pure Kotoba sampling planner,
+The target is an Itonami dapp running locally on Amu native selfhost. This
+is a source-level first slice, not an installed dapp or an alternative to
+`f3probe` yet. It contains a pure Kotoba sampling planner,
 result classifier and wraparound simulator. `main` runs its native self-test.
 It has no disk I/O, UI, consent implementation, dapp registration, cache
 invalidation or real-device test. A passing self-test says nothing about the
@@ -44,13 +45,15 @@ for broader evidence; reliability over time needs separate testing.
    persistence/cache conditions were verified. A clean sample report remains
    inconclusive. Retain no contents from the drive and send nothing remotely.
 
-The browser is not a raw block-device host. WebUSB is not assumed to grant
-access to OS mass-storage devices. The current Itonami native runtime and macOS
-bridge have not been shown to provide the exclusive scoped device capability,
-trusted consent, USB pass-through or durable-read guarantees above. Therefore
-this directory is **not registered** in the installed dapp catalog and no
-capability is declared as implemented. Integration needs an actual native host,
-trusted UI and a separate destructive QEMU fixture gate; physical-device
+The existing public Amu macOS native CLI runs a single pure guest and denies
+guest filesystem and process capabilities; its FS2 development provider is
+scoped to regular files. Neither currently provides the scoped raw block-device
+capability, target-bound trusted consent, exclusive access or durable-read
+guarantees above. The intended host is therefore a new native Amu capability
+broker and native local UI or CLI approval flow, not a browser application.
+This directory is **not registered** as an installed dapp and no capability
+is declared as implemented. Integration needs the native host capability,
+trusted interaction and a separate destructive fixture gate; physical-device
 qualification comes after that. Do not execute the model against physical
 storage.
 
