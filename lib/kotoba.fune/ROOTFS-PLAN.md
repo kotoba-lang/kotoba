@@ -15,16 +15,17 @@ layers in order. It is not an externally verifiable admission token.
 
 `rootfs-plan-entry` exposes accepted rows in insertion order as kind, mode and
 path bytes. A cross-layer replacement updates the stored mode, including when a
-directory requires no new creation command. This retains metadata needed for
-future finalization; it does not change the worker protocol or filesystem modes.
-The current worker still creates directories as 0700 and files as 0600, so this
-plan cannot yet provide image-permission semantics or executable files.
+directory requires no new creation command. The output-capable layout stream
+now sends the final modes after all layers have been applied, in reverse
+insertion order so children precede parents. Its draft Amu worker dependency
+applies those modes in an isolated temporary tree and rejects later writes.
+This still does not launch a workload or establish complete OCI semantics.
 The source-composed ARM64 planner gate checked file replacement, repeated
 directory mode updates, invalid indices and unchanged state on refusal. A
 separately built mutant discarding modes failed that gate. The source-composed
 layout producer still passed the native worker readback and refusal fixtures,
 including a 1 MiB file and a repeated-directory layer. Project linking, x86
-and filesystem mode application are not established by those observations.
+and end-to-end filesystem mode application are not established by those prior observations.
 
 `fune.rootfs-snapshot-plan/verify-layer-plan-hold` verifies a layer digest and
 tar structure in the same sealed snapshot, then traverses from offset zero and
@@ -192,8 +193,11 @@ not qualify source-locked project linking, native x86, hosted CI or a release.
 The planner tracks the number of emitted mutation commands, bounded to 512.
 Reusing a directory in a later layer does not add a command; a file create or
 replacement does. After all layers stream successfully, `emit-layout-hex`
-sends a terminal `C` frame carrying that count. The worker compares it to the
-number it completed and emits `D` only on a match, after which it refuses more
+sends one `P` mode-finalization command per retained path, then a terminal
+`C` frame carrying the combined command count (at most 640). The current Amu
+supervisor still accepts at most 512 acknowledgments and therefore refuses
+larger successful streams until that limit is extended. The worker compares
+the count to the number it completed and emits `D` only on a match, after which it refuses more
 writes. The native supervisor checks that its worker response ends in `D`;
 the caller no longer supplies an acknowledgment count. `D` only closes this
 diagnostic command stream: it does not persist a rootfs, authenticate the
@@ -201,11 +205,23 @@ producer, or authorize execution. The caller must still authenticate both image
 digests, and the supervisor destroys the private tree after the test run.
 
 The native ARM64 planner gate checked the 512-command boundary and confirmed
-that a repeated directory does not increase the count. A four-layer fixture
-with a repeated directory produced three worker acknowledgments followed by
+that a repeated directory does not increase the count. Before mode finalization
+was added, a four-layer fixture with a repeated directory produced three
+worker acknowledgments followed by
 `D`, and the file readback still matched. The native supervisor rejected
 separately compiled producer fixtures with an incorrect count and with no
 terminal frame. A worker mutant that skipped the count comparison and a
 supervisor mutant that ignored `D` each incorrectly accepted the corresponding
 fixture, so both negative controls failed. These tests use draft native images
 and do not establish an authenticated executable authority or runtime release.
+
+## Final mode stream candidate
+
+A source-composed ARM64 producer and worker built by the newly regenerated
+source-pinned compiler passed full-layout byte and final file-mode readback,
+bad metadata/layer refusal, repeated-directory and 1 MiB file checks. The
+stream observer independently checked child-before-parent mode order and the
+combined terminal count. A chmod-disabled worker built with a patched debug
+compiler failed the mode readback; an older worker refused the new protocol.
+No workload is executed and no tree is published. Project source linking, x86
+and a full release remain unqualified.
