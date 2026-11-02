@@ -3,13 +3,33 @@
 ;; pages or follow overflow cells.
 
 (ns kotoba.sqlite.reader
-  {:kotoba/export [read-notepad-leaf resolve-notepad-root read-notepad-image]}
+  {:kotoba/export [read-notepad-leaf resolve-notepad-root read-notepad-image
+                   read-notepad-image-packed]}
   (:require [kotoba.sqlite.notepad-record :as record]
+            [kotoba.sqlite.header :as db-header]
             [kotoba.sqlite.page :as page]
-            [kotoba.sqlite.record :as sqlite-record]))
+            [kotoba.sqlite.record :as sqlite-record]
+            [kotoba.sqlite.varint :as varint]))
 
 (defn- invalid [] :vector-i64
   (vector-i64 -1))
+
+(defn- admitted-db-page-count [image :bytes page-size :i64] :i64
+  (if (< page-size 512)
+    -1
+    (let [image-size (bytes-count image)
+          fields (db-header/decode image)
+          page-count (quot image-size page-size)]
+      (if (or (< image-size 100)
+              (not= (vector-at fields 0) page-size)
+              (not= (vector-at fields 1) 1)
+              (not= (vector-at fields 2) 1)
+              (not= (vector-at fields 3) 0)
+              (not= (vector-at fields 4) 1)
+              (not= (vector-at fields 5) page-count)
+              (not= image-size (* page-count page-size)))
+        -1
+        page-count))))
 
 (def table-type
   (bytes-from-vector-i64 (vector-i64 116 97 98 108 101)))
@@ -17,6 +37,9 @@
 (def notepad-name
   (bytes-from-vector-i64
     (vector-i64 99 114 111 110 95 110 111 116 101 112 97 100)))
+
+(def packed-magic
+  (bytes-from-vector-i64 (vector-i64 75 78 82 49)))
 
 (defn- bytes-equal? [left :bytes right :bytes index :i64] :bool
   (if (= index (bytes-count right))
@@ -386,11 +409,184 @@
 ;; left-to-right; duplicate/cyclic/out-of-range child pages and unordered rows
 ;; refuse. SQLite schema and payload overflow chains remain unsupported.
 (defn read-notepad-image [image :bytes page-size :i64] :vector-i64
-  (if (< page-size 512)
+  (let [page-count (admitted-db-page-count image page-size)]
+  (if (< page-count 2)
     (invalid)
-    (let [root (resolve-notepad-root image page-size)
-          page-count (quot (bytes-count image) page-size)]
+    (let [root (resolve-notepad-root image page-size)]
       (if (< root 2)
         (invalid)
         (walk-notepad-queue image page-size page-count (vector-i64 root) 0 -1
-                            (vector-i64))))))
+                            (vector-i64)))))))
+
+(defn- u32-be [data :bytes offset :i64] :i64
+  (+ (* (bytes-at data offset) 16777216)
+     (* (bytes-at data (+ offset 1)) 65536)
+     (* (bytes-at data (+ offset 2)) 256)
+     (bytes-at data (+ offset 3))))
+
+(defn- empty-bytes [] :bytes
+  (bytes-from-vector-i64 (vector-i64)))
+
+(defn- read-overflow-chain [image :bytes page-size :i64 page-count :i64
+                            reserved :i64 remaining :i64 page-number :i64
+                            visited :vector-i64 out :bytes] :bytes
+  (if (= remaining 0)
+    (if (= page-number 0) out (empty-bytes))
+    (let [usable-size (- page-size reserved)]
+      (if (or (< page-number 2)
+              (> page-number page-count)
+              (<= usable-size 4)
+              (page-seen? visited page-number 0))
+        (empty-bytes)
+        (let [start (* (- page-number 1) page-size)
+              page-image (bytes-slice image start (+ start page-size))
+              next-page (u32-be page-image 0)
+              chunk-size (if (> remaining (- usable-size 4))
+                           (- usable-size 4)
+                           remaining)
+              left (- remaining chunk-size)
+              next-visited (vector-conj visited page-number)
+              next-out (bytes-concat
+                         out
+                         (bytes-slice page-image 4 (+ 4 chunk-size)))]
+          (if (or (and (> left 0) (= next-page 0))
+                  (and (= left 0) (not= next-page 0)))
+            (empty-bytes)
+            (read-overflow-chain image page-size page-count reserved left
+                                 next-page next-visited next-out)))))))
+
+(defn- materialize-cell-payload [image :bytes page-image :bytes page-size :i64
+                                 page-count :i64 page-number :i64 cell-offset :i64
+                                 reserved :i64] :bytes
+  (let [cell (page/decode-table-leaf-cell page-image page-size page-number
+                                          reserved cell-offset)
+        payload-size (vector-at cell 0)
+        payload-offset (vector-at cell 2)
+        local-size (vector-at cell 3)
+        overflow-page (vector-at cell 4)
+        end-offset (vector-at cell 5)]
+    (if (or (< payload-size 0)
+            (< local-size 0)
+            (> end-offset page-size)
+            (> (+ payload-offset local-size) page-size))
+      (empty-bytes)
+      (let [local-payload (bytes-slice page-image payload-offset
+                                       (+ payload-offset local-size))
+            materialized (if (= payload-size local-size)
+                           (if (= overflow-page 0)
+                             local-payload
+                             (empty-bytes))
+                           (if (and (> payload-size local-size)
+                                    (> overflow-page 0)
+                                    (<= (+ payload-offset local-size 4) page-size))
+                             (read-overflow-chain
+                               image page-size page-count reserved
+                               (- payload-size local-size) overflow-page
+                               (vector-i64) local-payload)
+                             (empty-bytes)))]
+        (if (= (bytes-count materialized) payload-size)
+          materialized
+          (empty-bytes))))))
+
+(defn- pack-record-fields [payload :bytes spans :vector-i64 field :i64
+                          out :bytes] :bytes
+  (if (= field 4)
+    out
+    (let [offset (vector-at spans (* field 2))
+          length (vector-at spans (+ (* field 2) 1))
+          value (bytes-slice payload offset (+ offset length))]
+      (pack-record-fields payload spans (+ field 1)
+                          (bytes-concat
+                            (bytes-concat out (varint/encode length)) value)))))
+
+(defn- pack-notepad-leaf-cells [image :bytes page-image :bytes page-size :i64
+                                page-count :i64 page-number :i64 reserved :i64 cell-count :i64
+                                index :i64 previous-rowid :i64 out :bytes]
+                                :bytes
+  (if (= index cell-count)
+    out
+    (let [cell-offset (page/cell-pointer page-image page-size page-number reserved
+                                         index)]
+      (if (< cell-offset 0)
+        (empty-bytes)
+        (let [cell (page/decode-table-leaf-cell page-image page-size page-number
+                                                reserved cell-offset)
+              rowid (vector-at cell 1)
+              payload (materialize-cell-payload image page-image page-size
+                                                page-count page-number cell-offset
+                                                reserved)]
+          (if (or (< rowid 0)
+                  (<= rowid previous-rowid)
+                  (= (bytes-count payload) 0))
+            (empty-bytes)
+            (let [spans (record/decode payload)]
+              (if (or (not= (vector-count spans) 8)
+                      (< (vector-at spans 0) 0))
+                (empty-bytes)
+                (let [row-prefix
+                        (bytes-concat out (varint/encode rowid))
+                      row-bytes (pack-record-fields payload spans 0 row-prefix)]
+                  (pack-notepad-leaf-cells image page-image page-size page-count
+                                           page-number reserved cell-count
+                                           (+ index 1) rowid row-bytes))))))))))
+
+(defn- last-leaf-rowid [page-image :bytes page-size :i64 page-number :i64
+                        reserved :i64 cell-count :i64 previous-rowid :i64]
+                        :i64
+  (if (= cell-count 0)
+    previous-rowid
+    (let [cell-offset (page/cell-pointer page-image page-size page-number
+                                         reserved (- cell-count 1))]
+      (if (< cell-offset 0)
+        -1
+        (vector-at (page/decode-table-leaf-cell page-image page-size page-number
+                                                reserved cell-offset) 1)))))
+
+(defn- walk-packed-notepad-queue [image :bytes page-size :i64 page-count :i64
+                                 queue :vector-i64 queue-index :i64
+                                 previous-rowid :i64 out :bytes] :bytes
+  (if (= queue-index (vector-count queue))
+    out
+    (let [page-number (vector-at queue queue-index)
+          start (* (- page-number 1) page-size)
+          page-image (bytes-slice image start (+ start page-size))
+          header (page/decode-header page-image page-size page-number 0)
+          page-type (vector-at header 0)
+          cell-count (vector-at header 3)
+          next-queue (if (= page-type 5)
+                       (enqueue-interior-page page-image page-size page-number
+                                              page-count header queue)
+                       queue)]
+      (if (or (< page-number 2)
+              (> page-number page-count)
+              (< cell-count 0)
+              (not (or (= page-type 5) (= page-type 13)))
+              (and (= (vector-count next-queue) 1)
+                   (= (vector-at next-queue 0) -1)))
+        (empty-bytes)
+        (if (= page-type 5)
+          (walk-packed-notepad-queue image page-size page-count next-queue
+                                     (+ queue-index 1) previous-rowid out)
+          (let [next-out
+                  (pack-notepad-leaf-cells image page-image page-size page-count
+                                            page-number 0 cell-count 0
+                                            previous-rowid out)
+                next-rowid (last-leaf-rowid page-image page-size page-number 0
+                                            cell-count previous-rowid)]
+            (if (or (= (bytes-count next-out) 0) (< next-rowid previous-rowid))
+              (empty-bytes)
+              (walk-packed-notepad-queue image page-size page-count next-queue
+                                         (+ queue-index 1) next-rowid next-out))))))))
+
+;; Binary row stream: `KNR1`, then repeated SQLite-varint rowid and four
+;; [SQLite-varint byte-length, UTF-8 bytes] fields. Values are materialized so
+;; fields spanning overflow pages remain contiguous. Empty bytes means refusal.
+(defn read-notepad-image-packed [image :bytes page-size :i64] :bytes
+  (let [page-count (admitted-db-page-count image page-size)]
+    (if (< page-count 2)
+      (empty-bytes)
+      (let [root (resolve-notepad-root image page-size)]
+        (if (< root 2)
+          (empty-bytes)
+          (walk-packed-notepad-queue image page-size page-count
+                                     (vector-i64 root) 0 -1 packed-magic))))))
