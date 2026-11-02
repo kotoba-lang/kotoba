@@ -194,9 +194,8 @@ The planner tracks the number of emitted mutation commands, bounded to 512.
 Reusing a directory in a later layer does not add a command; a file create or
 replacement does. After all layers stream successfully, `emit-layout-hex`
 sends one `P` mode-finalization command per retained path, then a terminal
-`C` frame carrying the combined command count (at most 640). The current Amu
-supervisor still accepts at most 512 acknowledgments and therefore refuses
-larger successful streams until that limit is extended. The worker compares
+`C` frame carrying the combined command count (at most 640). The draft Amu
+supervisor now accepts up to 640 acknowledgments. The worker compares
 the count to the number it completed and emits `D` only on a match, after which it refuses more
 writes. The native supervisor checks that its worker response ends in `D`;
 the caller no longer supplies an acknowledgment count. `D` only closes this
@@ -229,6 +228,6 @@ and a full release remain unqualified.
 The independent `test/fune/stage_limit_layout.py OUTPUT` fixture stages four
 layers of 128 zero-length files. A native producer and worker completed 512
 file create/update operations plus 128 mode operations and read back the final
-mode. The previous supervisor rejected that valid 640-operation stream; the
-Amu candidate extends its response bound. The fixture is narrowly scoped and
+mode. The previous supervisor rejected that valid 640-operation stream; a
+source-pinned Amu candidate accepted it and refused an extra acknowledgment. The fixture is narrowly scoped and
 does not prove arbitrary OCI support.
