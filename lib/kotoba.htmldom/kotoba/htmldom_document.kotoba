@@ -1,0 +1,87 @@
+(ns htmldom-document
+  (:require [htmldom-tag :as tag] [htmldom-data :as data])
+  (:export [unwrap]))
+
+;; A deliberately bounded full-document envelope. This is not the HTML tree
+;; construction algorithm: unsupported head metadata, repair and rawtext
+;; refuse. The body is parsed separately by the fragment implementation.
+(defn field [d :document k :keyword] :document (option-or (document-get d k) (document-null)))
+(defn kval [d :document] :keyword (option-or (document-keyword-value d) :bad))
+(defn text [d :document] :string (option-or (document-string-value d) ""))
+(defn num [d :document] :i64 (option-or (document-i64-value d) -1))
+(defn at [d :document i :i64] :document (option-or (document-vector-at d i) (document-null)))
+(defn space? [c :i64] :bool (or (= c 9) (= c 10) (= c 12) (= c 13) (= c 32)))
+(defn skip [s :string i :i64] :i64
+  (if (and (< i (string-length s)) (space? (string-code-point-at s i))) (skip s (+ i 1)) i))
+(defn trim-end [s :string i :i64] :i64
+  (loop [p 0 last 0]
+    (if (>= p i) last
+      (let [c (string-code-point-at s p) width (cond (< c 128) 1 (< c 2048) 2 (< c 65536) 3 :else 4)
+            next (+ p width)]
+        (if (> next i) -1 (recur next (if (space? c) last next)))))))
+(defn prefix? [s :string i :i64 p :string] :bool
+  (and (>= i 0) (<= (+ i (string-length p)) (string-length s))
+       (string=? (string-substring s i (+ i (string-length p))) p)))
+(defn simple-tag? [t :document k :keyword name :string] :bool
+  (and (= (kval (field t :kind)) k) (string=? (text (field t :name)) name)
+       (= (document-count (field t :attributes)) 0)
+       (not (option-or (document-bool-value (field t :self-closing)) false))))
+(defn charset-meta? [t :document] :bool
+  (let [attrs (field t :attributes) a (at attrs 0)]
+    (and (= (kval (field t :kind)) :tag/start) (string=? (text (field t :name)) "meta")
+         (= (document-count attrs) 1) (string=? (text (field a :name)) "charset")
+         (string=? (string-fold-ascii (text (field a :value))) "utf-8"))))
+(defn title-text [s :string] [:option :string]
+  ;; RCDATA for the bounded title envelope. A '<' that is not the already
+  ;; located closing tag is text; character references use HTML data rules.
+  (loop [i 0 out ""]
+    (if (= i (string-length s)) (option-some-of [:option :string] out)
+      (let [t (data/next-token (string-substring s i (string-length s))) k (kval (field t :kind))
+            n (num (field t :consumed)) a (num (field t :value)) b (num (field t :value2))]
+        (cond (= k :data/tag-open) (recur (+ i 1) (string-concat out "<"))
+              (= k :data/text) (recur (+ i n) (string-concat out (text (field t :text))))
+              (= k :data/character) (recur (+ i n) (string-concat out
+                 (string-concat (tag/scalar a) (if (< b 0) "" (tag/scalar b)))))
+              :else (option-none-of [:option :string]))))))
+(defn result [kind :keyword body :string title :string] :document
+  (document-map :kind (document-keyword kind) :body (document-string body) :title (document-string title)))
+(defn unwrap [s :string] :document
+  (let [n (string-length s) lower (string-fold-ascii s) start (skip s 0)]
+    (if (> n 65536) (result :document/unsupported "" "")
+      (let [doctype? (prefix? lower start "<!doctype")
+            first-tag (if (>= start n) (document-null) (tag/parse (string-substring s start n)))
+            candidate? (or doctype? (and (= (kval (field first-tag :kind)) :tag/start)
+                                         (string=? (text (field first-tag :name)) "html")))]
+        (if (not candidate?) (result :document/fragment s "")
+          (let [after-doctype (if doctype?
+                               (let [p (+ start 9) q (skip s p) e (+ q 4) close (skip s e)]
+                                 (if (and (< p q) (prefix? lower q "html") (< close n)
+                                          (= (string-code-point-at s close) 62)) (+ close 1) -1)) start)
+                html-at (if (< after-doctype 0) n (skip s after-doctype))
+                html-tag (tag/parse (string-substring s html-at n))
+                head-at (skip s (+ html-at (if (< (num (field html-tag :consumed)) 0) 0 (num (field html-tag :consumed)))))
+                head-tag (tag/parse (string-substring s head-at n))]
+            (if (or (< after-doctype 0) (not (simple-tag? html-tag :tag/start "html"))
+                    (not (simple-tag? head-tag :tag/start "head")))
+              (result :document/unsupported "" "")
+              (head s lower (skip s (+ head-at (num (field head-tag :consumed)))) "" false))))))))
+(defn head [s :string lower :string i :i64 title :string has-title :bool] :document
+  (let [n (string-length s) pos (skip s i) t (tag/parse (string-substring s pos n))
+        k (kval (field t :kind)) name (text (field t :name)) consumed (num (field t :consumed))]
+    (cond (simple-tag? t :tag/end "head") (body s lower (skip s (+ pos consumed)) title)
+          (charset-meta? t) (head s lower (+ pos consumed) title has-title)
+          (and (simple-tag? t :tag/start "title") (not has-title))
+            (let [from (+ pos consumed) rel (string-index-of (string-substring lower from n) "</title>")]
+              (if (< rel 0) (result :document/unsupported "" "")
+                (let [end (+ from rel) decoded (title-text (string-substring s from end))]
+                  (if (not (option-some?-of [:option :string] decoded)) (result :document/unsupported "" "")
+                    (head s lower (+ end 8) (option-or decoded "") true)))))
+          :else (result :document/unsupported "" ""))))
+(defn body [s :string lower :string pos :i64 title :string] :document
+  (let [n (string-length s) t (tag/parse (string-substring s pos n)) end (trim-end s n)
+        html-start (- end 7) before-html (if (>= html-start 0) (trim-end s html-start) -1)
+        body-start (- before-html 7) from (+ pos (num (field t :consumed)))]
+    (if (or (not (simple-tag? t :tag/start "body")) (< body-start from)
+            (not (prefix? lower html-start "</html>")) (not (prefix? lower body-start "</body>")))
+      (result :document/unsupported "" "")
+      (result :document/ok (string-substring s from body-start) title))))
