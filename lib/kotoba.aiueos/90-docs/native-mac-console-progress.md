@@ -65,6 +65,27 @@ Source-bound receipts and screen readbacks are under
  authentication before backend access, RFB versions/pixels, bounded keys,
  clipboard discard, band failure controls and queued drag edge preservation.
 
+The subsequent persistent-channel candidate reuses one authenticated SSH
+session for status, nonce-bound pointer/key input and screenshot bands. The
+framed protocol caps requests at1024 bytes and replies at1MiB, requires rising
+request identities, and refuses administrative reboot/type/USB commands.
+Every operation still takes the shared management lock and performs native
+nonce/signature admission. Transport failure closes the channel without
+replaying ambiguous input. Authentication/capture failure and disconnect
+retire the session. The adapter remains a Mac administration bridge.
+
+`persistent-channel.json` records a sequential ABBA hardware comparison with
+no connected RFB client and one native boot. Pooled status medians were
+0.250s versus0.144s;32-row bands were0.333s versus0.221s. Baseline full captures
+took5.84–7.28s and persistent captures3.97–4.34s. The final lifecycle-cleanup
+revision has a separate repeat in the same receipt. Eight channel tests
+exercise framing, denied operations, malformed/repeated identities, generic
+private failures, response bounds and no replay after an ambiguous input
+timeout. The RFB suite now has ten tests, including failed initial-capture
+cleanup. Actual signed hover motion changed only the expected cursor pixels;
+reboot, stale-nonce key input and an invalid pointer were refused. These
+measurements do not qualify Sidecar responsiveness or native OS SSH.
+
 The actual Mac Screen Sharing app displayed the desktop, entered `r`
 (independent band readback `abar`), deleted it and opened Murakumo by pointer
 click. A separate real loopback RFB wire session drove signed drag/typing

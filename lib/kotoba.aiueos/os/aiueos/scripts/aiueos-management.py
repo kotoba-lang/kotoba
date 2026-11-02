@@ -61,17 +61,8 @@ def watch(state):
             if tag == 0xc000 and value: save_nonce(state, value)
 
 
-def main(a):
-    cfg = private_json(a.config.resolve(strict=True)); state = Path(cfg['state'])
-    assert state.is_dir() and state.stat().st_mode & 0o077 == 0
-    if a.mode == 'watch': return watch(state)
-    words = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', 'help')) if a.mode == 'ssh' else a.command
-    if not words: words = ['help']
-    op, args = words[0], words[1:]
-    if op == 'help' and not args:
-        print('Mac SSH management bridge -> signed Itonami debug link')
-        print('status | ping | key SCANCODE | type TEXT | screenshot | pointer X Y LEFT | console-key SCANCODE | usb-select BDF | reboot')
-        print('This endpoint is not the OS-native SSH server.'); return
+def operation(cfg,state,words,seed=None):
+    op,args=words[0],words[1:]
     modes = {'status': 'ping', 'ping': 'ping', 'reboot': 'reboot', 'key': 'key',
              'type': 'type', 'usb-select': 'usb-select', 'screenshot': 'shot', 'pointer': 'pointer', 'console-key': 'console-key', 'screenshot-band':'band'}
     if op not in modes: raise ValueError('unsupported management operation')
@@ -98,47 +89,74 @@ def main(a):
         first,count=(int(v,0) for v in args)
         if not (0<=first<8192 and 1<=count<=32 and first+count<=8192): raise ValueError('band outside finite row range')
     key = Path(cfg['remoteKey']); assert key.stat().st_mode & 0o077 == 0
-    seed = key.read_bytes(); assert len(seed) == 32
+    if seed is None: seed = key.read_bytes()
+    assert len(seed) == 32
     # Serialize operations across SSH sessions and keep reply attribution exact.
     with (state/'command.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        log = listen(7799, .5); nonce = get_nonce(state, log)
-        if expected_nonce is not None and nonce != expected_nonce:
-            raise RuntimeError('native boot changed; reconnect the console')
-        if cmd == 'band':
-            counter=time.time_ns(); shots=listen(7797,.1)
+        with listen(7799,.5) as log:
+            return locked_operation(cfg,state,op,cmd,args,expected_nonce,key,seed,log)
+
+
+def locked_operation(cfg,state,op,cmd,args,expected_nonce,key,seed,log):
+    nonce=get_nonce(state,log)
+    if cmd=='pointer':x,y,left=(int(v,0) for v in args)
+    if cmd=='band':first,count=(int(v,0) for v in args)
+    if expected_nonce is not None and nonce != expected_nonce:
+        raise RuntimeError('native boot changed; reconnect the console')
+    if cmd == 'band':
+        counter=time.time_ns()
+        with listen(7797,.1) as shots:
             remote.send(argparse.Namespace(broadcast=cfg.get('broadcast','10.77.0.255')),seed,
                         nonce,counter,20,first|(count<<16))
             width,height,rgb=remote.receive_band(shots,nonce,counter,first,count,5)
-            accepted=remote.reply(log,{0xc014},5)
-            if accepted!=(0xc014,counter): raise RuntimeError('band acknowledgement differs')
-            sys.stdout.buffer.write(struct.pack('<8sQHHHH',b'IRGBBND1',nonce,first,count,width,height)+rgb)
-            return
-        if cmd == 'shot':
-            target = state/('screen-'+str(time.time_ns())+'.png')
-            remote.listen = listen; remote.wait_nonce = lambda sock, seconds: nonce
-            sys.argv = [str(HERE/'aiueos-remote.py'), '--key', str(key), '--wait','10',
-                        '--nonce',hex(nonce),'shot',str(target)]
-            with contextlib.redirect_stdout(io.StringIO()) as result: remote.main()
-            if '600 rows, 800x600' not in result.getvalue():
-                raise RuntimeError('incomplete physical screenshot: '+result.getvalue())
-            sys.stdout.buffer.write(target.read_bytes()); return
-        ids = {'ping':1,'reboot':2,'key':3,'usb-select':7,'type':3,'pointer':18,'console-key':19}
-        expected = {'ping':0xc001,'reboot':0xc002,'key':0xc003,'usb-select':0xc007,'type':0xc003,'pointer':0xc012,'console-key':0xc013}
-        counter = time.time_ns()
-        values = ([x | (y << 13) | (left << 26)] if cmd == 'pointer' else
-                  [remote.SCAN[c] for c in args[0]] if cmd == 'type' else [int(args[0],0) if args else 0])
-        replies = []
-        for index, value in enumerate(values):
-            remote.send(argparse.Namespace(broadcast=cfg.get('broadcast','10.77.0.255')), seed,
-                        nonce,counter+index,ids[cmd],value)
-            reply = remote.reply(log,{expected[cmd]},15)
-            if reply is None or reply[0] == 0xc0ff: raise RuntimeError(f'board did not accept operation: {reply}')
-            if cmd in ('ping','reboot','pointer','console-key') and reply[1] != counter+index: raise RuntimeError('reply counter differs')
-            if cmd in ('key','type') and reply[1] != value: raise RuntimeError('reply key differs')
-            replies.append(dict(tag=f'{reply[0]:04x}',value=reply[1]))
-        print(json.dumps(dict(transport='Mac loopback SSH -> signed UDP',nativeSSH=False,
-                              operation=op,bootNonce=f'{nonce:016x}',replies=replies)))
+        accepted=remote.reply(log,{0xc014},5)
+        if accepted!=(0xc014,counter): raise RuntimeError('band acknowledgement differs')
+        return 1,struct.pack('<8sQHHHH',b'IRGBBND1',nonce,first,count,width,height)+rgb
+    if cmd == 'shot':
+        target = state/('screen-'+str(time.time_ns())+'.png')
+        remote.listen = listen; remote.wait_nonce = lambda sock, seconds: nonce
+        sys.argv = [str(HERE/'aiueos-remote.py'), '--key', str(key), '--wait','10',
+                    '--nonce',hex(nonce),'shot',str(target)]
+        with contextlib.redirect_stdout(io.StringIO()) as result: remote.main()
+        if '600 rows, 800x600' not in result.getvalue():
+            raise RuntimeError('incomplete physical screenshot: '+result.getvalue())
+        return 1,target.read_bytes()
+    ids = {'ping':1,'reboot':2,'key':3,'usb-select':7,'type':3,'pointer':18,'console-key':19}
+    expected = {'ping':0xc001,'reboot':0xc002,'key':0xc003,'usb-select':0xc007,'type':0xc003,'pointer':0xc012,'console-key':0xc013}
+    counter = time.time_ns()
+    values = ([x | (y << 13) | (left << 26)] if cmd == 'pointer' else
+              [remote.SCAN[c] for c in args[0]] if cmd == 'type' else [int(args[0],0) if args else 0])
+    replies = []
+    for index, value in enumerate(values):
+        remote.send(argparse.Namespace(broadcast=cfg.get('broadcast','10.77.0.255')), seed,
+                    nonce,counter+index,ids[cmd],value)
+        reply = remote.reply(log,{expected[cmd]},15)
+        if reply is None or reply[0] == 0xc0ff: raise RuntimeError(f'board did not accept operation: {reply}')
+        if cmd in ('ping','reboot','pointer','console-key') and reply[1] != counter+index: raise RuntimeError('reply counter differs')
+        if cmd in ('key','type') and reply[1] != value: raise RuntimeError('reply key differs')
+        replies.append(dict(tag=f'{reply[0]:04x}',value=reply[1]))
+    return 0,json.dumps(dict(transport='Mac loopback SSH -> signed UDP',nativeSSH=False,
+                          operation=op,bootNonce=f'{nonce:016x}',replies=replies)).encode()
+
+def main(a):
+    cfg=private_json(a.config.resolve(strict=True));state=Path(cfg['state'])
+    assert state.is_dir() and state.stat().st_mode & 0o077 == 0
+    if a.mode=='watch':return watch(state)
+    words=shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND','help')) if a.mode=='ssh' else a.command
+    if not words:words=['help']
+    if words==['help']:
+        print('Mac SSH management bridge -> signed Itonami debug link')
+        print('status | ping | key SCANCODE | type TEXT | screenshot | pointer X Y LEFT | console-key SCANCODE | screenshot-band nonce=HEX ROW COUNT | usb-select BDF | reboot')
+        print('console-session: finite persistent console transport; not OS-native SSH');return
+    if words==['console-session']:
+        spec=importlib.util.spec_from_file_location('console_channel',HERE/'aiueos-console-channel.py')
+        channel=importlib.util.module_from_spec(spec);spec.loader.exec_module(channel)
+        key=Path(cfg['remoteKey']);assert key.stat().st_mode & 0o077 == 0
+        seed=key.read_bytes();assert len(seed)==32
+        return channel.serve(sys.stdin.buffer,sys.stdout.buffer,lambda request:operation(cfg,state,request,seed))
+    kind,payload=operation(cfg,state,words)
+    sys.stdout.buffer.write(payload+(b'\n' if kind==0 else b''))
 
 
 if __name__ == '__main__':

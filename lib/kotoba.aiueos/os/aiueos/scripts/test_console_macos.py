@@ -39,8 +39,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(c.vnc_response(password,bytes.fromhex('0123456789abcdef')*2),
                          bytes.fromhex('85e813540f0ab405')*2)
 
-    def start(self,version=b'RFB 003.008\n'):
-        client,server = socket.socketpair(); client.settimeout(8); backend=Backend(); errors=[]
+    def start(self,version=b'RFB 003.008\n',backend=None):
+        client,server = socket.socketpair(); client.settimeout(8); backend=backend or Backend(); errors=[]
         def serve():
             try:
                 with server: c.session(server,backend,PASSWORD,.5)
@@ -65,6 +65,17 @@ class Tests(unittest.TestCase):
         self.assertEqual(struct.unpack('>I',c.receive(client,4))[0],1)
         c.receive(client,struct.unpack('>I',c.receive(client,4))[0]); client.close();t.join(5)
         self.assertFalse(t.is_alive());self.assertEqual(b.captures,0);self.assertEqual(b.events,[])
+
+    def test_failed_initial_capture_releases_authenticated_session(self):
+        class Failed(Backend):
+            def capture(self): raise RuntimeError('fixture capture failure')
+        client,b,t,challenge,errors=self.start(backend=Failed())
+        client.sendall(c.vnc_response(PASSWORD,challenge))
+        self.assertEqual(c.receive(client,4),bytes(4));client.sendall(b'\x01')
+        with self.assertRaises(EOFError):c.receive(client,24)
+        t.join(3)
+        self.assertFalse(t.is_alive());self.assertEqual(b.releases,1)
+        self.assertEqual(errors,['RuntimeError'])
 
     def test_standard_and_apple_version_negotiation(self):
         for version in (b'RFB 003.003\n',b'RFB 003.007\n',b'RFB 003.889\n'):

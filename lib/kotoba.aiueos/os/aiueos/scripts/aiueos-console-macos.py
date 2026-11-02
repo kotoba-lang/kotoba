@@ -9,6 +9,7 @@ import argparse
 import collections
 import ctypes
 import hmac
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,9 @@ import subprocess
 import threading
 import time
 import zlib
+
+_channel_spec=importlib.util.spec_from_file_location('console_channel',Path(__file__).with_name('aiueos-console-channel.py'))
+channel=importlib.util.module_from_spec(_channel_spec);_channel_spec.loader.exec_module(channel)
 
 
 def private_file(path):
@@ -82,23 +86,26 @@ class Bridge:
     def __init__(self, host):
         if host != 'itonami-6600h': raise ValueError('unsupported management host')
         self.host = host; self.cv = threading.Condition(); self.queue = collections.deque()
+        self.channel=None
         self.stopped = False; self.active = False; self.session_nonce = None; self.last_pointer = (0,0,0); self.errors = 0; self.input_serial=0
         self.thread = threading.Thread(target=self.run,daemon=True); self.thread.start()
 
     def ssh(self, *args, screenshot=False):
-        control=Path.home()/'.ssh/itonami-6600h/console-control'
-        r = subprocess.run(['/usr/bin/ssh','-o','BatchMode=yes','-o','ConnectTimeout=5',
-                           '-o','ControlMaster=auto','-o','ControlPersist=60',
-                           '-o','ControlPath='+str(control),self.host,*args],
-                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
-        if r.returncode != 0: raise RuntimeError('bounded SSH management operation failed')
-        if screenshot: return r.stdout
-        reply = json.loads(r.stdout)
+        if self.channel is None: raise RuntimeError('no authenticated console channel')
+        kind,payload=self.channel.request(args[0],args[1:])
+        if kind!=(1 if screenshot else 0):
+            self.channel.close();raise RuntimeError('unexpected management response kind')
+        if screenshot: return payload
+        reply = json.loads(payload)
         if reply.get('nativeSSH') is not False: raise RuntimeError('unexpected management transport')
         return reply
 
     def begin(self):
-        self.session_nonce = self.ssh('status')['bootNonce']
+        if self.channel:self.channel.close()
+        self.session_nonce=None;self.channel=channel.Channel(self.host)
+        try:self.session_nonce = self.ssh('status')['bootNonce']
+        except (OSError,ValueError,RuntimeError):
+            self.channel.close();self.channel=None;raise
 
     def input(self, kind, *values):
         item = (kind,tuple(values))
@@ -164,7 +171,11 @@ class Bridge:
             self.queue.append(('pointer',(x,y,0)))
             self.queue.append(('_barrier',(barrier,)))
             self.last_pointer = (x,y,0); self.cv.notify()
-        if not barrier.wait(20): raise RuntimeError('console release did not drain')
+        try:
+            if not barrier.wait(20): raise RuntimeError('console release did not drain')
+        finally:
+            if self.channel:self.channel.close();self.channel=None
+            self.session_nonce=None
 
 
 def receive(sock, size):
@@ -230,9 +241,13 @@ def session(sock, bridge, password, interval):
     sock.sendall(struct.pack('>I',0)); receive(sock,1)
     print('ITONAMI_CONSOLE_AUTHENTICATED',flush=True)
     bridge.begin()
-    width,height,initial = bridge.capture()
-    name = b'Itonami 6600H - local SSH console (diagnostic)'
-    sock.sendall(struct.pack('>HH',width,height)+DEFAULT_FORMAT+struct.pack('>I',len(name))+name)
+    try:
+        width,height,initial = bridge.capture()
+        name = b'Itonami 6600H - local SSH console (diagnostic)'
+        sock.sendall(struct.pack('>HH',width,height)+DEFAULT_FORMAT+struct.pack('>I',len(name))+name)
+    except (OSError,ValueError,RuntimeError,EOFError,subprocess.TimeoutExpired):
+        bridge.release()
+        raise
     print('ITONAMI_CONSOLE_FRAMEBUFFER_READY',flush=True)
     lock = threading.Lock(); cv = threading.Condition(); requests = collections.deque(maxlen=1)
     closed = threading.Event(); fmt = [pixel_format(DEFAULT_FORMAT)]; modifiers = set()
