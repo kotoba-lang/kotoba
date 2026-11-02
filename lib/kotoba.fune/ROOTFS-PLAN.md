@@ -59,3 +59,36 @@ regular-file tar, manifest and digest; duplicate tar, manifest and digest. The
 staging script prints the digests. Compile the pure planner and its gate as a
 second source-composed image. Both test processes must exit zero. These local
 source compositions are test harnesses, not the project linker or CI.
+
+## Full manifest planning candidate
+
+`fune.layout-check/verify-layout-plan` applies the bounded layout marker,
+index, manifest and config checks, then traverses every manifest layer in
+order through `verify-layer-plan-hold`. Each layer's snapshot is closed after
+it has been incorporated; the metadata plan is discarded when the call
+returns. `ok` therefore describes the bytes observed during this read-only
+call, not any later snapshot or rootfs, and must never authorize extraction or
+execution. In particular, reopening a blob later requires its digest to be
+verified again. There is still no verified-archive-to-worker channel.
+
+On Linux ARM64, the source-composed `layout_plan_runner.kotoba` accepted a
+single manifest with three layers: directory, file and replacement of that
+file. A layer order putting the file before its parent and a layer with a
+duplicate path were rejected as `fune/rootfs-plan`. Corruption in either the
+second or third file layer was rejected as `fune/blob-digest`; a control that
+stopped after the first layer incorrectly accepted both. The second and third layers have
+different bytes and digests. The original snapshot layout route was also rerun:
+its existing two-layer fixture passed and its tampered counterpart failed.
+These are source-composed local checks, not native x86 or project-linker gates.
+
+Stage `stage_layer_fixtures.py` and `stage_layout_fixtures.py` into fresh
+workspace directories. The latter prints each immutable manifest digest and
+creates `plan-good`, `plan-parent-missing`, `plan-duplicate`,
+`plan-second-tampered`, and `plan-third-tampered`. Compose the dependencies listed above, plus
+`image_config.kotoba`, `layout_check.kotoba` and `layout_plan_runner.kotoba`,
+with namespace aliases removed as in the existing local examples. Run with the
+same Linux runtime settings and a grant scoped to each layout. The good case
+must print `ok` and exit 0; both metadata conflicts must print
+`fune/rootfs-plan`, and both tampered cases must print `fune/blob-digest`, all
+with exit 1. The separate test-only first-layer-only mutant prints `ok` for
+the tampered case. No real rootfs is created by these tests.

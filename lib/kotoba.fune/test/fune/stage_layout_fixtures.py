@@ -98,6 +98,45 @@ print('manifest', 'sha256:' + md)
 print('config', 'sha256:' + cd)
 print('layer', 'sha256:' + ld)
 
+# Independent full-manifest planner fixtures. The order deliberately matters:
+# the bounded planner requires an explicit directory before a child file.
+def plan_layout(name, layers):
+    root = base / name
+    blobs = root / 'blobs' / 'sha256'
+    blobs.mkdir(parents=True)
+    (root / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}')
+    layer_digests = [hashlib.sha256(data).hexdigest() for data in layers]
+    plan_config_obj = json.loads(config)
+    plan_config_obj['rootfs']['diff_ids'] = ['sha256:' + digest for digest in layer_digests]
+    plan_config = json.dumps(plan_config_obj, separators=(',', ':')).encode()
+    plan_manifest_obj = json.loads(manifest)
+    plan_manifest_obj['config']['digest'] = 'sha256:' + hashlib.sha256(plan_config).hexdigest()
+    plan_manifest_obj['config']['size'] = len(plan_config)
+    plan_manifest_obj['layers'] = [
+        {'mediaType':'application/vnd.oci.image.layer.v1.tar', 'digest':'sha256:' + digest, 'size':len(data)}
+        for data, digest in zip(layers, layer_digests)]
+    plan_manifest = json.dumps(plan_manifest_obj, separators=(',', ':')).encode()
+    write_index(root, plan_manifest)
+    (blobs / hashlib.sha256(plan_manifest).hexdigest()).write_bytes(plan_manifest)
+    (blobs / hashlib.sha256(plan_config).hexdigest()).write_bytes(plan_config)
+    for data, digest in zip(layers, layer_digests):
+        (blobs / digest).write_bytes(data)
+    digest = 'sha256:' + hashlib.sha256(plan_manifest).hexdigest()
+    print(name + '-manifest', digest)
+    return layer_digests
+
+plan_digests = plan_layout('plan-good', [other, layer, (source / 'replacement.tar').read_bytes()])
+plan_layout('plan-parent-missing', [layer, other])
+plan_layout('plan-duplicate', [other, (source / 'duplicate.tar').read_bytes()])
+shutil.copytree(base / 'plan-good', base / 'plan-second-tampered')
+bad_layer = bytearray(layer)
+bad_layer[-1] ^= 1
+(base / 'plan-second-tampered' / 'blobs' / 'sha256' / plan_digests[1]).write_bytes(bad_layer)
+shutil.copytree(base / 'plan-good', base / 'plan-third-tampered')
+bad_replacement = bytearray((source / 'replacement.tar').read_bytes())
+bad_replacement[-1] ^= 1
+(base / 'plan-third-tampered' / 'blobs' / 'sha256' / plan_digests[2]).write_bytes(bad_replacement)
+
 if len(sys.argv) == 4:
     # Sparse files exercise pre-read bounds without allocating their full size.
     for name, rel, size in (

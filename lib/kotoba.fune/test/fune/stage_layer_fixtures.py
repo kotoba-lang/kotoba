@@ -59,6 +59,7 @@ badmode[100:108] = b'0000899\0'
 fix_checksum(badmode)
 cases = {
     'good': valid,
+    'replacement': archive('bin/hello', data=b'updated'),
     'directory': archive('bin/', tarfile.DIRTYPE, b''),
     'prefix': archive('a' * 90 + '/' + 'b' * 40),
     'multi': multi_archive(),
