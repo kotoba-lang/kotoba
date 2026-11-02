@@ -13,7 +13,7 @@ amu,out = map(lambda x:Path(x).resolve(),sys.argv[1:]); repo=Path(__file__).reso
 out.mkdir(parents=True,exist_ok=False)
 sha=lambda b:hashlib.sha256(b).hexdigest()
 compiler=amu/'seed/bootstrap/aarch64-macos/amu-full-root.macho'
-if sha(compiler.read_bytes())!='2c551579c06a0228029bb06bae177e93126ecbbc37d636d693c471dbac8d1536': raise ValueError('compiler mismatch')
+if sha(compiler.read_bytes())!='df6b602af6375ec96d951c7bea9bfdd4c456702af7e1f1487d0a2e7fa3874574': raise ValueError('compiler mismatch')
 spec=importlib.util.spec_from_file_location('pq',repo/'scripts/check-pq-native.py');pq=importlib.util.module_from_spec(spec);spec.loader.exec_module(pq)
 paths=dict(pq.TCP_DEMO['files'])
 paths.update({'kagami/fleet_noise_native.kotoba':'lib/kotoba.kagami/src/kagami/fleet_noise_native.kotoba',
