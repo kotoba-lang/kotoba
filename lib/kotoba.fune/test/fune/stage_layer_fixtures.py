@@ -84,3 +84,8 @@ for name, data in cases.items():
 alpine = (Path(__file__).parent / 'fixtures' / 'alpine-3.24.3-arm64-manifest.json').read_bytes()
 (out / 'alpine.manifest').write_bytes(alpine)
 print('alpine-manifest', sha(alpine), len(alpine))
+for source, dest in [('alpine-3.24.3-arm64-uncompressed-manifest.json', 'alpine-uncompressed.manifest'),
+                     ('alpine-3.24.3-arm64-config.json', 'alpine.config')]:
+    data = (Path(__file__).parent / 'fixtures' / source).read_bytes()
+    (out / dest).write_bytes(data)
+    print(dest, sha(data), len(data))
