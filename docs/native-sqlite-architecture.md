@@ -468,3 +468,17 @@ when its single-leaf table/index roots fill, plus FS2 publish/reopen/readback
 and refusal of the next upsert. Further splits/rebalancing, arbitrary SQLite
 layouts, WAL or rollback-journal handling, atomic/crash-safe transactions,
 concurrent locking, Linux x86_64, and Itonami integration remain open.
+
+## Native Linux gate scope (2026-11-03)
+
+Rechecked Kotoba Actions run
+[41478551197](https://github.com/kotoba-lang/kotoba/actions/runs/41478551197),
+source revision `c19db0cae7347f2e733dc74bf3283e7fce9d7fe3`: the Amu
+selfhost/Kotoba CLI job passed, including the native ARM64 SQLite publication,
+readback, and sidecar refusal step. The separate x86 native controller job was
+cancelled, and the overall workflow conclusion is `cancelled`. Therefore this
+is evidence for that ARM64 SQLite gate only, not a successful full workflow or
+x86 SQLite qualification. The source-pinned FS2 export plus independent,
+read-only SQLite 3.54.1 readback described above remains a bounded result.
+WAL/recovery, locking, crash consistency, broader layouts, x86_64 qualification,
+and Itonami integration remain open.
