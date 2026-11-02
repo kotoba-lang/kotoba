@@ -19,10 +19,12 @@ p.add_argument('--output', type=Path, required=True)
 gate = native.NativeGate(p.parse_args())
 files = {
  'kagami/fleet_store_native.kotoba': ROOT / 'lib/kotoba.kagami/src/kagami/fleet_store_native.kotoba',
+ 'kagami/fleet_announce_edn.kotoba': ROOT / 'lib/kotoba.kagami/src/kagami/fleet_announce_edn.kotoba',
  'kagami/fleet_native.kotoba': ROOT / 'lib/kotoba.kagami/src/kagami/fleet_native.kotoba',
  'kagami/fleet_store_native_test.kotoba': ROOT / 'lib/kotoba.kagami/test/kagami/fleet_store_native_test.kotoba',
  'hata/store_io.kotoba': ROOT / 'lib/kotoba.hata/src/hata/store_io.kotoba',
  'hata/codec.kotoba': ROOT / 'lib/kotoba.hata/src/hata/codec.kotoba',
+ 'kotoba_harness/data.kotoba': ROOT / 'lib/kotoba.kotobaHarness/src/kotoba_harness/data.kotoba',
  'ed25519/selfhost.kotoba': ROOT / 'lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba',
  'sha2/core.kotoba': ROOT / 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba'}
 sources = {n:p.read_bytes() for n,p in files.items()}
@@ -41,6 +43,9 @@ for mode in ['init','announce-invalid','state-old','announce','state-new','annou
 message = gate.out / 'message'; message.mkdir()
 for mode in ['init','message-invalid','state-old','message','state-new']:
  run('message-'+mode+str(len(gate.observations)),mode,message)
+edn = gate.out / 'edn'; edn.mkdir()
+for mode in ['init','edn-invalid','state-old','edn','state-new']:
+ run('edn-'+mode+str(len(gate.observations)),mode,edn)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
 def race_one(i):
@@ -60,6 +65,13 @@ if results.count(10)!=1 or any(x not in (10,11,12,16) for x in results): raise V
 run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
+ingress_source = sources['kagami/fleet_announce_edn.kotoba']
+needle=b'(not (lexical-safe? raw))'
+if ingress_source.count(needle)!=1: raise ValueError('unexpected EDN ingress guard')
+mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'true')
+broken=gate.build('control-edn-refuse-all','kagami/fleet_store_native_test.kotoba',mutant)
+directory=gate.out/'control-edn-refuse-all-state';directory.mkdir();run('control-init-edn-refuse-all','init',directory)
+gate.run('control-detected-edn-refuse-all',broken,23,['edn',directory],'35,38',directory)
 needle=b'(if present (io/read file) "")'
 if store_source.count(needle)!=1: raise ValueError('unexpected missing-checkpoint guard')
 mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'(io/read file)')
