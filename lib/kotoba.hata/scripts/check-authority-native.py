@@ -130,6 +130,17 @@ def main():
 
     normal = out / "normal"
     normal.mkdir()
+    unlink_target = normal / "unlink"
+    unlink_target.write_text("inside", encoding="ascii")
+    run("remove", normal, label="store-io-remove-positive")
+    assert not unlink_target.exists()
+    run("remove-absent", normal, label="store-io-remove-absent")
+    unlink_target.write_text("preserve", encoding="ascii")
+    refusal = call("store-io-remove-ungranted",
+        [runner, store, "0", "0", "x86_64", "38", "--", "remove", normal],
+        runtime("38", out), expected=120)
+    assert b"KEXE_CAP {:wire 35 :refused :not-granted}" in refusal.stderr
+    assert unlink_target.read_text(encoding="ascii") == "preserve"
     for mode in ["create", "create-again", "state-empty", "denied", "save-token", "submit",
                  "state-reserved", "duplicate", "conflict", "stale", "complete", "state-complete"]:
         run(mode, normal)
