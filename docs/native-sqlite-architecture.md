@@ -450,9 +450,10 @@ Kotoba commit `34c10ebd25a40b77d946037d8b76d60adf864b52` adds a first split
 path to notepad upsert. When an exact three-page `cron_notepad` with single-
 leaf table and index roots can no longer append, Kotoba materializes its rows,
 adds the new row, rebuilds table and composite-PK index leaves, and constructs
-one-cell interior roots. The scope admits only child leaves that fit, rejects
-overflow rows and malformed inputs, and does not support further upserts to an
-already interior-root database.
+one-cell interior roots. The scope admits only child leaves that fit and
+rejects overflow rows and malformed inputs. A later bounded extension accepts
+repeat upserts only for this exact two-leaf table/index root shape; it does not
+support deeper trees or general B-tree rebalancing.
 
 The source-pinned native fixture and Linux ARM64 gate fill the database to the
 split, publish with FS2, reopen and look up a value through Kotoba, and require
@@ -484,11 +485,39 @@ The native and oracle receipts are
 [`split native receipt`](../lib/kotoba.sql/evidence/interior-root-split-native-linux-arm64-20261103.json)
 and [`split oracle receipt`](../lib/kotoba.sql/evidence/interior-root-split-readonly-oracle-20261103.json).
 
-This qualifies only the first split from the exact three-page schema image
-when its single-leaf table/index roots fill, plus FS2 publish/reopen/readback
-and refusal of the next upsert. Further splits/rebalancing, arbitrary SQLite
-layouts, WAL or rollback-journal handling, atomic/crash-safe transactions,
-concurrent locking, Linux x86_64, and Itonami integration remain open.
+This qualifies the first split from the exact three-page schema image when its
+single-leaf table/index roots fill, plus FS2 publish/reopen/readback. The
+subsequent bounded repeat-upsert qualification is recorded below. Further
+splits/rebalancing, arbitrary SQLite layouts, WAL or rollback-journal handling,
+atomic/crash-safe transactions, concurrent locking, Linux x86_64, and Itonami
+integration remain open.
+
+## Bounded repeat upserts on the two-leaf roots (2026-11-03)
+
+Exact-head Linux ARM64 run
+[`41507315368`](https://github.com/kotoba-lang/kotoba/actions/runs/41507315368)
+passed the Amu selfhost native SQLite fixture. Starting from the exact
+Kotoba-generated two-leaf table/index root image, the fixture performed three
+successful 970-byte-value upserts, refused a fourth capacity-exceeding upsert,
+published the three-row extension through FS2, reopened it, and read all three
+inserted values through the Kotoba reader. The native gate also passed the
+existing SQLite and sidecar refusal fixtures in the same job.
+
+The emitted repeat database is 28,672 bytes, page size 4096, with seven pages.
+A separate Python 3.15.0 / SQLite 3.54.1 immutable read-only connection reported
+`integrity_check=ok`, the expected `cron_notepad` schema and composite primary
+key autoindex, and eight ordered rows (five initial rows plus the three
+inserted rows), each with a 970-byte value. This oracle validates the emitted
+file's standard SQLite readability; it is not part of the native path and does
+not establish general SQLite correctness. Exact source, artifact, and oracle
+details are in the [repeat native receipt](../lib/kotoba.sql/evidence/interior-root-repeat-native-linux-arm64-20261103.json)
+and [separate read-only oracle receipt](../lib/kotoba.sql/evidence/interior-root-repeat-readonly-oracle-20261103.json).
+
+This expands qualification only to three repeat upserts that fit in the exact
+two-leaf image and fail-closed refusal when the next row exceeds that bounded
+capacity. It does not qualify deeper splits, arbitrary page layouts, WAL or
+rollback-journal processing, atomic/crash-safe transactions, concurrent
+locking, Linux x86_64, or Itonami integration.
 
 ## Native Linux gate scope (2026-11-03)
 
