@@ -30,6 +30,9 @@ image = gate.build('store', 'kagami/fleet_store_native_test.kotoba', sources)
 base = gate.out / 'normal'; base.mkdir()
 def run(label, mode, directory=base, expected=0):
  return gate.run(label, image, expected, [mode, directory], '35,38', directory)
+missing=gate.out/'missing';missing.mkdir()
+run('missing-checkpoint-refused','missing',missing)
+if (missing/'fleet.state').exists() or (missing/'fleet.state.pending').exists(): raise ValueError('missing checkpoint was recreated')
 for mode in ['init', 'state-old', 'invalid', 'state-old', 'success', 'state-new', 'already', 'state-new']:
  run('normal-'+mode+str(len(gate.observations)), mode)
 announce = gate.out / 'announce'; announce.mkdir()
@@ -57,6 +60,14 @@ if results.count(10)!=1 or any(x not in (10,11,12,16) for x in results): raise V
 run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
+needle=b'(if present (io/read file) "")'
+if store_source.count(needle)!=1: raise ValueError('unexpected missing-checkpoint guard')
+mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'(io/read file)')
+broken=gate.build('control-missing-checkpoint','kagami/fleet_store_native_test.kotoba',mutant)
+directory=gate.out/'control-missing-checkpoint-state';directory.mkdir()
+if gate.darwin:
+ r=gate.fd3([broken,*gate.guest_args(['missing',directory])])
+ if r.returncode!=-signal.SIGTRAP or r.stdout or r.stderr: raise ValueError(('missing control',r.returncode,r.stdout,r.stderr))
 for label,needle,replacement,mode,expected in [
  ('verify-bypass', b'(not (fleet/verify-edn-plan-into plan heads seq hash signer))', b'false', 'invalid', 4),
  ('compare-bypass', b'(string=? old observed)', b'true', 'stale', 6),
