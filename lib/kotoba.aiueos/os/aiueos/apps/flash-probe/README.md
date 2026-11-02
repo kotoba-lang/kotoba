@@ -3,7 +3,8 @@
 The target is an Itonami dapp running locally on Amu native selfhost. This
 is a source-level first slice, not an installed dapp or an alternative to
 `f3probe` yet. It contains a pure Kotoba sampling planner,
-result classifier and wraparound simulator. `main` runs its native self-test.
+result classifier, wraparound simulator, and a separate in-memory write/read
+backend. `main` runs its native self-test.
 It has no disk I/O, UI, consent implementation, dapp registration, cache
 invalidation or real-device test. A passing self-test says nothing about the
 capacity of either attached SSD. The core is independently designed and does
@@ -13,6 +14,8 @@ The sample plan uses block 0, powers of two below the reported block count,
 and the final block, omitting it when it duplicates a power of two. Input is a logical sector count from
 2 through 2^62; the list is at most 64 entries. The pure simulator models a
 simple wraparound device and detects some aliases within the chosen samples.
+The in-memory backend writes and subsequently reads four words per simulated
+block, including a wrapping model. It does not model OS I/O or physical caches.
 Other fake controllers, caches, remapping, faults, and capacities can evade the
 plan. A matched sample run is **inconclusive**, never a genuine/16 TB verdict
 or an estimate of usable capacity. A mismatch indicates observed corruption,
