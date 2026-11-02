@@ -156,9 +156,14 @@ def main(amu, compiler, out, amu_pin=None):
     interior_root = out / receipts[5]["image"]
     interior_root_path = out / "data/interior-root.db"
     run("sqlite-interior-root-image-fs2-write-read-and-refusal",
-        [interior_root, "data/interior-root.db"], out, guest_env, calls, timeout=300)
+        [interior_root, "data/interior-root.db", "data/interior-root-split.db"],
+        out, guest_env, calls, timeout=300)
     if not interior_root_path.is_file() or interior_root_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the expected seven-page interior-root SQLite image")
+
+    interior_split_path = out / "data/interior-root-split.db"
+    if not interior_split_path.is_file() or interior_split_path.stat().st_size != 7 * 4096:
+        raise RuntimeError("Kotoba did not publish the split-upsert interior-root SQLite image")
 
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
@@ -199,8 +204,15 @@ def main(amu, compiler, out, amu_pin=None):
             "databaseBytes": interior_root_path.stat().st_size,
             "result": "Kotoba constructed and FS2-published a seven-page SQLite image with table/index interior roots, reopened it, read both rows, and returned an empty refusal for upsert on the unsupported root shape",
         },
+        "interiorRootSplitUpsert": {
+            "fixture": "sqlite.interior-root-image",
+            "image": receipts[5]["image"],
+            "databaseSha256": sha(interior_split_path),
+            "databaseBytes": interior_split_path.stat().st_size,
+            "result": "Kotoba appended rows to a single-leaf image until full, split table/index roots into two leaves on a subsequent upsert, published via FS2, reopened/read a value, and refused a follow-up upsert",
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, and interior-root image write/read/refusal passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, interior-root image write/read/refusal, and single-leaf full-root split upsert passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")

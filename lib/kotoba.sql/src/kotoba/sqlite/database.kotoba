@@ -1240,6 +1240,161 @@
         true
         (nonblank-text? data (+ offset 1))))))
 
+(defn- packed-notepad-field [value :bytes] :bytes
+  (bytes-concat (varint/encode (bytes-count value)) value))
+
+(defn- append-packed-notepad-row [packed :bytes rowid :i64
+                                  job-id :bytes key :bytes value :bytes
+                                  updated-at :bytes] :bytes
+  (bytes-concat
+    (bytes-concat
+      (bytes-concat
+        (bytes-concat
+          (bytes-concat packed (varint/encode rowid))
+          (packed-notepad-field job-id))
+        (packed-notepad-field key))
+      (packed-notepad-field value))
+    (packed-notepad-field updated-at)))
+
+(defn- rebuild-table-leaf-range [packed :bytes rows :vector-i64
+                                start :i64 end :i64 page-size :i64
+                                page-number :i64] :bytes
+  (loop [index start
+         out (page/encode-empty-leaf-page 13 page-size page-number 0)]
+    (if (= index end)
+      out
+      (let [base (* index 9)
+            rowid (vector-at rows base)
+            job-id (safe-span packed rows (+ base 1))
+            key (safe-span packed rows (+ base 3))
+            value (safe-span packed rows (+ base 5))
+            updated-at (safe-span packed rows (+ base 7))
+            payload (notepad-record/encode job-id key value updated-at)
+            next (page/append-table-leaf-cell out payload rowid page-size
+                                               page-number 0)]
+        (if (or (= (bytes-count payload) 0)
+                (= (bytes-count next) 0))
+          (empty-bytes)
+          (recur (+ index 1) next))))))
+
+(defn- insert-index-row-order [image :bytes rows :vector-i64
+                               row-index :i64 order :vector-i64] :vector-i64
+  (let [count (vector-count order)]
+    (loop [index 0 out (vector-i64) inserted? false]
+      (if (= index count)
+        (if inserted? out (vector-conj out row-index))
+        (let [current (vector-at order index)
+              before? (and (not inserted?)
+                           (< (compare-row-index-keys image rows row-index
+                                                      current) 0))]
+          (if before?
+            (loop [tail index result (vector-conj out row-index)]
+              (if (= tail count)
+                result
+                (recur (+ tail 1) (vector-conj result
+                                               (vector-at order tail)))))
+            (recur (+ index 1) (vector-conj out current) inserted?)))))))
+
+(defn- sorted-index-row-order [image :bytes rows :vector-i64
+                               row-index :i64 order :vector-i64] :vector-i64
+  (if (= row-index (quot (vector-count rows) 9))
+    order
+    (sorted-index-row-order image rows (+ row-index 1)
+      (insert-index-row-order image rows row-index order))))
+
+(defn- rebuild-index-leaf-range [image :bytes rows :vector-i64
+                                order :vector-i64 start :i64 end :i64
+                                page-size :i64 page-number :i64] :bytes
+  (loop [index start
+         out (page/encode-empty-leaf-page 10 page-size page-number 0)]
+    (if (= index end)
+      out
+      (let [row-index (vector-at order index)
+            payload (index-payload-for-row image rows row-index)
+            cell (page/encode-index-leaf-cell payload page-size 0)
+            next (if (= (bytes-count cell) 0)
+                   (empty-bytes)
+                   (page/append-index-leaf-cell out cell page-size
+                                                 page-number 0))]
+        (if (= (bytes-count next) 0)
+          (empty-bytes)
+          (recur (+ index 1) next))))))
+
+;; Rebuild a three-page, single-leaf notepad image as two table/index leaves
+;; beneath one-cell interior roots. Overflow rows and more than one split level
+;; remain outside this first split implementation and fail closed.
+(defn- split-upsert-notepad-row [image :bytes page-size :i64
+                                 job-id :bytes key :bytes value :bytes
+                                 updated-at :bytes] :bytes
+  (let [header-fields (header/decode image)
+        page-count (vector-at header-fields 5)
+        packed (reader/read-notepad-image-packed image page-size)
+        rows (materialized-notepad-rows image page-size)
+        row-count (quot (vector-count rows) 9)
+        next-rowid (if (= row-count 0) 1
+                     (+ (vector-at rows (* (- row-count 1) 9)) 1))
+        extended-packed (append-packed-notepad-row packed next-rowid job-id key
+                                                    value updated-at)
+        extended-rows (decode-packed-rows extended-packed 4 -1 (vector-i64))
+        extended-count (quot (vector-count extended-rows) 9)
+        table-left-count (quot (+ extended-count 1) 2)
+        table-separator (vector-at extended-rows
+                          (* (- table-left-count 1) 9))
+        order (sorted-index-row-order extended-packed extended-rows 0
+                                       (vector-i64))
+        index-separator-index (quot (- extended-count 1) 2)
+        index-separator (index-payload-for-row extended-packed extended-rows
+                                                (vector-at order index-separator-index))
+        table-root-cell (page/encode-table-interior-cell 4 table-separator)
+        index-root-cell (page/encode-index-interior-cell 6 index-separator
+                                                         page-size 0)
+        table-root (page/encode-table-interior-page table-root-cell page-size
+                                                    2 0 5)
+        index-root (page/encode-index-interior-page index-root-cell page-size
+                                                    3 0 7)
+        table-left (rebuild-table-leaf-range extended-packed extended-rows 0
+                       table-left-count page-size 4)
+        table-right (rebuild-table-leaf-range extended-packed extended-rows
+                        table-left-count extended-count page-size 5)
+        index-left (rebuild-index-leaf-range extended-packed extended-rows
+                       order 0 index-separator-index page-size 6)
+        index-right (rebuild-index-leaf-range extended-packed extended-rows
+                        order (+ index-separator-index 1) extended-count
+                        page-size 7)
+        resized-header (header/set-page-count (bytes-slice image 0 100) 7)
+        next-header (header/advance-change-counter resized-header)
+        schema-page (bytes-concat next-header (bytes-slice image 100 page-size))
+        next-image (bytes-concat
+          (bytes-concat
+            (bytes-concat
+              (bytes-concat
+                (bytes-concat
+                  (bytes-concat schema-page table-root)
+                  index-root)
+                table-left)
+              table-right)
+            index-left)
+          index-right)]
+    (if (or (not= page-count 3)
+            (not= (bytes-count image) (* page-size page-count))
+            (not (supported-notepad-schema? image page-size))
+            (< (bytes-count packed) 4)
+            (< row-count 1)
+            (not= (* row-count 9) (vector-count rows))
+            (row-has-key? packed rows 0 job-id key)
+            (< (vector-count extended-rows) 0)
+            (not= (* extended-count 9) (vector-count extended-rows))
+            (not= (vector-count order) extended-count)
+            (= (bytes-count table-root) 0)
+            (= (bytes-count index-root) 0)
+            (= (bytes-count table-left) 0)
+            (= (bytes-count table-right) 0)
+            (= (bytes-count index-left) 0)
+            (= (bytes-count index-right) 0)
+            (not= (bytes-count next-image) (* page-size 7)))
+      (empty-bytes)
+      next-image)))
+
 (defn- job-bytes-excluding-key [image :bytes rows :vector-i64 row-index :i64
                                job-id :bytes key :bytes total :i64] :i64
   (if (= row-index (quot (vector-count rows) 9))
@@ -1287,4 +1442,9 @@
         (update-notepad-row image page-size job-id key value updated-at)
         (if (= row-count 0)
           (insert-first-notepad-row image page-size job-id key value updated-at)
-          (append-notepad-row image page-size job-id key value updated-at))))))
+          (let [appended (append-notepad-row image page-size job-id key
+                                             value updated-at)]
+            (if (= (bytes-count appended) 0)
+              (split-upsert-notepad-row image page-size job-id key value
+                                        updated-at)
+              appended)))))))
