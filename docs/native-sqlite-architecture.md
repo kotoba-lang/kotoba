@@ -1,7 +1,7 @@
 # Native SQLite in Kotoba and Amu
 
-Status: design baseline for JUN-768. This document does not claim a SQLite
-engine, filesystem provider, or Itonami integration is implemented.
+Status: evolving design and evidence record for JUN-768. It does not claim a
+complete SQLite engine or Itonami integration is implemented.
 
 ## Goal
 
@@ -238,7 +238,7 @@ rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
 launcher wiring and the selected one-time offline converter remain paused
 until those native gates pass.
 
-## FS2 storage adapter boundary (2026-11-02)
+## FS2 storage adapter boundary (initial checkpoint, 2026-11-02)
 
 The native FS2 export and independent read-only SQLite readback above qualify
 image export and the exercised Amu path only. They do not qualify a Kotoba
@@ -258,9 +258,38 @@ is [`native storage roundtrip`](../lib/kotoba.sql/evidence/notepad-storage-round
 The Mac provider requires an FD3-scoped basename for form B/C. The passing
 reader uses the already exercised pair-backed string request to raw-byte
 response shape; an initial kind-9-to-kind-9 read stopped in the Mac FS2 wrapper.
-These results qualify direct whole-file write/read only. Form B writes directly
-to the destination, so atomic replacement and crash durability are not
-established. The Mac runtime artifact does not yet expose the Linux seed's
-temp-create/fsync/rename/unlink forms. WAL or rollback-journal support,
-locking, crash recovery, Linux qualification, and Itonami storage cutover remain
+At this initial checkpoint, the results qualified direct whole-file write/read
+only. Form B wrote directly to the destination, so atomic replacement and
+crash durability were not established then. The later atomic native upsert
+qualification below supersedes those adapter limits for its exact macOS
+ARM64 source path. WAL or rollback-journal support, concurrent locking,
+power-loss recovery, Linux qualification, and Itonami storage cutover remain
 open.
+
+## Atomic native upsert qualification (2026-11-02; supersedes the adapter limits above)
+
+A source-pinned Kotoba program compiled by the Amu full-bootstrap ARM64
+selfhost compiler and ran through the Amu FS2 FD3-scoped runtime with
+`PATH=/nonexistent`. The Kotoba adapter serialized image publication with an
+Amu FS35 persistent file lock, removed a stale staging basename using FS2 J,
+wrote the replacement using exclusive FS2 B, then called FS35 file fsync,
+atomic rename, and parent-directory fsync. Two successive SQLite image
+publications passed; the test seeded a stale stage file before execution and
+verified it was removed while the persistent lock file remained.
+
+Python 3.15.0 `sqlite3` / SQLite 3.54.1 opened the final file read-only and
+immutable. `PRAGMA integrity_check` returned `ok`; readback confirmed the
+last-write-wins value and timestamp, all three expected rows, the primary-key
+autoindex, seven 4096-byte pages, and four overflow pages. The fixture also
+accepted a 128-character BMP key and 16-KiB value, and refused a blank key, a
+129-character key, and a value above 16 KiB. No hosted or native SQL fallback
+was used. See [`atomic native upsert receipt`](../lib/kotoba.sql/evidence/notepad-upsert-atomic-native-20261102.json)
+for source hashes and measured details.
+
+This narrows the earlier statement that no Kotoba storage adapter or atomic
+replacement had been qualified: the exact macOS ARM64 adapter path above is
+now qualified for sequential image replacement and next-run stale-stage
+cleanup. It does not qualify concurrent-process contention or lock fairness,
+power-loss injection between commit steps, general SQLite transaction
+semantics, WAL/rollback-journal handling, arbitrary page layouts or splits,
+Linux x86_64/ARM64, or Itonami cutover. Those gates remain open.
