@@ -3,7 +3,7 @@
 ;; pages or follow overflow cells.
 
 (ns kotoba.sqlite.reader
-  {:kotoba/export [read-notepad-leaf resolve-notepad-root]}
+  {:kotoba/export [read-notepad-leaf resolve-notepad-root read-notepad-image]}
   (:require [kotoba.sqlite.notepad-record :as record]
             [kotoba.sqlite.page :as page]
             [kotoba.sqlite.record :as sqlite-record]))
@@ -189,3 +189,130 @@
       (invalid)
       (read-cells image page-size page-number reserved cell-count 0 -1
                   (vector-i64)))))
+
+(defn- page-seen? [pages :vector-i64 target :i64 index :i64] :bool
+  (if (= index (vector-count pages))
+    false
+    (if (= (vector-at pages index) target)
+      true
+      (page-seen? pages target (+ index 1)))))
+
+(defn- enqueue-child [queue :vector-i64 child :i64 page-count :i64] :vector-i64
+  (if (or (< child 2)
+          (> child page-count)
+          (page-seen? queue child 0))
+    (invalid)
+    (vector-conj queue child)))
+
+(defn- enqueue-interior-cells [page-image :bytes page-size :i64 page-number :i64
+                               page-count :i64 cell-count :i64 index :i64
+                               previous-key :i64 queue :vector-i64] :vector-i64
+  (if (= index cell-count)
+    queue
+    (let [cell-offset (page/cell-pointer page-image page-size page-number 0 index)]
+      (if (< cell-offset 0)
+        (invalid)
+        (let [cell (page/decode-table-interior-cell page-image page-size
+                                                   page-number 0 cell-offset)
+              child (vector-at cell 0)
+              key (vector-at cell 1)]
+          (if (or (< child 2)
+                  (> child page-count)
+                  (< key 0)
+                  (<= key previous-key)
+                  (< (vector-at cell 2) 0))
+            (invalid)
+            (let [next-queue (enqueue-child queue child page-count)]
+              (if (or (= (vector-count next-queue) 1)
+                      (= (vector-at next-queue 0) -1))
+                (invalid)
+                (enqueue-interior-cells page-image page-size page-number
+                                        page-count cell-count (+ index 1) key
+                                        next-queue)))))))))
+
+(defn- enqueue-interior-page [page-image :bytes page-size :i64 page-number :i64
+                              page-count :i64 header :vector-i64
+                              queue :vector-i64] :vector-i64
+  (let [cell-count (vector-at header 3)
+        children (enqueue-interior-cells page-image page-size page-number
+                                          page-count cell-count 0 -1 queue)
+        right-child (vector-at header 7)]
+    (if (or (= (vector-count children) 1)
+            (= (vector-at children 0) -1))
+      (invalid)
+      (enqueue-child children right-child page-count))))
+
+(defn- append-leaf-results [rows :vector-i64 page-size :i64 page-number :i64
+                            index :i64 previous-rowid :i64 out :vector-i64]
+                            :vector-i64
+  (if (= index (vector-count rows))
+    out
+    (let [rowid (vector-at rows index)]
+      (if (or (< rowid 0) (<= rowid previous-rowid))
+        (invalid)
+        (let [base (* (- page-number 1) page-size)
+              absolute-out
+                (loop [field 1 result (vector-conj out rowid)]
+                  (if (= field 9)
+                    result
+                    (let [value (vector-at rows (+ index field))
+                          absolute (if (= (- field (* (quot field 2) 2)) 1)
+                                     (+ base value)
+                                     value)]
+                      (recur (+ field 1) (vector-conj result absolute)))))]
+          (append-leaf-results rows page-size page-number (+ index 9) rowid
+                               absolute-out))))))
+
+(defn- walk-notepad-queue [image :bytes page-size :i64 page-count :i64
+                           queue :vector-i64 queue-index :i64
+                           previous-rowid :i64 out :vector-i64] :vector-i64
+  (if (= queue-index (vector-count queue))
+    out
+    (let [page-number (vector-at queue queue-index)
+          start (* (- page-number 1) page-size)
+          page-image (bytes-slice image start (+ start page-size))
+          header (page/decode-header page-image page-size page-number 0)
+          page-type (vector-at header 0)
+          next-queue
+            (if (= page-type 5)
+              (enqueue-interior-page page-image page-size page-number page-count
+                                     header queue)
+              queue)]
+      (if (or (< page-number 2)
+              (> page-number page-count)
+              (< (vector-at header 3) 0)
+              (not (or (= page-type 5) (= page-type 13)))
+              (and (= (vector-count next-queue) 1)
+                   (= (vector-at next-queue 0) -1)))
+        (invalid)
+        (if (= page-type 5)
+          (walk-notepad-queue image page-size page-count next-queue
+                              (+ queue-index 1) previous-rowid out)
+          (let [rows (read-notepad-leaf page-image page-size page-number 0)
+                next-out (if (and (= (vector-count rows) 1)
+                                  (= (vector-at rows 0) -1))
+                           (invalid)
+                           (append-leaf-results rows page-size page-number 0
+                                                previous-rowid out))]
+            (if (and (= (vector-count next-out) 1)
+                     (= (vector-at next-out 0) -1))
+              (invalid)
+              (let [next-previous (if (= (vector-count next-out) 0)
+                                    previous-rowid
+                                    (vector-at next-out
+                                      (- (vector-count next-out) 9)))]
+                (walk-notepad-queue image page-size page-count next-queue
+                                    (+ queue-index 1) next-previous next-out)))))))))
+
+;; Read the notepad table across its table B-tree. Internal pages are queued
+;; left-to-right; duplicate/cyclic/out-of-range child pages and unordered rows
+;; refuse. SQLite schema and payload overflow chains remain unsupported.
+(defn read-notepad-image [image :bytes page-size :i64] :vector-i64
+  (if (< page-size 512)
+    (invalid)
+    (let [root (resolve-notepad-root image page-size)
+          page-count (quot (bytes-count image) page-size)]
+      (if (< root 2)
+        (invalid)
+        (walk-notepad-queue image page-size page-count (vector-i64 root) 0 -1
+                            (vector-i64))))))
