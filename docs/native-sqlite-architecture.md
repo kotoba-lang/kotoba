@@ -275,7 +275,17 @@ Amu FS35 persistent file lock, requested a fresh randomized staging basename
 using FS2 N, wrote the replacement using FS2 B, then called FS35 file fsync,
 atomic rename, and parent-directory fsync. Two successive SQLite image
 publications passed. The test pre-seeded stage-like names and verified that
-their contents remained unchanged while the persistent lock file remained.
+their contents remained unchanged while the persistent lock file remained. A
+follow-up source-pinned fixture placed each of `-wal`, `-shm`, and `-journal`
+next to the database in turn; Kotoba returned refusal status 6 and preserved
+the main database bytes and sidecar in all three cases. The check runs under
+Kotoba's FS35 writer lock and treats an unknown `EXISTS` response as a refusal.
+
+This sidecar check does not implement SQLite's standard byte-range locking and
+cannot prevent an unrelated SQLite process from creating a journal after the
+check. It establishes fail-closed behavior for sidecars already present, not
+full concurrent SQLite compatibility. Standard SQLite lock coordination and
+WAL/rollback recovery remain required before wiring a live consumer.
 
 Python 3.15.0 `sqlite3` / SQLite 3.54.1 opened the final file read-only and
 immutable. `PRAGMA integrity_check` returned `ok`; readback confirmed the
@@ -290,7 +300,9 @@ This narrows the earlier statement that no Kotoba storage adapter or atomic
 replacement had been qualified: the exact macOS ARM64 adapter path above is
 now qualified for sequential image replacement with fresh randomized names.
 An abandoned random stage after a crash remains inert and is not currently
-collected. It does not qualify concurrent-process contention or lock fairness,
+collected. Sidecars already present are refused, but SQLite byte-range lock
+coordination and races with external SQLite processes remain unqualified. It
+does not qualify concurrent-process contention or lock fairness,
 power-loss injection between commit steps, general SQLite transaction
 semantics, WAL/rollback-journal handling, arbitrary page layouts or splits,
 Linux x86_64/ARM64, or Itonami cutover. Random orphan-stage collection and those gates remain open.
