@@ -1,0 +1,98 @@
+(ns htmldom-tag
+  (:require [htmldom-attribute :as attr])
+  (:export [parse]))
+
+;; Consume a complete start/end tag beginning at '<'. Other markup and
+;; malformed cases return an explicit handoff/unsupported result, not a guessed
+;; DOM. Offsets are UTF-8 byte offsets. The caller owns input preprocessing,
+;; parse error aggregation and tree construction.
+(defn field [d :document k :keyword] :document (option-or (document-get d k) (document-null)))
+(defn text [d :document] :string (option-or (document-string-value d) ""))
+(defn num [d :document] :i64 (option-or (document-i64-value d) -1))
+(defn key [d :document] :keyword (option-or (document-keyword-value d) :bad))
+(defn width [cp :i64] :i64 (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+(defn letter? [cp :i64] :bool (or (and (>= cp 65) (<= cp 90)) (and (>= cp 97) (<= cp 122))))
+(defn space? [cp :i64] :bool (or (= cp 9) (= cp 10) (= cp 12) (= cp 13) (= cp 32)))
+(defn scalar [cp :i64] :string
+  (cond (< cp 128) (string-from-utf8 (bytes-from-vector-i64 (vector-i64 cp)))
+        (< cp 2048) (string-from-utf8 (bytes-from-vector-i64 (vector-i64 (+ 192 (quot cp 64)) (+ 128 (bit-and cp 63)))))
+        (< cp 65536) (string-from-utf8 (bytes-from-vector-i64 (vector-i64 (+ 224 (quot cp 4096)) (+ 128 (bit-and (quot cp 64) 63)) (+ 128 (bit-and cp 63)))))
+        :else (string-from-utf8 (bytes-from-vector-i64 (vector-i64 (+ 240 (quot cp 262144)) (+ 128 (bit-and (quot cp 4096) 63)) (+ 128 (bit-and (quot cp 64) 63)) (+ 128 (bit-and cp 63)))))))
+(defn lower [cp :i64] :i64 (if (and (>= cp 65) (<= cp 90)) (+ cp 32) cp))
+(defn normalized [s :string start :i64 end :i64] :string
+  (loop [i start out ""]
+    (if (>= i end) out
+      (let [cp (string-code-point-at s i)]
+        (recur (+ i (width cp)) (string-concat out (if (and (>= cp 65) (<= cp 90)) (scalar (lower cp)) (string-substring s i (+ i (width cp))))))))))
+(defn skip-space [s :string i :i64] :i64
+  (if (and (< i (string-length s)) (space? (string-code-point-at s i))) (skip-space s (+ i 1)) i))
+(defn tag-end [s :string i :i64] :i64
+  (if (>= i (string-length s)) i
+    (let [c (string-code-point-at s i)]
+      (if (or (space? c) (= c 47) (= c 62) (= c 0)) i (tag-end s (+ i (width c)))))))
+(defn attr-end [s :string i :i64] :i64
+  (if (>= i (string-length s)) i
+    (let [c (string-code-point-at s i)]
+      (if (or (space? c) (= c 47) (= c 62) (= c 61) (= c 0) (= c 34) (= c 39) (= c 60)) i
+        (attr-end s (+ i (width c)))))))
+(defn result [kind :keyword consumed :i64 name :string attrs :document self-close :bool] :document
+  (document-map :kind (document-keyword kind) :consumed (document-i64 consumed)
+                :name (document-string name) :attributes attrs :self-closing (document-bool self-close)))
+(defn value-result [kind :keyword at :i64 value :string] :document
+  (document-map :kind (document-keyword kind) :at (document-i64 at) :value (document-string value)))
+(defn attribute-value [s :string start :i64 mode :keyword] :document
+  (loop [i start out ""]
+    (let [t (attr/next-token (string-substring s i (string-length s)) mode)
+          kind (key (field t :kind)) n (num (field t :consumed)) status (key (field t :status))]
+      (cond (= kind :attribute/text)
+              (if (= status :attribute/unexpected-character) (value-result :tag/unsupported i out)
+                (recur (+ i n) (string-concat out (text (field t :text)))))
+            (= kind :attribute/character)
+              (let [cp (num (field t :value)) second (num (field t :value2))]
+                (recur (+ i n) (string-concat out (string-concat (scalar cp) (if (< second 0) "" (scalar second))))))
+            (= kind :attribute/quote-end) (value-result :tag/continue (+ i n) out)
+            (= kind :attribute/space-end) (value-result :tag/continue (+ i n) out)
+            (= kind :attribute/tag-end) (value-result :tag/done (+ i n) out)
+            :else (value-result :tag/incomplete i out)))))
+(defn duplicate? [attrs :document name :string i :i64] :bool
+  (if (>= i (document-count attrs)) false
+    (let [a (option-or (document-vector-at attrs i) (document-null))]
+      (if (string=? name (text (field a :name))) true (duplicate? attrs name (+ i 1))))))
+(defn add-attribute [attrs :document name :string value :string] :document
+  (if (duplicate? attrs name 0) attrs
+    (document-vector-conj attrs (document-map :name (document-string name) :value (document-string value)))))
+(defn attributes [s :string start :i64 kind :keyword name :string] :document
+  (loop [i start attrs (document-vector)]
+    (let [pos (skip-space s i) n (string-length s)]
+      (cond (>= pos n) (result :tag/incomplete pos name attrs false)
+            (= (string-code-point-at s pos) 62) (result kind (+ pos 1) name attrs false)
+            (and (= (string-code-point-at s pos) 47) (< (+ pos 1) n) (= (string-code-point-at s (+ pos 1)) 62))
+              (result kind (+ pos 2) name attrs true)
+            (= (string-code-point-at s pos) 47) (result :tag/unsupported pos name attrs false)
+            :else (let [end (attr-end s pos)]
+              (cond (= end pos) (result :tag/unsupported pos name attrs false)
+                    (> (document-count attrs) 30) (result :tag/limit pos name attrs false)
+                    :else (let [aname (normalized s pos end) p (skip-space s end)]
+                      (if (and (< p n) (= (string-code-point-at s p) 61))
+                        (let [begin (skip-space s (+ p 1))]
+                          (if (>= begin n) (result :tag/incomplete begin name attrs false)
+                            (let [c (string-code-point-at s begin)
+                                  mode (cond (= c 34) :attribute/double (= c 39) :attribute/single :else :attribute/unquoted)
+                                  from (if (or (= c 34) (= c 39)) (+ begin 1) begin)
+                                  v (attribute-value s from mode) k (key (field v :kind))
+                                  next (num (field v :at)) new (add-attribute attrs aname (text (field v :value)))]
+                              (cond (= k :tag/done) (result kind next name new false)
+                                    (= k :tag/continue) (recur next new)
+                                    :else (result k next name attrs false)))))
+                        (recur p (add-attribute attrs aname ""))))))))))
+(defn parse [s :string] :document
+  (let [n (string-length s) empty (document-vector)]
+    (cond (> n 65536) (result :tag/limit 0 "" empty false)
+          (or (< n 2) (not= (string-code-point-at s 0) 60)) (result :tag/handoff 0 "" empty false)
+          :else (let [end-tag (= (string-code-point-at s 1) 47) start (if end-tag 2 1)]
+            (if (or (>= start n) (not (letter? (string-code-point-at s start))))
+              (result :tag/handoff 0 "" empty false)
+              (let [end (tag-end s start) name (normalized s start end)]
+                (if (or (>= end n) (= (string-code-point-at s end) 0))
+                  (result :tag/incomplete end name empty false)
+                  (attributes s end (if end-tag :tag/end :tag/start) name))))))))
