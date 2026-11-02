@@ -143,6 +143,10 @@ ROSTER_MUTATIONS={
  'rd-wipe':('(do (clear work 0) 0)', '(do (clear work 98304) 0)')}
 
 SESSION_MUTATIONS={
+ 'ab-transcript':('(b owner (+ 58528 (- i 64)))', '(b owner (+ 58529 (- i 64)))'),
+ 'ab-generation':('(u64-shift-right (ld owner 32776) (* (- i 8) 8))', '(u64-shift-right (r/version owner 262144) (* (- i 8) 8))'),
+ 'ab-peer':('(b owner (+ 32832 (- i 24)))', '(b owner (+ 32833 (- i 24)))'),
+ 'ab-phase':('(= (poll owner 262144 now) 2)', '(>= (poll owner 262144 now) 0)'),
  'ms-self':('(self-match owner 0)', '(or (self-match owner 0) true)'),
  'ms-bind':('(initialize (kernel-subregion owner 262144 33280 8192) 8192 role 1)', '(initialize (kernel-subregion owner 262144 33280 8192) 8192 role 0)'),
  'ms-version':('(decimal owner (r/version owner 262144) 1000000000000000000 false)', '(decimal owner (do (r/version owner 262144) 0) 1000000000000000000 false)'),
@@ -624,6 +628,10 @@ def main(a):
                     low,high=struct.unpack('<2I',boot.dump(boot.work+408,8));other_address=low+(high<<32)
                     if not 0<other_address<1<<39 or not (address+262144<=other_address or other_address+262144<=address):raise ValueError('managed owner and caller IO allocations overlap')
                     session_counts=struct.unpack('<2I',boot.dump(boot.work+80*4,8))
+                    if not link and not frame:
+                        binding_counts=boot.dump(boot.work+97*4,12)
+                        (out/'native-session-application-binding-counts.bin').write_bytes(binding_counts)
+                        session_binding_counts=struct.unpack('<3I',binding_counts)
                     if not 0<=session_counts[0]<=2048 or not 0<=session_counts[1]<=1024:raise ValueError('managed trace count exceeds its allocation')
                     (out/'native-session-returns.bin').write_bytes(boot.dump(other_address+(229376 if frame else 196608),session_counts[0]*16))
                     (out/'native-session-hashes.bin').write_bytes(boot.dump(other_address+(216064 if frame else 229376),session_counts[1]*32))
@@ -752,11 +760,13 @@ def main(a):
             case_assertions=list(struct.unpack('<%dI'%case_count,roster_trace[512:512+case_count*4]))
             state['observed']=dict(nativeAssertionFailures=words[1],completed=words[5],caseCount=words[4],guards=words[0],guardsCompleted=words[2],canary=words[3],
                 transientWiped=(out/'native-roster-transient.bin').read_bytes()==bytes(196608),sessionWiped=raw[32768:65536]==bytes(32768),
-                ownerAndCallerIODisjoint=True,returnPairs=pairs,returnPairsMatch=all(a==e for a,e in pairs),hashCount=session_counts[1],hashesMatch=hashes==expected_hashes,caseAssertions=case_assertions)
+                ownerAndCallerIODisjoint=True,returnPairs=pairs,returnPairsMatch=all(a==e for a,e in pairs),hashCount=session_counts[1],hashesMatch=hashes==expected_hashes,caseAssertions=case_assertions,
+                applicationBindingCases=session_binding_counts[0],applicationBindingRefusals=session_binding_counts[1],applicationBindingCopies=session_binding_counts[2])
             state['artifacts']={n:pin(q) for n,q in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
-            good=words==(30,0,1,1,case_count,2) and state['observed']['transientWiped'] and raw[32768:65536]==bytes(32768) and state['observed']['returnPairsMatch'] and state['observed']['hashesMatch'] and not any(case_assertions) and session_counts[1]==case_count*2
+            good=words==(30,0,1,1,case_count,2) and state['observed']['transientWiped'] and raw[32768:65536]==bytes(32768) and state['observed']['returnPairsMatch'] and state['observed']['hashesMatch'] and not any(case_assertions) and session_counts[1]==case_count*2 and session_binding_counts==(case_count,case_count*6,case_count*3)
             if a.mutation:
                 if (words[0],words[2],words[3],words[4],words[5])!=(30,1,1,case_count,2) or session_counts[1]!=case_count*2:raise AssertionError('managed fault did not normally complete')
+                if session_binding_counts!=(case_count,case_count*6,case_count*3):raise AssertionError('managed fault did not complete all binding cases/refusals/copies')
                 if good or words[1]==0:raise AssertionError('managed fault survived')
                 state['state']='DETECTED_NATIVE_MANAGED_SESSION_MUTATION'
             else:
