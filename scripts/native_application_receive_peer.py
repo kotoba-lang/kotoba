@@ -24,10 +24,10 @@ def load(name, path):
 def digest(raw): return hashlib.sha256(raw).hexdigest()
 
 
-def exercise(boot, peer, target, out, small=False):
+def exercise(boot, peer, target, out, small=False, initiator=False):
     link = load('receive_udp_public', ROOT/'scripts/native_udp_link_peer.py')
     ref = load('receive_public_cases', ROOT/'lib/kotoba.kekkai/tools/application_receive_reference.py')
-    fixture, cases = ref.fixtures(small)
+    fixture, cases = ref.fixtures(small,initiator)
     addresses = struct.unpack('<8I', boot.dump(boot.work+400, 32))
     owner, io, log, pool = [addresses[i]+(addresses[i+1] << 32) for i in range(0,8,2)]
     allocations = [(owner,262144),(io,262144),(log,262144),(pool,8388608)]
@@ -79,7 +79,8 @@ def exercise(boot, peer, target, out, small=False):
         item = dict(label=case['label'],inputBytes=len(frame),inputSHA256=digest(frame),
             actual=actual,expected=case['status'],checks=checks,
             replySHA256=[digest(x) for x in replies],expectedReplySHA256=[digest(x) for x in expected_reply],
-            rawFrameAPIForUnobservedChannelTransition=bool(case['flags'] & 4))
+            rawFrameAPIForUnobservedChannelTransition=bool(case['flags'] & 4),
+            scheduledFirstSendTrigger=bool(case['flags'] & 16))
         if before_state is not None:
             after = boot.dump(owner,65536)
             checks['wholeSessionPreserved'] = after == before_state
@@ -133,7 +134,10 @@ def exercise(boot, peer, target, out, small=False):
         allEventPairsMatch=all(a==e for a,e in pairs),sessionAndTransientZero=state[32768:]==bytes(229376),
         finalPoolPending=struct.unpack_from('<I',raw,8)[0],finalPoolBuffered=struct.unpack_from('<I',raw,12)[0],
         finalPoolCompleted=struct.unpack_from('<I',raw,16)[0],finalPoolBodyZero=raw[4096:]==bytes(8384512),
-        poolSHA256=digest(raw),fixtureSHA256=digest(fixture))
+        poolSHA256=digest(raw),fixtureSHA256=digest(fixture),managedRole='initiator' if initiator else 'responder',
+        scheduledFirstSendTriggers=sum(bool(x['flags'] & 16) for x in cases),
+        actualProtocolPackets=sum(not bool(x['flags'] & 16) for x in cases),
+        actualBridgeReceiveCalls=sum(not bool(x['flags'] & 20) for x in cases))
     expected = dict(cases=len(cases),nativeErrors=0,terminal=2,nicStarted=1,
         rxFrames=len(cases),released=len(cases),rxErrors=0,replies=sum(x['reply'] is not None for x in cases),
         transitions=2,oldGuards=41,oldHeaderProbes=8,allEventPairsMatch=True,sessionAndTransientZero=True,

@@ -35,3 +35,8 @@ does not change Amu's global adoption/release flags or qualify initiator
 composition, all network quota/concurrency combinations, product protection,
 native Mac backend, Mac/6600H app installation/live peers, schema/pending
 context/directed socket policy/fresh consent, native SSH or whole OS/L1 release.
+
+The later [both-role receive qualification](native-receive-roles.md) executes
+the same native kernel in initiator and responder roles. The earlier receipt
+and its bounded scope remain historical evidence; product app/backend,
+schema/pending/directed socket policy/fresh consent and OS/L1 gates remain open.

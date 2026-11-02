@@ -124,3 +124,8 @@ HHKB/Trackpad acceptance remains paused and existing management paths remain.
 The explicit [main-derived compiler profile](native-receive-compiler-main.md)
 qualifies this same responder corpus separately and retains the original
 source/artifact/runtime receipts without a silent producer replacement.
+
+The later [both-role receive qualification](native-receive-roles.md) executes
+the same native kernel in initiator and responder roles. The earlier receipt
+and its bounded scope remain historical evidence; product app/backend,
+schema/pending/directed socket policy/fresh consent and OS/L1 gates remain open.

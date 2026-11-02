@@ -19,7 +19,7 @@ def load(name, path):
     return module
 
 
-def fixtures(small=False):
+def fixtures(small=False, initiator=False):
     prior = load('receive_managed_public', ROOT/'lib/kotoba.kekkai/tools/frame_link_reference.py')
     raw, old = prior.fixtures()
     blob = bytearray(raw)
@@ -60,17 +60,19 @@ def fixtures(small=False):
 
     alice, ea = value(44, 64)[:32], value(44, 64)[32:]
     bob, eb = value(40, 64)[:32], value(40, 64)[32:]
-    one = handshake(alice, ea, bob, eb, 42)
+    one = handshake(bob, eb, alice, ea, 42) if initiator else handshake(alice, ea, bob, eb, 42)
     ea2, eb2 = digest(b'JUN-757 receive Alice channel2'), digest(b'JUN-757 receive Bob channel2')
-    two = handshake(alice, ea2, bob, eb2, 42)
+    two = handshake(bob, eb2, alice, ea2, 42) if initiator else handshake(alice, ea2, bob, eb2, 42)
     ea44 = digest(b'JUN-757 public NIC Alice fresh 44')
     eb44 = digest(b'JUN-757 public NIC Bob fresh 44')
-    three = handshake(alice, ea44, bob, eb44, 44)
+    three = handshake(bob, eb44, alice, ea44, 44) if initiator else handshake(alice, ea44, bob, eb44, 44)
+    struct.pack_into('<I', blob, 140, int(initiator))
     struct.pack_into('<II', blob, 176, store(bob+eb2), store(two[4]))
     struct.pack_into('<II', blob, 184, store(one[4]), store(three[4]))
     old = {row['label']: row for row in old}
-    assert old['valid-42-with-invalid-policy-update']['payload'] == b'k\1\x30'+one[0]
-    assert old['valid-44-fresh-key']['reply'] == b'k\1\x31'+three[1]
+    if not initiator:
+        assert old['valid-42-with-invalid-policy-update']['payload'] == b'k\1\x30'+one[0]
+        assert old['valid-44-fresh-key']['reply'] == b'k\1\x31'+three[1]
     cases = []
     channel, number, sequence = one, 0, 0
 
@@ -89,11 +91,11 @@ def fixtures(small=False):
     def body(label, data, status, kind=1, reply_kind=None, counter=None, **kwargs):
         nonlocal number, sequence
         n = number if counter is None else counter
-        packet = dg(n, bytes([kind])+data, channel[2])
+        packet = dg(n, bytes([kind])+data, channel[3 if initiator else 2])
         if counter is None: number += 1
         reply = None
         if reply_kind is not None:
-            reply = dg(sequence, bytes([reply_kind])+data, channel[3])
+            reply = dg(sequence, bytes([reply_kind])+data, channel[2 if initiator else 3])
             sequence += 1
         add(label, packet, status, (-1 if status == -2 else (kind*65536+len(data) if 1 <= kind <= 5 else 0)), reply, **kwargs)
         return packet
@@ -102,9 +104,26 @@ def fixtures(small=False):
         document = codec.wire(ident, data, index, total)
         return body(label, document, status, **kwargs)
 
-    add('actual-handshake42', b'k\1\x30'+one[0], 4, 48*65536,
-        b'k\1\x31'+one[1], transition=3, snapshot=True)
-    add('handshake-replay', b'k\1\x30'+one[0], preserve=True)
+    def connect(label, protocol, transition=0, pending=0, buffered=0,
+                bypass=False, send_first=True):
+        # Empty trigger packets are part of this immutable test schedule only.
+        # They make the native test peer emit the actual initial Noise wire;
+        # no received 'authenticated' event or consent is fabricated.
+        if initiator:
+            if send_first:
+                add(label+'-send-first', b'', 4, 48*65536,
+                    b'k\1\x30'+protocol[0], transition=transition, phase=1,
+                    pending=pending, buffered=buffered, flags=16, snapshot=True)
+            add(label+'-receive-response', b'k\1\x31'+protocol[1], 4, 49*65536,
+                pending=pending, buffered=buffered, flags=4 if bypass else 0, snapshot=True)
+        else:
+            add(label, b'k\1\x30'+protocol[0], 4, 48*65536,
+                b'k\1\x31'+protocol[1], transition=transition,
+                pending=pending, buffered=buffered, flags=4 if bypass else 0, snapshot=True)
+
+    connect('actual-handshake42', one, transition=3)
+    add('handshake-replay', b'k\1'+bytes([49 if initiator else 48])+
+        (one[1] if initiator else one[0]), preserve=True)
     body('typed-pong', b'id', 3, kind=3, control=b'id', snapshot=True, flags=8)
     body('typed-cmm-no-route', b'[]', 3, kind=4, control=b'[]')
     body('typed-ping-and-pong', b'JUN-757', 3, kind=2, reply_kind=3, control=b'JUN-757')
@@ -136,19 +155,24 @@ def fixtures(small=False):
     # the bridge to observe phase2 -> phase2 at the same peer/key/epoch/time.
     # Only the final public Noise transcript can identify this channel change.
     channel, number, sequence = two, 0, 0
-    add('fresh-same-epoch-unobserved-handshake', b'k\1\x30'+two[0], 4, 48*65536,
-        b'k\1\x31'+two[1], transition=5, pending=1, buffered=1, flags=4, snapshot=True)
+    connect('fresh-same-epoch-unobserved-handshake', two, transition=5,
+        pending=1, buffered=1, bypass=True)
     part('new-channel-part1-cannot-complete-old', 'channel', b'}', 1, 2,
         pending=1, buffered=1, snapshot=True)
     part('new-channel-part0-completes', 'channel', b'{', 0, 2,
         status=2, completed=b'{}', snapshot=True)
     part('before-roster-revoke', 'epoch', b'{', 0, 2, flags=1, pending=1, buffered=1)
-    add('revoked-old-data', dg(number, b'\1revoked', two[2]), transition=1, phase=0, snapshot=True)
-    add('revoked-handshake', b'k\1\x30'+two[0], phase=0)
-    add('restored44-old-prologue-refused', b'k\1\x30'+two[0], transition=2, phase=1, snapshot=True)
+    add('revoked-old-data', dg(number, b'\1revoked', two[3 if initiator else 2]), transition=1, phase=0, snapshot=True)
+    add('revoked-handshake', b'k\1'+bytes([49 if initiator else 48])+
+        (two[1] if initiator else two[0]), phase=0)
+    if initiator:
+        add('restored44-send-first', b'', 4, 48*65536, b'k\1\x30'+three[0],
+            transition=2, phase=1, flags=16, snapshot=True)
+        add('restored44-old-prologue-refused', b'k\1\x31'+two[1], phase=1, snapshot=True)
+    else:
+        add('restored44-old-prologue-refused', b'k\1\x30'+two[0], transition=2, phase=1, snapshot=True)
     channel, number, sequence = three, 0, 0
-    add('actual-handshake44', b'k\1\x30'+three[0], 4, 48*65536,
-        b'k\1\x31'+three[1], snapshot=True)
+    connect('actual-handshake44', three, send_first=False)
     part('new-epoch-part1-cannot-complete-old', 'epoch', b'}', 1, 2, pending=1, buffered=1)
     part('new-epoch-part0-completes', 'epoch', b'{', 0, 2, status=2, completed=b'{}', snapshot=True)
     if not small:
@@ -171,7 +195,7 @@ def fixtures(small=False):
         part('release-full-and-receive-next', 'next', b'{}', status=2,
             completed=b'{}', flags=1, snapshot=True)
     # Session expiry must invalidate even a pinned completed application result.
-    add('expiry-clears-pinned-completion', dg(number, b'\1expired', three[2]),
+    add('expiry-clears-pinned-completion', dg(number, b'\1expired', three[3 if initiator else 2]),
         phase=0, delta=180, snapshot=True)
     table_at = len(blob)
     for row in cases:

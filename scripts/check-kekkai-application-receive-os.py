@@ -128,7 +128,7 @@ def main(a):
             target.parent.mkdir(parents=True,exist_ok=True)
             shutil.copyfile(ROOT/relative,target)
         ref = load('receive_frozen_reference',public/'lib/kotoba.kekkai/tools/application_receive_reference.py')
-        data,cases = ref.fixtures(a.small_development_probe)
+        data,cases = ref.fixtures(a.small_development_probe,a.role=='initiator')
         font = bytearray((stage/'boot-font.bin').read_bytes())
         font[393216:] = data+bytes(131072-len(data))
         (stage/'boot-font.bin').write_bytes(font)
@@ -138,7 +138,7 @@ def main(a):
         for root in roots[1::2]: (stage/root.lstrip('/')).mkdir(parents=True,exist_ok=True)
         report.update(overlays={p:pin(ROOT/p) for p in overlays.values()},nativeFixture=pin(new_gate),
             publicFixtureSources={p:pin(public/p) for p in PUBLIC},bootFont=pin(stage/'boot-font.bin'),
-            userSlot=pin(stage/'boot-user-slot.bin'),fixture=dict(bytes=len(data),sha256=digest(data),cases=len(cases),
+            userSlot=pin(stage/'boot-user-slot.bin'),fixture=dict(bytes=len(data),sha256=digest(data),cases=len(cases),managedRole=a.role,
             smallDevelopmentProbe=a.small_development_probe))
 
         def run(label,argv):
@@ -259,7 +259,7 @@ def main(a):
             report['state'] = 'NATIVE_RECEIVE_RUNNING'
             save()
             observer = load('receive_frozen_peer',public/'scripts/native_application_receive_peer.py')
-            result,good = observer.exercise(boot,peer,target,out,a.small_development_probe)
+            result,good = observer.exercise(boot,peer,target,out,a.small_development_probe,a.role=='initiator')
             report['receiveResult'] = result
             completed = (result['observed']['terminal'] == 2 and result['observed']['cases'] == len(cases)
                 and result['observed']['released'] == len(cases) and result['observed']['rxErrors'] == 0)
@@ -295,6 +295,7 @@ if __name__ == '__main__':
     parser.add_argument('--firmware',type=Path,required=True)
     parser.add_argument('--firmware-sha256',required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--role',choices=['responder','initiator'],default='responder')
     parser.add_argument('--small-development-probe',action='store_true')
     parser.add_argument('--fault',choices=sorted(FAULTS))
     main(parser.parse_args())
