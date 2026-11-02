@@ -17,4 +17,6 @@
       (not (raw-text-safe? (record-new [:ref :html/raw-pair] "script" "safe"))) 10
       (raw-text-safe? (record-new [:ref :html/raw-pair] "script" "</script>")) 11
       (not (string=? (attrs many) " k00=\"v\" k01=\"v\" k02=\"v\" k03=\"v\" k04=\"v\" k05=\"v\" k06=\"v\" k07=\"v\" k08=\"v\" k09=\"v\" k10=\"v\" k11=\"v\" k12=\"v\" k13=\"v\" k14=\"v\" k15=\"v\" k16=\"v\" k17=\"v\" k18=\"v\" k19=\"v\" k20=\"v\" k21=\"v\" k22=\"v\" k23=\"v\" k24=\"v\" k25=\"v\" k26=\"v\" k27=\"v\" k28=\"v\" k29=\"v\" k30=\"v\"")) 12
+      (not (string=? (attrs-from (record-new [:ref :html/attrs-from] m 1 "prefix")) "prefix z=\"last\"")) 13
+      (not (string=? (style-from (record-new [:ref :html/style-from] m 1 "prefix")) "prefixz:last;")) 14
       :else 0)))
