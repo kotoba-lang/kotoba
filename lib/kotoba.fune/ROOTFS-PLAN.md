@@ -280,3 +280,25 @@ mutant with the process check removed incorrectly succeeded on the no-execute
 fixture. The existing extraction-only stream still passed the data-image
 readback. These are source-composed local observations, not x86, production
 isolation, source-locked linking or release qualification.
+
+## Bounded process specification candidate
+
+`fune.process-rootfs/process-launch-spec` returns a bounded byte vector only
+when digest-bound config and the final-plan process check both pass. Its
+version-1 encoding is `FPS` + byte `1`, followed by big-endian 16-bit `argc`,
+`envc` and cwd-byte length, cwd bytes, then `argc` argv and `envc` environment
+entries, each a big-endian 32-bit byte length followed by UTF-8 bytes. `argv`
+is Entrypoint followed by Cmd, or Cmd alone when Entrypoint is absent/empty.
+Empty arguments and ordered environment entries are preserved; an empty or
+absent working directory becomes `/`. The config policy rejects NULs, duplicate
+names and oversized arrays before encoding. `[-1]` means refusal.
+
+The ARM64 source-composed native gate compared full vectors with independently
+encoded byte fixtures for Entrypoint+Cmd, empty arguments, non-ASCII environment
+values, Cmd fallback and default cwd. It exercised 256 argv and 128 environment
+entries, rejected an over-limit array, bad environment, non-executable path and
+a digest-tampered config. Separately compiled controls that dropped Cmd or
+bypassed process/config verification failed the gate. This mutable value is not
+passed to the worker and is not an execution grant; its eventual transport,
+parser, integrity binding, UID/GID and isolation remain open. No x86 or
+source-locked project-link qualification is implied.
