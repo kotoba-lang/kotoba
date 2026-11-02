@@ -42,9 +42,14 @@ for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
  idx=index_of(wire,field)
  event=gate.run(name+'-event',parser,args=[wire,'action',str(idx),'input',content]).stdout.decode()
  if event!='app|input|'+field+'|'+content+'\n':raise ValueError((name,'event mapping'))
+ current=gate.run(name+'-current-event',parser,args=[wire,'current',str(idx),'input',content]).stdout.decode()
+ if current!=event:raise ValueError((name,'current event mapping'))
+ for mode in ('stale-generation','zero-generation'):
+  if gate.run(name+'-'+mode,parser,expected=3,args=[wire,mode,str(idx),'input',content]).stdout:raise ValueError((name,mode))
  route,kind,target,value=event.removesuffix('\n').split('|',3)
  edited=gate.run(name+'-edit',image,args=['step',init,target,kind,value]).stdout.decode().removesuffix('\n')
  updated=gate.run(name+'-edited-view',image,args=['view',edited]).stdout.decode()
+ if gate.run(name+'-stale-view',parser,expected=3,args=[wire,'stale-view',str(idx),'input',content,updated]).stdout:raise ValueError((name,'stale view'))
  parsed=gate.run(name+'-edited-decode',parser,args=[updated,'']).stdout.decode().strip()
  if content not in updated or not parsed.endswith(':div'):raise ValueError((name,'edited view'))
  button_key={'bunsho':'mode','hyokeisan':'backup-export','zuhyo':'mode'}[name]
@@ -105,6 +110,11 @@ if sources['aiueos/office_view.kotoba'].count(needle)!=1:raise ValueError('actio
 mutant=dict(sources);mutant['aiueos/office_view.kotoba']=mutant['aiueos/office_view.kotoba'].replace(needle,b'true (string=? value "")')
 broken=gate.build('action-mutant','aiueos/office_view_native_test.kotoba',mutant)
 if gate.run('action-mutation-detected',broken,args=[positive,'action','1','click','']).stdout!=b'app|click|body|\n':raise ValueError('action negative control')
+needle=b'(= rendered-generation current-generation)'
+if sources['aiueos/office_view.kotoba'].count(needle)!=1:raise ValueError('generation mutation anchor')
+mutant=dict(sources);mutant['aiueos/office_view.kotoba']=mutant['aiueos/office_view.kotoba'].replace(needle,b'true')
+broken=gate.build('generation-mutant','aiueos/office_view_native_test.kotoba',mutant)
+if gate.run('generation-mutation-detected',broken,args=[positive,'stale-generation','1','input','x']).stdout!=b'app|input|body|x\n':raise ValueError('generation negative control')
 
 gate.finish('PASS_OFFICE_VIEW_NATIVE',observerSHA256=sha(Path(__file__).read_bytes()),apps=report,refusals=list(bad),
             scope='macOS Arm native synthetic views and actions; no Itonami OS rendering/input, QEMU execution, real migration or publication')
