@@ -1,5 +1,10 @@
 # Both managed Noise roles — JUN-757
 
+Follow-up: [full1MiB application message schema](native-application-message.md)
+adds strict request/response data decoding with a separate native corpus and
+both-role receive regression. Pending/service/socket/fresh-consent composition
+and actual Mac/6600H application acceptance remain open.
+
 The role-aware receive fixture executes the same production receiver and
 native kernel for both Noise roles under the explicit main-derived efec
 compiler profile. Product source, real runtime, code/stack/grant bounds and
