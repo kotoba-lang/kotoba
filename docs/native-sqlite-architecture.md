@@ -578,3 +578,23 @@ x86 SQLite qualification. The source-pinned FS2 export plus independent,
 read-only SQLite 3.54.1 readback described above remains a bounded result.
 WAL/recovery, locking, crash consistency, broader layouts, x86_64 qualification,
 and Itonami integration remain open.
+
+## FS2 export and independent SQLite readback checkpoint (2026-11-03)
+
+The initial codec checkpoint's statement that the generated image had not yet
+been exported is superseded. Kotoba now exports its SQLite image through the
+source-pinned Amu selfhost FS2 path; the native fixture reopens the published
+image and reads the exercised values through Kotoba. A separate, dated Python
+3.15.0 / SQLite 3.54.1 connection opens the artifact read-only and immutable,
+reports `integrity_check=ok`, and checks the expected schema, rows, and
+composite primary-key index. The latest bounded multi-row deletion evidence is
+in the [native receipt](../lib/kotoba.sql/evidence/interior-root-multi-delete-native-linux-arm64-20261103.json)
+and [read-only SQLite receipt](../lib/kotoba.sql/evidence/interior-root-multi-delete-readonly-oracle-20261103.json).
+
+This establishes a bounded FS2 export/reopen and independent SQLite
+readability result on the tested Amu/Kotoba ARM64 route. The SQLite oracle is
+measurement evidence only; it is not part of the required runtime, build, or
+CI path. It does not establish standard SQLite locking, WAL/rollback recovery,
+crash-safe transactions, arbitrary page-tree support, Linux x86_64, or Itonami
+integration. Kotoba PR #1172 remains open and draft; its exact-head Linux
+x86_64 workflow is still in progress.
