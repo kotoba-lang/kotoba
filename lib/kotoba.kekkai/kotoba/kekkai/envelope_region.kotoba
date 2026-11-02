@@ -1,0 +1,152 @@
+;; JUN-757: native admission of existing signed-netmap envelope bytes.
+;; verify(work,actual-work-bytes,envelope,actual-bytes,authority,32,out,capacity).
+;; Returns verified raw payload length0..65536, or-1. No payload EDN parsing,
+;; peer admission, IO, key enrollment or authority selection occurs here.
+;; The caller supplies an independently configured raw Ed25519 authority key.
+;; Work98304 bytes: metadata/key/signature/hash0..511, SHA512..1023,
+;; padding1024..1087, Ed25519 work4096..20479, private payload32768..98303.
+;; Invalid shapes preserve work/output. Processed calls erase all work;
+;; every refusal preserves output. All inputs must remain immutable during
+;; the call. Work and output must be disjoint from each other and all inputs.
+;; Output capacity0..65536; envelope0..98304. The outer codec accepts the
+;; publisher's flat four-key EDN map in any order, ASCII whitespace/commas,
+;; ordinary unescaped ASCII strings. Unknown/duplicate keys, reader forms,
+;; comments, escaped strings and trailing forms fail closed. Not general EDN.
+;; Base64 is canonical RFC4648 (standard alphabet/padding/zero pad bits);
+;; signer SPKI is exact RFC8410 Ed25519 DER with absent parameters. Digest
+;; is64 lowercase hex characters. This opt-in bounded profile does not change
+;; the legacy wire format or qualify a production authority/connection.
+(ns kekkai.envelope-region
+  (:require [aiueos.ed25519-region :as ed]
+            [aiueos.lib.sha256-stream :refer [load32 sha-init sha-block sha-blocks]])
+  (:export [verify]))
+(defn- b [input count i]
+  (if (and (>= i 0) (< i count)) (kernel-load-u8 (kernel-subregion input count i 1) 1 0) -1))
+(defn- wb [work i] (kernel-load-u8 (kernel-subregion work 98304 i 1) 1 0))
+(defn- wp [work i v] (kernel-store-u8 (kernel-subregion work 98304 i 1) 1 0 v))
+(defn- get [work i] (kernel-load-u32 (kernel-subregion work 98304 i 4) 4 0))
+(defn- put [work i v] (kernel-store-u32 (kernel-subregion work 98304 i 4) 4 0 v))
+(defn- wipe [work i]
+  (if (>= i 98304) 1 (do (wp work i 0) (wipe work (+ i 1)))))
+(defn- white [v] (or (= v 32) (= v 9) (= v 10) (= v 13) (= v 44)))
+(defn- skip [input count at]
+  (if (white (b input count at)) (skip input count (+ at 1)) at))
+(defn- key-size [k] (case k 0 19 1 21 2 23 14))
+(defn- key-byte [k i]
+  (if (< i 8) (case i 0 58 1 110 2 101 3 116 4 109 5 97 6 112 47)
+    (case k
+      0 (case (- i 8) 0 112 1 97 2 121 3 108 4 111 5 97 6 100 7 45 8 98 9 54 52)
+      1 (case (- i 8) 0 115 1 105 2 103 3 110 4 97 5 116 6 117 7 114 8 101 9 45 10 98 11 54 52)
+      2 (case (- i 8) 0 115 1 105 2 103 3 110 4 101 5 114 6 45 7 115 8 112 9 107 10 105 11 45 12 98 13 54 52)
+      (case (- i 8) 0 115 1 104 2 97 3 50 4 53 54))))
+(defn- key-match [input count at k i] :bool
+  (if (>= i (key-size k)) true
+    (if (= (b input count (+ at i)) (key-byte k i)) (key-match input count at k (+ i 1)) false)))
+(defn- key-kind [input count at]
+  (if (key-match input count at 0 0) 0 (if (key-match input count at 1 0) 1
+    (if (key-match input count at 2 0) 2 (if (key-match input count at 3 0) 3 -1)))))
+(defn- string-end [input count at start limit]
+  (if (or (>= at count) (> (- at start) limit)) -1
+    (if (= (b input count at) 34) at
+      (if (and (>= (b input count at) 32) (< (b input count at) 127) (not= (b input count at) 92))
+        (string-end input count (+ at 1) start limit) -1))))
+(defn- member [work input count at]
+  (let [k (key-kind input count at)]
+    (if (< k 0) -1
+      (let [flag (i64-shift-left 1 k) quote (skip input count (+ at (key-size k)))]
+        (if (or (not= (bit-and (get work 80) flag) 0) (not= (b input count quote) 34)) -1
+          (let [start (+ quote 1) end (string-end input count (+ quote 1) (+ quote 1) (case k 0 87384 1 88 2 60 64))]
+            (if (< end 0) -1
+              (do (put work (* k 8) start) (put work (+ (* k 8) 4) (- end start))
+                  (put work 80 (bit-or (get work 80) flag)) (+ end 1)))))))))
+(defn- members [work input count at]
+  (if (< at 0) 0
+    (if (= (b input count (skip input count at)) 125)
+      (if (and (= (get work 80) 15) (= (skip input count (+ (skip input count at) 1)) count)) 1 0)
+      (if (= (get work 80) 15) 0 (members work input count (member work input count (skip input count at)))))))
+(defn- parse [work input count]
+  (if (= (b input count (skip input count 0)) 123) (members work input count (+ (skip input count 0) 1)) 0))
+(defn- six [v]
+  (if (and (>= v 65) (<= v 90)) (- v 65)
+    (if (and (>= v 97) (<= v 122)) (+ 26 (- v 97))
+      (if (and (>= v 48) (<= v 57)) (+ 52 (- v 48)) (if (= v 43) 62 (if (= v 47) 63 -1))))))
+(defn- quad [work input count source remaining target]
+  (let [a (six (b input count source)) c (six (b input count (+ source 1)))
+        d (six (b input count (+ source 2))) e (six (b input count (+ source 3)))]
+    (if (or (< a 0) (< c 0)) -1
+      (if (= (b input count (+ source 2)) 61)
+        (if (and (= remaining 4) (= (b input count (+ source 3)) 61) (= (bit-and c 15) 0))
+          (do (wp work target (+ (* a 4) (quot c 16))) 1) -1)
+        (if (< d 0) -1
+          (if (= (b input count (+ source 3)) 61)
+            (if (and (= remaining 4) (= (bit-and d 3) 0))
+              (do (wp work target (+ (* a 4) (quot c 16)))
+                  (wp work (+ target 1) (+ (* (bit-and c 15) 16) (quot d 4))) 2) -1)
+            (if (< e 0) -1
+              (do (wp work target (+ (* a 4) (quot c 16)))
+                  (wp work (+ target 1) (+ (* (bit-and c 15) 16) (quot d 4)))
+                  (wp work (+ target 2) (+ (* (bit-and d 3) 64) e)) 3))))))))
+(defn- decode-loop [work input count source remaining target]
+  (if (= remaining 0) 1
+    (if (< (quad work input count source remaining target) 0) 0
+      (decode-loop work input count (+ source 4) (- remaining 4) (+ target 3)))))
+(defn- decode [work input count k target capacity]
+  (let [start (get work (* k 8)) size (get work (+ (* k 8) 4))]
+    (if (not= (mod size 4) 0) -1
+      (let [n (- (* (quot size 4) 3) (if (= (b input count (+ start size -1)) 61) 1 0)
+                 (if (= (b input count (+ start size -2)) 61) 1 0))]
+        (if (or (< n 0) (> n capacity)) -1
+          (if (= (decode-loop work input count start size target) 1) n -1))))))
+(defn- der-byte [i] (case i 0 48 1 42 2 48 3 5 4 6 5 3 6 43 7 101 8 112 9 3 10 33 0))
+(defn- trusted [work authority i] :bool
+  (if (>= i 44) true
+    (if (= (wb work (+ 256 i)) (if (< i 12) (der-byte i) (kernel-load-u8 authority 32 (- i 12))))
+      (trusted work authority (+ i 1)) false)))
+(defn- pad-clear [work i]
+  (if (>= i 64) 1 (do (wp work (+ 1024 i) 0) (pad-clear work (+ i 1)))))
+(defn- pad-copy [work base tail i]
+  (if (>= i tail) 1 (do (wp work (+ 1024 i) (wb work (+ 32768 base i))) (pad-copy work base tail (+ i 1)))))
+(defn- pad-length [work size i]
+  (if (>= i 8) 1
+    (do (wp work (+ 1024 63 (- i)) (bit-and (u64-shift-right (* size 8) (* i 8)) 255))
+        (pad-length work size (+ i 1)))))
+(defn- sha [work size]
+  (do (sha-init (kernel-subregion work 98304 512 512))
+      (sha-blocks (kernel-subregion work 98304 512 512) (kernel-subregion work 98304 32768 size) size 0 (quot size 64))
+      (pad-clear work 0) (pad-copy work (* (quot size 64) 64) (mod size 64) 0) (wp work (+ 1024 (mod size 64)) 128)
+      (if (>= (mod size 64) 56)
+        (do (sha-block (kernel-subregion work 98304 512 512) (kernel-subregion work 98304 1024 64)) (pad-clear work 0)) 0)
+      (pad-length work size 0) (sha-block (kernel-subregion work 98304 512 512) (kernel-subregion work 98304 1024 64))))
+(defn- hex [v] (if (< v 10) (+ v 48) (+ v 87)))
+(defn- digest-matches [work input count i] :bool
+  (if (>= i 64) true
+    (let [v (load32 (kernel-subregion work 98304 512 512) (+ 64 (quot i 8)))
+          nibble (bit-and (u64-shift-right v (* (- 7 (mod i 8)) 4)) 15)]
+      (if (= (b input count (+ (get work 24) i)) (hex nibble)) (digest-matches work input count (+ i 1)) false))))
+(defn- check-payload [work input count size]
+  (if (< size 0) -1
+    (do (sha work size)
+        (if (and (digest-matches work input count 0)
+                 (= (ed/verify (kernel-subregion work 98304 4096 16384) 16384
+                      (kernel-subregion work 98304 268 32) 32 (kernel-subregion work 98304 320 64) 64
+                      (kernel-subregion work 98304 32768 size) size) 1)) size -1))))
+(defn- authenticated [work input count authority]
+  (if (and (= (parse work input count) 1) (= (get work 28) 64)
+           (= (decode work input count 2 256 44) 44) (trusted work authority 0)
+           (= (decode work input count 1 320 64) 64))
+    (check-payload work input count (decode work input count 0 32768 65536)) -1))
+(defn- commit-payload [work output capacity size i]
+  (if (>= i size) size
+    (do (kernel-store-u8-64k output capacity i (wb work (+ 32768 i))) (commit-payload work output capacity size (+ i 1)))))
+(defn- process [work input count authority output capacity]
+  (do (wipe work 0)
+      (let [size (authenticated work input count authority)]
+        (let [result (if (and (>= size 0) (<= size capacity)) (commit-payload work output capacity size 0) -1)]
+          (do (wipe work 0) result)))))
+(defn- separate [a n b m] (or (= n 0) (= m 0) (<= (+ a n) b) (<= (+ b m) a)))
+(defn verify [work work-bytes input count authority authority-bytes output capacity]
+  (if (and (>= work-bytes 98304) (>= count 0) (<= count 98304) (= authority-bytes 32)
+           (>= capacity 0) (<= capacity 65536)
+           (separate work 98304 input count) (separate work 98304 authority 32) (separate work 98304 output capacity)
+           (separate output capacity input count) (separate output capacity authority 32))
+    (process (kernel-subregion work work-bytes 0 98304) input count (kernel-subregion authority authority-bytes 0 32) output capacity) -1))

@@ -12,6 +12,7 @@ import hmac
 import importlib.util
 import json
 import os
+import re
 import socket
 from pathlib import Path
 import struct
@@ -98,6 +99,18 @@ UDP_LINK_MUTATIONS={
                  '(>= (sum frame capacity (+ 14 header) (+ 14 total)\n                (+ (be frame capacity 26) (be frame capacity 28) (be frame capacity 30) (be frame capacity 32) 17 (- total header))) 0)'),
  'udp-fragment':('(bit-and (be frame capacity 20) 49151)', '(bit-and (be frame capacity 20) 40959)')}
 
+ENVELOPE_MUTATIONS={
+ 'env-authority':('(trusted work authority 0)', '(or (trusted work authority 0) true)'),
+ 'env-digest':('(digest-matches work input count 0)', '(or (digest-matches work input count 0) true)'),
+ 'env-signature':('(= (ed/verify', '(<= (ed/verify'),
+ 'env-duplicate':('(not= (bit-and (get work 80) flag) 0)', 'false'),
+ 'env-pad-bits':('(= (bit-and c 15) 0)', 'true'),
+ 'env-spki-pad-bits':('(= (bit-and d 3) 0)', 'true'),
+ 'env-wipe':('(if (>= i 98304)', '(if (>= i 98303)'),
+ 'env-alias':('(separate work 98304 input count)', 'true'),
+ 'env-sha-padding':('(>= (mod size 64) 56)', '(> (mod size 64) 56)'),
+ 'env-output-refusal':('(commit-payload work output capacity size 0) -1)', '(commit-payload work output capacity size 0) (do (if (> capacity 0) (kernel-store-u8-64k output capacity 0 0) 0) -1))')}
+
 def pin(path):
     raw=path.read_bytes();return dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
 
@@ -172,11 +185,12 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed
+    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';envelope=a.component=='envelope';klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed or envelope
     namespace='aiueos.native.kekkai-link-gate' if klink else ('aiueos.native.udp-link-gate' if link else ('noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')))))
     slug='kekkai-link' if klink else ('udp-link' if link else ('datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s')))))
     mutations=KEKKAI_LINK_MUTATIONS if klink else (UDP_LINK_MUTATIONS if link else (DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)))))
     if ed:namespace='aiueos.native.ed25519-region-gate';slug='ed25519';mutations=ED_MUTATIONS
+    if envelope:namespace='kekkai.envelope-region-gate';slug='envelope';mutations=ENVELOPE_MUTATIONS
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
     state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
@@ -230,6 +244,7 @@ def main(a):
         core=ROOT/('lib/kotoba.kekkai/kotoba/kekkai/wire_region.kotoba' if klink else ('lib/kotoba.aiueos/os/aiueos/native/ipv4_udp.kotoba' if link else ('lib/kotoba.noise/kotoba/noise/datagram_region.kotoba' if datagram else ('lib/kotoba.noise/kotoba/noise/ik_region.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba'))))))
         fixture=ROOT/('lib/kotoba.aiueos/os/aiueos/native/kekkai_link_gate.kotoba' if klink else ('lib/kotoba.aiueos/os/aiueos/native/udp_link_gate.kotoba' if link else ('lib/kotoba.noise/tools/datagram_region_gate.kotoba' if datagram else ('lib/kotoba.noise/tools/ik_region_gate.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba'))))))
         if ed:core=ROOT/'lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/ed25519_region.kotoba';fixture=ROOT/'lib/kotoba.aiueos/os/aiueos/native/ed25519_region_gate.kotoba'
+        if envelope:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/envelope_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/envelope_region_gate.kotoba'
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
         if a.mutation and not chacha and not (klink and a.mutation=='kw-duplicate') and not (ed and a.mutation.startswith(('es-','ee-'))):
             old,new=mutations[a.mutation];text=core_bytes.decode()
@@ -239,10 +254,12 @@ def main(a):
               ([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
                [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())]))))))
         if ed:files=[('aiueos/ed25519_region.kotoba',core_bytes),('aiueos/native/ed25519_region_gate.kotoba',fixture.read_bytes())]
+        if envelope:files=[('kekkai/envelope_region.kotoba',core_bytes),('kekkai/envelope_region_gate.kotoba',fixture.read_bytes())]
         owner_root='/ed25519-owner' if ed else ('/link-owner' if link else ('/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner')))
+        if envelope:owner_root='/envelope-owner'
         for virtual,raw in files:
             target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
-        if ed:
+        if ed or envelope:
             state['dependencySources']={}
             for name in ['ed25519','ed25519_verify','sha512','sha512_stream','gf25519']:
                 dep=ROOT/('lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/'+name+'.kotoba')
@@ -252,6 +269,11 @@ def main(a):
                     if text.count(old)!=1:raise ValueError('Ed shared mutation is not unique')
                     raw=text.replace(old,new).encode();state['mutationSource']=dict(name=name,original=pin(dep),mutated=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
                 (stage/('os/aiueos/kotoba/aiueos/'+name+'.kotoba')).write_bytes(raw)
+            if envelope:
+                for name in ['ed25519_region','lib/sha256_stream']:
+                    dep=ROOT/('lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/'+name+'.kotoba')
+                    state['dependencySources'][str(dep.relative_to(ROOT))]=pin(dep)
+                    target=stage/('os/aiueos/kotoba/aiueos/'+name+'.kotoba');target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(dep.read_bytes())
         if link:
             dependency=ROOT/'lib/kotoba.aiueos/os/aiueos/native/rtl8139_cplus.kotoba'
             state['dependencySources']={str(dependency.relative_to(ROOT)):pin(dependency)}
@@ -298,6 +320,16 @@ def main(a):
         (stage/('boot-font.bin' if dual else 'boot-payload.bin')).write_bytes(payload.read_bytes())
         state['bootPayload']=None if dual else pin(payload)
         if dual:
+            if envelope:
+                reference=ROOT/'lib/kotoba.kekkai/tools/envelope_region_reference.py'
+                blob,env_returns,env_final,env_cases=load('envelope_public_reference',reference).fixtures()
+                state['referenceSources']={str(q.relative_to(ROOT)):pin(q) for q in [reference,OS_SCRIPTS/'check-native-consent-qemu.py',OS_SCRIPTS/'check-native-ed25519-qemu.py',ROOT/'lib/kotoba.kekkai/test/fixtures/netmap.signed.edn']}
+                state['cases']=env_cases
+                font=bytearray(payload.read_bytes());end=393216+len(blob)
+                if len(font)!=524288 or end>len(font) or any(font[393216:end]):raise ValueError('envelope diagnostic tail unavailable')
+                font[393216:end]=blob;(stage/'boot-font.bin').write_bytes(font)
+                (out/'envelope-vectors.bin').write_bytes(blob);(out/'expected-envelope-returns.bin').write_bytes(env_returns);(out/'expected-final-payload.bin').write_bytes(env_final)
+                state['vectorData']=pin(out/'envelope-vectors.bin')
             if ed:
                 reference=OS_SCRIPTS/'ed25519-region-reference.py'
                 blob,ed_hashes,ed_returns,ed_cases=load('ed_public_reference',reference).fixtures()
@@ -398,15 +430,28 @@ def main(a):
                 link_peer=ROOT/('scripts/native_kekkai_link_peer.py' if klink else 'scripts/native_udp_link_peer.py');state['linkPeerObserver']=pin(link_peer)
                 state['state']='NATIVE_LINK_RUNNING';save()
                 state['linkResult'],link_good=load('native_udp_link_peer',link_peer).exercise(boot,peer,target,out)
-            if x25519 or protocol or ed:
+            if x25519 or protocol or ed or envelope:
                 started=time.monotonic();state['state']='NATIVE_RUNNING';save()
                 while boot.W(79)==1:
                     if boot.proc.poll() is not None:raise RuntimeError('region guest terminated')
+                    if envelope:
+                        log=out/'qemu-debug.log'
+                        traps=re.findall(rb'v=06 [^\n]*IP=0008:([0-9a-f]+)',log.read_bytes()) if log.exists() else []
+                        if any(0x100000<=int(pc,16)<0x400000 for pc in traps):
+                            state['nativeInvalidOpcodePCs']=[pc.decode() for pc in traps];save()
+                            raise RuntimeError('native envelope guest halted on an invalid opcode; not a bounded refusal')
                     state['completedCases']=boot.W(78);save()
                     if time.monotonic()-started>a.execution_seconds:raise TimeoutError('region native execution deadline')
                     time.sleep(2)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
             if link:raw=b''
+            elif envelope:
+                low,high=struct.unpack('<2I',boot.dump(boot.work+400,8));address=low+(high<<32)
+                if not 0<address<1<<39:raise ValueError('native envelope request address differs')
+                raw=boot.dump(boot.work+4096,len(env_returns))
+                (out/'native-envelope-work.bin').write_bytes(boot.dump(address,98304))
+                (out/'native-final-payload.bin').write_bytes(boot.dump(address+196608,65536))
+                env_legacy=boot.W(80)
             elif ed:
                 low,high=struct.unpack('<2I',boot.dump(boot.work+400,8));address=low+(high<<32)
                 if not 0<address<1<<39:raise ValueError('native Ed request address differs')
@@ -472,6 +517,22 @@ def main(a):
             else:
                 if not good:raise AssertionError('native raw Ed/SHA512 mismatch: '+str(observed))
                 state['state']='PASS_NATIVE_OS_REGION_ED25519_SHA512'
+            state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
+        if envelope:
+            (out/'native-envelope-returns.bin').write_bytes(raw);count=len(env_returns)//4
+            mismatches=[i for i in range(count) if raw[i*4:(i+1)*4]!=env_returns[i*4:(i+1)*4]]
+            work_zero=(out/'native-envelope-work.bin').read_bytes()==bytes(98304)
+            final_equal=(out/'native-final-payload.bin').read_bytes()==env_final
+            observed=dict(shapeGuardCount=words[0],nativeAssertionFailures=words[1],guardsCompleted=words[2],canary=words[3],caseCount=words[4],completed=words[5],legacyCases=env_legacy,returnMismatches=mismatches,finalWorkWiped=work_zero,finalPayloadEquals=final_equal)
+            state['observed']=observed;state['artifacts']={n:pin(q) for n,q in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
+            good=words==(10,0,1,1,count,2) and env_legacy==3 and not mismatches and work_zero and final_equal
+            if a.mutation:
+                if words[0]!=10 or words[2:]!=(1,1,count,2) or env_legacy!=3:raise AssertionError('envelope mutant did not complete bounded controls')
+                if good:raise AssertionError('envelope mutation escaped native controls')
+                state['state']='DETECTED_NATIVE_MUTATION'
+            else:
+                if not good:raise AssertionError('native envelope/control mismatch: '+str(observed))
+                state['state']='PASS_NATIVE_OS_SIGNED_ENVELOPE'
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
         if protocol:
             count=39 if datagram else 95
@@ -546,7 +607,7 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519'],default='blake2s')
+    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519','envelope'],default='blake2s')
     p.add_argument('--execution-seconds',type=float,default=3600)
-    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS])
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS,*ENVELOPE_MUTATIONS])
     main(p.parse_args())
