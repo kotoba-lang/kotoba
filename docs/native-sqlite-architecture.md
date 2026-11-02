@@ -103,11 +103,18 @@ dated oracle only; oracle success never substitutes for Kotoba/Amu execution.
 
 The Kotoba package now has source for the fixed database header, signed-i64
 varints, four-TEXT notepad records, generic record-layout spans, B-tree page
-headers/cell pointers, and table-leaf cells. The table-interior cell decoder
-now also extracts its left-child page and rowid boundary. These are source
-components only: no full page-tree walk, `sqlite_schema` reader, overflow
-traversal, SQL operation layer, Amu byte provider, or database mutation path
-is qualified. The current Amu Mac CLI cannot compile this imported multi-file
-package through its exposed source-lock route (E6015), so no Kotoba/Amu
-runtime result is claimed. Continue with the pinned Amu project-build route
-and native byte capability before consumer wiring.
+headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
+On 2026-11-02, the native Amu Mac CLI checked and ran a source-locked six-module
+graph with codec calls: the positive fixture returned 0, and malformed/truncated
+varint, record, notepad-record, and page inputs returned their named sentinel
+values in a refusal fixture. Both used `bytes-from-vector-i64` for zero-length
+bytes. A separate one-source native probe using `bytes-empty` exited 139; this
+Amu runtime issue is recorded as a blocker, and the varint negative encoder
+constructs its empty result through `bytes-from-vector-i64` instead.
+
+These checks qualify only the exercised codec calls on macOS ARM64. No full
+page-tree walk, `sqlite_schema` reader, overflow traversal, SQL operation
+layer, Amu byte-provider durability/locking, WAL/recovery, or database
+mutation path is qualified. An earlier complex scratch harness returned
+E6015; the smaller pinned six-module graph now passes, so E6015 is not evidence
+that the general Mac multi-module source-lock route is absent.
