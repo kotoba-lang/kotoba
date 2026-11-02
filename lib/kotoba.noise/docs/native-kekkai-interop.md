@@ -63,6 +63,54 @@ not booted or changed the physical machine. `scripts/check-kekkai-os-profile.py`
 reproduces and records that refusal against an explicit baseline source-lock
 pin; a refusal exits 2 and cannot count as a passing OS gate.
 
+## OS region hash prerequisite
+
+`noise.blake2s-region` adds an allocation-free streaming BLAKE2s-256/HMAC
+implementation for the kernel's region ABI. It owns no global memory: the
+caller supplies a disjoint512-byte state, with explicit initialization,
+byte updates, finalization, digest access and wipe. HMAC streams the key
+before the message, hashes a key longer than64 bytes and preserves an empty
+key. This is HMAC-BLAKE2s for the existing suite, not BLAKE2's keyed mode.
+The two32-bit count words retain a pending full final block; overflow is
+refused before changing state. Wrong phases, short states, non-byte values
+and corrupted fill counts are refused without mutation. There is no
+constant-time qualification; the caller must wipe retained key material.
+
+`scripts/check-kekkai-region-os.py` stages that exact canonical owner with
+the existing OS ValueRuntime exports, compiles a locked14-module closure
+under `x86_64-aiueos-kernel-v3`, reproduces kernel/EFI and boots a private
+NIC-less QEMU fixture. Its main is a crypto component entry, not the desktop
+or a CPL3 app. It does not replace the actual ABI with deny stubs, widen the
+2MiB code limit, grant authority, enroll a device or touch physical media.
+
+The fixture emits303 complete native digests: message lengths0–257, `abc`,
+64KiB and1MiB, plus six HMAC key lengths0/32/64/65/100/4096 crossed with
+seven message lengths0/1/63/64/65/257/4096. All match independent Python
+hashlib/HMAC expected bytes. Native fixed KAT mask3, refusal/wipe/state mask1023
+and adjacent-memory canary1 also pass. Count carry and overflow use synthetic
+boundary states; this does not claim actual hashing of a greater-than4GiB
+message. Public fixture media are unchanged. The observer treats a missing
+completion, trap or compiler refusal as failure, never mutation success.
+
+Six separately booted mutations are detected: wrong rotation/final flag
+change all303 digests; omitted long-key normalization changes21 HMAC results;
+broken carry, overflow refusal and post-finalization admission reduce the
+native guard mask to895,959 and1019. Every mutant completes with operation
+errors0,303 digests and canary1. ELF/EFI reproduce per candidate. The earlier
+fixture type/intrinsic refusals and an initial missing boot marker are retained
+as failures in `docs/evidence/kekkai-native-20261102/os-region-blake2s.json`.
+The corrected setup uses an unconditional crypto main and the pinned existing
+boot payload; the initial boot failure was not causally isolated between
+those two setup changes. It is not a passing negative control.
+
+This adds an OS-compatible hash dependency for the Kekkai adapter. It does
+not make the shared vector Noise closure kernel-compatible.
+The X25519/ChaChaPoly region integration, IK handshake and datagram state,
+signed netmap, socket/clock/key lifecycle, app entry/install and fresh
+operation consent remain open. Mac and6600H app installation and a real
+authenticated connection are still unqualified. Existing SSH/PXE and other
+management routes remain in place.
+
 Documentation discrepancy found during this task: the older README's first
 native-port paragraph says state size 362; current `noise.native/state-size` is
 1646 after the XXhfs extension. The source layout is authoritative. The README

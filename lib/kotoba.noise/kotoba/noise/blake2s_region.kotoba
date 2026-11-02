@@ -1,0 +1,146 @@
+;; JUN-757: allocation-free BLAKE2s-256 / HMAC for the OS region ABI.
+;; RFC7693 unkeyed hash; Noise HKDF requires HMAC, not keyed BLAKE2.
+;; Caller owns one disjoint512-byte region. No heap, socket, identity or grant.
+;; init/update-byte/finish/digest-byte stream arbitrary blocks; HMAC streams
+;; the whole key first, then the message. A key over64 bytes is hashed.
+;; Calls return1 on success,0 on invalid length/byte/phase/counter; refused
+;; calls do not mutate state. digest-byte returns-1 until finalized or OOB.
+;; Counter is two unsigned32-bit words, with overflow refused before mutation.
+;; Not a constant-time qualification. Key/intermediate bytes remain until wipe.
+;; Layout: H0..31 V32..95 buffer160..223 count224..231 fill232 phase236
+;; magic240; normalized key256..319 inner digest320..351 HMAC phase360.
+(ns noise.blake2s-region
+  (:export [init update-byte finish digest-byte wipe
+            hmac-key-init hmac-key-byte hmac-key-finish hmac-update-byte hmac-finish]))
+
+(defn- ld [st at] (kernel-load-u32 st 512 at))
+(defn- put [st at value] (kernel-store-u32 st 512 at value))
+(defn- b [st at] (kernel-load-u8 st 512 at))
+(defn- p [st at value] (kernel-store-u8 st 512 at value))
+(defn- m32 [x] (bit-and x 4294967295))
+(defn- rr [x n]
+  (m32 (bit-or (u64-shift-right x n) (i64-shift-left x (- 32 n)))))
+(defn- iv [i]
+  (case i 0 1779033703 1 3144134277 2 1013904242 3 2773480762
+    4 1359893119 5 2600822924 6 528734635 7 1541459225 0))
+(defn- sigma [round index]
+  (bit-and (u64-shift-right
+    (case round 0 -81985529216486896 1 3853709921291437230
+      2 5266788149650328715 3 -8141200382097550441
+      4 -3204650750919412471 5 -7931023849780369726
+      6 -5176546439255363236 7 -6744053556625741891
+      8 6503616966983130870 9 991893350865389610 0) (* index 4)) 15))
+(defn- fill [st at end value]
+  (if (>= at end) 1 (do (p st at value) (fill st (+ at 1) end value))))
+(defn- h-init [st i]
+  (if (>= i 8) 1
+    (do (put st (* i 4) (bit-xor (iv i) (if (= i 0) 16842784 0)))
+        (h-init st (+ i 1)))))
+(defn- core-init [st]
+  (do (fill st 0 256 0) (h-init st 0) (put st 236 1) (put st 240 1112290354) 1))
+(defn- valid [st]
+  (and (= (ld st 240) 1112290354) (= (ld st 236) 1)
+    (= (ld st 232)
+       (if (and (= (ld st 224) 0) (= (ld st 228) 0)) 0
+         (if (= (mod (ld st 224) 64) 0) 64 (mod (ld st 224) 64))))))
+(defn- can-add [st value]
+  (and (valid st) (>= value 0) (<= value 255)
+       (not (and (= (ld st 224) 4294967295) (= (ld st 228) 4294967295)))))
+(defn- v [st i] (ld st (+ 32 (* i 4))))
+(defn- vp [st i x] (put st (+ 32 (* i 4)) x))
+(defn- g [st ids x y]
+  (let [a (mod ids 16) b (mod (quot ids 16) 16)
+        c (mod (quot ids 256) 16) d (quot ids 4096)]
+    (do (vp st a (m32 (+ (+ (v st a) (v st b)) x)))
+        (vp st d (rr (bit-xor (v st d) (v st a)) 16))
+        (vp st c (m32 (+ (v st c) (v st d))))
+        (vp st b (rr (bit-xor (v st b) (v st c)) 12))
+        (vp st a (m32 (+ (+ (v st a) (v st b)) y)))
+        (vp st d (rr (bit-xor (v st d) (v st a)) 8))
+        (vp st c (m32 (+ (v st c) (v st d))))
+        (vp st b (rr (bit-xor (v st b) (v st c)) 7)) 1)))
+(defn- indices [j]
+  (if (< j 4) (+ j (* (+ j 4) 16) (* (+ j 8) 256) (* (+ j 12) 4096))
+    (let [k (- j 4)]
+      (+ k (* (+ 4 (mod (+ k 1) 4)) 16)
+        (* (+ 8 (mod (+ k 2) 4)) 256) (* (+ 12 (mod (+ k 3) 4)) 4096)))))
+(defn- rounds [st round j]
+  (if (>= round 10) 1
+    (if (>= j 8) (rounds st (+ round 1) 0)
+      (do (g st (indices j)
+              (ld st (+ 160 (* (sigma round (* j 2)) 4)))
+              (ld st (+ 160 (* (sigma round (+ (* j 2) 1)) 4))))
+          (rounds st round (+ j 1))))))
+(defn- v-init [st i]
+  (if (>= i 16) 1
+    (do (vp st i (if (< i 8) (ld st (* i 4)) (iv (- i 8)))) (v-init st (+ i 1)))))
+(defn- merge [st i]
+  (if (>= i 8) 1
+    (do (put st (* i 4) (bit-xor (ld st (* i 4)) (bit-xor (v st i) (v st (+ i 8)))))
+        (merge st (+ i 1)))))
+(defn- compress [st final]
+  (do (v-init st 0)
+      (vp st 12 (bit-xor (v st 12) (ld st 224)))
+      (vp st 13 (bit-xor (v st 13) (ld st 228)))
+      (if (= final 1) (vp st 14 (bit-xor (v st 14) 4294967295)) 0)
+      (rounds st 0 0) (merge st 0) 1))
+(defn- increment [st]
+  (if (= (ld st 224) 4294967295)
+    (do (put st 224 0) (put st 228 (+ (ld st 228) 1)))
+    (put st 224 (+ (ld st 224) 1))))
+(defn- add [st value]
+  (do (if (= (ld st 232) 64)
+        (do (compress st 0) (fill st 160 224 0) (put st 232 0)) 0)
+      (p st (+ 160 (ld st 232)) value) (put st 232 (+ (ld st 232) 1))
+      (increment st) 1))
+(defn- core-finish [st]
+  (do (compress st 1) (put st 236 2) 1))
+
+(defn wipe [st length]
+  (if (< length 512) 0 (fill st 0 512 0)))
+(defn init [st length]
+  (if (< length 512) 0 (do (fill st 0 512 0) (core-init st))))
+(defn update-byte [st length value]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 0) (can-add st value)) (add st value) 0)))
+(defn finish [st length]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 0) (valid st)) (core-finish st) 0)))
+(defn digest-byte [st length index]
+  (if (or (< length 512) (< index 0) (>= index 32)) -1
+    (if (and (= (ld st 240) 1112290354) (= (ld st 236) 2)
+             (or (= (ld st 360) 0) (= (ld st 360) 3))) (b st index) -1)))
+
+(defn hmac-key-init [st length]
+  (if (< length 512) 0
+    (do (fill st 0 512 0) (core-init st) (put st 360 1) 1)))
+(defn hmac-key-byte [st length value]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 1) (can-add st value))
+      (do (if (and (= (ld st 228) 0) (< (ld st 224) 64))
+            (p st (+ 256 (ld st 224)) value) 0)
+          (add st value)) 0)))
+(defn- normalize-key [st i]
+  (if (>= i 64) 1
+    (do (p st (+ 256 i) (if (< i 32) (b st i) 0)) (normalize-key st (+ i 1)))))
+(defn- pad [st xor i]
+  (if (>= i 64) 1
+    (do (add st (bit-xor (b st (+ 256 i)) xor)) (pad st xor (+ i 1)))))
+(defn hmac-key-finish [st length]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 1) (valid st))
+      (do (if (or (> (ld st 228) 0) (> (ld st 224) 64))
+            (do (core-finish st) (normalize-key st 0)) 0)
+          (core-init st) (pad st 54 0) (put st 360 2) 1) 0)))
+(defn hmac-update-byte [st length value]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 2) (can-add st value)) (add st value) 0)))
+(defn- save-inner [st i]
+  (if (>= i 32) 1 (do (p st (+ 320 i) (b st i)) (save-inner st (+ i 1)))))
+(defn- absorb-inner [st i]
+  (if (>= i 32) 1 (do (add st (b st (+ 320 i))) (absorb-inner st (+ i 1)))))
+(defn hmac-finish [st length]
+  (if (< length 512) 0
+    (if (and (= (ld st 360) 2) (valid st))
+      (do (core-finish st) (save-inner st 0) (core-init st)
+          (pad st 92 0) (absorb-inner st 0) (core-finish st) (put st 360 3) 1) 0)))
