@@ -51,6 +51,12 @@ fix_checksum(numeric)
 long_size = bytearray(valid)
 long_size[124:136] = b'00000010000\0'  # 4096 bytes but less than that follows
 fix_checksum(long_size)
+setuid = bytearray(valid)
+setuid[100:108] = b'0004755\0'
+fix_checksum(setuid)
+badmode = bytearray(valid)
+badmode[100:108] = b'0000899\0'
+fix_checksum(badmode)
 cases = {
     'good': valid,
     'directory': archive('bin/', tarfile.DIRTYPE, b''),
@@ -65,6 +71,8 @@ cases = {
     'terminator': bytes(terminator),
     'numeric': bytes(numeric),
     'truncated': bytes(long_size),
+    'setuid': bytes(setuid),
+    'badmode': bytes(badmode),
     'pax': archive('header', tarfile.XHDTYPE, b''),
 }
 for name, data in cases.items():

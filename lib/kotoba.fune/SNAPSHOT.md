@@ -58,6 +58,16 @@ structure refusal the function closes the snapshot; success leaves it open.
 It does not validate conflicts between entries or across layers, apply file
 metadata, create paths, or authorize execution.
 
+While retaining that same verified snapshot, `snapshot-entry` returns the next
+header offset, payload offset, kind, size, mode and ASCII path bytes for a
+caller-supplied aligned entry offset. It rejects invalid headers and out-of-range
+offsets; the caller must traverse from the start using the returned next offset
+and must not close/reopen the snapshot between validation and consumption.
+This low-level cursor does not prove that an arbitrary supplied offset is an
+entry boundary, resolve path conflicts, enforce aggregate rootfs quotas, or
+authorize filesystem writes. The ustar profile now refuses invalid mode fields
+and modes above `0777`, including setuid/setgid/sticky bits.
+
 Native ARM64 checks covered valid regular file, directory, ustar prefix and
 two-entry archives; absolute and traversal paths, whiteout, symlink, device,
 PAX, checksum, numeric field, truncated payload and nonzero tail were refused.
@@ -67,6 +77,10 @@ or terminator validation failed their negative controls. An Alpine ARM64
 layer passed digest checking but was refused for its unsupported symlink.
 These checks use the test-only `snapshot_archive_gate.kotoba`; the positive
 `hold` mode overwrites its input, so use a disposable fixture copy.
+`snapshot_entry_gate.kotoba` additionally checked regular-file, directory,
+prefix and two-entry cursors, invalid offsets, payload bytes after source replacement,
+and descriptor lifetime. Independently staged setuid and malformed mode
+headers were rejected; a mode-check-removal mutant accepted the setuid case.
 
 The test-only `layout_snapshot_runner.kotoba` calls the new whole-layout route.
 With the rebuilt ARM64 root from Amu PR #1785, one- and two-layer layouts
