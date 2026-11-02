@@ -271,11 +271,11 @@ open.
 A source-pinned Kotoba program compiled by the Amu full-bootstrap ARM64
 selfhost compiler and ran through the Amu FS2 FD3-scoped runtime with
 `PATH=/nonexistent`. The Kotoba adapter serialized image publication with an
-Amu FS35 persistent file lock, removed a stale staging basename using FS2 J,
-wrote the replacement using exclusive FS2 B, then called FS35 file fsync,
+Amu FS35 persistent file lock, requested a fresh randomized staging basename
+using FS2 N, wrote the replacement using FS2 B, then called FS35 file fsync,
 atomic rename, and parent-directory fsync. Two successive SQLite image
-publications passed; the test seeded a stale stage file before execution and
-verified it was removed while the persistent lock file remained.
+publications passed. The test pre-seeded stage-like names and verified that
+their contents remained unchanged while the persistent lock file remained.
 
 Python 3.15.0 `sqlite3` / SQLite 3.54.1 opened the final file read-only and
 immutable. `PRAGMA integrity_check` returned `ok`; readback confirmed the
@@ -288,8 +288,9 @@ for source hashes and measured details.
 
 This narrows the earlier statement that no Kotoba storage adapter or atomic
 replacement had been qualified: the exact macOS ARM64 adapter path above is
-now qualified for sequential image replacement and next-run stale-stage
-cleanup. It does not qualify concurrent-process contention or lock fairness,
+now qualified for sequential image replacement with fresh randomized names.
+An abandoned random stage after a crash remains inert and is not currently
+collected. It does not qualify concurrent-process contention or lock fairness,
 power-loss injection between commit steps, general SQLite transaction
 semantics, WAL/rollback-journal handling, arbitrary page layouts or splits,
-Linux x86_64/ARM64, or Itonami cutover. Those gates remain open.
+Linux x86_64/ARM64, or Itonami cutover. Random orphan-stage collection and those gates remain open.
