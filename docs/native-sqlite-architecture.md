@@ -350,3 +350,28 @@ checked integrity and the expected row/index. This qualifies these exact
 ARM64 provider routes only. Linux x86_64, standard SQLite byte-range locking,
 external-process races, WAL/recovery, crash injection/recovery, and Itonami
 wiring remain open.
+
+## Existing SQLite mutation and wider rowid qualification (2026-11-02)
+
+The source-pinned Amu selfhost F2 Linux ARM64 Kotoba gate now also opens a
+standard SQLite 3.54.1 `cron_notepad` file, updates an existing row, inserts a
+row for another job, deletes one job, publishes through the Kotoba FS2/FS35
+path, then reopens and reads the result through Kotoba. The separate
+read-only/immutable SQLite 3.54.1 oracle reports `integrity_check=ok`, confirms
+the admitted schema and unique composite primary-key index, and reads the
+expected surviving rows. A companion standard three-page fixture updates
+rowid 128 and inserts rowids 129 and 130; Kotoba reopens it successfully, and
+the independent read-only oracle confirms all three rows and integrity.
+Exact Amu pin, compiler/program/source hashes, and results are recorded in
+[`Linux native mutation receipt`](../lib/kotoba.sql/evidence/notepad-high-rowid-native-linux-arm64-20261102.json),
+[`legacy mutation readback`](../lib/kotoba.sql/evidence/legacy-notepad-mutation-readonly-oracle-20261102.json),
+and [`high-rowid readback`](../lib/kotoba.sql/evidence/high-rowid-native-readonly-oracle-20261102.json).
+
+This extends the measured Linux ARM64 behavior from creating and reopening an
+initial image to bounded mutation of the exact admitted four-TEXT schema and
+positive rowids through 130. It does not implement B-tree root/page splitting
+or qualify databases whose existing table or index roots are interior pages;
+those shapes still fail closed. It also does not qualify arbitrary SQLite
+schemas, WAL or rollback-journal recovery, standard byte-range/concurrent
+locking, crash recovery, Linux x86_64, or Itonami wiring. Python is used only
+for the separate dated read-only oracle and is not part of the native path.
