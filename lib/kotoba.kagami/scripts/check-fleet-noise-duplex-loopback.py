@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Observe two synthetic Noise endpoints on isolated Linux loopback."""
-import json, socket, subprocess, time
+import json, os, socket, subprocess, time
 from pathlib import Path
 
 root=Path('/work');image=root/'test.elf';results={}
-for case in ('good','wrong','wrong-server','tampered'):
+cases = (os.environ['FLEET_CASE_ONLY'],) if 'FLEET_CASE_ONLY' in os.environ else ('good','wrong','wrong-server','tampered','bad-ack','bad-record')
+for case in cases:
  directory=root/('case-'+case);directory.mkdir()
  with socket.socket() as p:
   p.bind(('127.0.0.1',0));address='127.0.0.1:'+str(p.getsockname()[1])

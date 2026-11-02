@@ -3,9 +3,9 @@
 ;; roster, and own a single-use session state before calling this function.
 ;; This function does not perform or assert peer authentication or key setup.
 (ns kagami.fleet-noise-native
-  (:require [noise.native :as noise] [noise.tcp :as tcp]
+  (:require [noise.native :as noise] [noise.tcp :as tcp] [sha3.core :as sha3] [ed25519.selfhost :as ed]
             [kagami.fleet-tcp-native :as raw] [kagami.fleet-announce-edn :as ingress])
-  (:export [receive-successor]))
+  (:export [receive-successor receive-and-ack receive-ack]))
 
 ;; After an authenticated frame decrypts, next-state is always written even
 ;; when the fleet record is rejected: reusing the old receive nonce is unsafe.
@@ -34,3 +34,50 @@
                                   (let [x (vector-assoc! body i (vector-at decoded (+ size i)))] (recur (+ i 1)))))]
               (if (not (raw/valid-utf8? body)) "invalid"
                 (ingress/advance-successor-edn out base seq hash value signer (string-from-utf8 (bytes-from-vector-i64 body)))))))))))))
+
+;; Experimental application ACK, not an established fleet wire protocol.
+;; The independent expected record hash and value must be known by sender.
+(defn ack-bytes [seq :i64 hash :string value :string] :vector-i64
+  (vector-i64-from-bytes (string-to-utf8 (str "fleet-ack/v1\n" (string-from-i64 seq) "\n" hash "\n" value "\n"))))
+(defn slice [v :vector-i64 offset :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)]
+    (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ offset i)))))))
+(defn copy-state [target :vector-i64 source :vector-i64] :bool
+  (loop [i 0]
+    (if (= i (noise/state-size)) true
+      (let [ignored (vector-assoc! target i (vector-at source i))] (recur (+ i 1))))))
+(defn usable? [state :vector-i64 sending :bool] :bool
+  (if (not (= (vector-count state) (noise/state-size))) false
+    (let [role (vector-at state 293) done (vector-at state 295)
+          slot (if sending (if (= role 1) 328 361) (if (= role 1) 361 328))
+          counter (vector-at state slot)]
+      (and (or (= role 0) (= role 1)) (= done 1) (>= counter 0) (< counter 9223372036854775807)))))
+
+;; Send ACK only after a definite commit or durable already-committed result.
+;; A send failure returns uncertain even if the local commit already happened;
+;; next-state advances before the send and the caller must close the session.
+(defn receive-and-ack [out :vector-i64 next-state :vector-i64 state :vector-i64
+                      base :string seq :i64 hash :string value :string signer :string handle :string ms :i64] :string
+  (let [status (receive-successor out next-state state base seq hash value signer handle ms)]
+    (if (not (or (string=? status "committed") (string=? status "already-committed"))) status
+      (if (not (usable? next-state true)) "uncertain"
+        (let [payload (ack-bytes (+ seq 1) (sha3/hex (slice out 0 32)) (sha3/hex (slice out 32 32)))
+              encrypted (noise/transport-encrypt next-state payload) size (noise/state-size)]
+          (if (not (= (vector-count encrypted) (+ size (vector-count payload) 16))) "uncertain"
+            (let [copied (copy-state next-state encrypted)
+                  frame (slice encrypted size (- (vector-count encrypted) size))]
+              (if (= (tcp/send-frame handle frame) 0) status "uncertain"))))))))
+
+;; On authenticated-but-mismatching ACK the nonce still advances. The caller
+;; closes on false and must not treat absent/malformed ACK as proof of commit.
+(defn receive-ack [next-state :vector-i64 state :vector-i64 expected-seq :i64 expected-hash :string expected-value :string
+                  handle :string ms :i64] :bool
+  (if (or (not (= (vector-count next-state) (noise/state-size))) (not (usable? state false))
+          (< expected-seq 0) (not (= (string-byte-length expected-hash) 64))
+          (not (= (string-byte-length expected-value) 64)) (< ms 1) (> ms 30000)) false
+    (let [frame (tcp/recv-frame handle ms) n (vector-count frame)]
+      (if (or (< n 16) (> n 256)) false
+        (let [decoded (noise/transport-decrypt state frame) size (noise/state-size)]
+          (if (< (vector-count decoded) size) false
+            (let [copied (copy-state next-state decoded) body (slice decoded size (- (vector-count decoded) size))]
+              (ed/bytes=? body (ack-bytes expected-seq expected-hash expected-value)))))))))

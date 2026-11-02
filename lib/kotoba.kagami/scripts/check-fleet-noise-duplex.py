@@ -41,9 +41,11 @@ def build(name,staged):
  (work/'runner.kotoba').write_bytes(runner)
  mac.native_run(compiler,work,'compile','runner.kotoba','--target','aarch64-linux','--output','test.elf','--format','packed','--payload','test.kseed');(work/'test.elf').chmod(0o755)
  return work
-def run(work):
- return subprocess.run(['podman','run','--rm','--pull','never','--network','none','--platform','linux/arm64',
-  '-v',str(work)+':/work:rw','-v',str(observer)+':/observer.py:ro',image,'python3','/observer.py'],capture_output=True,text=True,timeout=600)
+def run(work,only=None):
+ cmd=['podman','run','--rm','--pull','never','--network','none','--platform','linux/arm64',
+  '-v',str(work)+':/work:rw','-v',str(observer)+':/observer.py:ro']
+ if only:cmd+=['-e','FLEET_CASE_ONLY='+only]
+ return subprocess.run(cmd+[image,'python3','/observer.py'],capture_output=True,text=True,timeout=600)
 good=build('good',sources);r=run(good)
 if r.returncode:raise ValueError(('good',r.returncode,r.stdout,r.stderr[-1500:]))
 report=json.loads((good/'duplex-result.json').read_text())
@@ -58,10 +60,23 @@ if sources[key].count(needle)!=1:raise ValueError('initiator identity guard anch
 mutant=dict(sources);mutant[key]=mutant[key].replace(needle,b'false')
 bad=build('initiator-identity-mutant',mutant);r=run(bad)
 if r.returncode==0 or 'good PASS' not in r.stdout or 'wrong-server' not in r.stderr:raise ValueError(('initiator mutant not detected',r.returncode,r.stdout,r.stderr[-1500:]))
+initiator_mutant_exit=r.returncode
+key='kagami/fleet_noise_native.kotoba';needle=b'(ed/bytes=? body (ack-bytes expected-seq expected-hash expected-value))'
+if sources[key].count(needle)!=1:raise ValueError('ACK comparison anchor')
+mutant=dict(sources);mutant[key]=mutant[key].replace(needle,b'true')
+bad=build('ack-mutant',mutant);r=run(bad)
+if r.returncode==0 or 'good PASS' not in r.stdout or 'bad-ack' not in r.stderr:raise ValueError(('ACK mutant not detected',r.returncode,r.stdout,r.stderr[-1500:]))
+ack_mutant_exit=r.returncode
+needle=b'(tcp/send-frame handle frame)'
+if sources[key].count(needle)!=1:raise ValueError('ACK send anchor')
+fault=dict(sources);fault[key]=fault[key].replace(needle,b'-1')
+failed=build('ack-send-fault',fault);r=run(failed,'fail-send')
+if r.returncode or 'fail-send PASS' not in r.stdout:raise ValueError(('ACK send fault',r.returncode,r.stdout,r.stderr[-1500:]))
 evidence={'status':'PASS_FLEET_NOISE_DUPLEX_SYNTHETIC','compilerSha256':sha(compiler.read_bytes()),'runnerSourceSha256':sha(runner),
  'builderSha256':sha(Path(__file__).read_bytes()),'observerSha256':sha(observer.read_bytes()),'driverSha256':sha(driver),'image':image_info,
  'sources':{k:sha(v) for k,v in sorted(original.items())},'stagedEntrySha256':sha(base),'kseedSha256':sha((good/'test.kseed').read_bytes()),'elfSha256':sha((good/'test.elf').read_bytes()),
  'result':report,'responderIdentityGuardMutant':{'exit':responder_mutant_exit,'detected':True},
- 'initiatorIdentityGuardMutant':{'exit':r.returncode,'detected':True},
+ 'initiatorIdentityGuardMutant':{'exit':initiator_mutant_exit,'detected':True},
+ 'ackComparisonMutant':{'exit':ack_mutant_exit,'detected':True},'ackSendFault':'uncertain after durable commit; send nonce advanced',
  'scope':'two Linux ARM processes over isolated loopback, deterministic synthetic keys; no live trust, multiple hosts, constant-time or production qualification'}
 (out/'evidence.json').write_text(json.dumps(evidence,indent=2)+'\n');print('PASS_FLEET_NOISE_DUPLEX_SYNTHETIC',flush=True)
