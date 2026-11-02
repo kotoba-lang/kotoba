@@ -135,3 +135,35 @@ exact candidate, including dock icons, overlap drag, viewport clipping and
 modal pointer movement without granting approval. The owner has been asked
 once to judge actual Trackpad drag and residual Window/Dock flicker. No
 acceptance answer has arrived yet, and JUN-502 remains open.
+
+## Clipped tile glyph candidate, not physically deployed
+
+Tile glyphs now visit only intersecting rows/columns and write bitmap bits
+to guarded tile offsets directly. The full-reference painter is unchanged.
+The exact44-source v2 ELF/EFI reproduces and passes USB/NVMe12, pointer12,
+PXE hub smoke and24 drags/28 pixel comparisons (the benchmark used v1,
+whose native ELF is byte-identical). QEMU normal1/4-window scene medians
+are251/314ms, raster155/232ms; timing remains diagnostic, with other VMs
+running, and no physical speed claim is made for this candidate.
+
+The first full input-state gate failed at bad-GPT: F5 was not yet consumed
+(keycount1,lastscan3,framecount1,generation0,load=-22,save-result0). Its
+failed receipt/context are retained. An independent same-image/same-disk
+boot consumes F5 and refuses save with-24, keeping generation0. The gate
+now waits for started==presented, idle effects and exact make counter/scan
+in this storage-refusal scenario; it neither resends the key nor weakens
+the negative save/disk-unchanged assertion. Fresh full v2 passes all12.
+Failure snapshots also include started/effects counters. This storage gate
+does not qualify all input arrival schedules or continuous input under load.
+
+An additional pause-based busy-paint experiment was invalid: QEMU v10.0.3
+ui/input.c:321–323 discards key events sent while stopped. Its unconsumed
+F5 is not an OS input-loss finding. A corrected running-input control is
+being investigated separately; the native loss claim is withdrawn. See
+https://github.com/qemu/qemu/blob/v10.0.3/ui/input.c#L321-L323 .
+
+The old material-op comment described rounded solid as kind3; actual
+Browser frame2 and present-ops use kind7, while kind3 is paired glyphs.
+This minor comment was corrected after reporting it in JUN-502. Native
+code and key assignments are unchanged by that correction. The physical
+board remains on sparse-v3 while owner drag/flicker feedback is pending.
