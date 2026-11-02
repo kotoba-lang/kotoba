@@ -59,8 +59,8 @@ SQL compatibility.
 1. Pure Kotoba SQLite v3 codec: 100-byte database header encode/decode,
    empty one-page database image construction, page-size and encoding
    validation, 1..9-byte varints, serial types, record encode/decode, bounded
-   table-leaf cell encoding, and checked page offsets. No file writes in this
-   unit.
+   table-leaf cell and single-cell page encoding, and checked page offsets.
+   No file writes in this unit.
 2. Schema and B-tree reader: validate `sqlite_schema`, resolve the table and
    composite primary-key index, walk leaf/interior pages, and reject malformed
    pointers, cycles, overflow chains, unsupported collations, and unsupported
@@ -107,7 +107,10 @@ The Kotoba package now has source for the fixed database header, signed-i64
 varints, four-TEXT notepad records, generic record-layout spans, B-tree page
 headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
 It can also encode a table-leaf cell when its payload fits on the page; it
-refuses negative rowids and payloads requiring overflow pages.
+refuses negative rowids and payloads requiring overflow pages. A separate
+single-cell page builder places that cell into a bounded table-leaf page,
+including the page-1 B-tree header offset, but its page image excludes the
+100-byte database header and is not a complete database file.
 On 2026-11-02, source-locked Amu Mac ARM64 runtime fixtures passed for positive
 codec calls, malformed/truncated refusal sentinels, and negative-varint empty
 encoding. A separate source-locked fixture constructs empty database images
@@ -115,8 +118,10 @@ for page sizes 512, 16,384, 32,768 and 65,536 bytes; it decodes the generated
 header, validates page 1 as an empty table-leaf root (including the 65,536-byte
 zero offset representation), and refuses page size 513. The builder creates
 zero-filled pages by concatenating bounded byte chunks after a large-vector
-probe trapped. The images have not yet been exported for independent SQLite
-readback. Zero-length data uses `bytes-from-vector-i64`; a standalone guest
+probe trapped. The leaf-cell and single-cell page writers pass positive and
+refusal checks at 512 bytes, and the page writer also passes at 65,536 bytes.
+The images have not yet been exported for independent SQLite readback.
+Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
 
 These checks qualify only the exercised codec calls on macOS ARM64. No full
