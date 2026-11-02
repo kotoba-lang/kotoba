@@ -225,3 +225,10 @@ combined terminal count. A chmod-disabled worker built with a patched debug
 compiler failed the mode readback; an older worker refused the new protocol.
 No workload is executed and no tree is published. Project source linking, x86
 and a full release remain unqualified.
+
+The independent `test/fune/stage_limit_layout.py OUTPUT` fixture stages four
+layers of 128 zero-length files. A native producer and worker completed 512
+file create/update operations plus 128 mode operations and read back the final
+mode. The previous supervisor rejected that valid 640-operation stream; the
+Amu candidate extends its response bound. The fixture is narrowly scoped and
+does not prove arbitrary OCI support.
