@@ -56,9 +56,10 @@ SQL compatibility.
 
 ## Format and transaction work order
 
-1. Pure Kotoba SQLite v3 codec: 100-byte database header, page-size and
-   encoding validation, 1..9-byte varints, serial types, record encode/decode,
-   and checked page offsets. No file writes in this unit.
+1. Pure Kotoba SQLite v3 codec: 100-byte database header encode/decode,
+   empty one-page database image construction, page-size and encoding
+   validation, 1..9-byte varints, serial types, record encode/decode, and
+   checked page offsets. No file writes in this unit.
 2. Schema and B-tree reader: validate `sqlite_schema`, resolve the table and
    composite primary-key index, walk leaf/interior pages, and reject malformed
    pointers, cycles, overflow chains, unsupported collations, and unsupported
@@ -104,17 +105,21 @@ dated oracle only; oracle success never substitutes for Kotoba/Amu execution.
 The Kotoba package now has source for the fixed database header, signed-i64
 varints, four-TEXT notepad records, generic record-layout spans, B-tree page
 headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
-On 2026-11-02, the native Amu Mac CLI checked and ran a source-locked six-module
-graph with codec calls: the positive fixture returned 0, and malformed/truncated
-varint, record, notepad-record, and page inputs returned their named sentinel
-values in a refusal fixture. Both used `bytes-from-vector-i64` for zero-length
-bytes. A separate one-source native probe using `bytes-empty` exited 139; this
-Amu runtime issue is recorded as a blocker, and the varint negative encoder
-constructs its empty result through `bytes-from-vector-i64` instead.
+On 2026-11-02, source-locked Amu Mac ARM64 runtime fixtures passed for positive
+codec calls, malformed/truncated refusal sentinels, and negative-varint empty
+encoding. A separate source-locked fixture constructs empty database images
+for page sizes 512, 16,384, 32,768 and 65,536 bytes; it decodes the generated
+header, validates page 1 as an empty table-leaf root (including the 65,536-byte
+zero offset representation), and refuses page size 513. The builder creates
+zero-filled pages by concatenating bounded byte chunks after a large-vector
+probe trapped. The images have not yet been exported for independent SQLite
+readback. Zero-length data uses `bytes-from-vector-i64`; a standalone guest
+probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
 
 These checks qualify only the exercised codec calls on macOS ARM64. No full
 page-tree walk, `sqlite_schema` reader, overflow traversal, SQL operation
-layer, Amu byte-provider durability/locking, WAL/recovery, or database
-mutation path is qualified. An earlier complex scratch harness returned
-E6015; the smaller pinned six-module graph now passes, so E6015 is not evidence
-that the general Mac multi-module source-lock route is absent.
+layer, independent SQLite readback of the generated image, Amu byte-provider
+durability/locking, WAL/recovery, or database mutation path is qualified. An
+earlier complex scratch harness returned E6015; smaller pinned source-lock
+graphs now pass, so E6015 is not evidence that the general Mac multi-module
+source-lock route is absent.
