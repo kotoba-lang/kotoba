@@ -91,11 +91,15 @@ def main(amu, compiler, out, amu_pin=None):
         graph = dict(MODULES)
         graph[fixture_module] = next(source for name, source in FIXTURES if name == fixture_module)
         graph_paths = {module: staged[module] for module in graph}
+        source_paths = ["--source-path", source_root]
         if fixture_module == "sqlite.interior-root-job-delete":
             # Use KSL2 for the new standalone fixture so its full multi-module
             # graph is bound by exact namespace-to-path mappings. This avoids
             # root-search ambiguity while retaining an exact byte pin for
-            # every module and the entry source.
+            # every module and the entry source. KSL2 has no root fallback, so
+            # do not also pass --source-path (the compiler rejects that mixed
+            # lock/root configuration).
+            source_paths = []
             lock_lines = ["KSL2", f"entry {staged[fixture_module]}"]
             lock_lines.extend(f"module {module} {path}"
                               for module, path in sorted(graph_paths.items()))
@@ -112,7 +116,7 @@ def main(amu, compiler, out, amu_pin=None):
         image = out / (stem + ".elf")
         run("compile-" + fixture_module.rsplit(".", 1)[-1],
             [compiler, "compile", staged[fixture_module], "--target", "aarch64-macos",
-             "--output", payload, "--source-path", source_root, "--source-lock", lock,
+             "--output", payload, *source_paths, "--source-lock", lock,
              "--source-lock-sha256", sha(lock)], out, env, calls)
         runner = amu / "seed/x86_64-kx64-runner.kotoba"
         run("pack-" + fixture_module.rsplit(".", 1)[-1],
