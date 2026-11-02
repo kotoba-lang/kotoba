@@ -27,6 +27,13 @@ cursor pixel changes were read back independently. Whole-screen completion
 still took4.35–4.37s. These are protocol-harness samples, not human-visible
 first paint, physical input-to-panel latency or drag-smoothness acceptance.
 
+The committed progressive adapter was then restarted on the Mac loopback
+endpoint. Native macOS Screen Sharing displayed the full desktop, opened
+Itonami with a pointer click, and sent `r`: Goal `aba` became `abar` in the
+viewer. Backspace restored `aba`; Approved remained0 and Network remained
+off. This verifies native-client compatibility and local input/readback,
+not human timing or a trusted app approval. See `progressive-deployment.json`.
+
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
 `itonami-6600h`), `vncPassword` (an owner-only eight-byte file), optional
