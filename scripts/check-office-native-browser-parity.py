@@ -48,6 +48,12 @@ for name in builds:
  view=compare(name,['view',state])
  if not view.startswith('BV2|') or text not in view:raise ValueError(name+' view lacks value')
  if name=='bunsho':
+  # An old BS1 multiline snapshot must receive identical BS3 protection on
+  # native and Wasm before either host exposes it for editing.
+  old='BS1|'+''.join(str(len(v.encode()))+':'+v for v in ['無題の文書','edit','2','p',text,'p','Write here.'])
+  protected=compare(name,['protect',old])
+  if not protected.startswith('BS3|1') or text not in protected:raise ValueError('legacy multiline protection mismatch')
+  compare(name,['protect','BS1|bad'],expected=3)
   state=compare(name,['step',state,'mode','click',''])
   if text not in compare(name,['view',state]):raise ValueError('preview lost paragraph')
  elif name=='hyokeisan':
