@@ -1,14 +1,136 @@
-;; Bounded reader for the leaf pages of Itonami's four-TEXT table.
-;; The caller supplies one already selected table-leaf page. This does not
-;; resolve sqlite_schema roots, traverse interior pages, or follow overflow.
+;; Bounded sqlite_schema lookup and leaf reader for Itonami's four-TEXT table.
+;; The schema lookup admits a leaf root on page 1; it does not walk interior
+;; pages or follow overflow cells.
 
 (ns kotoba.sqlite.reader
-  {:kotoba/export [read-notepad-leaf]}
+  {:kotoba/export [read-notepad-leaf resolve-notepad-root]}
   (:require [kotoba.sqlite.notepad-record :as record]
-            [kotoba.sqlite.page :as page]))
+            [kotoba.sqlite.page :as page]
+            [kotoba.sqlite.record :as sqlite-record]))
 
 (defn- invalid [] :vector-i64
   (vector-i64 -1))
+
+(def table-type
+  (bytes-from-vector-i64 (vector-i64 116 97 98 108 101)))
+
+(def notepad-name
+  (bytes-from-vector-i64
+    (vector-i64 99 114 111 110 95 110 111 116 101 112 97 100)))
+
+(defn- bytes-equal? [left :bytes right :bytes index :i64] :bool
+  (if (= index (bytes-count right))
+    (= (bytes-count left) (bytes-count right))
+    (and (= (bytes-at left index) (bytes-at right index))
+         (bytes-equal? left right (+ index 1)))))
+
+(defn- field-equals? [payload :bytes layout :vector-i64 field :i64
+                     expected :bytes] :bool
+  (let [serial-index (+ 1 (* field 3))
+        offset-index (+ serial-index 1)
+        length-index (+ serial-index 2)
+        offset (vector-at layout offset-index)
+        length (vector-at layout length-index)]
+    (and (>= (vector-at layout 0) (+ field 1))
+         (>= (vector-at layout serial-index) 13)
+         (not= (- (vector-at layout serial-index)
+                  (* (quot (vector-at layout serial-index) 2) 2)) 0)
+         (= length (bytes-count expected))
+         (bytes-equal? (bytes-slice payload offset (+ offset length))
+                       expected 0))))
+
+(defn- integer-length [serial :i64] :i64
+  (cond
+    (= serial 1) 1
+    (= serial 2) 2
+    (= serial 3) 3
+    (= serial 4) 4
+    (= serial 5) 6
+    (= serial 6) 8
+    :else 0))
+
+(defn- read-unsigned [payload :bytes offset :i64 length :i64
+                     index :i64 value :i64] :i64
+  (if (= index length)
+    value
+    (read-unsigned payload offset length (+ index 1)
+                   (+ (* value 256) (bytes-at payload (+ offset index))))))
+
+(defn- field-root-page [payload :bytes layout :vector-i64] :i64
+  (let [field 3
+        serial-index (+ 1 (* field 3))
+        offset-index (+ serial-index 1)
+        length-index (+ serial-index 2)
+        serial (vector-at layout serial-index)
+        width (integer-length serial)
+        offset (vector-at layout offset-index)]
+    (if (or (< (vector-at layout 0) 5)
+            (= width 0)
+            (not= (vector-at layout length-index) width)
+            (>= (bytes-at payload offset) 128))
+      -1
+      (read-unsigned payload offset width 0 0))))
+
+(defn- schema-cell-root [page-image :bytes page-size :i64 cell-index :i64
+                         maximum-root :i64] :i64
+  (let [cell-offset (page/cell-pointer page-image page-size 1 0 cell-index)]
+    (if (< cell-offset 0)
+      -1
+      (let [cell (page/decode-table-leaf-cell page-image page-size 1 0 cell-offset)
+            payload-size (vector-at cell 0)
+            payload-offset (vector-at cell 2)
+            local-size (vector-at cell 3)
+            overflow-page (vector-at cell 4)
+            end-offset (vector-at cell 5)]
+        (if (or (< payload-size 0)
+                (not= payload-size local-size)
+                (not= overflow-page 0)
+                (> end-offset page-size))
+          -1
+          (let [payload (bytes-slice page-image payload-offset end-offset)
+                layout (sqlite-record/decode payload)]
+            (if (and (= (vector-at layout 0) 5)
+                     (field-equals? payload layout 0 table-type)
+                     (field-equals? payload layout 1 notepad-name)
+                     (field-equals? payload layout 2 notepad-name))
+              (let [root (field-root-page payload layout)]
+                (if (and (>= root 2) (<= root maximum-root)) root -1))
+              0)))))))
+
+(defn- resolve-schema-cells [page-image :bytes page-size :i64 cell-count :i64
+                             index :i64 maximum-root :i64 found :i64] :i64
+  (if (= index cell-count)
+    found
+    (let [root (schema-cell-root page-image page-size index maximum-root)]
+      (if (< root 0)
+        -1
+        (if (= root 0)
+          (resolve-schema-cells page-image page-size cell-count (+ index 1)
+                                maximum-root found)
+          (if (> found 0)
+            -1
+            (resolve-schema-cells page-image page-size cell-count (+ index 1)
+                                  maximum-root root)))))))
+
+;; Return cron_notepad's root page from sqlite_schema page 1. This bounded
+;; lookup admits a table-leaf schema root and refuses missing/duplicate rows,
+;; overflow records, invalid root pages, and databases without whole pages.
+(defn resolve-notepad-root [image :bytes page-size :i64] :i64
+  (let [image-size (bytes-count image)]
+    (if (or (< page-size 512)
+            (not= (- image-size (* (quot image-size page-size) page-size)) 0)
+            (< image-size (* page-size 2)))
+      -1
+      (let [page-image (bytes-slice image 0 page-size)
+            header (page/decode-header page-image page-size 1 0)
+            page-type (vector-at header 0)
+            cell-count (vector-at header 3)
+            page-count (quot image-size page-size)]
+        (if (or (not= page-type 13) (< cell-count 0))
+          -1
+          (let [root (resolve-schema-cells page-image page-size cell-count 0
+                                           (- page-count 1) 0)]
+            (if (< root 2) -1 root)))))))
 
 (defn- append-record-spans [out :vector-i64 spans :vector-i64
                             index :i64 base :i64] :vector-i64
