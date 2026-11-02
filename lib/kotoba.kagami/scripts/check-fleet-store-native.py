@@ -46,6 +46,9 @@ for mode in ['init','message-invalid','state-old','message','state-new']:
 edn = gate.out / 'edn'; edn.mkdir()
 for mode in ['init','edn-invalid','state-old','edn','state-new']:
  run('edn-'+mode+str(len(gate.observations)),mode,edn)
+shorthand = gate.out / 'edn-shorthand'; shorthand.mkdir()
+for mode in ['init','edn-shorthand','state-new']:
+ run('shorthand-'+mode+str(len(gate.observations)),mode,shorthand)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
 def race_one(i):
@@ -66,7 +69,7 @@ run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
 ingress_source = sources['kagami/fleet_announce_edn.kotoba']
-needle=b'(not (lexical-safe? raw))'
+needle=b'(not (lexical-safe? normalized))'
 if ingress_source.count(needle)!=1: raise ValueError('unexpected EDN ingress guard')
 mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'true')
 broken=gate.build('control-edn-refuse-all','kagami/fleet_store_native_test.kotoba',mutant)
