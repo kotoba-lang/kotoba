@@ -33,6 +33,7 @@ FIXTURES = (
 )
 LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
 UNSUPPORTED_SCHEMA_FIXTURE = PACKAGE / "test/fixtures/unsupported-cron-notepad-20261102.sqlite"
+HIGH_ROWID_FIXTURE = PACKAGE / "test/fixtures/high-rowid-cron-notepad-20261102.sqlite"
 
 
 def sha(path):
@@ -64,6 +65,8 @@ def main(amu, compiler, out, amu_pin=None):
     (out / "data/legacy.db").write_bytes(LEGACY_FIXTURE.read_bytes())
     unsupported_schema_sha256 = sha(UNSUPPORTED_SCHEMA_FIXTURE)
     (out / "data/unsupported.db").write_bytes(UNSUPPORTED_SCHEMA_FIXTURE.read_bytes())
+    high_rowid_sha256 = sha(HIGH_ROWID_FIXTURE)
+    (out / "data/high-rowid.db").write_bytes(HIGH_ROWID_FIXTURE.read_bytes())
     source_root = out / "src"
     staged = {}
     for module, source in (*MODULES, *FIXTURES):
@@ -132,6 +135,10 @@ def main(amu, compiler, out, amu_pin=None):
     run("sqlite-existing-file-mutation", [legacy_mutation, "data/legacy.db"], out, guest_env,
         calls, timeout=300)
 
+    high_rowid_path = out / "data/high-rowid.db"
+    run("sqlite-existing-high-rowid-mutation", [legacy_mutation, "data/high-rowid.db"],
+        out, guest_env, calls, timeout=300)
+
     unsupported_schema_image = out / receipts[3]["image"]
     unsupported_path = out / "data/unsupported.db"
     unsupported_before = sha(unsupported_path)
@@ -158,6 +165,11 @@ def main(amu, compiler, out, amu_pin=None):
             "inputDatabase": "SQLite 3.54.1 standard file generated once with three existing rows",
             "nativeResult": "updated an existing row, inserted a second row for a different job, deleted one job, published atomically, reopened and read back through Kotoba",
         },
+        "highRowidMutation": {
+            "fixture": HIGH_ROWID_FIXTURE.name,
+            "inputSha256": high_rowid_sha256,
+            "nativeResult": "read, updated rowid 128, appended rowid 129, and reopened through Kotoba",
+        },
         "unsupportedSchema": {
             "fixture": UNSUPPORTED_SCHEMA_FIXTURE.name,
             "inputSha256": unsupported_schema_sha256,
@@ -165,7 +177,7 @@ def main(amu, compiler, out, amu_pin=None):
             "preserved": sha(unsupported_path) == unsupported_before,
         },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen, and unsupported-schema refusal/preservation passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, and unsupported-schema refusal/preservation passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
