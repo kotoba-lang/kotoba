@@ -423,7 +423,7 @@ split code below or index-tree traversal. Existing interior-root mutation
 remains unsupported. WAL/recovery, concurrent SQLite locking, crash recovery,
 Linux x86_64, and Itonami wiring remain open.
 
-## First bounded table/index root split — implementation pending qualification (2026-11-02)
+## First bounded table/index root split (2026-11-02; qualified on Linux ARM64 2026-11-03)
 
 Kotoba commit `34c10ebd25a40b77d946037d8b76d60adf864b52` adds a first split
 path to notepad upsert. When an exact three-page `cron_notepad` with single-
@@ -433,29 +433,38 @@ one-cell interior roots. The scope admits only child leaves that fit, rejects
 overflow rows and malformed inputs, and does not support further upserts to an
 already interior-root database.
 
-The source-pinned native fixture and Linux ARM64 gate were extended to fill the
-database to the split, publish with FS2, reopen and look up a value through
-Kotoba, and require a subsequent upsert to refuse. Local source-pin audit,
-gate-script `py_compile`, and `git diff --check` passed. At the time of this
-note, CI run `41464479549` and Native shared run `41464479463` were queued;
-native execution and a separate read-only SQLite integrity/row/index oracle
-have not yet qualified the split. Their outcomes must be recorded separately
-before claiming this behavior is usable.
+The source-pinned native fixture and Linux ARM64 gate fill the database to the
+split, publish with FS2, reopen and look up a value through Kotoba, and require
+a subsequent upsert to refuse. The corrected exact-source run and independent
+oracle are recorded below. This qualifies only this bounded first split; it
+does not qualify another mutation of the interior-root result.
 
 ### Split artifact readback and native fixture correction (2026-11-03)
 
-The exact-pin Linux ARM64 run `41475188287` produced the seven-page database
-through Kotoba and FS2. The native fixture returned 13 because its KNV1
-readback check inspected byte offset 6 for the first value byte even though a
-1,150-byte value has a two-byte SQLite varint length; the value begins at
-offset 7. The split path therefore reached artifact generation, but its full
-native fixture has not yet passed.
+The first exact-pin Linux ARM64 run `41475188287` produced the seven-page
+database through Kotoba and FS2, but its native fixture returned 13 because
+the KNV1 readback check inspected byte offset 6 for the first value byte even
+though a 1,150-byte value has a two-byte SQLite varint length; the value begins
+at offset 7. That run's SQLite oracle passed, but the native fixture was not
+qualified at that point.
 
 A separate Python 3.15.0 / SQLite 3.54.1 read-only immutable oracle opened the
 artifact and reported `integrity_check=ok`, page size 4096, page count 7, the
 expected table and composite primary-key index, and four ordered rows with
 1,150-byte values. Artifact SHA-256 and row details are recorded in the
 [dated split oracle receipt](../lib/kotoba.sql/evidence/interior-root-split-readonly-oracle-20261103.json).
-This oracle confirms the generated artifact only; it is not a Kotoba runtime
-or CI dependency. The fixture assertion is corrected in the source, and a new
-exact-pin native run must pass before the split is qualified.
+The oracle confirms the generated artifact only; it is not a Kotoba runtime or
+CI dependency. The fixture assertion was corrected, and exact-pin Linux ARM64
+run `41478551197` passed the native SQLite image publication/readback and
+sidecar-refusal step. Its artifact has the same SHA-256 and again passed the
+separate immutable read-only SQLite oracle (`integrity_check=ok`, 4096-byte
+pages, seven pages, four ordered rows, and the composite primary-key index).
+The native and oracle receipts are
+[`split native receipt`](../lib/kotoba.sql/evidence/interior-root-split-native-linux-arm64-20261103.json)
+and [`split oracle receipt`](../lib/kotoba.sql/evidence/interior-root-split-readonly-oracle-20261103.json).
+
+This qualifies only the first split from the exact three-page schema image
+when its single-leaf table/index roots fill, plus FS2 publish/reopen/readback
+and refusal of the next upsert. Further splits/rebalancing, arbitrary SQLite
+layouts, WAL or rollback-journal handling, atomic/crash-safe transactions,
+concurrent locking, Linux x86_64, and Itonami integration remain open.
