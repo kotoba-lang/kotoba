@@ -1,10 +1,10 @@
-;; Bounded sqlite_schema lookup and leaf reader for Itonami's four-TEXT table.
-;; The schema lookup admits a leaf root on page 1; it does not walk interior
-;; pages or follow overflow cells.
+;; Bounded sqlite_schema lookup and reader for Itonami's four-TEXT table.
+;; Interior B-trees and payload overflow are traversed; freelists and WAL
+;; images remain outside this reader's admitted format.
 
 (ns kotoba.sqlite.reader
   {:kotoba/export [read-notepad-leaf resolve-notepad-root read-notepad-image
-                   read-notepad-image-packed]}
+                   read-notepad-image-packed find-notepad-value]}
   (:require [kotoba.sqlite.notepad-record :as record]
             [kotoba.sqlite.header :as db-header]
             [kotoba.sqlite.page :as page]
@@ -590,3 +590,74 @@
           (empty-bytes)
           (walk-packed-notepad-queue image page-size page-count
                                      (vector-i64 root) 0 -1 packed-magic))))))
+
+(defn- packed-field-match? [data :bytes offset :i64 length :i64
+                            expected :bytes] :bool
+  (and (= length (bytes-count expected))
+       (bytes-equal? (bytes-slice data offset (+ offset length)) expected 0)))
+
+;; Decode the four KNR1 [length,value] fields for one row. Returns
+;; [next-offset matched value-offset value-length], or [-1].
+(defn- scan-packed-fields [data :bytes job-id :bytes key :bytes
+                           offset :i64 field :i64 job-match :bool
+                           key-match :bool value-offset :i64 value-length :i64]
+                           :vector-i64
+  (if (= field 4)
+    (vector-i64 offset
+                (if (and job-match key-match) 1 0)
+                value-offset value-length)
+    (let [length-varint (varint/decode data offset)
+          length (vector-at length-varint 0)
+          start (vector-at length-varint 1)
+          end (+ start length)]
+      (if (or (< length 0) (< start 0) (> end (bytes-count data)))
+        (vector-i64 -1)
+        (let [matches-job (if (= field 0)
+                            (packed-field-match? data start length job-id)
+                            job-match)
+              matches-key (if (= field 1)
+                            (packed-field-match? data start length key)
+                            key-match)
+              next-value-offset (if (= field 2) start value-offset)
+              next-value-length (if (= field 2) length value-length)]
+          (scan-packed-fields data job-id key end (+ field 1)
+                              matches-job matches-key next-value-offset
+                              next-value-length))))))
+
+(defn- scan-packed-rows [data :bytes job-id :bytes key :bytes
+                        offset :i64 previous-rowid :i64
+                        found :bool found-offset :i64 found-length :i64]
+                        :vector-i64
+  (if (= offset (bytes-count data))
+    (if found
+      (vector-i64 1 found-offset found-length)
+      (vector-i64 0))
+    (let [rowid-varint (varint/decode data offset)
+          rowid (vector-at rowid-varint 0)
+          fields-offset (vector-at rowid-varint 1)]
+      (if (or (< rowid 0) (<= rowid previous-rowid) (< fields-offset 0))
+        (vector-i64 -1)
+        (let [fields (scan-packed-fields data job-id key fields-offset 0
+                                         false false -1 -1)
+              next-offset (vector-at fields 0)]
+          (if (or (< next-offset 0)
+                  (= (vector-count fields) 1))
+            (vector-i64 -1)
+            (let [matched (vector-at fields 1)
+                  value-offset (vector-at fields 2)
+                  value-length (vector-at fields 3)]
+              (if (and (= matched 1) found)
+                (vector-i64 -1)
+                (scan-packed-rows data job-id key next-offset rowid
+                                  (or found (= matched 1))
+                                  (if (= matched 1) value-offset found-offset)
+                                  (if (= matched 1) value-length found-length))))))))))
+
+;; Search a KNR1 stream returned by read-notepad-image-packed. Result is
+;; [-1] for malformed input, [0] for missing, or [1 offset length] into data.
+;; The full stream is validated and duplicate (job_id,key) matches refuse.
+(defn find-notepad-value [data :bytes job-id :bytes key :bytes] :vector-i64
+  (if (or (< (bytes-count data) 4)
+          (not (bytes-equal? (bytes-slice data 0 4) packed-magic 0)))
+    (vector-i64 -1)
+    (scan-packed-rows data job-id key 4 -1 false -1 -1)))
