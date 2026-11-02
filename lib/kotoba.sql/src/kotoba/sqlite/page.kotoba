@@ -3,8 +3,11 @@
 
 (ns kotoba.sqlite.page
   {:kotoba/export [decode-header cell-pointer decode-table-leaf-cell decode-table-interior-cell
-                   encode-table-leaf-cell encode-table-leaf-page encode-empty-leaf-page
-                   append-table-leaf-cell encode-index-leaf-cell
+                   encode-table-leaf-cell encode-table-leaf-cell-with-overflow
+                   table-leaf-local-payload-size overflow-page-count encode-overflow-pages
+                   encode-table-leaf-page encode-empty-leaf-page
+                   append-table-leaf-cell append-table-leaf-cell-with-overflow
+                   encode-index-leaf-cell
                    encode-index-leaf-page append-index-leaf-cell]}
   (:require [kotoba.sqlite.varint :as varint]))
 
@@ -106,6 +109,13 @@
 (defn- append-u16 [out :vector-i64 value :i64] :vector-i64
   (vector-conj (vector-conj out (quot value 256)) (remainder value 256)))
 
+(defn- append-u32 [out :vector-i64 value :i64] :vector-i64
+  (-> out
+      (vector-conj (quot value 16777216))
+      (vector-conj (remainder (quot value 65536) 256))
+      (vector-conj (remainder (quot value 256) 256))
+      (vector-conj (remainder value 256))))
+
 (defn- append-zeroes [out :vector-i64 count :i64] :vector-i64
   (loop [result out index 0]
     (if (= index count)
@@ -122,22 +132,111 @@
                     (append-zeroes (vector-i64) chunk-size))]
         (recur (bytes-concat result chunk) (+ index chunk-size))))))
 
-;; Encode one table-leaf cell when the entire payload fits locally. Overflow
-;; payloads and negative rowids are refused until their writer paths exist.
-(defn encode-table-leaf-cell [payload :bytes rowid :i64 page-size :i64
-                              reserved :i64] :bytes
+(defn table-leaf-local-payload-size [payload-size :i64 usable-size :i64] :i64
+  (let [maximum-local (- usable-size 35)]
+    (if (or (< payload-size 0) (< usable-size 480))
+      -1
+      (if (<= payload-size maximum-local)
+        payload-size
+        (let [minimum-local (- (quot (* (- usable-size 12) 32) 255) 23)
+              candidate (+ minimum-local
+                           (remainder (- payload-size minimum-local) (- usable-size 4)))]
+          (if (<= candidate maximum-local) candidate minimum-local))))))
+
+(defn overflow-page-count [payload-size :i64 local-size :i64 usable-size :i64] :i64
+  (let [overflow-size (- payload-size local-size)
+        page-payload (- usable-size 4)]
+    (if (or (< overflow-size 0) (<= page-payload 0))
+      -1
+      (if (= overflow-size 0)
+        0
+        (quot (+ overflow-size page-payload -1) page-payload)))))
+
+;; The payload fraction formula is the SQLite table-leaf file format. For an
+;; overflowing cell the caller supplies the first page number of its chain.
+(defn encode-table-leaf-cell-with-overflow [payload :bytes rowid :i64
+                                           page-size :i64 reserved :i64
+                                           first-overflow-page :i64] :bytes
   (let [payload-size (bytes-count payload)
-        usable-size (- page-size reserved)
-        maximum-local (- usable-size 35)]
+        usable-size (- page-size reserved)]
+    (let [local-size (table-leaf-local-payload-size payload-size usable-size)
+          overflow-count (overflow-page-count payload-size local-size usable-size)
+          overflow? (> overflow-count 0)
+          overflow-pointer (bytes-from-vector-i64
+                             (append-u32 (vector-i64)
+                               (if (and overflow?
+                                        (>= first-overflow-page 2)
+                                        (<= first-overflow-page 2147483647))
+                                 first-overflow-page
+                                 0)))]
     (if (or (not (valid-page-size? page-size))
             (< reserved 0)
             (< usable-size 480)
             (< rowid 0)
-            (> payload-size maximum-local))
+            (< local-size 0)
+            (< overflow-count 0)
+            (and overflow? (< first-overflow-page 2))
+            (and overflow? (> (+ first-overflow-page overflow-count -1) 2147483647))
+            (and (not overflow?) (not= first-overflow-page 0))
+            (> (+ (bytes-count (varint/encode payload-size))
+                  (bytes-count (varint/encode rowid)) local-size
+                  (if overflow? 4 0))
+               usable-size))
       (empty-bytes)
       (bytes-concat
-        (bytes-concat (varint/encode payload-size) (varint/encode rowid))
-        payload))))
+        (bytes-concat
+          (bytes-concat (varint/encode payload-size) (varint/encode rowid))
+          (bytes-slice payload 0 local-size))
+        (if overflow? overflow-pointer (empty-bytes)))))))
+
+;; Existing in-page cell API retains its refusal contract for overflow payloads.
+(defn encode-table-leaf-cell [payload :bytes rowid :i64 page-size :i64
+                              reserved :i64] :bytes
+  (if (> (bytes-count payload) (- (- page-size reserved) 35))
+    (empty-bytes)
+    (encode-table-leaf-cell-with-overflow payload rowid page-size reserved 0)))
+
+(defn- encode-overflow-pages-from [payload :bytes offset :i64 page-number :i64
+                                   page-size :i64 reserved :i64 out :bytes] :bytes
+  (if (= offset (bytes-count payload))
+    out
+    (let [usable-size (- page-size reserved)
+          capacity (- usable-size 4)
+          remaining (- (bytes-count payload) offset)
+          chunk-size (if (> remaining capacity) capacity remaining)
+          left (- remaining chunk-size)
+          next-page (if (= left 0) 0 (+ page-number 1))
+          page-image (bytes-concat
+                       (bytes-concat
+                         (bytes-concat
+                           (bytes-from-vector-i64 (append-u32 (vector-i64) next-page))
+                           (bytes-slice payload offset (+ offset chunk-size)))
+                         (zero-bytes (- usable-size 4 chunk-size)))
+                       (zero-bytes reserved))]
+      (if (or (<= capacity 0) (= (bytes-count page-image) 0))
+        (empty-bytes)
+        (encode-overflow-pages-from payload (+ offset chunk-size)
+                                    (+ page-number 1) page-size reserved
+                                    (bytes-concat out page-image))))))
+
+;; Return complete overflow page images in ascending page-number order.
+(defn encode-overflow-pages [payload :bytes first-overflow-page :i64
+                             page-size :i64 reserved :i64] :bytes
+  (let [usable-size (- page-size reserved)
+        capacity (- usable-size 4)
+        page-count (if (<= capacity 0)
+                     -1
+                     (quot (+ (bytes-count payload) capacity -1) capacity))]
+  (if (or (= (bytes-count payload) 0)
+          (< first-overflow-page 2)
+          (not (valid-page-size? page-size))
+          (< reserved 0)
+          (< usable-size 480)
+          (< page-count 1)
+          (> (+ first-overflow-page page-count -1) 2147483647))
+    (empty-bytes)
+    (encode-overflow-pages-from payload 0 first-overflow-page page-size
+                                reserved (empty-bytes)))))
 
 ;; Build a leaf page around zero or one already encoded cell. Page images
 ;; exclude the 100-byte database header even when page-number is 1.
@@ -294,14 +393,38 @@
                           (+ cell-count 1) cell-offset cell-offset cell 0
                           (vector-i64) (empty-bytes)))))
 
-(defn- table-leaf-local-size [payload-size :i64 usable-size :i64] :i64
-  (let [maximum-local (- usable-size 35)]
-    (if (<= payload-size maximum-local)
-      payload-size
-      (let [minimum-local (- (quot (* (- usable-size 12) 32) 255) 23)
-            candidate (+ minimum-local
-                         (remainder (- payload-size minimum-local) (- usable-size 4)))]
-        (if (<= candidate maximum-local) candidate minimum-local)))))
+(defn append-table-leaf-cell-with-overflow [page :bytes payload :bytes rowid :i64
+                                           page-size :i64 page-number :i64
+                                           reserved :i64 first-overflow-page :i64]
+                                           :bytes
+  (let [header (decode-header page page-size page-number reserved)
+        cell-count (vector-at header 3)
+        cell (encode-table-leaf-cell-with-overflow payload rowid page-size reserved
+                                                   first-overflow-page)
+        cell-size (bytes-count cell)
+        header-offset (vector-at header 1)
+        content-start (vector-at header 4)
+        pointer-end (+ header-offset 8 (* (+ cell-count 1) 2))
+        cell-offset (- content-start cell-size)
+        prior-rowid (if (= cell-count 0)
+                      -1
+                      (let [prior-offset
+                              (cell-pointer page page-size page-number reserved
+                                            (- cell-count 1))]
+                        (vector-at
+                          (decode-table-leaf-cell page page-size page-number
+                                                  reserved prior-offset)
+                          1)))]
+    (if (or (not= (vector-at header 0) 13)
+            (< cell-count 0)
+            (< rowid 0)
+            (= cell-size 0)
+            (<= rowid prior-rowid)
+            (< cell-offset pointer-end))
+      (empty-bytes)
+      (copy-appended-page page page-size header-offset cell-count
+                          (+ cell-count 1) cell-offset cell-offset cell 0
+                          (vector-i64) (empty-bytes)))))
 
 ;; Returns [payload-size rowid payload-offset local-size overflow-page end-offset].
 ;; Overflow chains and unsigned rowids beyond signed-i64 are deliberately refused.
@@ -328,7 +451,7 @@
                     (<= payload-offset rowid-offset)
                     (> payload-offset usable-size))
               (invalid-cell)
-              (let [local-size (table-leaf-local-size payload-size usable-size)
+              (let [local-size (table-leaf-local-payload-size payload-size usable-size)
                     overflow? (> payload-size local-size)
                     overflow-bytes (if overflow? 4 0)
                     remaining (- usable-size payload-offset)]

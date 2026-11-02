@@ -192,15 +192,26 @@ key is refused and existing-row update is a separate bounded operation.
 The native header codec now also exposes a validated in-memory page-count
 replacement. Its source-locked Amu ARM64 fixture accepts a valid new page
 count, advances the change counter and version-valid-for together, and refuses
-zero, out-of-range, and malformed headers. This is a prerequisite for an
-overflow-page writer; it does not append pages, implement overflow writes, or
-make the returned image crash-atomic. See
+zero, out-of-range, and malformed headers. At that checkpoint it did not yet
+append pages or implement overflow writes. See
 [`header page-count receipt`](../lib/kotoba.sql/evidence/notepad-page-count-header-native-20261102.json).
+
+The first-row writer now uses this header operation with SQLite's table-leaf
+local-payload formula and overflow-page chain format. An exact-source Amu
+ARM64 run wrote a 16-KiB value into four overflow pages, emitted a seven-page
+image through FD3-scoped FS2, and verified the value through Kotoba. Read-only
+SQLite 3.54.1 reported `integrity_check=ok`, page_count 7, the expected row,
+and the unique composite primary-key index. Receipt:
+[`first-row overflow writer`](../lib/kotoba.sql/evidence/notepad-overflow-first-row-writer-native-20261102.json).
+This qualifies overflow only while inserting the first row into the exact
+empty image. Existing-row update/delete/reinsert on an image with overflow
+pages and arbitrary database layouts remain unqualified.
 
 The implementation remains a bounded codec, reader, initializer, and
 single-leaf mutation slice, not a complete SQLite engine or transactional
 storage layer. It does not yet qualify arbitrary database layouts, page-split
-writes, atomic/crash-safe persistence, locks/concurrent writers, WAL or
+writes or general overflow-page mutation, atomic/crash-safe persistence,
+locks/concurrent writers, WAL or
 rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
 launcher wiring and the selected one-time offline converter remain paused
 until those native gates pass.
