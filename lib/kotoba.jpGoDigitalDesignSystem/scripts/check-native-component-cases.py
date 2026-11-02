@@ -34,8 +34,8 @@ def main():
     pins = {str(p): sha(p) for p in tracked}
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
 
-    def run(name, table, expected):
-        modules = {'components': COMPONENTS, 'table': table, 'dds-components-test': TEST}
+    def run(name, table, expected, components=COMPONENTS):
+        modules = {'components': components, 'table': table, 'dds-components-test': TEST}
         lock = out / (name + '.ksl')
         lock.write_text('KSL2\nentry ' + str(TEST.resolve()) + '\n' +
                         ''.join('module ' + n + ' ' + str(p.resolve()) + '\n' for n, p in sorted(modules.items())) +
@@ -58,10 +58,18 @@ def main():
     mutant = out / 'mutant-table.kotoba'
     mutant.write_text(text.replace(needle, '(= (get cell :index) 1)'))
     negative = run('dds-negative', mutant, b'7\n')
+    component_text = COMPONENTS.read_text()
+    component_needle = '"dds-ext-container"'
+    if component_text.count(component_needle) != 1:
+        raise ValueError('container mutation anchor changed')
+    component_mutant = out / 'mutant-components.kotoba'
+    component_mutant.write_text(component_text.replace(component_needle, '"wrong-container"'))
+    negative_container = run('dds-container-negative', TABLE, b'7\n', component_mutant)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source or compiler changed during gate')
     result = {'status': 'PASS_NATIVE_DDS_COMPONENT_CASES', 'inputs': pins,
               'positive': positive, 'rowHeaderMutationRejected': negative,
+              'containerMutationRejected': negative_container,
               'fullComponentParity': False, 'siteGenerated': False}
     (out / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
     print(result['status'])
