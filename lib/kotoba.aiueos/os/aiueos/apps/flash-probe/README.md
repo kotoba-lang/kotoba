@@ -5,8 +5,9 @@ is a source-level first slice, not an installed dapp or an alternative to
 `f3probe` yet. It contains a pure Kotoba sampling planner,
 result classifier, wraparound simulator, and a separate in-memory write/read
 backend. `main` runs its native self-test.
-It has no disk I/O, UI, consent implementation, dapp registration, cache
-invalidation or real-device test. A passing self-test says nothing about the
+A separate native FS2 test writes a bounded serialized model to ordinary
+files and reads those files back. It has no raw disk I/O, UI, consent
+implementation, dapp registration, cache invalidation or real-device test. A passing self-test says nothing about the
 capacity of either attached SSD. The core is independently designed and does
 not implement the `f3probe` algorithm.
 
@@ -15,7 +16,10 @@ and the final block, omitting it when it duplicates a power of two. Input is a l
 2 through 2^62; the list is at most 64 entries. The pure simulator models a
 simple wraparound device and detects some aliases within the chosen samples.
 The in-memory backend writes and subsequently reads four words per simulated
-block, including a wrapping model. It does not model OS I/O or physical caches.
+block, including a wrapping model. The FS2 fixture persists those simulated
+blocks to regular files, reads them back and applies the same verification.
+Wraparound is simulated before the file write; it is not a virtual block
+device. Neither test models physical caches or raw block I/O.
 Other fake controllers, caches, remapping, faults, and capacities can evade the
 plan. A matched sample run is **inconclusive**, never a genuine/16 TB verdict
 or an estimate of usable capacity. A mismatch indicates observed corruption,
@@ -66,3 +70,16 @@ scratch directory under the workspace, then run `./test-native.sh`. It runs
 the Kotoba source using native Amu, and a deliberately broken fixture must
 produce a nonzero assertion count. This exercises the actual Kotoba functions,
 not a Python copy. It does not test disk I/O or a dapp installation.
+
+## Native scoped regular-file exercise
+
+Set `AIUEOS_AMU_SOURCE` to the exact Amu checkout pinned in
+`scripts/native-ci-inputs.json` and `TMPDIR` to workspace scratch, then run
+`./test-file-native.sh`. The existing native generator assembles the checked-in
+planner and fixture into Kotoba, compiles and signs it with the pinned native
+Amu root and packager, and runs it with FD3 scoped to its own new temporary
+directory. The guest writes and reads ordinary regular files, accepting a
+nonwrapping model and detecting a wrapping model; a write-corruption mutant
+must exit 1 without producing the success output. The runner removes the
+fixture files. The test neither calls fsync nor defeats the OS cache; it is
+not evidence of durability, virtual block I/O, or physical capacity.
