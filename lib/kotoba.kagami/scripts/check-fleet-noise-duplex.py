@@ -52,9 +52,16 @@ if sources[key].count(needle)!=1:raise ValueError('identity guard anchor')
 mutant=dict(sources);mutant[key]=mutant[key].replace(needle,b'true')
 bad=build('identity-mutant',mutant);r=run(bad)
 if r.returncode==0 or 'good PASS' not in r.stdout or 'wrong' not in r.stderr:raise ValueError(('mutant not detected',r.returncode,r.stdout,r.stderr[-1500:]))
+responder_mutant_exit=r.returncode
+needle=b'(not (identity/verify-payload (tail message) hash expected))'
+if sources[key].count(needle)!=1:raise ValueError('initiator identity guard anchor')
+mutant=dict(sources);mutant[key]=mutant[key].replace(needle,b'false')
+bad=build('initiator-identity-mutant',mutant);r=run(bad)
+if r.returncode==0 or 'good PASS' not in r.stdout or 'wrong-server' not in r.stderr:raise ValueError(('initiator mutant not detected',r.returncode,r.stdout,r.stderr[-1500:]))
 evidence={'status':'PASS_FLEET_NOISE_DUPLEX_SYNTHETIC','compilerSha256':sha(compiler.read_bytes()),'runnerSourceSha256':sha(runner),
  'builderSha256':sha(Path(__file__).read_bytes()),'observerSha256':sha(observer.read_bytes()),'driverSha256':sha(driver),'image':image_info,
  'sources':{k:sha(v) for k,v in sorted(original.items())},'stagedEntrySha256':sha(base),'kseedSha256':sha((good/'test.kseed').read_bytes()),'elfSha256':sha((good/'test.elf').read_bytes()),
- 'result':report,'identityGuardMutant':{'exit':r.returncode,'detected':True},
+ 'result':report,'responderIdentityGuardMutant':{'exit':responder_mutant_exit,'detected':True},
+ 'initiatorIdentityGuardMutant':{'exit':r.returncode,'detected':True},
  'scope':'two Linux ARM processes over isolated loopback, deterministic synthetic keys; no live trust, multiple hosts, constant-time or production qualification'}
 (out/'evidence.json').write_text(json.dumps(evidence,indent=2)+'\n');print('PASS_FLEET_NOISE_DUPLEX_SYNTHETIC',flush=True)
