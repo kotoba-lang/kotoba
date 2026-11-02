@@ -71,12 +71,14 @@
       -1
       (read-unsigned payload offset width 0 0))))
 
-(defn- schema-cell-root [page-image :bytes page-size :i64 cell-index :i64
-                         maximum-root :i64] :i64
-  (let [cell-offset (page/cell-pointer page-image page-size 1 0 cell-index)]
+(defn- schema-cell-root [page-image :bytes page-size :i64 page-number :i64
+                         cell-index :i64 maximum-root :i64] :i64
+  (let [cell-offset (page/cell-pointer page-image page-size page-number 0
+                                       cell-index)]
     (if (< cell-offset 0)
       -1
-      (let [cell (page/decode-table-leaf-cell page-image page-size 1 0 cell-offset)
+      (let [cell (page/decode-table-leaf-cell page-image page-size page-number 0
+                                               cell-offset)
             payload-size (vector-at cell 0)
             payload-offset (vector-at cell 2)
             local-size (vector-at cell 3)
@@ -97,40 +99,116 @@
                 (if (and (>= root 2) (<= root maximum-root)) root -1))
               0)))))))
 
-(defn- resolve-schema-cells [page-image :bytes page-size :i64 cell-count :i64
-                             index :i64 maximum-root :i64 found :i64] :i64
+(defn- resolve-schema-leaf-cells [page-image :bytes page-size :i64
+                                  page-number :i64 cell-count :i64 index :i64
+                                  maximum-root :i64 found :i64] :i64
   (if (= index cell-count)
     found
-    (let [root (schema-cell-root page-image page-size index maximum-root)]
+    (let [root (schema-cell-root page-image page-size page-number index
+                                 maximum-root)]
       (if (< root 0)
         -1
         (if (= root 0)
-          (resolve-schema-cells page-image page-size cell-count (+ index 1)
-                                maximum-root found)
+          (resolve-schema-leaf-cells page-image page-size page-number
+                                     cell-count (+ index 1) maximum-root found)
           (if (> found 0)
             -1
-            (resolve-schema-cells page-image page-size cell-count (+ index 1)
-                                  maximum-root root)))))))
+            (resolve-schema-leaf-cells page-image page-size page-number
+                                       cell-count (+ index 1) maximum-root root)))))))
+
+(defn- schema-page-seen? [pages :vector-i64 target :i64 index :i64] :bool
+  (if (= index (vector-count pages))
+    false
+    (if (= (vector-at pages index) target)
+      true
+      (schema-page-seen? pages target (+ index 1)))))
+
+(defn- schema-enqueue-child [queue :vector-i64 child :i64 page-count :i64]
+                            :vector-i64
+  (if (or (< child 2)
+          (> child page-count)
+          (schema-page-seen? queue child 0))
+    (invalid)
+    (vector-conj queue child)))
+
+(defn- schema-enqueue-cells [page-image :bytes page-size :i64 page-number :i64
+                             page-count :i64 cell-count :i64 index :i64
+                             previous-key :i64 queue :vector-i64] :vector-i64
+  (if (= index cell-count)
+    queue
+    (let [cell-offset (page/cell-pointer page-image page-size page-number 0 index)]
+      (if (< cell-offset 0)
+        (invalid)
+        (let [cell (page/decode-table-interior-cell page-image page-size
+                                                   page-number 0 cell-offset)
+              child (vector-at cell 0)
+              key (vector-at cell 1)
+              next-queue (schema-enqueue-child queue child page-count)]
+          (if (or (< key 0)
+                  (<= key previous-key)
+                  (< (vector-at cell 2) 0)
+                  (and (= (vector-count next-queue) 1)
+                       (= (vector-at next-queue 0) -1)))
+            (invalid)
+            (schema-enqueue-cells page-image page-size page-number page-count
+                                  cell-count (+ index 1) key next-queue)))))))
+
+(defn- schema-enqueue-page [page-image :bytes page-size :i64 page-number :i64
+                            page-count :i64 header :vector-i64
+                            queue :vector-i64] :vector-i64
+  (let [children (schema-enqueue-cells page-image page-size page-number
+                                        page-count (vector-at header 3) 0 -1 queue)
+        right-child (vector-at header 7)]
+    (if (and (= (vector-count children) 1)
+             (= (vector-at children 0) -1))
+      (invalid)
+      (schema-enqueue-child children right-child page-count))))
+
+(defn- walk-schema-pages [image :bytes page-size :i64 page-count :i64
+                          queue :vector-i64 queue-index :i64 found-root :i64]
+                          :i64
+  (if (= queue-index (vector-count queue))
+    found-root
+    (let [page-number (vector-at queue queue-index)
+          start (* (- page-number 1) page-size)
+          page-image (bytes-slice image start (+ start page-size))
+          header (page/decode-header page-image page-size page-number 0)
+          page-type (vector-at header 0)
+          cell-count (vector-at header 3)
+          next-queue (if (= page-type 5)
+                       (schema-enqueue-page page-image page-size page-number
+                                            page-count header queue)
+                       queue)
+          page-root (if (= page-type 13)
+                      (resolve-schema-leaf-cells page-image page-size page-number
+                                                 cell-count 0 page-count 0)
+                      0)]
+      (if (or (< page-number 1)
+              (> page-number page-count)
+              (< cell-count 0)
+              (not (or (= page-type 5) (= page-type 13)))
+              (and (= (vector-count next-queue) 1)
+                   (= (vector-at next-queue 0) -1))
+              (< page-root 0)
+              (and (> page-root 0) (> found-root 0)))
+        -1
+        (walk-schema-pages image page-size page-count next-queue
+                           (+ queue-index 1)
+                           (if (> page-root 0) page-root found-root))))))
 
 ;; Return cron_notepad's root page from sqlite_schema page 1. This bounded
-;; lookup admits a table-leaf schema root and refuses missing/duplicate rows,
-;; overflow records, invalid root pages, and databases without whole pages.
+;; lookup walks the sqlite_schema table B-tree and refuses missing/duplicate
+;; rows, overflow records, invalid root pages, and databases without whole pages.
 (defn resolve-notepad-root [image :bytes page-size :i64] :i64
   (let [image-size (bytes-count image)]
     (if (or (< page-size 512)
             (not= (- image-size (* (quot image-size page-size) page-size)) 0)
             (< image-size (* page-size 2)))
       -1
-      (let [page-image (bytes-slice image 0 page-size)
-            header (page/decode-header page-image page-size 1 0)
-            page-type (vector-at header 0)
-            cell-count (vector-at header 3)
-            page-count (quot image-size page-size)]
-        (if (or (not= page-type 13) (< cell-count 0))
-          -1
-          (let [root (resolve-schema-cells page-image page-size cell-count 0
-                                           (- page-count 1) 0)]
-            (if (< root 2) -1 root)))))))
+      (let [page-count (quot image-size page-size)
+            root (walk-schema-pages image page-size page-count (vector-i64 1)
+                                    0 0)]
+        (if (< root 2) -1 root)))))
 
 (defn- append-record-spans [out :vector-i64 spans :vector-i64
                             index :i64 base :i64] :vector-i64
