@@ -217,6 +217,19 @@ and one index leaf. Arbitrary layouts, page splits, delete/reinsert
 combinations beyond the exercised sequence, and persistence transactions
 remain unqualified.
 
+The Kotoba API now also has `upsert-notepad-row`, applying the Itonami
+`set-note` contract to byte inputs: SQLite last-write-wins behavior, a
+128 UTF-16-code-unit key cap, a 16-KiB UTF-8 value cap, and a 64-KiB
+per-job key-plus-value aggregate check. Its source-pinned Amu ARM64 fixture
+verified replacement, a 128-character BMP key, 16-KiB value, blank and
+129-character key refusals, and refusal above the value cap. SQLite 3.54.1
+read-only readback accepted the exported seven-page database and its three
+rows. The aggregate-cap boundary is not qualified: current single-leaf roots
+cannot hold enough admitted rows to reach it, so multi-page B-tree writes are
+needed. Supplementary-plane UTF-16 length and complete JVM whitespace parity
+also remain open. Receipt:
+[`native upsert contract`](../lib/kotoba.sql/evidence/notepad-upsert-contract-native-20261102.json).
+
 The implementation remains a bounded codec, reader, initializer, and
 single-leaf mutation slice, not a complete SQLite engine or transactional
 storage layer. It does not yet qualify arbitrary database layouts, page-split

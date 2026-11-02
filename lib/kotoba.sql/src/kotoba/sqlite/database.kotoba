@@ -6,7 +6,7 @@
   {:kotoba/export [create-cron-notepad validate-cron-notepad-image
                    insert-first-notepad-row insert-second-notepad-row
                    append-notepad-row update-notepad-row
-                   delete-notepad-key delete-notepad-job]}
+                   upsert-notepad-row delete-notepad-key delete-notepad-job]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.notepad-record :as notepad-record]
             [kotoba.sqlite.page :as page]
@@ -18,6 +18,10 @@
 (def table-name
   (bytes-from-vector-i64
     (vector-i64 99 114 111 110 95 110 111 116 101 112 97 100)))
+
+(def max-notepad-key-characters 128)
+(def max-notepad-value-bytes 16384)
+(def max-notepad-job-bytes 65536)
 
 (def index-prefix
   (bytes-from-vector-i64
@@ -889,3 +893,93 @@
                                               next-rows 0)))
           (empty-bytes)
           next-image)))))
+
+(defn- utf8-continuation? [data :bytes offset :i64] :bool
+  (and (>= offset 0) (< offset (bytes-count data))
+       (>= (bytes-at data offset) 128) (< (bytes-at data offset) 192)))
+
+(defn- utf8-character-count [data :bytes offset :i64 characters :i64] :i64
+  (if (= offset (bytes-count data))
+    characters
+    (let [first (bytes-at data offset)
+          width (cond (< first 128) 1
+                      (and (>= first 194) (< first 224)) 2
+                      (and (>= first 224) (< first 240)) 3
+                      (and (>= first 240) (< first 245)) 4
+                      :else 0)
+          second (if (and (> width 1) (< (+ offset 1) (bytes-count data)))
+                   (bytes-at data (+ offset 1)) 0)
+          third-ok (or (< width 3) (utf8-continuation? data (+ offset 2)))
+          fourth-ok (or (< width 4) (utf8-continuation? data (+ offset 3)))
+          bounded (or (not= width 2)
+                      (utf8-continuation? data (+ offset 1)))
+          scalar (or (not= width 3)
+                     (and (utf8-continuation? data (+ offset 1))
+                          (or (not= first 224) (>= second 160))
+                          (or (not= first 237) (< second 160))))
+          plane (or (not= width 4)
+                    (and (utf8-continuation? data (+ offset 1))
+                         (or (not= first 240) (>= second 144))
+                         (or (not= first 244) (< second 144))))]
+      (if (or (= width 0) (not bounded) (not third-ok) (not fourth-ok)
+              (not scalar) (not plane))
+        -1
+        (utf8-character-count data (+ offset width)
+                              (+ characters (if (= width 4) 2 1)))))))
+
+(defn- nonblank-text? [data :bytes offset :i64] :bool
+  (if (= offset (bytes-count data))
+    false
+    (let [byte (bytes-at data offset)]
+      (if (or (> byte 127) (and (> byte 32) (not (and (>= byte 9) (<= byte 13)))))
+        true
+        (nonblank-text? data (+ offset 1))))))
+
+(defn- job-bytes-excluding-key [image :bytes rows :vector-i64 row-index :i64
+                               job-id :bytes key :bytes total :i64] :i64
+  (if (= row-index (quot (vector-count rows) 9))
+    total
+    (let [row-base (* row-index 9)
+          row-job (safe-span image rows (+ row-base 1))
+          row-key (safe-span image rows (+ row-base 3))
+          row-value-length (vector-at rows (+ row-base 8))
+          same-job (and (= (bytes-count row-job) (bytes-count job-id))
+                        (bytes-equal? row-job job-id 0))
+          target-key (and same-job (= (bytes-count row-key) (bytes-count key))
+                          (bytes-equal? row-key key 0))
+          row-bytes (+ (bytes-count row-key) row-value-length)]
+      (if (and same-job (not target-key))
+        (job-bytes-excluding-key image rows (+ row-index 1) job-id key
+                                 (+ total row-bytes))
+        (job-bytes-excluding-key image rows (+ row-index 1) job-id key total)))))
+
+;; Apply Itonami's existing caps, then perform SQLite last-write-wins upsert.
+;; Invalid inputs refuse without changing the supplied image.
+(defn upsert-notepad-row [image :bytes page-size :i64 job-id :bytes key :bytes
+                          value :bytes updated-at :bytes] :bytes
+  (let [packed (reader/read-notepad-image-packed image page-size)
+        rows (materialized-notepad-rows image page-size)
+        row-count (quot (vector-count rows) 9)
+        key-characters (utf8-character-count key 0 0)
+        value-characters (utf8-character-count value 0 0)
+        other-bytes (job-bytes-excluding-key packed rows 0 job-id key 0)
+        valid? (and (>= (bytes-count packed) 4)
+                    (>= (vector-count rows) 0)
+                    (= (* row-count 9) (vector-count rows))
+                    (nonblank-text? job-id 0)
+                    (nonblank-text? key 0)
+                    (>= key-characters 0)
+                    (<= key-characters max-notepad-key-characters)
+                    (>= value-characters 0)
+                    (<= (bytes-count value) max-notepad-value-bytes)
+                    (>= other-bytes 0)
+                    (<= (+ other-bytes (bytes-count key) (bytes-count value))
+                        max-notepad-job-bytes))
+        exists? (and valid? (row-has-key? packed rows 0 job-id key))]
+    (if (not valid?)
+      (empty-bytes)
+      (if exists?
+        (update-notepad-row image page-size job-id key value updated-at)
+        (if (= row-count 0)
+          (insert-first-notepad-row image page-size job-id key value updated-at)
+          (append-notepad-row image page-size job-id key value updated-at))))))
