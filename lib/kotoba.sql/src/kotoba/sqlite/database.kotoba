@@ -4,12 +4,14 @@
 
 (ns kotoba.sqlite.database
   {:kotoba/export [create-cron-notepad validate-cron-notepad-image
-                   insert-first-notepad-row]}
+                   insert-first-notepad-row insert-second-notepad-row]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.notepad-record :as notepad-record]
             [kotoba.sqlite.page :as page]
             [kotoba.sqlite.record :as record]
-            [kotoba.sqlite.schema :as schema]))
+            [kotoba.sqlite.schema :as schema]
+            [kotoba.sqlite.varint :as varint]
+            [kotoba.sqlite.reader :as reader]))
 
 (def table-name
   (bytes-from-vector-i64
@@ -221,3 +223,114 @@
           (bytes-concat next-header (bytes-slice image 100 page-size))
           (bytes-concat table-page index-page))
         (bytes-slice image (* page-size 3) (bytes-count image))))))
+
+(defn- compare-bytes [left :bytes right :bytes index :i64] :i64
+  (cond
+    (and (= index (bytes-count left)) (= index (bytes-count right))) 0
+    (= index (bytes-count left)) -1
+    (= index (bytes-count right)) 1
+    (< (bytes-at left index) (bytes-at right index)) -1
+    (> (bytes-at left index) (bytes-at right index)) 1
+    :else (compare-bytes left right (+ index 1))))
+
+(defn- safe-span [source :bytes spans :vector-i64 offset-index :i64] :bytes
+  (if (or (< offset-index 0)
+          (>= (+ offset-index 1) (vector-count spans))
+          (< (vector-at spans offset-index) 0)
+          (< (vector-at spans (+ offset-index 1)) 0)
+          (> (+ (vector-at spans offset-index)
+                (vector-at spans (+ offset-index 1)))
+             (bytes-count source)))
+    (empty-bytes)
+    (bytes-slice source
+                 (vector-at spans offset-index)
+                 (+ (vector-at spans offset-index)
+                    (vector-at spans (+ offset-index 1))))))
+
+;; Append rowid 2 after the exact one-row image made by
+;; insert-first-notepad-row. SQLite table rowids increase, and the composite
+;; primary-key index must also sort after its existing key. This deliberately
+;; refuses page splits, overflow payloads, duplicate/out-of-order keys, and
+;; any image outside this three-page one-row shape.
+(defn insert-second-notepad-row [image :bytes page-size :i64
+                                 job-id :bytes key :bytes value :bytes
+                                 updated-at :bytes] :bytes
+  (let [header-fields (header/decode image)
+        rows (reader/read-notepad-image image page-size)
+        empty-image (create-cron-notepad page-size)
+        schema-page-match (bytes-equal? (bytes-slice image 100 page-size)
+                                        (bytes-slice empty-image 100 page-size) 0)
+        table-page-number 2
+        index-page-number 3
+        table-page (bytes-slice image (* page-size 1) (* page-size 2))
+        index-page (bytes-slice image (* page-size 2) (* page-size 3))
+        table-header (page/decode-header table-page page-size table-page-number 0)
+        index-header (page/decode-header index-page page-size index-page-number 0)
+        table-payload (notepad-record/encode job-id key value updated-at)
+        table-cell-page (page/append-table-leaf-cell table-page table-payload 2
+                                                    page-size table-page-number 0)
+        prior-job-id (safe-span image rows 1)
+        prior-key (safe-span image rows 3)
+        index-cell-offset (page/cell-pointer index-page page-size index-page-number 0 0)
+        index-size (if (< index-cell-offset 0)
+                     (vector-i64 -1 -1)
+                     (varint/decode index-page index-cell-offset))
+        index-payload-offset (vector-at index-size 1)
+        index-payload-size (vector-at index-size 0)
+        index-payload (if (or (< index-payload-offset 0)
+                              (< index-payload-size 0)
+                              (> (+ index-payload-offset index-payload-size)
+                                 (bytes-count index-page)))
+                        (empty-bytes)
+                        (bytes-slice index-page index-payload-offset
+                                     (+ index-payload-offset index-payload-size)))
+        index-fields (record/decode index-payload)
+        index-job-id (safe-span index-payload index-fields 2)
+        index-key (safe-span index-payload index-fields 5)
+        index-rowid-type (if (>= (vector-count index-fields) 8)
+                           (vector-at index-fields 7) -1)
+        index-data (bytes-concat (bytes-concat job-id key)
+                                 (bytes-from-vector-i64 (vector-i64 2)))
+        index-record (record/encode
+                       (vector-i64 (text-serial job-id) (text-serial key) 1)
+                       index-data)
+        index-cell (page/encode-index-leaf-cell index-record page-size 0)
+        index-cell-page (page/append-index-leaf-cell index-page index-cell
+                                                     page-size index-page-number 0)
+        next-header (header/advance-change-counter (bytes-slice image 0 100))
+        next-image (bytes-concat
+                     (bytes-concat
+                       (bytes-concat next-header (bytes-slice image 100 page-size))
+                       (bytes-concat table-cell-page index-cell-page))
+                     (bytes-slice image (* page-size 3) (bytes-count image)))
+        next-rows (reader/read-notepad-image next-image page-size)]
+    (if (or (not= (bytes-count image) (* page-size 3))
+            (not= (vector-at header-fields 0) page-size)
+            (not= (vector-at header-fields 5) 3)
+            (not schema-page-match)
+            (not= (vector-count rows) 9)
+            (not= (vector-at rows 0) 1)
+            (not= (vector-at table-header 0) 13)
+            (not= (vector-at table-header 3) 1)
+            (not= (vector-at index-header 0) 10)
+            (not= (vector-at index-header 3) 1)
+            (< index-cell-offset 0)
+            (not= (vector-count index-fields) 10)
+            (not= index-rowid-type 9)
+            (not (and (bytes-equal? index-job-id prior-job-id 0)
+                      (= (bytes-count index-job-id) (bytes-count prior-job-id))))
+            (not (and (bytes-equal? index-key prior-key 0)
+                      (= (bytes-count index-key) (bytes-count prior-key))))
+            (or (> (compare-bytes prior-job-id job-id 0) 0)
+                (and (= (compare-bytes prior-job-id job-id 0) 0)
+                     (>= (compare-bytes prior-key key 0) 0)))
+            (= (bytes-count table-payload) 0)
+            (= (bytes-count table-cell-page) 0)
+            (= (bytes-count index-record) 0)
+            (= (bytes-count index-cell-page) 0)
+            (= (bytes-count next-header) 0)
+            (not= (vector-count next-rows) 18)
+            (not= (vector-at next-rows 0) 1)
+            (not= (vector-at next-rows 9) 2))
+      (empty-bytes)
+      next-image)))
