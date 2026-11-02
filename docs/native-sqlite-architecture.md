@@ -59,8 +59,8 @@ SQL compatibility.
 1. Pure Kotoba SQLite v3 codec: 100-byte database header encode/decode,
    empty one-page database image construction, page-size and encoding
    validation, 1..9-byte varints, serial types, record encode/decode, bounded
-   table-leaf cell and single-cell page encoding, and checked page offsets.
-   No file writes in this unit.
+   table-leaf cell and page encoding, ordered cell append, and checked page
+   offsets. No file writes in this unit.
 2. Schema and B-tree reader: validate `sqlite_schema`, resolve the table and
    composite primary-key index, walk leaf/interior pages, and reject malformed
    pointers, cycles, overflow chains, unsupported collations, and unsupported
@@ -108,9 +108,11 @@ varints, four-TEXT notepad records, generic record-layout spans, B-tree page
 headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
 It can also encode a table-leaf cell when its payload fits on the page; it
 refuses negative rowids and payloads requiring overflow pages. A separate
-single-cell page builder places that cell into a bounded table-leaf page,
-including the page-1 B-tree header offset, but its page image excludes the
-100-byte database header and is not a complete database file.
+page builder places a cell into a bounded table-leaf page, including the
+page-1 B-tree header offset, but its page image excludes the 100-byte database
+header and is not a complete database file. Ordered append supports increasing
+rowids while contiguous free space remains; it refuses out-of-order rows and
+does not compact freeblocks or split pages.
 On 2026-11-02, source-locked Amu Mac ARM64 runtime fixtures passed for positive
 codec calls, malformed/truncated refusal sentinels, and negative-varint empty
 encoding. A separate source-locked fixture constructs empty database images
@@ -120,6 +122,8 @@ zero offset representation), and refuses page size 513. The builder creates
 zero-filled pages by concatenating bounded byte chunks after a large-vector
 probe trapped. The leaf-cell and single-cell page writers pass positive and
 refusal checks at 512 bytes, and the page writer also passes at 65,536 bytes.
+The ordered append fixture placed and decoded two cells in rowid order on both
+page-2 and page-1 leaf pages and refused an out-of-order rowid.
 The images have not yet been exported for independent SQLite readback.
 Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
