@@ -12,6 +12,7 @@ COMPONENTS = ROOT / 'kotoba/components.kotoba'
 TABLE = ROOT / 'kotoba/table.kotoba'
 BUTTON = ROOT / 'kotoba/button.kotoba'
 THEME = ROOT / 'kotoba/theme_toggle.kotoba'
+LANGUAGE = ROOT / 'kotoba/language_selector.kotoba'
 TEST = ROOT / 'test/native/dds_components_test.kotoba'
 
 
@@ -32,12 +33,12 @@ def main():
         raise ValueError('Amu digest mismatch')
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    tracked = [amu, COMPONENTS, TABLE, BUTTON, THEME, TEST, Path(__file__).resolve()]
+    tracked = [amu, COMPONENTS, TABLE, BUTTON, THEME, LANGUAGE, TEST, Path(__file__).resolve()]
     pins = {str(p): sha(p) for p in tracked}
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
 
     def run(name, table, expected, components=COMPONENTS, button=BUTTON):
-        modules = {'components': components, 'table': table, 'button': button, 'theme-toggle': THEME, 'dds-components-test': TEST}
+        modules = {'components': components, 'table': table, 'button': button, 'theme-toggle': THEME, 'language-selector': LANGUAGE, 'dds-components-test': TEST}
         lock = out / (name + '.ksl')
         lock.write_text('KSL2\nentry ' + str(TEST.resolve()) + '\n' +
                         ''.join('module ' + n + ' ' + str(p.resolve()) + '\n' for n, p in sorted(modules.items())) +
