@@ -30,6 +30,15 @@ MUTATIONS={
  'carry':('(put st 228 (+ (ld st 228) 1))','(put st 228 (ld st 228))'),
  'overflow':('(not (and (= (ld st 224) 4294967295) (= (ld st 228) 4294967295)))','true'),
  'phase':('(= (ld st 236) 1)','(or (= (ld st 236) 1) (= (ld st 236) 2))')}
+APPLICATION_FRAME_MUTATIONS={
+ 'aj-count':('(and (>= count 0) (<= count 65536) (>= at 0) (< at end) (<= end count))','(and (>= count 0) (>= at 0) (< at end) (<= end count))'),
+ 'ac-alias':('(or (= al 0) (= bl 0) (<= (+ a al) b) (<= (+ b bl) a))','true'),
+ 'ac-version':('(= (natural work input count 1 1) 1)','(<= (natural work input count 1 1) 1)'),
+ 'ac-pad-bits':('(= (mod b 16) 0)','true'),
+ 'ac-utf16':('(<= units 160)','(<= units 164)'),
+ 'ac-wipe':('(clear work 0) ok','ok'),
+ 'ac-duplicate':('(not= (bit-and mask (i64-shift-left 1 (- kind 1))) 0)','false'),
+ 'ac-early-output':('(let [ok (admitted work input count)]','(let [ok (do (commit work output capacity 20 0) (admitted work input count))]')}
 FRAME_MUTATIONS={
  'mf-keepalive':('(and (= kind 5) (not= bytes 1))','false'),
  'mf-body-offset':('(b io (+ 147457 at))','(b io (+ 147456 at))'),
@@ -223,7 +232,7 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    frame=a.component=='frame';mlink=a.component=='managed-link';chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';envelope=a.component=='envelope';roster=a.component=='roster';session=a.component=='session' or mlink or frame;klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink or mlink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed or envelope or roster or session
+    app_link=a.component=='application-link';app=a.component=='application-frame';frame=a.component=='frame';mlink=a.component=='managed-link' or app_link;chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';envelope=a.component=='envelope';roster=a.component=='roster';session=a.component=='session' or mlink or frame;klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink or mlink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed or envelope or roster or session or app
     namespace='aiueos.native.kekkai-link-gate' if klink else ('aiueos.native.udp-link-gate' if link else ('noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')))))
     slug='kekkai-link' if klink else ('udp-link' if link else ('datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s')))))
     mutations=KEKKAI_LINK_MUTATIONS if klink else (UDP_LINK_MUTATIONS if link else (DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)))))
@@ -231,8 +240,10 @@ def main(a):
     if envelope:namespace='kekkai.envelope-region-gate';slug='envelope';mutations=ENVELOPE_MUTATIONS
     if roster:namespace='kekkai.roster-region-gate';slug='roster';mutations=ROSTER_MUTATIONS
     if session:namespace='kekkai.session-region-gate';slug='session';mutations=SESSION_MUTATIONS
+    if app:namespace='kekkai.application-frame-gate';slug='application-frame';mutations=APPLICATION_FRAME_MUTATIONS
     if frame:namespace='kekkai.frame-bounds-gate';slug='frame';mutations={}
     if mlink:namespace='kekkai.frame-link-gate';slug='managed-link';mutations=FRAME_MUTATIONS
+    if app_link:namespace='kekkai.application-link-gate';slug='application-link';mutations={}
     if frame and a.session_suite not in ['handshake-responder','handshake-initiator','transport-responder','transport-initiator']:
         raise ValueError('frame component requires a maximum-size suite')
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
@@ -293,8 +304,10 @@ def main(a):
         if session:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/session_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/session_region_gate.kotoba'
         if mlink:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/frame_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/frame_link_gate.kotoba'
         if frame:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/frame_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/frame_bounds_gate.kotoba'
+        if app:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/application_frame_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/application_frame_gate.kotoba'
+        if app_link:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/application_frame_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/application_link_gate.kotoba'
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
-        if a.mutation and not chacha and not (klink and a.mutation=='kw-duplicate') and not (ed and a.mutation.startswith(('es-','ee-'))) and not (roster and a.mutation.startswith('rd-')) and not (session and a.mutation.startswith('mr-')):
+        if a.mutation and not (app and a.mutation.startswith('aj-')) and not chacha and not (klink and a.mutation=='kw-duplicate') and not (ed and a.mutation.startswith(('es-','ee-'))) and not (roster and a.mutation.startswith('rd-')) and not (session and a.mutation.startswith('mr-')):
             old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
@@ -307,12 +320,25 @@ def main(a):
         if session:files=[('kekkai/session_region.kotoba',core_bytes),('kekkai/session_region_gate.kotoba',fixture.read_bytes())]
         if mlink:files=[('kekkai/frame_region.kotoba',core_bytes),('kekkai/frame_link_gate.kotoba',fixture.read_bytes())]
         if frame:files=[('kekkai/frame_region.kotoba',core_bytes),('kekkai/frame_bounds_gate.kotoba',fixture.read_bytes())]
+        if app:files=[('kekkai/application_frame_region.kotoba',core_bytes),('kekkai/application_frame_gate.kotoba',fixture.read_bytes())]
+        if app_link:files=[('kekkai/application_frame_region.kotoba',core_bytes),('kekkai/application_link_gate.kotoba',fixture.read_bytes())]
         owner_root='/ed25519-owner' if ed else ('/link-owner' if link else ('/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner')))
         if envelope:owner_root='/envelope-owner'
         if roster:owner_root='/roster-owner'
         if session:owner_root='/session-owner'
+        if app:owner_root='/application-owner'
         for virtual,raw in files:
             target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+        if app:
+            state['dependencySources']={}
+            for virtual,relative in [('/json-owner/kotoba/json/region.kotoba','lib/kotoba.json/src/kotoba/json/region.kotoba'),('/edn-owner/kotoba/edn/region.kotoba','lib/kotoba.edn/src/kotoba/edn/region.kotoba'),('/noise-owner/noise/blake2s_region.kotoba','lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba')]:
+                dep=ROOT/relative;state['dependencySources'][relative]=pin(dep);raw=dep.read_bytes()
+                if a.mutation and a.mutation.startswith('aj-') and relative=='lib/kotoba.json/src/kotoba/json/region.kotoba':
+                    old,new=mutations[a.mutation];text=raw.decode()
+                    if text.count(old)!=1:raise ValueError('JSON cursor mutation is not unique')
+                    raw=text.replace(old,new).encode()
+                target=stage/virtual.lstrip('/');target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+            roots+=['/json-owner','/edn-owner','/noise-owner']
         if session:
             state['dependencySources']={}
             dependencies=[('/roster-owner/kekkai/roster_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/roster_region.kotoba'),
@@ -322,6 +348,9 @@ def main(a):
                 ('/x25519-owner/aiueos/x25519.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba')]
             if mlink or frame:
                 dependencies += [('/session-owner/kekkai/'+name+'.kotoba','lib/kotoba.kekkai/'+folder+'/'+name+'.kotoba') for name,folder in [('session_region','kotoba/kekkai'),('wire_region','kotoba/kekkai'),('session_region_gate','tools')]]
+            if app_link:
+                dependencies += [('/session-owner/kekkai/frame_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/frame_region.kotoba'),('/json-owner/kotoba/json/region.kotoba','lib/kotoba.json/src/kotoba/json/region.kotoba')]
+                roots.append('/json-owner')
             if mlink:
                 dependencies.append(('/link-owner/aiueos/native/ipv4_udp.kotoba','lib/kotoba.aiueos/os/aiueos/native/ipv4_udp.kotoba'))
                 roots.append('/link-owner')
@@ -412,8 +441,17 @@ def main(a):
         (stage/('boot-font.bin' if dual else 'boot-payload.bin')).write_bytes(payload.read_bytes())
         state['bootPayload']=None if dual else pin(payload)
         if dual:
+            if app:
+                reference=ROOT/'lib/kotoba.kekkai/tools/application_frame_reference.py'
+                blob,app_cases=load('application_public_frames',reference).fixtures();state['cases']=app_cases
+                state['referenceSources']={str(reference.relative_to(ROOT)):pin(reference)}
+                font=bytearray(payload.read_bytes());end=393216+len(blob)
+                if len(font)!=524288 or end>len(font) or any(font[393216:end]):raise ValueError('application diagnostic tail unavailable')
+                font[393216:end]=blob;(stage/'boot-font.bin').write_bytes(font)
+                (out/'application-vectors.bin').write_bytes(blob);state['vectorData']=pin(out/'application-vectors.bin')
             if session:
                 reference=ROOT/('lib/kotoba.kekkai/tools/frame_link_reference.py' if mlink else 'lib/kotoba.kekkai/tools/session_region_reference.py')
+                if app_link:reference=ROOT/'lib/kotoba.kekkai/tools/application_link_reference.py'
                 if frame:reference=ROOT/'lib/kotoba.kekkai/tools/frame_bounds_reference.py'
                 if mlink:
                     blob,network_cases=load('managed_link_reference',reference).fixtures(a.mutation)
@@ -422,6 +460,8 @@ def main(a):
                 else:blob,session_cases=load('managed_session_reference',reference).fixtures(a.session_suite,a.mutation)
                 state['referenceSources']={str(q.relative_to(ROOT)):pin(q) for q in [reference,OS_SCRIPTS/'check-native-ed25519-qemu.py',OS_SCRIPTS/'check-native-consent-qemu.py',ROOT/'lib/org.ietf.x25519/tools/reference.py',ROOT/'lib/org.ietf.chacha20Poly1305/tools/reference.py']}
                 if mlink or frame:state['referenceSources']['lib/kotoba.kekkai/tools/session_region_reference.py']=pin(ROOT/'lib/kotoba.kekkai/tools/session_region_reference.py')
+                if app_link:
+                    for dep in ['lib/kotoba.kekkai/tools/frame_link_reference.py','lib/kotoba.kekkai/tools/application_frame_reference.py']:state['referenceSources'][dep]=pin(ROOT/dep)
                 state['cases']=session_cases
                 font=bytearray(payload.read_bytes());end=393216+len(blob)
                 if len(font)!=524288 or end>len(font) or any(font[393216:end]):raise ValueError('session diagnostic tail unavailable')
@@ -544,16 +584,16 @@ def main(a):
             keys.Boot.__init__(boot,SimpleNamespace(kernel=kernel,efi=efi,media=media,qemu=a.qemu,firmware=a.firmware),out,'region-crypto',None,
                                extra=extra,first_frame_seconds=a.first_frame_seconds)
             if link:
-                link_peer=ROOT/('scripts/native_managed_link_peer.py' if mlink else ('scripts/native_kekkai_link_peer.py' if klink else 'scripts/native_udp_link_peer.py'));state['linkPeerObserver']=pin(link_peer)
+                link_peer=ROOT/('scripts/native_application_link_peer.py' if app_link else ('scripts/native_managed_link_peer.py' if mlink else ('scripts/native_kekkai_link_peer.py' if klink else 'scripts/native_udp_link_peer.py')));state['linkPeerObserver']=pin(link_peer)
                 if mlink:state['linkPeerDependencies']={'scripts/native_udp_link_peer.py':pin(ROOT/'scripts/native_udp_link_peer.py')}
                 state['state']='NATIVE_LINK_RUNNING';save()
                 peer_module=load('native_udp_link_peer',link_peer)
                 state['linkResult'],link_good=peer_module.exercise(boot,peer,target,out,a.mutation) if mlink else peer_module.exercise(boot,peer,target,out)
-            if x25519 or protocol or ed or envelope or roster or session:
+            if x25519 or protocol or ed or envelope or roster or session or app:
                 started=time.monotonic();state['state']='NATIVE_RUNNING';save()
                 while boot.W(79)==1:
                     if boot.proc.poll() is not None:raise RuntimeError('region guest terminated')
-                    if envelope or roster or session:
+                    if envelope or roster or session or app:
                         log=out/'qemu-debug.log'
                         traps=re.findall(rb'v=06 [^\n]*IP=0008:([0-9a-f]+)',log.read_bytes()) if log.exists() else []
                         if any(0x100000<=int(pc,16)<0x400000 for pc in traps):
@@ -567,6 +607,12 @@ def main(a):
                     time.sleep(2)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
             if link:raw=b''
+            elif app:
+                low,high,other_low,other_high=struct.unpack('<4I',boot.dump(boot.work+400,16));address=low+(high<<32);other=other_low+(other_high<<32)
+                if not (0<address<1<<39 and 0<other<1<<39 and (address+262144<=other or other+262144<=address)):raise ValueError('application test owners overlap')
+                raw=boot.dump(address,8192);n=app_cases['count'];app_known_answers=boot.W(91);app_cursor_guards=boot.W(92);app_cursor_failures=boot.W(93)
+                for name,offset,size in [('returns',196608,n*16),('hashes',229376,n*32),('assertions',163840,n*4),('output',65536,65537)]:
+                    (out/('native-application-'+name+'.bin')).write_bytes(boot.dump(other+offset,size))
             elif roster or session:
                 low,high=struct.unpack('<2I',boot.dump(boot.work+400,8));address=low+(high<<32)
                 if not 0<address<1<<39:raise ValueError('native roster request address differs')
@@ -635,7 +681,7 @@ def main(a):
                 state['state']='DETECTED_NATIVE_LINK_MUTATION'
             else:
                 if not link_good:raise AssertionError('native UDP link/control mismatch: '+str(state['linkResult']['violations']))
-                state['state']='PASS_NATIVE_OS_MANAGED_LINK' if mlink else ('PASS_NATIVE_OS_KEKKAI_LINK' if klink else 'PASS_NATIVE_OS_UDP_LINK')
+                state['state']='PASS_NATIVE_OS_APPLICATION_LINK' if app_link else ('PASS_NATIVE_OS_MANAGED_LINK' if mlink else ('PASS_NATIVE_OS_KEKKAI_LINK' if klink else 'PASS_NATIVE_OS_UDP_LINK'))
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(state['observed']));return
         if ed:
             (out/'native-ed-records.bin').write_bytes(raw)
@@ -675,6 +721,21 @@ def main(a):
                 if not good:raise AssertionError('native envelope/control mismatch: '+str(observed))
                 state['state']='PASS_NATIVE_OS_SIGNED_ENVELOPE'
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
+        if app:
+            (out/'native-application-work.bin').write_bytes(raw)
+            pairs=list(struct.iter_unpack('<qq',(out/'native-application-returns.bin').read_bytes()));hashes=(out/'native-application-hashes.bin').read_bytes();expected=bytes.fromhex(''.join(app_cases['expectedHashes']))
+            errors=list(struct.unpack('<%dI'%app_cases['count'],(out/'native-application-assertions.bin').read_bytes()))
+            state['observed']=dict(sharedKnownAnswers=app_known_answers,cursorGuards=app_cursor_guards,cursorAssertionFailures=app_cursor_failures,caseCount=words[0],nativeErrors=words[1],guardsCompleted=words[2],canary=words[3],completed=words[4],terminal=words[5],returnPairs=pairs,returnPairsMatch=all(a==b for a,b in pairs),hashesMatch=hashes==expected,caseAssertions=errors,workWiped=raw==bytes(8192))
+            good=app_known_answers==1 and app_cursor_guards==12 and app_cursor_failures==0 and words==(app_cases['count'],0,1,1,app_cases['count'],2) and state['observed']['returnPairsMatch'] and state['observed']['hashesMatch'] and not any(errors) and state['observed']['workWiped']
+            if a.mutation:
+                if (words[0],*words[2:])!=(app_cases['count'],1,1,app_cases['count'],2) or app_known_answers!=1 or app_cursor_guards!=12 or not state['observed']['workWiped']:raise AssertionError('application fault did not complete normally')
+                if good or not words[1]:raise AssertionError('application fault survived')
+                state['state']='DETECTED_NATIVE_APPLICATION_FRAME_MUTATION'
+            else:
+                if not good:raise AssertionError('native application codec differs: '+str(state['observed']))
+                state['state']='PASS_NATIVE_OS_APPLICATION_FRAME'
+            state['artifacts']={n:pin(q) for n,q in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
+            state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(state['observed']));return
         if frame:
             (out/'native-session-state.bin').write_bytes(raw)
             pairs=list(struct.iter_unpack('<qq',(out/'native-session-returns.bin').read_bytes()))
@@ -816,9 +877,9 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519','envelope','roster','session','managed-link','frame'],default='blake2s')
+    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519','envelope','roster','session','managed-link','frame','application-frame','application-link'],default='blake2s')
     p.add_argument('--execution-seconds',type=float,default=3600)
     p.add_argument('--roster-suite',choices=['policy','bounds','faults'],default='policy')
     p.add_argument('--session-suite',choices=['policy','handshake-responder','handshake-initiator','transport-responder','transport-initiator','faults'],default='policy')
-    p.add_argument('--mutation',choices=[*FRAME_MUTATIONS,*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS,*ENVELOPE_MUTATIONS,*ROSTER_MUTATIONS,*SESSION_MUTATIONS])
+    p.add_argument('--mutation',choices=[*APPLICATION_FRAME_MUTATIONS,*FRAME_MUTATIONS,*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS,*ENVELOPE_MUTATIONS,*ROSTER_MUTATIONS,*SESSION_MUTATIONS])
     main(p.parse_args())

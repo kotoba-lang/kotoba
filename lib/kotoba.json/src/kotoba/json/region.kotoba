@@ -1,0 +1,100 @@
+;; JUN-757: allocation-free strict JSON cursor for native byte-region consumers.
+;; Input0..65536 immutable bytes; nesting at most64. No AST/heap/IO/authority.
+;; Shared EDN region character codec supplies strict Unicode scalars/UTF8;
+;; JSON additionally admits escaped slash. Lone surrogates refuse, not replace.
+;; value-end returns exclusive end of ONE value/-1, caller owns separators.
+;; string-end returns closing quote index/-1, starting after opening quote.
+;; next-character packs exclusive byte end*2^21+scalar; raw-step reads UTF8.
+;; natural-value accepts plain decimal0..limit (limit<=2147483647), else-1.
+;; This profile is not the document/string facade or whole JSON migration.
+(ns kotoba.json.region
+  (:require [kotoba.edn.region :as e])
+  (:export [skip-space string-end next-character raw-step value-end natural-value utf16-length]))
+(defn- b [input count at]
+  (if (and (>= count 0) (<= count 65536) (>= at 0) (< at count)) (kernel-load-u8-64k input count at) -1))
+(defn skip-space [input count at]
+  (if (or (= (b input count at) 32) (= (b input count at) 9) (= (b input count at) 10) (= (b input count at) 13))
+    (skip-space input count (+ at 1)) at))
+(defn- valid-span [count at end] :bool
+  (and (>= count 0) (<= count 65536) (>= at 0) (< at end) (<= end count)))
+(defn next-character [input count at end]
+  (if (not (valid-span count at end)) -1
+    (if (and (= (b input count at) 92) (= (b input count (+ at 1)) 47) (< (+ at 1) end))
+      (+ (* (+ at 2) 2097152) 47) (e/next-character input count at end))))
+(defn raw-step [input count at end]
+  (if (not (valid-span count at end)) -1
+    (if (= (b input count at) 92) (+ (* (+ at 1) 2097152) 92) (e/next-character input count at end))))
+(defn string-end [input count at]
+  (if (or (< at 0) (>= at count) (< (b input count at) 32)) -1
+    (if (= (b input count at) 34) at
+      (let [step (next-character input count at count)]
+        (if (< step 0) -1 (string-end input count (quot step 2097152)))))))
+(defn- digit [v] :bool (and (>= v 48) (<= v 57)))
+(defn- digits-end [input count at]
+  (if (digit (b input count at)) (digits-end input count (+ at 1)) at))
+(defn- exponent-end [input count at]
+  (if (or (= (b input count at) 101) (= (b input count at) 69))
+    (let [start (if (or (= (b input count (+ at 1)) 43) (= (b input count (+ at 1)) 45)) (+ at 2) (+ at 1))]
+      (if (digit (b input count start)) (digits-end input count (+ start 1)) -1)) at))
+(defn- fraction-end [input count at]
+  (if (= (b input count at) 46)
+    (if (digit (b input count (+ at 1))) (exponent-end input count (digits-end input count (+ at 2))) -1)
+    (exponent-end input count at)))
+(defn- number-end [input count at]
+  (let [start (if (= (b input count at) 45) (+ at 1) at)]
+    (if (= (b input count start) 48) (fraction-end input count (+ start 1))
+      (if (and (>= (b input count start) 49) (<= (b input count start) 57))
+        (fraction-end input count (digits-end input count (+ start 1))) -1))))
+(defn- literal-end [input count at kind i]
+  (if (>= i (if (= kind 1) 4 (if (= kind 2) 5 4))) (+ at i)
+    (if (= (b input count (+ at i))
+      (if (= kind 1) (case i 0 116 1 114 2 117 101)
+        (if (= kind 2) (case i 0 102 1 97 2 108 3 115 101) (case i 0 110 1 117 2 108 108))))
+      (literal-end input count at kind (+ i 1)) -1)))
+;; Each sibling list self-tail-calls; only nesting recurses across functions.
+(defn- array-next [input count at depth] :i64
+  (let [finish (value-end input count at depth)]
+    (if (< finish 0) -1
+      (let [next (skip-space input count finish)]
+        (if (= (b input count next) 93) (+ next 1)
+          (if (= (b input count next) 44) (array-next input count (skip-space input count (+ next 1)) depth) -1))))))
+(defn- object-next [input count at depth] :i64
+  (if (not= (b input count at) 34) -1
+    (let [key-end (string-end input count (+ at 1))]
+      (if (< key-end 0) -1
+        (let [colon (skip-space input count (+ key-end 1))]
+          (if (not= (b input count colon) 58) -1
+            (let [finish (value-end input count (skip-space input count (+ colon 1)) depth)]
+              (if (< finish 0) -1
+                (let [next (skip-space input count finish)]
+                  (if (= (b input count next) 125) (+ next 1)
+                    (if (= (b input count next) 44) (object-next input count (skip-space input count (+ next 1)) depth) -1)))))))))))
+(defn value-end [input count at depth] :i64
+  (if (or (< count 0) (> count 65536) (< at 0) (>= at count) (< depth 0) (> depth 64)) -1
+    (let [first (b input count at)]
+      (if (and (or (= first 123) (= first 91)) (>= depth 64)) -1
+      (if (= first 123)
+        (let [start (skip-space input count (+ at 1))]
+          (if (= (b input count start) 125) (+ start 1) (object-next input count start (+ depth 1))))
+        (if (= first 91)
+          (let [start (skip-space input count (+ at 1))]
+            (if (= (b input count start) 93) (+ start 1) (array-next input count start (+ depth 1))))
+          (if (= first 34) (let [end (string-end input count (+ at 1))] (if (< end 0) -1 (+ end 1)))
+            (if (= first 116) (literal-end input count at 1 0)
+              (if (= first 102) (literal-end input count at 2 0)
+                (if (= first 110) (literal-end input count at 3 0) (number-end input count at)))))))))))
+(defn- natural-loop [input count at end limit value]
+  (if (>= at end) value
+    (if (or (not (digit (b input count at))) (> (+ (* value 10) (- (b input count at) 48)) limit)) -1
+      (natural-loop input count (+ at 1) end limit (+ (* value 10) (- (b input count at) 48))))))
+(defn natural-value [input count at end limit]
+  (if (and (>= count 0) (<= count 65536) (>= at 0) (> end at) (<= end count) (>= limit 0) (<= limit 2147483647)
+           (not (and (> (- end at) 1) (= (b input count at) 48))))
+    (natural-loop input count at end limit 0) -1))
+(defn utf16-length [input count at end raw :bool] :i64
+  (if (or (< count 0) (> count 65536) (< at 0) (> end count) (> at end)) -1
+    (utf16-loop input count at end raw 0)))
+(defn- utf16-loop [input count at end raw :bool units] :i64
+  (if (>= at end) units
+    (let [step (if raw (raw-step input count at end) (next-character input count at end))]
+      (if (< step 0) -1 (utf16-loop input count (quot step 2097152) end raw (+ units (if (> (mod step 2097152) 65535) 2 1)))))))
