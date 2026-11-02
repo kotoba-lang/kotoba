@@ -76,6 +76,10 @@ DATAGRAM_MUTATIONS={
  'dg-receive-limit':('(>= (ld st 40) 9007199254740990)', '(> (ld st 40) 9007199254740990)'),
  'dg-wire-limit':('(< number 9007199254740990)', '(<= number 9007199254740990)'),
  'dg-state-alias':('(separate st 17408 input input-bytes)', 'true')}
+KEKKAI_LINK_MUTATIONS={
+ 'kw-magic':('(= (b input capacity 0) 107)', '(>= (b input capacity 0) 0)'),
+ 'kw-version':('(= (b input capacity 1) 1)', '(>= (b input capacity 1) 0)'),
+ 'kw-duplicate':DATAGRAM_MUTATIONS['dg-duplicate']}
 UDP_LINK_MUTATIONS={
  'udp-ip-checksum':('(= (sum frame capacity 14 (+ 14 header) 0) 65535)', '(>= (sum frame capacity 14 (+ 14 header) 0) 0)'),
  'udp-checksum':('(= (sum frame capacity (+ 14 header) (+ 14 total)\n                (+ (be frame capacity 26) (be frame capacity 28) (be frame capacity 30) (be frame capacity 32) 17 (- total header))) 65535)',
@@ -156,10 +160,10 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';link=a.component=='udp-link';protocol=ik or datagram;dual=chacha or x25519 or protocol or link
-    namespace='aiueos.native.udp-link-gate' if link else ('noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate'))))
-    slug='udp-link' if link else ('datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s'))))
-    mutations=UDP_LINK_MUTATIONS if link else (DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS))))
+    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link
+    namespace='aiueos.native.kekkai-link-gate' if klink else ('aiueos.native.udp-link-gate' if link else ('noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')))))
+    slug='kekkai-link' if klink else ('udp-link' if link else ('datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s')))))
+    mutations=KEKKAI_LINK_MUTATIONS if klink else (UDP_LINK_MUTATIONS if link else (DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)))))
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
     state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
@@ -210,16 +214,16 @@ def main(a):
             source=source.replace(old,new)
         entry='/os/aiueos/native/kekkai-'+slug+'-region-entry.kotoba'
         (stage/entry.lstrip('/')).write_text(source)
-        core=ROOT/('lib/kotoba.aiueos/os/aiueos/native/ipv4_udp.kotoba' if link else ('lib/kotoba.noise/kotoba/noise/datagram_region.kotoba' if datagram else ('lib/kotoba.noise/kotoba/noise/ik_region.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba')))))
-        fixture=ROOT/('lib/kotoba.aiueos/os/aiueos/native/udp_link_gate.kotoba' if link else ('lib/kotoba.noise/tools/datagram_region_gate.kotoba' if datagram else ('lib/kotoba.noise/tools/ik_region_gate.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba')))))
+        core=ROOT/('lib/kotoba.kekkai/kotoba/kekkai/wire_region.kotoba' if klink else ('lib/kotoba.aiueos/os/aiueos/native/ipv4_udp.kotoba' if link else ('lib/kotoba.noise/kotoba/noise/datagram_region.kotoba' if datagram else ('lib/kotoba.noise/kotoba/noise/ik_region.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba'))))))
+        fixture=ROOT/('lib/kotoba.aiueos/os/aiueos/native/kekkai_link_gate.kotoba' if klink else ('lib/kotoba.aiueos/os/aiueos/native/udp_link_gate.kotoba' if link else ('lib/kotoba.noise/tools/datagram_region_gate.kotoba' if datagram else ('lib/kotoba.noise/tools/ik_region_gate.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba'))))))
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
-        if a.mutation and not chacha:
+        if a.mutation and not chacha and not (klink and a.mutation=='kw-duplicate'):
             old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
-        files=([('aiueos/native/ipv4_udp.kotoba',core_bytes),('aiueos/native/udp_link_gate.kotoba',fixture.read_bytes())] if link else ([('noise/datagram_region.kotoba',core_bytes),('noise/datagram_region_gate.kotoba',fixture.read_bytes())] if datagram else ([('noise/ik_region.kotoba',core_bytes),('noise/ik_region_gate.kotoba',fixture.read_bytes())] if ik else ([('aiueos/x25519.kotoba',core_bytes),('aiueos/native/x25519_region_gate.kotoba',fixture.read_bytes())] if x25519 else
+        files=([('kekkai/wire_region.kotoba',core_bytes),('aiueos/native/kekkai_link_gate.kotoba',fixture.read_bytes())] if klink else ([('aiueos/native/ipv4_udp.kotoba',core_bytes),('aiueos/native/udp_link_gate.kotoba',fixture.read_bytes())] if link else ([('noise/datagram_region.kotoba',core_bytes),('noise/datagram_region_gate.kotoba',fixture.read_bytes())] if datagram else ([('noise/ik_region.kotoba',core_bytes),('noise/ik_region_gate.kotoba',fixture.read_bytes())] if ik else ([('aiueos/x25519.kotoba',core_bytes),('aiueos/native/x25519_region_gate.kotoba',fixture.read_bytes())] if x25519 else
               ([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
-               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())])))))
+               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())]))))))
         owner_root='/link-owner' if link else ('/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner'))
         for virtual,raw in files:
             target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
@@ -246,11 +250,22 @@ def main(a):
         if protocol:
             state['dependencySources']={}
             dependencies=[('/x25519-owner','aiueos/x25519.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba')]
-            if datagram:dependencies.append(('/noise-owner','noise/ik_region.kotoba','lib/kotoba.noise/kotoba/noise/ik_region.kotoba'))
+            if datagram or klink:dependencies.append(('/noise-owner','noise/ik_region.kotoba','lib/kotoba.noise/kotoba/noise/ik_region.kotoba'))
             for root,virtual,relative in dependencies:
                 dependency=ROOT/relative;state['dependencySources'][relative]=pin(dependency)
                 target=stage/root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(dependency.read_bytes())
                 if root!=owner_root:roots.append(root)
+            if klink:
+                dependencies_more=[('noise/datagram_region.kotoba','lib/kotoba.noise/kotoba/noise/datagram_region.kotoba'),('aiueos/native/ipv4_udp.kotoba','lib/kotoba.aiueos/os/aiueos/native/ipv4_udp.kotoba')]
+                for virtual,relative in dependencies_more:
+                    dependency=ROOT/relative;state['dependencySources'][relative]=pin(dependency)
+                    raw=dependency.read_bytes()
+                    if virtual=='noise/datagram_region.kotoba' and a.mutation=='kw-duplicate':
+                        old,new=mutations[a.mutation];text=raw.decode()
+                        if text.count(old)!=1:raise ValueError('datagram link mutation is not unique')
+                        raw=text.replace(old,new).encode()
+                        state['mutationSource']=dict(name=relative,original=pin(dependency),mutated=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+                    target=stage/'link-owner'/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
             roots.append('/chacha-owner')
         roots.append(owner_root);flags=[v for r in roots for v in ('--source-path',r)]
         payload=a.payload.resolve(strict=True)
@@ -345,7 +360,7 @@ def main(a):
             keys.Boot.__init__(boot,SimpleNamespace(kernel=kernel,efi=efi,media=media,qemu=a.qemu,firmware=a.firmware),out,'region-crypto',None,
                                extra=extra,first_frame_seconds=a.first_frame_seconds)
             if link:
-                link_peer=ROOT/'scripts/native_udp_link_peer.py';state['linkPeerObserver']=pin(link_peer)
+                link_peer=ROOT/('scripts/native_kekkai_link_peer.py' if klink else 'scripts/native_udp_link_peer.py');state['linkPeerObserver']=pin(link_peer)
                 state['state']='NATIVE_LINK_RUNNING';save()
                 state['linkResult'],link_good=load('native_udp_link_peer',link_peer).exercise(boot,peer,target,out)
             if x25519 or protocol:
@@ -370,6 +385,7 @@ def main(a):
         except BaseException:
             if hasattr(boot,'proc') and boot.proc.poll() is None:
                 (out/'failure-context.bin').write_bytes(boot.dump(boot.work,8192))
+                if klink:(out/'failure-native-context.bin').write_bytes(boot.dump(0x408000,512))
                 boot.send('info registers');state['failureRegisters']=boot.drain();save()
             if hasattr(boot,'proc'):
                 state['qemuExitCode']=boot.proc.poll()
@@ -386,13 +402,13 @@ def main(a):
             state['artifacts']={n:pin(p) for n,p in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
             if a.mutation:
                 observed=state['observed']
-                if not (observed['nicStarted']==observed['completed']==observed['canary']==1 and observed['terminal']==2 and observed['nativeErrors']==0):
+                if not (observed['nicStarted']==observed['wiped' if klink else 'completed']==observed['canary']==1 and observed['terminal']==2 and observed['nativeErrors']==0):
                     raise AssertionError('link mutation did not complete normally')
                 if link_good:raise AssertionError('link mutation escaped real packet controls')
                 state['state']='DETECTED_NATIVE_LINK_MUTATION'
             else:
                 if not link_good:raise AssertionError('native UDP link/control mismatch: '+str(state['linkResult']['violations']))
-                state['state']='PASS_NATIVE_OS_UDP_LINK'
+                state['state']='PASS_NATIVE_OS_KEKKAI_LINK' if klink else 'PASS_NATIVE_OS_UDP_LINK'
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(state['observed']));return
         if protocol:
             count=39 if datagram else 95
@@ -467,7 +483,7 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link'],default='blake2s')
+    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link'],default='blake2s')
     p.add_argument('--execution-seconds',type=float,default=3600)
-    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS])
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS])
     main(p.parse_args())
