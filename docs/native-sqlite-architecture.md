@@ -133,16 +133,22 @@ The generic record encoder round-trips through the decoder, including a
 fixtures refuse reserved serial types and mismatched value widths. Schema
 entry fixtures encode the Itonami `cron_notepad` table DDL with rootpage 2 and
 its primary-key autoindex row with rootpage 3 and NULL SQL; rootpage-width and
-invalid-rootpage cases are also checked. The records have not yet been placed
-into a complete database image.
-The images have not yet been exported for independent SQLite readback.
+invalid-rootpage cases are also checked. A bounded initial `cron_notepad`
+database-image builder now combines the header, two `sqlite_schema` rows, an
+empty table root, and an empty primary-key autoindex root into a three-page
+file image. This is a schema initializer, not a general database writer or a
+query/update engine. The source-locked native fixture assembles and checks
+three-page images at 512 and 4,096-byte page sizes, and refuses page size 513;
+the image has not yet been exported for independent SQLite readback.
 Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
 
 These checks qualify only the exercised codec calls on macOS ARM64. No full
 page-tree walk, `sqlite_schema` reader, overflow traversal, SQL operation
 layer, independent SQLite readback of the generated image, Amu byte-provider
-durability/locking, WAL/recovery, or database mutation path is qualified. An
+durability/locking, WAL/recovery, or database mutation path is qualified. The
+initial image is not wired into Itonami, and legacy SQLite data conversion is
+still a separate planned offline step. An
 earlier complex scratch harness returned E6015; smaller pinned source-lock
 graphs now pass, so E6015 is not evidence that the general Mac multi-module
 source-lock route is absent.
