@@ -45,6 +45,27 @@ The existing read-only layout checker still uses whole-file FS2 reads and does
 not call this snapshot function. Layer application, safe transactional rootfs,
 compression, whiteouts, links and actual container lifecycle remain open.
 
+`fune.snapshot-archive/verify-archive-and-hold` adds tar inspection to that
+same snapshot. It first verifies the descriptor digest, then reads only the
+512-byte headers and zero-filled terminator windows through FS2 W. The shared
+ustar header checker refuses unsupported entry types, whiteouts, absolute or
+dot-component paths, malformed numeric fields and bad checksums. After two
+zero blocks, all remaining bytes must be zero. It admits at most 50,000 entries;
+invalid or unsupported headers share the `fune/tar-header` refusal. On any
+structure refusal the function closes the snapshot; success leaves it open.
+It does not validate conflicts between entries or across layers, apply file
+metadata, create paths, or authorize execution.
+
+Native ARM64 checks covered valid regular file, directory, ustar prefix and
+two-entry archives; absolute and traversal paths, whiteout, symlink, device,
+PAX, checksum, numeric field, truncated payload and nonzero tail were refused.
+The successful test rewrote the source after validation and observed unchanged
+bytes from the held snapshot. Separately built mutants that removed traversal
+or terminator validation failed their negative controls. An Alpine ARM64
+layer passed digest checking but was refused for its unsupported symlink.
+These checks use the test-only `snapshot_archive_gate.kotoba`; the positive
+`hold` mode overwrites its input, so use a disposable fixture copy.
+
 To repeat the native fixture, prepare the layer fixtures as described in the
 README and make a disposable copy of `good.tar`. With `G` set to a task-owned
 workspace, place the candidate Amu compiler from PR #1785 at
