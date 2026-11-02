@@ -10,6 +10,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENTS = ROOT / 'kotoba/components.kotoba'
 TABLE = ROOT / 'kotoba/table.kotoba'
+BUTTON = ROOT / 'kotoba/button.kotoba'
 TEST = ROOT / 'test/native/dds_components_test.kotoba'
 
 
@@ -30,12 +31,12 @@ def main():
         raise ValueError('Amu digest mismatch')
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    tracked = [amu, COMPONENTS, TABLE, TEST, Path(__file__).resolve()]
+    tracked = [amu, COMPONENTS, TABLE, BUTTON, TEST, Path(__file__).resolve()]
     pins = {str(p): sha(p) for p in tracked}
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
 
-    def run(name, table, expected, components=COMPONENTS):
-        modules = {'components': components, 'table': table, 'dds-components-test': TEST}
+    def run(name, table, expected, components=COMPONENTS, button=BUTTON):
+        modules = {'components': components, 'table': table, 'button': button, 'dds-components-test': TEST}
         lock = out / (name + '.ksl')
         lock.write_text('KSL2\nentry ' + str(TEST.resolve()) + '\n' +
                         ''.join('module ' + n + ' ' + str(p.resolve()) + '\n' for n, p in sorted(modules.items())) +
@@ -65,11 +66,18 @@ def main():
     component_mutant = out / 'mutant-components.kotoba'
     component_mutant.write_text(component_text.replace(component_needle, '"wrong-container"'))
     negative_container = run('dds-container-negative', TABLE, b'7\n', component_mutant)
+    button_text = BUTTON.read_text()
+    button_needle = '(document-string "dads-button")'
+    if button_text.count(button_needle) != 1:
+        raise ValueError('button mutation anchor changed')
+    button_mutant = out / 'mutant-button.kotoba'
+    button_mutant.write_text(button_text.replace(button_needle, '(document-string "wrong-button")'))
+    negative_button = run('dds-button-negative', TABLE, b'7\n', button=button_mutant)
     if any(sha(p) != pins[str(p)] for p in tracked):
         raise ValueError('source or compiler changed during gate')
     result = {'status': 'PASS_NATIVE_DDS_COMPONENT_CASES', 'inputs': pins,
               'positive': positive, 'rowHeaderMutationRejected': negative,
-              'containerMutationRejected': negative_container,
+              'containerMutationRejected': negative_container, 'buttonMutationRejected': negative_button,
               'fullComponentParity': False, 'siteGenerated': False}
     (out / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
     print(result['status'])
