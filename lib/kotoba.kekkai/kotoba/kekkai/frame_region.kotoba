@@ -1,0 +1,95 @@
+;; JUN-757: existing Kekkai v1 frames around a roster-bound managed session.
+;; Pure carrier codec: no sockets, endpoint/route/app/port/consent grants.
+;; State is the protected session-region owner262144. Separate caller IO
+;; requires262144: input4096..69633 (65538), output73728..139265 (65538),
+;; private work147456..212991 (65536). Header u32 input-used0/out-capacity4.
+;; Inputs/header immutable during call; serialize both owners. Actual owned
+;; allocations must be disjoint. Shape refusal preserves work/output/state;
+;; processed calls erase all work. Trusted clock may advance/reap on refusal.
+;; receive: -1 unauthenticated/shape/phase refusal;0 authenticated invalid inner;
+;; otherwise kind*65536+body bytes. Kinds48/49 are handshake progress/payload,
+;; kinds1..5 are data/ping/pong/call-me-maybe/keepalive. No event executes an
+;; app or changes a route. Authenticated-invalid inner consumes the RX counter
+;; and preserves output. Keepalive requires empty body; other bodies typed only.
+;; send-handshake: raw plaintext in input, framed output; actual role chooses
+;; init48/response49. send: inner kind + body -> encrypted transport50.
+;; Both send operations return wire bytes or-1; preflight total framed length
+;; before cipher state advances. Header is emitted only after crypto succeeds.
+;; Max raw outer65538, transport body65510 (one inner +24 crypto +3 outer).
+;; Per-operation service/port/reply/approval belongs to the trusted app/socket
+;; consumer. These methods do not authorize network emission or arbitrary data.
+(ns kekkai.frame-region
+  (:require [kekkai.session-region :as s] [kekkai.wire-region :as w])
+  (:export [receive send-handshake send]))
+(defn- rd [io at] (kernel-load-u32 (kernel-subregion io 262144 at 4) 4 0))
+(defn- b [io at] (kernel-load-u8 (kernel-subregion io 262144 at 1) 1 0))
+(defn- p [io at value] (kernel-store-u8 (kernel-subregion io 262144 at 1) 1 0 value))
+(defn- clear [io at]
+  (if (>= at 212992) 1
+    (do (kernel-store-u64 (kernel-subregion io 262144 at 8) 8 0 0) (clear io (+ at 8)))))
+(defn- shape [owner length io io-bytes] :bool
+  (and (>= length 262144) (>= io-bytes 262144)
+       (or (<= (+ owner 262144) io) (<= (+ io 262144) owner))))
+(defn- counts [io] :bool (and (<= (rd io 0) 65538) (<= (rd io 4) 65538)))
+(defn- role [owner] (kernel-load-u32 (kernel-subregion owner 262144 32788 4) 4 0))
+(defn- body-copy [io count at]
+  (if (>= at count) count
+    (do (p io (+ 73728 at) (b io (+ 147457 at))) (body-copy io count (+ at 1)))))
+(defn- finish [io value] (do (clear io 147456) value))
+(defn- read-handshake [owner io count capacity now kind]
+  (let [bytes (s/handshake-message owner 262144 (kernel-subregion io 262144 4099 count) count
+                (kernel-subregion io 262144 73728 capacity) capacity now 0)]
+    (if (>= bytes 0) (+ (* kind 65536) bytes) -1)))
+(defn- receive-handshake [owner io count capacity now kind]
+  (if (and (or (and (= kind 48) (= (role owner) 0)) (and (= kind 49) (= (role owner) 1)))
+           (>= count (if (= kind 48) 99 51)) (>= capacity (- count (if (= kind 48) 99 51))))
+    (read-handshake owner io (- count 3) (if (> capacity 65536) 65536 capacity) now kind) -1))
+(defn- read-data [owner io count now]
+    (let [bytes (s/transport-message owner 262144 (kernel-subregion io 262144 4099 count) count
+                  (kernel-subregion io 262144 147456 65536) 65536 now 0)]
+      (if (< bytes 0) -1
+        (let [kind (w/inner-type (kernel-subregion io 262144 147456 65536) 65536 bytes)]
+          (if (or (= kind 0) (and (= kind 5) (not= bytes 1))) 0
+            (+ (* kind 65536) (body-copy io (- bytes 1) 0)))))))
+(defn- receive-data [owner io count capacity now]
+  (if (and (>= count 3) (>= capacity (if (> count 27) (- count 28) 0)))
+    (read-data owner io (- count 3) now) -1))
+(defn- receive-packet [owner io count capacity now]
+  (let [kind (w/outer-type (kernel-subregion io 262144 4096 65538) 65538 count) phase (s/poll owner 262144 now)]
+    (finish io
+      (if (and (= phase 1) (or (= kind 48) (= kind 49))) (receive-handshake owner io count capacity now kind)
+        (if (and (= phase 2) (= kind 50)) (receive-data owner io count capacity now) -1)))))
+(defn receive [owner length io io-bytes now]
+  (if (and (shape owner length io io-bytes) (counts (kernel-subregion io io-bytes 0 262144)))
+    (receive-packet (kernel-subregion owner length 0 262144) (kernel-subregion io io-bytes 0 262144)
+      (rd (kernel-subregion io io-bytes 0 262144) 0) (rd (kernel-subregion io io-bytes 0 262144) 4) now) -1))
+(defn- header [io capacity kind bytes]
+  (if (< bytes 0) -1
+    (do (w/outer-header kind (kernel-subregion io 262144 73728 capacity) capacity) (+ bytes 3))))
+(defn- seal-handshake [owner io count capacity now]
+  (s/handshake-message owner 262144 (kernel-subregion io 262144 4096 count) count
+    (kernel-subregion io 262144 73731 capacity) capacity now 1))
+(defn- write-handshake [owner io count capacity now]
+  (if (and (= (s/poll owner 262144 now) 1) (<= count (if (= (role owner) 1) 65439 65487))
+           (>= capacity (+ count (if (= (role owner) 1) 99 51))))
+    (let [bytes (seal-handshake owner io count (- capacity 3) now)]
+      (header io capacity (if (= (role owner) 1) 48 49) bytes)) -1))
+(defn send-handshake [owner length io io-bytes now]
+  (if (and (shape owner length io io-bytes) (counts (kernel-subregion io io-bytes 0 262144)))
+    (finish (kernel-subregion io io-bytes 0 262144)
+      (write-handshake (kernel-subregion owner length 0 262144) (kernel-subregion io io-bytes 0 262144)
+        (rd (kernel-subregion io io-bytes 0 262144) 0) (rd (kernel-subregion io io-bytes 0 262144) 4) now)) -1))
+(defn- seal-inner [owner io capacity now count]
+  (s/transport-message owner 262144 (kernel-subregion io 262144 147456 count) count
+    (kernel-subregion io 262144 73731 capacity) capacity now 1))
+(defn- send-body [owner io count capacity now kind]
+  (if (and (= (s/poll owner 262144 now) 2) (>= kind 1) (<= kind 5) (or (not= kind 5) (= count 0))
+           (<= count 65510) (>= capacity (+ count 28)))
+    (let [inner (w/wrap-inner kind (kernel-subregion io 262144 4096 65538) 65538
+                  (kernel-subregion io 262144 147456 65536) 65536 count)]
+      (if (< inner 0) -1 (header io capacity 50 (seal-inner owner io (- capacity 3) now inner)))) -1))
+(defn send [owner length io io-bytes now kind]
+  (if (and (shape owner length io io-bytes) (counts (kernel-subregion io io-bytes 0 262144)))
+    (finish (kernel-subregion io io-bytes 0 262144)
+      (send-body (kernel-subregion owner length 0 262144) (kernel-subregion io io-bytes 0 262144)
+        (rd (kernel-subregion io io-bytes 0 262144) 0) (rd (kernel-subregion io io-bytes 0 262144) 4) now kind)) -1))
