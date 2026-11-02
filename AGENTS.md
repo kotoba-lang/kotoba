@@ -1,5 +1,20 @@
 # Kotoba native migration
 
+## Product and measurement language
+
+Introduce Kotoba as the language at the heart of a modern Lisp machine in
+development, inspired by Lisp's programs-as-data and composable forms. Amu
+owns native compilation; Kototama owns the execution contract and AIUEOS the
+OS direction. Do not describe the full machine or live development as shipped
+without evidence for that capability and host.
+
+The 2026-10-15 M4 observation measured translated Kotoba ports at 0.80× C
+execution time across 19 Embench workloads, using one compiler snapshot and
+one sample per workload. The measured path includes audited algorithm
+substitutions. This is not a released-toolchain result, certified score, or
+universal speed or safety ranking. Keep that boundary next to the comparison:
+https://kotoba-lang.org/blog/embench-c-parity-20261015/.
+
 Use the Kotoba Labs Linear workspace. This migration is tracked by AWAI-24,
 AWAI-43, AWAI-48 and JUN-290. Workspace architecture and authority rules apply.
 
