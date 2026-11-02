@@ -32,10 +32,11 @@ qualified runtime/build/package path.
 - Kotoba has `:bytes` primitives and `kotoba.bytes`. SQLite pages are binary;
   UTF-8 string file operations are insufficient.
 - Amu KX64 has no SQLite API. Amu already has a resource-scoped FS2 provider
-  for raw byte reads/writes and range reads (`kotoba-lang/amu/seed/72-linux-fs2.kotoba`);
-  this task still needs a Kotoba SQL adapter and exact source-pinned execution
-  evidence for the selected Amu runtime/target. Existing provider candidate
-  checks do not qualify SQLite locking, journal/WAL handling, or atomic commits.
+  for raw byte reads/writes and range reads (`kotoba-lang/amu/seed/72-linux-fs2.kotoba`).
+  A KSL2-pinned Kotoba program has now written a SQLite image through that
+  provider and an independent read-only SQLite oracle has accepted it on
+  macOS ARM64. This qualifies the exercised FS2 export path only; it does not
+  qualify SQLite locking, journal/WAL handling, or atomic commits.
 - The AIUEOS object-route `extern-*` mechanism is a different execution path
   and cannot qualify product kexe. C compiler/loader/runtime are excluded by
   the Kotoba and Amu selfhost contracts.
@@ -69,9 +70,10 @@ SQL compatibility.
    composite primary-key index, walk leaf/interior pages, and reject malformed
    pointers, cycles, overflow chains, unsupported collations, and unsupported
    schema forms.
-3. Native I/O: add the Amu raw byte read/write/browse/lock operations with
-   explicit resource scope, size limits, atomic replacement, and symlink/path
-   refusal. Binary payloads must not be re-encoded through strings.
+3. Native I/O: use Amu's existing resource-scoped raw-byte FS2 operations and
+   complete the Kotoba SQL adapter with explicit resource scope, size limits,
+   atomic replacement, and symlink/path refusal. Binary payloads must not be
+   re-encoded through strings. Locking and durability still require evidence.
 4. WAL/rollback compatibility: read and checkpoint existing WAL state, honor
    locks/busy state, then implement atomic mutation/recovery. Itonami enables
    WAL today, so a main-file-only writer is not sufficient.
@@ -145,16 +147,47 @@ query/update engine. The source-locked native fixture assembles and checks
 three-page images at 512 and 4,096-byte page sizes, validates both generated
 `sqlite_schema` records against the admitted DDL/root pages, rejects a
 one-page empty image, and refuses page size 513; the image has not yet been
-exported for independent SQLite readback.
+exported for independent SQLite readback at that checkpoint. The later
+source-pinned export and oracle acceptance below supersede this statement.
 Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
 
-These checks qualify only the exercised codec calls on macOS ARM64. No full
-page-tree walk, `sqlite_schema` reader, overflow traversal, SQL operation
-layer, independent SQLite readback of the generated image, Amu byte-provider
-durability/locking, WAL/recovery, or database mutation path is qualified. The
-initial image is not wired into Itonami, and legacy SQLite data conversion is
-still a separate planned offline step. An
-earlier complex scratch harness returned E6015; smaller pinned source-lock
-graphs now pass, so E6015 is not evidence that the general Mac multi-module
-source-lock route is absent.
+These initial checks qualified only the exercised codec calls on macOS ARM64.
+The later dated checkpoint below supersedes its statements about page-tree
+reading, `sqlite_schema` reading, overflow traversal, SQLite readback, and
+bounded mutation. Durability/locking, WAL/recovery, atomic commits, broader
+database layouts, Linux gates, Itonami wiring, and legacy SQLite data
+conversion remain open. An earlier complex scratch harness returned E6015;
+smaller pinned source-lock graphs now pass, so E6015 is not evidence that the
+general Mac multi-module source-lock route is absent.
+
+## Verified progress (2026-11-02, supersedes earlier checkpoint limits)
+
+Amu full-bootstrap ARM64 compiled and ran a KSL2-pinned Kotoba program through
+the FD3-scoped native FS2 packager with `PATH=/nonexistent`. Kotoba emitted a
+12,288-byte SQLite image; read-only Python 3.15.0 `sqlite3` / SQLite 3.54.1
+opened it with `mode=ro&immutable=1`, returned `PRAGMA integrity_check = ok`,
+and read the expected 4096-byte pages and `cron_notepad` table plus composite
+primary-key autoindex. This is an independent oracle readback, not a build or
+runtime dependency. Source hashes and result are in
+[`native-export-readback-20261102.json`](../lib/kotoba.sql/evidence/native-export-readback-20261102.json).
+
+Subsequent exact-source native receipts qualify bounded operations on the
+same three-page image: first-row insertion, increasing composite-key appends,
+exact-key deletion, per-job deletion preserving unrelated rows, and update of
+an existing row preserving rowid/key. Each fixture reads results through the
+Kotoba reader, writes through Amu FS2, and uses a read-only SQLite 3.54.1
+oracle for integrity and row/index readback. See the
+[`native evidence directory`](../lib/kotoba.sql/evidence/). These results do
+not establish arbitrary-order insertion or a general upsert: keys must
+currently be appended in increasing composite `(job_id,key)` order. A
+follow-up native attempt to remove this restriction failed and was reverted;
+it is not part of the qualified source.
+
+The implementation remains a bounded codec, reader, initializer, and
+single-leaf mutation slice, not a complete SQLite engine or transactional
+storage layer. It does not yet qualify arbitrary database layouts, page-split
+writes, atomic/crash-safe persistence, locks/concurrent writers, WAL or
+rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
+launcher wiring and the selected one-time offline converter remain paused
+until those native gates pass.
