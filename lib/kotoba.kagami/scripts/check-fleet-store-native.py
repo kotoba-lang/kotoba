@@ -35,6 +35,9 @@ for mode in ['init', 'state-old', 'invalid', 'state-old', 'success', 'state-new'
 announce = gate.out / 'announce'; announce.mkdir()
 for mode in ['init','announce-invalid','state-old','announce','state-new','announce-already','state-new']:
  run('announce-'+mode+str(len(gate.observations)),mode,announce)
+message = gate.out / 'message'; message.mkdir()
+for mode in ['init','message-invalid','state-old','message','state-new']:
+ run('message-'+mode+str(len(gate.observations)),mode,message)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
 def race_one(i):
@@ -78,6 +81,13 @@ for label,needle,replacement in [
  broken=gate.build('control-'+label,'kagami/fleet_store_native_test.kotoba',mutant)
  directory=gate.out/('control-'+label+'-state');directory.mkdir();run('control-init-'+label,'init',directory)
  gate.run('control-detected-'+label,broken,17,['announce-invalid',directory],'35,38',directory)
+# A complete otherwise-valid message with the wrong type must be rejected.
+needle=b'(document-equal? mtype (document-keyword :head-announce))'
+if store_source.count(needle)!=1: raise ValueError('unexpected message adapter source')
+mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'true')
+broken=gate.build('control-message-type','kagami/fleet_store_native_test.kotoba',mutant)
+directory=gate.out/'control-message-type-state';directory.mkdir();run('control-init-message-type','init',directory)
+gate.run('control-detected-message-type',broken,20,['message-invalid',directory],'35,38',directory)
 # Disk data is not a trust source: reject a modified stored value unchanged.
 tamper=gate.out/'tamper';tamper.mkdir();run('tamper-init','init',tamper)
 path=tamper/'fleet.state'; damaged=path.read_bytes().replace(b'0000000000000000',b'0000000000000009',1);path.write_bytes(damaged)
