@@ -36,7 +36,7 @@ def main(args):
         assert proc.returncode == 0 and not proc.stderr, (name, proc.returncode, proc.stderr[-1000:])
         return proc.stdout
 
-    for case in ('dom', 'dom_batches', 'dom_overflow', 'dom_replay', 'dom_nodes'):
+    for case in ('dom', 'dom_batches', 'dom_overflow', 'dom_replay', 'dom_nodes', 'dom_comment'):
         entry = tests / (case + '.kotoba')
         flags = [part for path in roots for part in ('--source-path', str(path))]
         lines = run(case + '-modules', [compiler, 'modules', entry, *flags]).decode().splitlines()
