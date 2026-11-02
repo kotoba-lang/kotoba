@@ -25,7 +25,7 @@ mac = module('mac', amu / 'scripts/seed/check-aiueos-user-macos-native.py')
 browser = module('browser', amu / 'scripts/seed/check-wasm32-browser.py')
 source = (root / 'lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/draft_policy.kotoba').read_text()
 driver = (root / 'lib/kotoba.aiueos/test/aiueos/draft_policy_test.kotoba').read_text()
-namespace = '(ns aiueos.draft-policy (:export [classify]))'
+namespace = '(ns aiueos.draft-policy (:export [classify classify-chunks units]))'
 testns = '(ns aiueos.draft-policy-test (:export [main]) (:require [aiueos.draft-policy :as p]))'
 if source.count(namespace) != 1 or driver.count(testns) != 1:
     raise ValueError('unexpected policy namespace')
@@ -38,7 +38,7 @@ sha = lambda b: hashlib.sha256(b).hexdigest()
 if sha(compiler.read_bytes()) != '2c551579c06a0228029bb06bae177e93126ecbbc37d636d693c471dbac8d1536':
     raise ValueError('compiler mismatch')
 rows = []
-for name, text in [('good', staged), ('mutant', staged.replace(needle, 'true'))]:
+for name, text in [('good', staged), ('mutant', staged.replace(needle, 'true', 1))]:
     (out / (name + '.kotoba')).write_text(text)
     mac.native_run(compiler, out, 'compile', name + '.kotoba', '--target', 'wasm32-browser', '--output', name + '.wasm')
     rows.append((name, out / (name + '.wasm'), {'fuel': 0}))

@@ -34,7 +34,7 @@ needle = b'(document-equal? base persisted)'
 if sources['aiueos/draft_policy.kotoba'].count(needle) != 1:
     raise ValueError('mutation anchor changed')
 mutant = dict(sources)
-mutant['aiueos/draft_policy.kotoba'] = mutant['aiueos/draft_policy.kotoba'].replace(needle, b'true')
+mutant['aiueos/draft_policy.kotoba'] = mutant['aiueos/draft_policy.kotoba'].replace(needle, b'true', 1)
 broken = gate.build('mutant', 'aiueos/draft_policy_test.kotoba', mutant)
 gate.run('base-mismatch-detected', broken, expected=1)
 gate.finish('PASS_DRAFT_POLICY_NATIVE_SYNTHETIC',
