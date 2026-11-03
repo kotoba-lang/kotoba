@@ -55,3 +55,51 @@ new implementation and final execution, and say no replacement native CI is
 qualified for this portable CLJK suite. Do not treat a patch to the historical
 decoder or this local reference as a native fix. Native admission and a
 negative-control gate remain open.
+
+## Common-input expression observation
+
+After the initial evaluator loading failure, a one-time local reference run
+loaded the unchanged CLJK evaluator and kernel with a test-only `ipld.core`
+namespace whose nine exported functions all throw if called. The selected
+pure programs have empty method effects, and none invoked this stub. No IPLD,
+actor, message admission, persistence, capability, or VM receipt behavior was
+tested. nbb v1.4.208 / Node v26.0.0 were used only as a local reference, not
+as a build, CI gate, fallback, or native engine. The invocation context directly
+supplied `:budget`, `:spent 0` and `:args []` to `invoke` after calling the
+historical `decode-canonical`; it bypassed the full actor entry path.
+
+The inputs and native receipt fields are recorded in
+[`cases.json`](evidence/jun-792-20261103/cases.json); the separate evaluator
+observations are in
+[`evaluator-observations.jsonl`](evidence/jun-792-20261103/evaluator-observations.jsonl).
+Each program was serialized with the existing Amu fixed-vector encoder and
+its SHA-256 checked against the native gate report before comparison. Of 24
+observations, all 12 successful and 11 fuel-exhausted observations matched
+the native result/charge projection. These include constant, add, wrapping
+add, negative quotient, branch selection and loop/recur, with zero, exact,
+above or one-short budgets where present in the original vectors.
+
+One observation differs: for division by zero with budget 100, native v2
+reported status 2 and spent 3, while the direct evaluator returned
+`:aborted? true`, `:last-error :not-callable`, and spent 0. The evaluator's
+division reports a `:kototama.vm/not-callable` exception; `invoke` catches
+it and calls `kernel/abort` using the incoming context, thereby discarding
+the progressed context in this direct-call scenario. This is a measured
+difference in the tested paths; preserving failure charges and failure kinds
+needs an explicit contract and native implementation. A direct invocation is
+not an end-to-end VM receipt comparison.
+
+Reproduction: the inputs were staged by a local Python data-only script using
+`program`, `const`, `var`, `arith` and `encode` from the pinned
+`check-kototama-i64.py` and the native report. The exact observations were
+obtained by `nbb --classpath oracle:<kotoba-checkout>/lib/kotoba.kotobaVm/src
+oracle/observe.cljs` from a scratch directory; that script calls
+`decode-canonical` and `invoke` and prints result fields. The scripts and
+throwing IPLD seam are retained with the local evidence, not installed into
+the product. SHA-256: staged cases
+`eb21cc529ae20519ff6059f5529d00766153b8c0635860625e14bb9b21c9cd96`;
+observations `9baadb4efcc49dbe17bc6a52a69969edbff405122b204a951d3a594bfbd94124`;
+observer `1b691de07dbccf7588bf1c47df678184486196ed1ebf87069cb9856e69b32f68`;
+IPLD stub `5ec8af7471eee46c5180ebc855c8867eb1c892aa7cee0857e9bc19f4351362c8`;
+stager `b560fbd0744047c68e34b30dbbc5964172481a4acf34e2908785e23dcf0aa6d8`.
+These vectors do not establish full evaluator or VM conformance.
