@@ -438,3 +438,17 @@ x86-64 AOT run of a nested-shadow program (CBOR SHA-256
 returned value 7 with spent 7, matching the model's fixed case. The model has
 no calls or loops; its slot strategy is not yet validated for either, and all
 prior admission, backend-independence and host limitations remain.
+
+The test-only expression evaluator now has an experimental `loop`/`recur`
+control path for manually constructed trusted trees. It stages loop initializers
+and recur arguments in frame-private slots before installing them in parallel,
+then restarts the innermost active loop without recharging the loop expression.
+The macOS ARM64 and Linux x86-64 native fixed fixtures matched the recorded
+loop/recur, swap, outer-initializer, nested-empty and exhaustion expectations;
+a mutant that installs recur arguments sequentially was rejected. After the
+runtime change, the existing 157-case live x86 comparison and macOS snapshot
+still passed. The x86 fixed fixture was added to CI as well as macOS. **The
+CBOR bridge still refuses `loop`/`recur`**, so the loop tests use manually
+constructed trees and do not yet compare the same loop input through AOT and
+reference; tail validation, nested-loop coverage, ARM64 live comparison,
+complete admission and untrusted resource bounds remain open.

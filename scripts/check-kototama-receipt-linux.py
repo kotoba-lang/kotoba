@@ -26,7 +26,7 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     for name in ('compiler-sha256', 'runner-sha256'):
         p.add_argument('--' + name, required=True)
-    p.add_argument('--fixture', choices=('receipt', 'cbor-reference'), default='receipt')
+    p.add_argument('--fixture', choices=('receipt', 'reference', 'cbor-reference'), default='receipt')
     a = p.parse_args()
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'AMD64'):
         raise ValueError('requires native Linux x86-64')
@@ -45,6 +45,11 @@ def main():
         extras['reference.kotoba'] = LIB / extra_keys[0]
         for name in ('codec', 'fragment', 'value'):
             extras['cbor/' + name + '.kotoba'] = ROOT / ('lib/org.ietf.cbor/src/cbor/' + name + '.kotoba')
+    elif a.fixture == 'reference':
+        source_key = 'test/kototama/experimental_i64_reference.kotoba'
+        gate_key = 'test/kototama/experimental_i64_reference_gate.kotoba'
+        source_name, gate_name = 'reference.kotoba', 'gate.kotoba'
+        original, replacement = '(if (= value 0) 3 2)', '(if (= value 0) 2 3)'
     else:
         source_key = 'src/kototama/pure_i64_receipt.kotoba'
         gate_key = 'test/kototama/pure_i64_receipt_gate.kotoba'
@@ -68,7 +73,11 @@ def main():
         gate.parent.mkdir(parents=True, exist_ok=True)
         text = src.read_text()
         if mutant:
-            old, new = (("(valid-methods methods 0)", "true") if name == 'mutant-methods'
+            parallel_old = '(vector-assoc! frames (+ temp-base index) value)'
+            parallel_new = ('(if (= phase 8) (vector-assoc! (vector-assoc! frames (+ temp-base index) value) '
+                            '(+ 320 (vector-at nodes (+ lb 3))) value) (vector-assoc! frames (+ temp-base index) value))')
+            old, new = ((parallel_old, parallel_new) if name == 'mutant-parallel'
+                        else ("(valid-methods methods 0)", "true") if name == 'mutant-methods'
                         else ("(>= count 4095)", "(>= count 4096)") if name == 'mutant-limit'
                         else ("(if (string=? (typed-list-nth [:list :string] env i) name) i",
                               "(if (string=? (typed-list-nth [:list :string] env i) name) "
@@ -126,10 +135,11 @@ def main():
     synthetic_negative = observe('mutant-synthetic', False, 0) if a.fixture == 'cbor-reference' else None
     eager_negative = observe('mutant-compare-eager', False, 0) if a.fixture == 'cbor-reference' else None
     shadow_negative = observe('mutant-shadow', True, 0) if a.fixture == 'cbor-reference' else None
+    parallel_negative = observe('mutant-parallel', True, 0) if a.fixture == 'reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     report = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_LINUX_X86_64', 'inputs': inputs,
-              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'fullVmQualified': False}
+              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     print(report['status'])
 

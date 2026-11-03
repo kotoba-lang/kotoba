@@ -78,7 +78,11 @@ def main():
         source, gate = work / 'source.kotoba', work / 'gate.kotoba'
         text = src.read_text()
         if mutant:
-            old, new = (("(valid-methods methods 0)", "true") if name == 'mutant-methods'
+            parallel_old = '(vector-assoc! frames (+ temp-base index) value)'
+            parallel_new = ('(if (= phase 8) (vector-assoc! (vector-assoc! frames (+ temp-base index) value) '
+                            '(+ 320 (vector-at nodes (+ lb 3))) value) (vector-assoc! frames (+ temp-base index) value))')
+            old, new = ((parallel_old, parallel_new) if name == 'mutant-parallel'
+                        else ("(valid-methods methods 0)", "true") if name == 'mutant-methods'
                         else ("(>= count 4095)", "(>= count 4096)") if name == 'mutant-limit'
                         else ("(if (string=? (typed-list-nth [:list :string] env i) name) i",
                               "(if (string=? (typed-list-nth [:list :string] env i) name) "
@@ -130,10 +134,11 @@ def main():
     synthetic_negative = observe('mutant-synthetic', False, 0) if a.fixture == 'cbor-reference' else None
     eager_negative = observe('mutant-compare-eager', False, 0) if a.fixture == 'cbor-reference' else None
     shadow_negative = observe('mutant-shadow', True, 0) if a.fixture == 'cbor-reference' else None
+    parallel_negative = observe('mutant-parallel', True, 0) if a.fixture == 'reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     receipt = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_MACOS', 'inputs': inputs,
-               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'fullVmQualified': False}
+               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'])
 
