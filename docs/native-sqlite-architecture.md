@@ -595,9 +595,18 @@ This establishes a bounded FS2 export/reopen and independent SQLite
 readability result on the tested Amu/Kotoba ARM64 route. The SQLite oracle is
 measurement evidence only; it is not part of the required runtime, build, or
 CI path. It does not establish standard SQLite locking, WAL/rollback recovery,
-crash-safe transactions, arbitrary page-tree support, Linux x86_64, or Itonami
-integration. Kotoba PR #1172 remains open and draft; its exact-head Linux
-x86_64 workflow is still in progress.
+crash-safe transactions, arbitrary page-tree support, or Itonami integration.
+Kotoba PR #1172 remains open and draft at exact head
+`bfd9665ad03e16baa57df2a1280c2c4a3dd06fde`; workflows
+[`41557323188`](https://github.com/kotoba-lang/kotoba/actions/runs/41557323188)
+and
+[`41557322925`](https://github.com/kotoba-lang/kotoba/actions/runs/41557322925)
+and all required PR checks passed. These include native ARM64 SQLite
+publication/readback/sidecar refusal, native controller x86, Amu selfhost and
+Kotoba CLI requests, native text on ARM64/x86_64, and wasm32 compile. The
+separate bounded Linux x86_64 SQLite legacy-file mutation remains recorded in
+the following section; it used the experimental Amu profile and does not make
+that profile canonical.
 
 ## Delete a job from generated two-leaf roots (2026-11-03)
 
