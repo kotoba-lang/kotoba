@@ -529,3 +529,44 @@ fixture. Thus all 53 program-refusal inputs are now compared byte-for-byte;
 this supersedes the length-only limitation above. The earlier `into` test's
 signal 5 remains unexplained, and the successful construction does not prove
 resource safety for arbitrary inputs.
+
+## Local affine oracle and native vector alias observation (2026-11-03)
+
+A separate native Amu observation fixture tests `into` followed by an affine
+`vector-assoc!` to an earlier input vector. With compiler candidates derived
+from source unity `6034654d05b1cf456548b21262f5a031b4aeb0930651b9d393e62d2cfe4e0d90`,
+the same source returned 192 on macOS ARM64 and 992 on Linux x86-64 and
+physical ARM64; the hundreds digit is the differing observation. These are
+actual execution results, not evidence that the program is admissible.
+
+A single developer-side historical reference measurement was made in
+`kotoba-lang/kotoba` checkout revision
+`135e733a8a6ecee895ba0a68c76548be8ca895e1`. From
+`lib/kotoba.kotobaSema`, the command was:
+
+```sh
+kbb -e "(require '[kotoba.compiler.affine :as a]) (println (a/linear? '(do (let [b [2] a [1] z (into a b) ignored (vector-assoc! a 0 9)] (vector-at z 0))) 'a))"
+```
+
+The result was `false` (exit 0). This calls the affine predicate on the
+specific body and target; it does **not** run the complete reference frontend.
+The checked reference frontend's `check-affine-writes!` calls that predicate
+and refuses a false result. The native compilers accepted and ran the input;
+that is a concrete difference from the reference predicate's result, not proof
+of full source-language parity or a decision about the normative VM contract.
+The tested `affine.cljk` SHA-256 was
+`555745d1f5e3861d95f479b3b6ba30664526540d60334d4782edf10a6dd35c20`;
+`kotoba.lang.coll` SHA-256 was
+`6880ecaf27a40f6385a5861d6b04ea31456c69d745964a97f513acfded86041e`.
+The local oracle used Node v26.0.0, the kbb wrapper SHA-256
+`0026d6b908e41b2f78d9e7c21beedfd1e9dd88210b6b6f319efd9924e0544f33`,
+and the `org-babashka-nbb` CLJK engine package version `1.5.212-cljk.1`.
+Its dependency resolver installed `@noble/hashes` 2.4.0 in the existing
+`kotoba.artifact/node_modules` application dependency directory. This is a
+one-time developer oracle, not a CI, build, runtime or fallback path.
+
+The reference result does not by itself qualify a native affine checker. A
+complete treatment must cover aliases, control flow, loops, function escape and
+callee summaries, avoid unsound acceptance and unjustified refusal, and compare
+accepted programs across engines. The bulk-copy `into` experiment was not
+adopted while those rules and the observed native difference remain open.
