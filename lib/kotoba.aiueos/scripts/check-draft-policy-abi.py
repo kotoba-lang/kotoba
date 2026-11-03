@@ -75,6 +75,8 @@ cases = [
     ('bad-frame', change(good, -1, '04:body'), '0\n', 0),
     ('frame-trailing', change(good, -1, '4:bodyx'), '0\n', 0),
     ('frame-truncated', change(good, -1, '5:body'), '0\n', 0),
+    ('frame-splits-unicode', change(good, -1, '1:雪'), '0\n', 0),
+    ('frame-nonascii-header', change(good, -1, '雪:body'), '0\n', 0),
     ('null-base', make_args([('body', 'x')], ['body'], base=None, persisted=None), '2\n', 0),
     ('max-value', make_args([('body', 'x' * 65536)], ['body']), '2\n', 0),
     ('over-value', make_args([('body', 'x' * 65537)], ['body']), '0\n', 0),
