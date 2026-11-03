@@ -303,3 +303,27 @@ receipt observations; the native comparison returned 42 and a separate
 remainder-sign mutant returned 0. This supersedes the earlier 80-case count
 for this tested corpus; it does not remove the Python adaptation, native
 decoder, whole-program admission or full VM limitations described above.
+
+## Native CBOR-to-reference experiment
+
+The checked-in `org.ietf.cbor` native codec was source-locked and its existing
+codec fixture returned 0 on macOS ARM64 with the pinned Amu CLI. Generic CBOR
+is not by itself VM admission: for example, it normalizes duplicate keys and
+non-shortest integer heads. The new test-only
+`experimental_cbor_reference_bridge.kotoba` decodes and re-encodes bytes for
+exact equality, extracts the selected entry body, and constructs the limited
+expression model tree in native Kotoba. It does not check the complete program
+or its authority and is not suitable as a general admission boundary.
+
+`stage-native-cbor-reference.py` transports selected actual AOT input bytes
+and receipt observations into a source-locked native gate; it checks the source
+and report hashes but does not decode or evaluate the CBOR. On macOS ARM64,
+98 actual Linux x86-64 AOT receipt projections (status, value, spent) matched
+the native CBOR bridge plus reference model. The gate also refused an overlong
+array header and trailing byte. A separate native bridge mutant mapping add
+to multiply made the earlier 98-case comparison return 0 rather than 42.
+The selection is supplied by the earlier limited adapter and is not a claim
+of complete coverage. The bridge supports only binary arithmetic and `if`;
+method reachability, unused invalid code, effects, limits and the complete
+canonical DAG-CBOR/program profile still need independently qualified native
+admission and CI. No production execution or host integration is claimed.
