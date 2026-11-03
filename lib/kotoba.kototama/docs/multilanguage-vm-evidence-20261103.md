@@ -475,3 +475,18 @@ skips restoration is rejected. These tests do not establish multi-method CBOR
 admission: the bridge still rejects parameters and calls, and no same-program
 AOT comparison for calls has been performed. Whole-program call validation,
 acyclicity, nested-call coverage, resource limits and host qualification remain.
+
+The experimental CBOR bridge now resolves direct calls and i64 parameters,
+compiles every method into the bounded reference tree, and rejects unknown
+calls, arity errors, duplicate parameter names and cycles including in unused
+methods. The entry must still have no parameters. Fixed native cases exercise
+nested calls, parameter order, caller-scope restoration and whole-program
+refusals; disabling cycle detection is a failing negative control. The existing
+AOT snapshot gained eight call/five-parameter budget cases, for 187 total.
+Native Linux x86-64 and physical Linux ARM64 each freshly compiled and ran all
+187 AOT cases and matched the reference status, value and spent fuel; the
+macOS ARM64 snapshot comparison also passed. The reference is capped at 63
+emitted nodes across all methods, 64 frames and 64 lexical slots, so it refuses
+some otherwise valid profile programs. The two sides still share a compiler
+backend per architecture; neither independent compilation nor full admission,
+artifact authorization, host qualification or general language support follows.

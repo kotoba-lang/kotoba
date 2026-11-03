@@ -81,6 +81,7 @@ def main():
                         else ("(valid-methods methods 0)", "true") if name == 'mutant-methods'
                         else ("(>= count 4095)", "(>= count 4096)") if name == 'mutant-limit'
                         else ("(not tail)", "false") if name == 'mutant-tail'
+                        else ("(acyclic? graph count)", "true") if name == 'mutant-cycle'
                         else ("(if (string=? (typed-list-nth [:list :string] env i) name) i",
                               "(if (string=? (typed-list-nth [:list :string] env i) name) "
                               "(if (> i 0) (let [prior (lookup env name (- i 1))] (if (< prior 0) i prior)) i)")
@@ -138,12 +139,13 @@ def main():
     eager_negative = observe('mutant-compare-eager', False, 0) if a.fixture == 'cbor-reference' else None
     shadow_negative = observe('mutant-shadow', True, 0) if a.fixture == 'cbor-reference' else None
     parallel_negative = observe('mutant-parallel', True, 0) if a.fixture == 'reference' else None
+    cycle_negative = observe('mutant-cycle', True, 0) if a.fixture == 'cbor-reference' else None
     call_scope_negative = observe('mutant-call-scope', True, 0) if a.fixture == 'reference' else None
     tail_negative = observe('mutant-tail', True, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     report = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_LINUX_X86_64', 'inputs': inputs,
-              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'tailNegative': tail_negative, 'fullVmQualified': False}
+              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'cycleNegative': cycle_negative, 'tailNegative': tail_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     print(report['status'])
 
