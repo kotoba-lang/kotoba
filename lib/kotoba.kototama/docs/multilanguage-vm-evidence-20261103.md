@@ -452,3 +452,16 @@ CBOR bridge still refuses `loop`/`recur`**, so the loop tests use manually
 constructed trees and do not yet compare the same loop input through AOT and
 reference; tail validation, nested-loop coverage, ARM64 live comparison,
 complete admission and untrusted resource bounds remain open.
+
+The experimental CBOR bridge now lowers bounded `loop` and `recur` to the
+reference control path. It checks recur tail position and arity, rejects
+repeated loop binding names, evaluates all loop initializers in the outer
+environment, and retains parallel recur argument assignment. The native fixed
+fixture includes valid loops plus out-of-loop, non-tail, wrong-arity, duplicate
+binding, and initializer-scope refusals; disabling the tail check causes the
+negative control to fail. The retained corpus gained 22 actual loop
+observations, for 179 total. Both native Linux x86-64 and physical ARM64 ran
+all 179 AOT inputs afresh and matched the native reference, and the macOS ARM64
+snapshot comparison passed. This remains a bounded experimental subset, not
+full program admission, independent artifact admission, a public VM or
+production host. Calls and broader resource/failure qualification remain open.
