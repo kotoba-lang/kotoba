@@ -30,7 +30,8 @@ def main(a):
  for v,sha in baseline['sourceGraph'].items():
   p=B/'source'/v.lstrip('/');assert pin(p)['sha256']==sha;t=stage/v.lstrip('/');t.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,t)
  for v,rel in [('/session-owner/kekkai/application_pending_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/application_pending_region.kotoba'),('/session-owner/kekkai/application_pending_gate.kotoba','lib/kotoba.kekkai/tools/application_pending_gate.kotoba'),('/session-owner/kekkai/application_message_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/application_message_region.kotoba')]:shutil.copyfile(R/rel,stage/v.lstrip('/'))
- flags=next(x['argv'][:-2] for x in baseline['calls'] if x['argv'][0]=='compile');roots=flags[8:flags.index('--source-lock')];entry=stage/flags[1].lstrip('/');entry.write_text(entry.read_text().replace('kekkai.application-receive-link-gate','kekkai.application-pending-gate'))
+ shutil.copyfile(R/'lib/kotoba.kekkai/kotoba/kekkai/session_region.kotoba',stage/'session-owner/kekkai/session_region.kotoba')
+ flags=next(x['argv'][:-2] for x in baseline['calls'] if x['argv'][0]=='compile');roots=flags[8:flags.index('--source-lock')];entry=stage/flags[1].lstrip('/');entry.write_text(entry.read_text().replace('kekkai.application-receive-link-gate','kekkai.application-pending-gate').replace('kekkai.application-response-link-gate','kekkai.application-pending-gate'))
  for n in ['boot-font.bin','boot-user-slot.bin']:shutil.copyfile(B/'source'/n,stage/n)
  refpath=R/'lib/kotoba.kekkai/tools/application_pending_reference.py';shutil.copyfile(refpath,out/'public_reference.py');ref=load('pending_frozen_public',out/'public_reference.py')
  # The reference module resolves only its pinned public crypto fixtures below.
@@ -42,7 +43,7 @@ def main(a):
  report.update(observer=pin(Path(__file__)),reference=pin(refpath),nativeFixture=pin(R/'lib/kotoba.kekkai/tools/application_pending_gate.kotoba'),productionSources={rel:pin(R/rel) for rel in ['lib/kotoba.kekkai/kotoba/kekkai/application_pending_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/application_message_region.kotoba','lib/kotoba.json/src/kotoba/json/document_region.kotoba']},nativeHelpers={str(p.relative_to(A)):pin(p) for p in [A/'scripts/seed/check-aiueos-user-macos-native.py',A/'scripts/seed/check-aiueos-application-pool-macos-native.py']},gdbObserver=pin(R/'scripts/check-kekkai-application-reassembly-os.py'),publicCryptoSources={rel:pin(R/rel) for rel in ['lib/org.ietf.x25519/tools/reference.py','lib/org.ietf.chacha20Poly1305/tools/reference.py']})
  if a.fault:
   p=stage/'session-owner/kekkai/application_pending_region.kotoba';text=p.read_text();before,after=FAULTS[a.fault];assert text.count(before)==1;p.write_text(text.replace(before,after))
- font=bytearray((stage/'boot-font.bin').read_bytes());assert not any(font[393216+126000:393216+126000+len(blob)]);font[393216+126000:393216+126000+len(blob)]=blob;(stage/'boot-font.bin').write_bytes(font);channels=ref.public_channels(bytes(font));report.update(bootFont=pin(stage/'boot-font.bin'),userSlot=pin(stage/'boot-user-slot.bin'))
+ font=bytearray((stage/'boot-font.bin').read_bytes());report['previousPublicTemplate']=pin(stage/'boot-font.bin');assert len(blob)<1024;font[393216+126000:393216+127024]=bytes(1024);font[393216+126000:393216+126000+len(blob)]=blob;(stage/'boot-font.bin').write_bytes(font);channels=ref.public_channels(bytes(font));report.update(bootFont=pin(stage/'boot-font.bin'),userSlot=pin(stage/'boot-user-slot.bin'))
  def run(label,args):
   try:p=m.native_run(compiler,stage,*args)
   except ValueError:p=m.native_run(compiler,stage,*args,expected=1)
@@ -55,7 +56,7 @@ def main(a):
    ns,v=line.split(' ',1);graph[v]=pin(stage/v.lstrip('/'))['sha256']
   lock=('KSL1\nentry '+flags[1]+'\n'+''.join('root '+v+'\n' for v in roots[1::2])+''.join('file '+v+' '+k+'\n' for k,v in sorted(graph.items()))).encode();(stage/'pending.ksl').write_bytes(lock);flags[-3]='pending.ksl';flags[-1]=hashlib.sha256(lock).hexdigest();report['sourceGraph']=graph
   assert len(graph)==37
-  assert all(graph[k]==v for k,v in baseline['sourceGraph'].items() if k in graph and k!=flags[1])
+  assert all(graph[k]==v for k,v in baseline['sourceGraph'].items() if k in graph and k!=flags[1] and not k.endswith(('/session_region.kotoba','/application_pending_region.kotoba')))
   for name in ['kernel.elf','kernel-repeat.elf']:run(name,[*flags,'--output',name])
   assert pin(stage/'kernel.elf')==pin(stage/'kernel-repeat.elf')
   for name in ['boot.efi','boot-repeat.efi']:run(name,['package-aiueos-boot','kernel.elf','--output',name,'--font','boot-font.bin','--user-slot','boot-user-slot.bin','--pci-resources','v1'])

@@ -34,6 +34,11 @@ index/key, self/peer eligibility, bound datagram peer and phase. Pending
 handshakes expire at90 seconds; transport uses the canonical180-second expiry
 and volume limits. `advice` reports0 usable/1 rekey/2 unavailable, retaining the
 120-second rekey advice. Advice does not launch a replacement handshake.
+`next-send-counter(owner, ownerBytes, nowSeconds)` polls that same actual
+session before returning its next transmit counter, or -1 if unavailable.
+The fragmented sender uses this data query to retire a cached frame beyond
+the 2048-counter replay-window guarantee. It exposes neither keys nor egress
+authority; it retains poll's existing expiry/revocation/clock semantics.
 `stop(owner,actual-bytes)` clears all32768 session bytes and retains the roster.
 Every successful new-version roster update also clears the full session;
 same-version exact refresh keeps it unless the peer expires. A revoked or

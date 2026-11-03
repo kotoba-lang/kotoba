@@ -51,6 +51,7 @@ an executed2^53-iteration qualification.
 | begin | session/sessionBytes, message/capacity, used, nowMs | positive handle / -1 |
 | complete | session/sessionBytes, message/capacity, used, nowMs | matched handle / -1; busy -2 |
 | cancel | session/sessionBytes, handle, nowMs | 1 removed,0 absent / -1 |
+| request-active | session/sessionBytes, handle, nowMs | 1 live,0 absent / -1; synchronize actual session/channel and reap deadlines first |
 | result-copy | session/sessionBytes, output/capacity, nowMs | 512 / -1 |
 | release-result | no additional arguments | 1 / -1 |
 | pending-count | no additional arguments | stored count / -1; snapshot only |
@@ -85,6 +86,10 @@ stay zero. Private work/schema/hash/binding scratch is245760..262143.
 
 An accepted result must be released before another completion (-2 busy).
 `result-copy` synchronizes the actual session again before exposing data.
+`request-active` is the corresponding live-context query for a sender waiting
+on egress. It checks the protected issued handle and actual current binding;
+it never grants service/socket/consent authority. The fragmented sender and
+its separate TX ownership are documented in [native-application-send.md](native-application-send.md).
 At expiry/revoke/reconnection, a previously copied record is merely stale
 caller data, never permission. The caller must keep the immutable response
 allocation alive until consumed and must not use an arbitrary imported/copied
