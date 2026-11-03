@@ -111,10 +111,19 @@ def main(a):
         B=a.baseline_run.resolve(strict=True);assert pin(B/'receipt.json')['sha256']==a.baseline_receipt_sha256
         baseline=json.loads((B/'receipt.json').read_text());assert baseline['state']=='PASS_NATIVE_OS_APPLICATION_FRAME' and not baseline['mutation']
         assert baseline['cases']['count']==113 and len(baseline['sourceGraph'])==17
-        build=json.loads((a.mac_build/'mac-aiueos-user-target.json').read_text());assert build['status']=='PASS_MAC_NATIVE_USER_TARGET_SELFHOST'
-        assert build['generations'][-1]['container']==build['generations'][-2]['container']
-        for row in build['sources']:assert pin(amu/row['name'])=={k:row[k] for k in ['bytes','sha256']}
-        compiler=a.mac_build/f"F{build['generations'][-1]['number']}-signed.macho";assert m.verify_macho(compiler)==build['generations'][-1]['signed']
+        if a.compiler is not None:
+            profiles={'pool-v4-main-2f842':'efec34486903fc189eb9e3a6d45e02edeaa7f7edf73a9e3e12586c8de048b225',
+                      'pool-v4-35f-reference':'3eb3f37318b35a612c6322d638f24060f1e6579d31f12573a2ea1cae88239521'}
+            assert a.mac_build is None and a.compiler_profile in profiles
+            compiler=a.compiler.resolve(strict=True);assert m.verify_macho(compiler)==dict(bytes=3826784,sha256=profiles[a.compiler_profile])
+            report['compilerProfile']=a.compiler_profile
+        else:
+            assert a.mac_build is not None and a.compiler_profile is None
+            build=json.loads((a.mac_build/'mac-aiueos-user-target.json').read_text());assert build['status']=='PASS_MAC_NATIVE_USER_TARGET_SELFHOST'
+            assert build['generations'][-1]['container']==build['generations'][-2]['container']
+            for row in build['sources']:assert pin(amu/row['name'])=={k:row[k] for k in ['bytes','sha256']}
+            compiler=a.mac_build/f"F{build['generations'][-1]['number']}-signed.macho";assert m.verify_macho(compiler)==build['generations'][-1]['signed']
+            report['compilerProfile']='explicit-legacy-build-receipt'
         for name in ['qemu','firmware']:
             path=getattr(a,name).resolve(strict=True);setattr(a,name,path);assert pin(path)['sha256']==getattr(a,name+'_sha256')
         stage=out/'source';stage.mkdir()
@@ -149,7 +158,7 @@ def main(a):
             assert pin(B/'source'/filename)==baseline[field];shutil.copyfile(B/'source'/filename,stage/filename)
         public,docs=ref.documents();font=bytearray((stage/'boot-font.bin').read_bytes());assert not any(font[475136:475136+len(public)])
         font[475136:475136+len(public)]=public;(stage/'boot-font.bin').write_bytes(font)
-        report.update(baselineReceipt=pin(B/'receipt.json'),compilerBuild=pin(a.mac_build/'mac-aiueos-user-target.json'),compiler=pin(compiler),
+        report.update(baselineReceipt=pin(B/'receipt.json'),compilerBuild=pin(a.mac_build/'mac-aiueos-user-target.json') if a.mac_build is not None else None,compiler=pin(compiler),
                       qemu=pin(a.qemu),firmware=pin(a.firmware),observer=pin(Path(__file__)),reference=pin(refpath),documents=docs,
                       bootFont=pin(stage/'boot-font.bin'),diagnosticUserSlot=pin(stage/'boot-user-slot.bin'),userCodeExecuted=False)
         def run(label,argv):
@@ -259,7 +268,8 @@ def main(a):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    for name in ['amu-repo','mac-build','baseline-run','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
+    for name in ['amu-repo','baseline-run','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--mac-build',type=Path);p.add_argument('--compiler',type=Path);p.add_argument('--compiler-profile',choices=['pool-v4-main-2f842','pool-v4-35f-reference'])
     for name in ['baseline-receipt-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--execution-seconds',type=int,default=1200)
     p.add_argument('--mutation',choices=list(MUTATIONS))

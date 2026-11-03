@@ -88,8 +88,10 @@ An accepted result must be released before another completion (-2 busy).
 At expiry/revoke/reconnection, a previously copied record is merely stale
 caller data, never permission. The caller must keep the immutable response
 allocation alive until consumed and must not use an arbitrary imported/copied
-record as protected state. Binding completed reassembly lifetime to that caller
-protocol remains a separate controller integration requirement.
+record as protected state. The subsequent
+[`native-application-response.md`](native-application-response.md) controller
+binds actual authenticated reassembly input lifetime to this protocol. Generic
+pending users must still provide the same exclusive ownership themselves.
 
 ## Validation scope
 
@@ -133,8 +135,9 @@ The actual managed session supplies identity association. It does not grant a
 private-http edge. Host integration must still check the configured service,
 exact port, normalized concrete URL/origin/redirect policy and fresh trusted
 shared-broker operation consent before sending or executing anything. It must
-connect authenticated receive/reassembly completion to this schema/pending
-lifetime without releasing or reusing pinned input early. Incoming service
+use the authenticated response controller's exclusive lifetime contract without
+releasing or reusing pinned input early. General concurrent outbound allocation
+and product wiring remain open. Incoming service
 requests and local outgoing requests have different roles; no blanket approval.
 
 Native Mac socket/backend, actual Mac/6600H install/launch/live peer/revoke/
