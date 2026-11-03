@@ -167,7 +167,7 @@ def main(args):
         name: HERE / name for name in (
             "build-kotoba-native-desktop.sh", "build-native-desktop-macos.py",
             "build-native-font-macos.py", "build-native-kernel-macos.py",
-            "build-native-media-macos.py", "check-native-desktop-qemu.py",
+            "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py",
