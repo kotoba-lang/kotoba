@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observe the pure-i64 receipt validator and a mutant on native Linux x86-64."""
+"""Observe bounded pure-i64 fixtures and mutants on native Linux x86-64."""
 import argparse
 import hashlib
 import json
@@ -26,6 +26,7 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     for name in ('compiler-sha256', 'runner-sha256'):
         p.add_argument('--' + name, required=True)
+    p.add_argument('--fixture', choices=('receipt', 'cbor-reference'), default='receipt')
     a = p.parse_args()
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'AMD64'):
         raise ValueError('requires native Linux x86-64')
@@ -33,30 +34,55 @@ def main():
     if digest(compiler) != a.compiler_sha256 or digest(runner) != a.runner_sha256:
         raise ValueError('compiler or runner digest mismatch')
     ledger = json.loads(LEDGER.read_text())['added']
-    for path, name in ((SOURCE, 'src/kototama/pure_i64_receipt.kotoba'),
-                       (GATE, 'test/kototama/pure_i64_receipt_gate.kotoba')):
-        if digest(path) != ledger[name]['sha256']:
-            raise ValueError('source digest mismatch: ' + name)
-    inputs = {str(path): digest(path) for path in (compiler, runner, SOURCE, GATE, LEDGER, Path(__file__).resolve())}
+    extras = {}
+    extra_keys = []
+    if a.fixture == 'cbor-reference':
+        source_key = 'test/kototama/experimental_cbor_reference_bridge.kotoba'
+        gate_key = 'test/kototama/experimental_cbor_reference_gate.kotoba'
+        source_name, gate_name = 'bridge.kotoba', 'comparison.kotoba'
+        original, replacement = '(vector-assoc! base kind)', '(vector-assoc! base (if (= kind 1) 5 kind))'
+        extra_keys.append('test/kototama/experimental_i64_reference.kotoba')
+        extras['reference.kotoba'] = LIB / extra_keys[0]
+        for name in ('codec', 'fragment', 'value'):
+            extras['cbor/' + name + '.kotoba'] = ROOT / ('lib/org.ietf.cbor/src/cbor/' + name + '.kotoba')
+    else:
+        source_key = 'src/kototama/pure_i64_receipt.kotoba'
+        gate_key = 'test/kototama/pure_i64_receipt_gate.kotoba'
+        source_name, gate_name = 'kototama/pure_i64_receipt.kotoba', 'kototama/pure_i64_receipt_gate.kotoba'
+        original, replacement = '(= magic 14164133038085195)', '(= magic magic)'
+    src, fixture = LIB / source_key, LIB / gate_key
+    for key in (source_key, gate_key, *extra_keys):
+        if digest(LIB / key) != ledger[key]['sha256']:
+            raise ValueError('source digest mismatch: ' + key)
+    inputs = {str(path): digest(path) for path in
+              (compiler, runner, src, fixture, LEDGER, Path(__file__).resolve(), *extras.values())}
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = {'PATH': '/nonexistent', 'KEXE_CAP_RESOURCES_35': str(output), 'KEXE_STACK_BYTES': '8388608'}
 
     def observe(name, mutant, expected):
         root = output / name / 'src'
-        (root / 'kototama').mkdir(parents=True)
-        source, gate = root / 'kototama' / SOURCE.name, root / 'kototama' / GATE.name
-        text = SOURCE.read_text()
+        root.mkdir(parents=True)
+        source, gate = root / source_name, root / gate_name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        text = src.read_text()
         if mutant:
-            original = '(= magic 14164133038085195)'
-            if text.count(original) != 1:
+            old, new = (("(valid-methods methods 0)", "true") if name == 'mutant-methods'
+                        else ("(>= count 4095)", "(>= count 4096)") if name == 'mutant-limit'
+                        else (original, replacement))
+            if text.count(old) != 1:
                 raise ValueError('negative-control anchor drift')
-            text = text.replace(original, '(= magic magic)')
+            text = text.replace(old, new)
         source.write_text(text)
-        shutil.copyfile(GATE, gate)
+        shutil.copyfile(fixture, gate)
+        for relative, path in extras.items():
+            dest = root / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, dest)
         lock = output / (name + '.ksl')
         lock.write_text('KSL1\nentry ' + str(gate) + '\nroot ' + str(root) + '\n' +
-                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in sorted((source, gate))))
+                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in sorted(root.rglob('*.kotoba'))))
         artifact, payload = output / (name + '.kx64'), output / (name + '.bin')
         command = [str(compiler), 'compile', str(gate), '--target', 'x86_64-linux', '--output', str(artifact),
                    '--format', 'kx64-v1', '--source-path', str(root), '--source-lock', str(lock),
@@ -82,10 +108,12 @@ def main():
                 'artifactSha256': digest(artifact), 'result': expected}
 
     positive, negative = observe('positive', False, 42), observe('mutant', True, 0)
+    method_negative = observe('mutant-methods', True, 0) if a.fixture == 'cbor-reference' else None
+    limit_negative = observe('mutant-limit', True, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
-    report = {'status': 'PASS_BOUNDED_PURE_I64_RECEIPT_LINUX_X86_64', 'inputs': inputs,
-              'positive': positive, 'negative': negative, 'fullVmQualified': False}
+    report = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_LINUX_X86_64', 'inputs': inputs,
+              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     print(report['status'])
 

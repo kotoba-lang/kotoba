@@ -354,3 +354,13 @@ actual-receipt native comparison still returned 42. These preflight limits are
 for the experimental subset and do not establish a bound on the generic
 codec's CPU/allocation behavior, safe hostile-input operation, full VM
 admission or cross-platform qualification.
+
+The same source-locked 98-input CBOR/reference comparison was subsequently
+compiled and executed natively on Linux x86-64 with the pinned Amu compiler and
+KX64 runner, returning 42. The bounded fixed CBOR fixture and its three
+controls (add-to-multiply, missing method scan, relaxed item limit) also
+passed on that host, as did the existing receipt fixture after the test runner
+was extended. The fixed fixture is now included in the Linux x86-64 CI job;
+the complete 98-input cross-engine experiment is still a local observation,
+not a CI gate. These results retain the admission, CPU/allocation and full VM
+limitations above.
