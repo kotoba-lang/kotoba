@@ -518,3 +518,14 @@ macOS native test terminated with signal 5, even in a separate process. Its
 cause and untrusted-input CPU/memory bounds remain unresolved. The experiment
 is bounded rejection evidence, not full admission equivalence, independent
 compiler provenance or production host qualification.
+
+The previous length-only oversized control has now been replaced with the
+exact 65,694-byte Amu input (SHA-256
+`15668e63c7c894a87a3db550b830ffc3b2fc635e432bec76deff176684234308`). The
+native fixture allocates the final vector once and writes its 158-byte prefix;
+it checks every prefix and zero-padding byte before asking the bridge to
+refuse it. A mutant that writes zeros instead of the prefix fails the native
+fixture. Thus all 53 program-refusal inputs are now compared byte-for-byte;
+this supersedes the length-only limitation above. The earlier `into` test's
+signal 5 remains unexplained, and the successful construction does not prove
+resource safety for arbitrary inputs.

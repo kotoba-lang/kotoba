@@ -105,6 +105,12 @@ def main():
             text = text.replace(old, new)
         source.write_text(text)
         shutil.copyfile(fixture_override or fixture, gate)
+        if name == 'mutant-oversize':
+            text = gate.read_text()
+            old = '(vector-assoc! data i (vector-at prefix i))'
+            if text.count(old) != 1:
+                raise ValueError('oversize construction control anchor drift')
+            gate.write_text(text.replace(old, '(vector-assoc! data i 0)'))
         lock = work / 'project.ksl'
         modules = [(module, source), (gate_module, gate)]
         for mod, original_path in sorted(extra_modules.items()):
@@ -150,11 +156,12 @@ def main():
     cycle_negative = observe('mutant-cycle', True, 0) if a.fixture == 'cbor-reference' else None
     call_scope_negative = observe('mutant-call-scope', True, 0) if a.fixture == 'reference' else None
     refusals = [observe('refusals-' + str(i), False, 42, path) for i, path in enumerate(refusal_fixtures)]
+    oversize_negative = observe('mutant-oversize', False, 0, refusal_fixtures[8]) if refusal_fixtures else None
     tail_negative = observe('mutant-tail', True, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     receipt = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_MACOS', 'inputs': inputs,
-               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'cycleNegative': cycle_negative, 'refusals': refusals, 'tailNegative': tail_negative, 'fullVmQualified': False}
+               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'cycleNegative': cycle_negative, 'refusals': refusals, 'oversizeNegative': oversize_negative, 'tailNegative': tail_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'])
 
