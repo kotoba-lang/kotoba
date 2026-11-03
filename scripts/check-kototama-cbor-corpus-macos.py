@@ -46,7 +46,7 @@ def main():
             raise ValueError('source digest mismatch: ' + key)
     data = json.loads(SNAPSHOT.read_text()); report_bytes = REPORT.read_bytes(); report = json.loads(report_bytes)
     if (data.get('schema') != 'kototama.experimental-aot-receipts-snapshot.v1'
-            or data.get('caseCount') != 98 or len(data.get('cases', [])) != 98
+            or data.get('caseCount') != 120 or len(data.get('cases', [])) != 120
             or data.get('profile') != 'kototama.pure-i64-receipt/v2'
             or data.get('reportSha256') != hashlib.sha256(report_bytes).hexdigest()
             or data.get('compilerSha256') != report.get('compilerSHA256')

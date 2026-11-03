@@ -401,3 +401,14 @@ x86 fixture, not independent ARM artifact admission. Reference and AOT
 compilations use the same native compiler backend on each platform. These
 bounded observations do not establish general VM, release, hostile-input, or
 production host qualification.
+
+The experimental reference now supports nonempty `do` and the bounded
+zero-, one-, and multi-operand arithmetic forms in the tested subset. Internal
+fold/sequence nodes carry no guest charge; the original expression and each
+executed child do. Six actual program inputs and their zero/exact/above/short
+budget observations extended the retained set from 98 to 120 cases. The
+macOS ARM64 snapshot comparison passed; fresh native AOT/reference comparisons
+also passed for all 120 on Linux x86-64 and physical ARM64 Xavier. The fixed
+fixture additionally detects a mutant that incorrectly charges synthetic
+nodes. This is still an experimental subset: calls, bindings, general loops,
+complete canonical program admission and host integration remain open.

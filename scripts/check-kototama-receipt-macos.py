@@ -91,6 +91,11 @@ def main():
         for mod, original_path in sorted(extra_modules.items()):
             dest = work / (mod + '.kotoba')
             shutil.copyfile(original_path, dest)
+            if name == 'mutant-synthetic' and mod == 'reference':
+                text = dest.read_text(); old = '(or (= op 8) (>= op 11))'
+                if text.count(old) != 1:
+                    raise ValueError('synthetic-charge control anchor drift')
+                dest.write_text(text.replace(old, 'false'))
             modules.append((mod, dest))
         modules.sort()
         paths = sorted(path for _, path in modules)
@@ -114,10 +119,11 @@ def main():
     negative = observe('mutant', True, 0)
     method_negative = observe('mutant-methods', True, 0) if a.fixture == 'cbor-reference' else None
     limit_negative = observe('mutant-limit', True, 0) if a.fixture == 'cbor-reference' else None
+    synthetic_negative = observe('mutant-synthetic', False, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     receipt = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_MACOS', 'inputs': inputs,
-               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'fullVmQualified': False}
+               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'])
 
