@@ -149,3 +149,29 @@ The test gate returns its decision as an i64; the native CLI process exits
 zero for both outputs, so a runner must check the returned value rather than
 equating a zero process exit with a passing gate. These are observations on
 two OS/ISA combinations, not Linux ARM64 or a full host integration.
+
+## Actual native receipt corpus through the validator
+
+On Linux x86-64, the updated Amu gate from
+[`amu#1802`](https://github.com/kotoba-lang/amu/pull/1802) produced 194
+complete receipts among its 275 cases: 77 successes, 100 fuel exhaustions,
+12 division-by-zero and 5 division-overflow failures. The other cases were
+compiler refusals and produced no receipt. The compiler image SHA-256 was
+`f6c887b23c8b8447dc397821cc82a972c3502a269ae51893075bf888a32aea9a`.
+
+`scripts/stage-pure-i64-receipt-corpus.py` stages those actual output files,
+their recorded budgets and exit codes, and an individually magic-corrupted
+copy of each as literals in a source-locked native Kotoba test. Python does
+not implement the validator or decide the test result. The generated test
+and the unchanged validator compiled and ran with the Amu-native KX64 runner:
+the native result was 42 for all 194 actual receipts and 194 corrupt controls.
+Weakening the validator's magic check in a separately compiled control made
+the same generated test return 0. The generated gate source SHA-256 was
+`d280d91b42a03d385c89401e26ae950772593fea455cd3dd24e1a0e32bb6c221`.
+
+The stager uses each receipt's observed stack field as the supplied expected
+stack. This checks handling of the varied stack values, but is not evidence
+that a host independently binds the stack to an admitted artifact. The test
+does not exercise live process transport, identity checks, signed receipts,
+host integration, Linux ARM64, or whole-VM execution. The generated program
+returns the verdict as an i64: an observer must check 42, not just process exit.
