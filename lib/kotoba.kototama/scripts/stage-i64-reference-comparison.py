@@ -2,7 +2,7 @@
 """Stage a test-only native comparison from actual Amu receipt/v2 corpus bytes.
 
 This is a deliberately limited data adapter, not VM admission or evaluation.
-It decodes test inputs for const/binary add/quot only; the native Kotoba
+It decodes test inputs for const/binary add/quot/if only; the native Kotoba
 reference computes results and compares actual AOT observations. Unsupported
 cases are skipped, never claimed. Run only on trusted local test artifacts.
 """
@@ -99,6 +99,9 @@ def tree(program):
                   and isinstance(expr[2], list) and len(expr[2]) == 2):
                 left, right = emit(expr[2][0]), emit(expr[2][1])
                 nodes[index] = [1 if expr[1] == 'add' else 2, left, right, 0]
+            elif len(expr) == 4 and expr[0] == 'if':
+                condition, yes, no = emit(expr[1]), emit(expr[2]), emit(expr[3])
+                nodes[index] = [3, condition, yes, no]
             else:
                 raise Unsupported('outside model')
             return index

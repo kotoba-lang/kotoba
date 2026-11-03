@@ -284,3 +284,13 @@ the subset filtering and representation mapping remain part of the test's
 trusted scaffolding. It does not cover programs with other operators, loops,
 methods, state or effects. The generated reference gate was compiled with the
 Linux source-lock route and is not yet a continuous CI gate.
+
+The experimental model and adapter were subsequently extended with `if`:
+the native model evaluates the condition and only its selected branch. On
+Linux x86-64 the generated gate compared 80 actual AOT receipt observations
+and returned 42; a model with the branch selection reversed returned 0. The
+macOS ARM64 standalone source-locked fixture returned 42 for true and false
+branches, unselected divide-by-zero and a short budget. These are still
+bounded test models with a Python input adapter, not VM admission or a native
+canonical decoder. The earlier three-operator model and 68-case count above
+refer to the prior experiment.
