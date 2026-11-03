@@ -81,10 +81,15 @@ def main():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, dest)
             if name == 'mutant-synthetic' and relative == 'reference.kotoba':
-                text = dest.read_text(); old = '(or (= op 8) (>= op 11))'
+                text = dest.read_text(); old = '(or (= op 8) (= op 11) (= op 12) (= op 13))'
                 if text.count(old) != 1:
                     raise ValueError('synthetic-charge control anchor drift')
                 dest.write_text(text.replace(old, 'false'))
+            if name == 'mutant-compare-eager' and relative == 'reference.kotoba':
+                text = dest.read_text(); old = '(if (= next-link -1)'
+                if text.count(old) != 1:
+                    raise ValueError('comparison eagerness control anchor drift')
+                dest.write_text(text.replace(old, '(if (or (= next-link -1) (not good))'))
         lock = output / (name + '.ksl')
         lock.write_text('KSL1\nentry ' + str(gate) + '\nroot ' + str(root) + '\n' +
                         ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in sorted(root.rglob('*.kotoba'))))
@@ -116,10 +121,11 @@ def main():
     method_negative = observe('mutant-methods', True, 0) if a.fixture == 'cbor-reference' else None
     limit_negative = observe('mutant-limit', True, 0) if a.fixture == 'cbor-reference' else None
     synthetic_negative = observe('mutant-synthetic', False, 0) if a.fixture == 'cbor-reference' else None
+    eager_negative = observe('mutant-compare-eager', False, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     report = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_LINUX_X86_64', 'inputs': inputs,
-              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'fullVmQualified': False}
+              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     print(report['status'])
 

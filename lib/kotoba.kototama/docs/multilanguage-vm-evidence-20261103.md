@@ -412,3 +412,15 @@ also passed for all 120 on Linux x86-64 and physical ARM64 Xavier. The fixed
 fixture additionally detects a mutant that incorrectly charges synthetic
 nodes. This is still an experimental subset: calls, bindings, general loops,
 complete canonical program admission and host integration remain open.
+
+The experimental model and CBOR bridge now cover the bounded multi-operand
+integer comparison forms (`=`, `<`, `>`, `<=`, `>=`) with eager, left-to-right
+argument evaluation and one charge for the original comparison. The retained
+corpus gained 29 observations, bringing the snapshot and fresh comparison to
+149. Linux x86-64 and physical Linux ARM64 both compiled and ran all 149 AOT
+inputs afresh and matched the native reference; the macOS ARM64 snapshot gate
+also passed. The fixed fixture detects a mutant that stops after a false
+comparison and therefore misses a later division fault. Existing receipt and
+reference fixtures still pass. Bindings, calls, general loops, complete
+admission, independent artifact admission and full VM qualification remain
+open; the reference and AOT still share a compiler backend on each ISA.
