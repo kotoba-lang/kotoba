@@ -2,7 +2,7 @@
 """Stage a test-only native comparison from actual Amu receipt/v2 corpus bytes.
 
 This is a deliberately limited data adapter, not VM admission or evaluation.
-It decodes test inputs for const/binary add/quot/if only; the native Kotoba
+It decodes test inputs for const/binary add/sub/mul/div/mod/if only; the native Kotoba
 reference computes results and compares actual AOT observations. Unsupported
 cases are skipped, never claimed. Run only on trusted local test artifacts.
 """
@@ -95,10 +95,10 @@ def tree(program):
                 if str(n) != text or not -(1 << 63) <= n < (1 << 63):
                     raise Unsupported('integer not canonical i64')
                 nodes[index] = [0, 0, 0, n]
-            elif (len(expr) == 3 and expr[0] == 'arith' and expr[1] in ('add', 'div', 'quot')
+            elif (len(expr) == 3 and expr[0] == 'arith' and expr[1] in ('add', 'sub', 'mul', 'div', 'quot', 'mod')
                   and isinstance(expr[2], list) and len(expr[2]) == 2):
                 left, right = emit(expr[2][0]), emit(expr[2][1])
-                nodes[index] = [1 if expr[1] == 'add' else 2, left, right, 0]
+                nodes[index] = [{'add': 1, 'div': 2, 'quot': 2, 'sub': 4, 'mul': 5, 'mod': 6}[expr[1]], left, right, 0]
             elif len(expr) == 4 and expr[0] == 'if':
                 condition, yes, no = emit(expr[1]), emit(expr[2]), emit(expr[3])
                 nodes[index] = [3, condition, yes, no]

@@ -294,3 +294,12 @@ branches, unselected divide-by-zero and a short budget. These are still
 bounded test models with a Python input adapter, not VM admission or a native
 canonical decoder. The earlier three-operator model and 68-case count above
 refer to the prior experiment.
+
+The experimental expression model was extended again with binary subtraction,
+wrapping multiplication and signed remainder, including zero divisor and
+`MIN rem -1 = 0`. The standalone native macOS fixture and its existing branch
+mutant gate passed. On Linux x86-64 the limited CBOR adapter staged 98 actual
+receipt observations; the native comparison returned 42 and a separate
+remainder-sign mutant returned 0. This supersedes the earlier 80-case count
+for this tested corpus; it does not remove the Python adaptation, native
+decoder, whole-program admission or full VM limitations described above.
