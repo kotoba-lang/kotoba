@@ -208,8 +208,40 @@ negative control made the real receipt return 0. The linked candidate
 container SHA-256 was
 `029023a4998d51f1be01babedf93058abb06c956f9fe3d810c2690ff3237f9da`.
 
-The test fixture binds its known expected exit, budget and stack directly;
+The test fixture at commit `1a6909136` binds its known expected exit, budget and stack directly;
 it is not a process supervisor and does not independently admit artifacts.
 The separate staging process launched the producer and wrote its bytes to a
 private test directory. This does not establish a production host, signed
 receipt, same-process transport, host lifecycle or entire VM conformance.
+
+## Cache host receipts with separate invocation context
+
+The existing Amu native cache host gate was run on Linux x86-64 with the
+same candidate compiler image and source digest `a5f990fc…`. Its native
+ordered gate passed 57 observations; the corrupted-observation control
+refused. The optional deadline control was not enabled. The source digest
+matches the staged full manifest, but the `native-product.json` at this
+revision explicitly marks the current compiler/source link and broader
+qualification unverified; this experiment does not establish that link.
+
+The FS2 fixture now receives exit, budget and stack as separate CLI arguments
+instead of using its original fixed values. The test supervisor invoked the
+cache host four more times and passed the emitted receipt bytes through FS2 to
+the independently compiled validator: success at budgets 1 and 2, exhaustion
+at budget 0, and division by zero at budget 3 were all accepted. The host's
+invocation exit was checked by the test supervisor; the budget came from the
+request, and the expected stack (160 or 192) from the respective cache binding,
+not from the receipt. For each receipt, a wrong exit, budget or stack was
+rejected: 4 valid observations and 12 mismatched-context observations.
+Malformed and missing numeric arguments returned 0, and withholding the FS or
+CLI capability refused with exit 120. These values and capabilities belong to
+the test supervisor; guest-supplied arguments are not authority.
+
+The native cache host image SHA-256 was
+`ca551b4bc2768d1f28b1dbe76378fbff286062a70987a5bf582bfbf39f1ea27f`;
+the linked FS2 test container SHA-256 was
+`9b27688e83e08f4c0d3228414f7d09789ca78763423aa97dd1fe3cd8d5a042a2`.
+The consumer still needs the experimental compiler candidate described above,
+and the file bridge and numeric context are test orchestration, not an
+integrated production supervisor. No signed or remote receipt, deployment,
+whole-VM parity, or Linux ARM64 result is claimed.
