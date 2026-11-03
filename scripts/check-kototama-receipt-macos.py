@@ -25,7 +25,7 @@ def main():
     p.add_argument('--compiler', type=Path, required=True)
     p.add_argument('--compiler-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--fixture', choices=('receipt', 'reference'), default='receipt')
+    p.add_argument('--fixture', choices=('receipt', 'reference', 'cbor-reference'), default='receipt')
     a = p.parse_args()
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('requires native macOS arm64')
@@ -34,7 +34,20 @@ def main():
         raise ValueError('compiler digest mismatch')
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(compiler)], check=True, capture_output=True, timeout=30)
     ledger = json.loads(LEDGER.read_text())['added']
-    if a.fixture == 'reference':
+    extra_modules = {}
+    extra_keys = []
+    if a.fixture == 'cbor-reference':
+        source_key = 'test/kototama/experimental_cbor_reference_bridge.kotoba'
+        gate_key = 'test/kototama/experimental_cbor_reference_gate.kotoba'
+        module, gate_module = 'bridge', 'comparison'
+        original = '(vector-assoc! base kind)'
+        replacement = '(vector-assoc! base (if (= kind 1) 5 kind))'
+        reference_key = 'test/kototama/experimental_i64_reference.kotoba'
+        extra_keys.append(reference_key)
+        extra_modules['reference'] = LIB / reference_key
+        for name in ('codec', 'fragment', 'value'):
+            extra_modules['cbor.' + name] = ROOT / ('lib/org.ietf.cbor/src/cbor/' + name + '.kotoba')
+    elif a.fixture == 'reference':
         source_key = 'test/kototama/experimental_i64_reference.kotoba'
         gate_key = 'test/kototama/experimental_i64_reference_gate.kotoba'
         module, gate_module = 'reference', 'gate'
@@ -50,7 +63,11 @@ def main():
     for path, name in ((src, source_key), (fixture, gate_key)):
         if digest(path) != ledger[name]['sha256']:
             raise ValueError('source digest mismatch: ' + name)
-    inputs = {str(path): digest(path) for path in (compiler, src, fixture, LEDGER, Path(__file__).resolve())}
+    for key in extra_keys:
+        if digest(LIB / key) != ledger[key]['sha256']:
+            raise ValueError('source digest mismatch: ' + key)
+    inputs = {str(path): digest(path) for path in
+              (compiler, src, fixture, LEDGER, Path(__file__).resolve(), *extra_modules.values())}
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
@@ -67,10 +84,16 @@ def main():
         source.write_text(text)
         shutil.copyfile(fixture, gate)
         lock = work / 'project.ksl'
-        modules = sorted(((module, source), (gate_module, gate)))
+        modules = [(module, source), (gate_module, gate)]
+        for mod, original_path in sorted(extra_modules.items()):
+            dest = work / (mod + '.kotoba')
+            shutil.copyfile(original_path, dest)
+            modules.append((mod, dest))
+        modules.sort()
+        paths = sorted(path for _, path in modules)
         lock.write_text('KSL2\nentry ' + str(gate) + '\n' +
                         ''.join('module ' + m + ' ' + str(f) + '\n' for m, f in modules) +
-                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in sorted((source, gate))))
+                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in paths))
         binary = work / 'gate'
         commands = [[str(compiler), 'check', str(gate), '--source-lock', str(lock)],
                     [str(compiler), 'compile', str(gate), '--source-lock', str(lock), '-o', str(binary)],
