@@ -3,7 +3,7 @@
 
 Before the desktop starts the guest runs aiueos.gf25519 on three (a, b) pairs and leaves a*b, inv(a), a+b and a-b
 (32 bytes each, canonical little-endian) in the browser context, 128 bytes per case from word 320. This gate boots
-once, waits for the first completed frame, reads the marker (word 99 = "GF25") and the 96 result words over the
+once, waits for the first completed frame, reads the preserved marker (effects word 51 = "GF25") and the 96 result words over the
 QEMU monitor and compares them with Python's big-integer arithmetic mod p. The pairs are a generic pair, (p-1, p-1)
 and (1, 2^254). Results must also be canonical (< p). No key, point arithmetic or signature; QEMU TCG only.
 """
@@ -57,7 +57,7 @@ def main(a):
         while time.monotonic() < deadline and words(79, 1)[0] < 1: pass
         frames = words(79, 1)[0]; assert frames >= 1, "no first frame"
         events.append(dict(name="first-frame", framesCompleted=frames))
-        marker = words(99, 1)[0]
+        marker = words(2048 + 51, 1)[0]
         assert marker == MARKER, ("the GF(2^255-19) self-test did not finish", hex(marker))
         for k, (x, y) in enumerate(CASES):
             raw = b"".join(struct.pack("<I", w) for w in words(320 + 32 * k, 32))

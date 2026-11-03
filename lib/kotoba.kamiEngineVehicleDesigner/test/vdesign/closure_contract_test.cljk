@@ -1,0 +1,154 @@
+(ns vdesign.closure-contract-test
+  "The design-actor invariant as executable tests:
+
+    1. A feasible spec CLOSES (mass spiral converges) and is RELEASED.
+    2. The two powertrains close to PHYSICALLY DISTINCT designs from the
+       same requirements (FCEV lighter store for long range, but volume-hungry).
+    3. An over-reach spec DIVERGES and is REJECTED — the proposer can NEVER
+       ship a design the PhysicsGovernor hasn't closed.
+    4. Energy balance scales monotonically with range (no free energy)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [langgraph.graph :as g]
+            [vdesign.proposer :as proposer]
+            [vdesign.physics :as physics]
+            [vdesign.simverify :as simverify]
+            [vdesign.process :as process]
+            [vdesign.design :as design]))
+
+(defn- glider [c]
+  (select-keys c [:crr :cd :frontal-area :avg-speed :glider-mass
+                  :gross-limit :p-aux-w]))
+
+(defn- close [requirements powertrain]
+  (let [c (proposer/propose requirements powertrain)]
+    (physics/check powertrain (glider c) c)))
+
+(deftest feasible-design-closes
+  (testing "a sedan at a sane range converges to a fixed-point curb mass"
+    (doseq [pt [:bev :fcev]]
+      (let [v (close {:class :sedan :range-km 500} pt)]
+        (is (:closes? v) (str pt " sedan/500 should close"))
+        (is (empty? (:violations v)))
+        (is (pos? (:curb-mass-kg v)))
+        ;; convergence: the spiral settles, it doesn't bail at the budget
+        (is (< (:iterations v) physics/max-iterations))))))
+
+(deftest powertrains-differ
+  (testing "BEV and FCEV close to distinct designs from identical requirements"
+    (let [bev  (close {:class :sedan :range-km 500} :bev)
+          fcev (close {:class :sedan :range-km 500} :fcev)]
+      (is (:closes? bev))
+      (is (:closes? fcev))
+      ;; the FCEV store is the lighter of the two…
+      (is (< (get-in fcev [:store :store-mass-kg])
+             (get-in bev  [:store :store-mass-kg]))
+          "FCEV store should be lighter than BEV at 500 km")
+      ;; …but pays for it in volume (H2 tanks are bulky)
+      (is (> (get-in fcev [:store :volume-L])
+             (get-in bev  [:store :volume-L]))
+          "FCEV store should be bulkier than BEV"))))
+
+(deftest overreach-is-rejected
+  (testing "a 1500 km city BEV cannot close — governor rejects, no spec"
+    (let [v (close {:class :city :range-km 1500} :bev)]
+      (is (not (:closes? v)))
+      (is (seq (:violations v)))
+      (is (some #(= :mass-closure (:gate %)) (:violations v))))))
+
+(deftest energy-balance-monotone
+  (testing "more range strictly costs more stored energy (no free lunch)"
+    (let [short (close {:class :sedan :range-km 300} :bev)
+          long  (close {:class :sedan :range-km 600} :bev)]
+      (is (> (get-in long  [:store :nominal-kWh])
+             (get-in short [:store :nominal-kWh]))))))
+
+(deftest actor-invariant-no-unclosed-release
+  (testing "every RELEASED design carries a converged, gate-clean verdict"
+    (let [actor (design/build)
+          res   (g/run* actor {:requirements {:class :sedan :range-km 450}
+                               :powertrain :bev}
+                        {:thread-id "t/release"})]
+      ;; closed designs interrupt for engineer sign-off before release
+      (is (= :interrupted (:status res)))
+      (let [d (get-in res [:state :design])]
+        (is (= :released (:status d)))
+        (is (pos? (:curb-mass-kg d))))
+      ;; resume past the human review → emitted
+      (let [res2 (g/run* actor nil {:thread-id "t/release"})]
+        (is (= :done (:status res2)))))))
+
+(deftest rejected-design-emits-without-review
+  (testing "an infeasible design skips human review and emits a rejection"
+    (let [actor (design/build)
+          res   (g/run* actor {:requirements {:class :city :range-km 1500}
+                               :powertrain :bev}
+                        {:thread-id "t/reject"})]
+      (is (= :done (:status res)))   ; no interrupt — straight to emit
+      (is (= :rejected (get-in res [:state :design :status]))))))
+
+;; ── (a) genesis/cae-compat structural + collision verification ──────────────
+
+(defn- release [requirements powertrain]
+  (let [c (proposer/propose requirements powertrain)
+        v (physics/check powertrain (select-keys c [:crr :cd :frontal-area :avg-speed
+                                                    :glider-mass :gross-limit :p-aux-w]) c)
+        store (:store v)]
+    {:status :released :class (:class c) :powertrain powertrain
+     :range-km (:range-km c) :curb-mass-kg (:curb-mass-kg v)
+     :p-peak-kW (:p-peak-kW store) :energy (dissoc store :propulsion-mass-kg)
+     :mass-budget {:glider-kg (:glider-mass c)
+                   :energy-store-kg (:store-mass-kg store)
+                   :propulsion-kg (:propulsion-mass-kg store)}
+     :margins (:margins v)}))
+
+(deftest sim-verify-passes-feasible
+  (testing "a feasible sedan survives structural + clash + DR on the sim surface"
+    (doseq [pt [:bev :fcev]]
+      (let [v (simverify/check (release {:class :sedan :range-km 500} pt))]
+        (is (:passed? v) (str pt " sedan should pass sim verify"))
+        (is (>= (:min-sf v) 1.0))
+        (is (= (:envs v) simverify/n-envs))
+        (is (pos? (count (:datoms v))) "verification is emitted as datoms")))))
+
+(deftest sim-verify-is-reproducible
+  (testing "domain randomization is seeded — identical batch every run"
+    (let [d (release {:class :sedan :range-km 500} :bev)]
+      (is (= (:min-sf (simverify/check d)) (:min-sf (simverify/check d)))))))
+
+;; ── (b) BOM → CAM → 4D assembly, all datafied ──────────────────────────────
+
+(deftest process-plan-is-complete
+  (testing "a verified design explodes into BOM + CAM + assembly datoms"
+    (let [p (process/plan (release {:class :sedan :range-km 500} :bev))]
+      (is (pos? (count (:bom-lines p))))
+      (is (pos? (count (:cam p))))
+      (is (pos? (count (:assembly p))))
+      (is (pos? (:datom-count p)) "the whole process is datafied")
+      ;; CAM jobs carry real G-code
+      (is (every? #(str/includes? (:gcode %) "G21") (:cam p)))
+      (is (every? #(str/includes? (:gcode %) "M30") (:cam p))))))
+
+(deftest assembly-order-diverges-by-powertrain
+  (testing "BEV and FCEV assembly sequences differ exactly at the energy system"
+    (let [steps (fn [pt] (set (map :step (:assembly (process/plan (release {:class :sedan :range-km 500} pt))))))
+          bev   (steps :bev)
+          fcev  (steps :fcev)]
+      (is (contains? bev  "battery-pack-install"))
+      (is (contains? bev  "charge-to-soc"))
+      (is (contains? fcev "h2-tank-install"))
+      (is (contains? fcev "h2-fill"))
+      (is (not (contains? bev  "h2-tank-install")))
+      (is (not (contains? fcev "battery-pack-install"))))))
+
+(deftest actor-runs-full-pipeline-to-datoms
+  (testing "released design flows review → (a) verify → (b) process, emitting datoms"
+    (let [actor (design/build)
+          _     (g/run* actor {:requirements {:class :sedan :range-km 500}
+                               :powertrain :fcev} {:thread-id "t/full"})
+          res2  (g/run* actor nil {:thread-id "t/full"})]
+      (is (= :done (:status res2)))
+      (is (:passed? (get-in res2 [:state :verification])))
+      (is (pos? (count (get-in res2 [:state :process :assembly]))))
+      (is (pos? (count (get-in res2 [:state :datoms])))
+          "verification + manufacturing facts land on the Datom log"))))

@@ -1,0 +1,147 @@
+(ns hata.read
+  (:export [attestation latest])
+  (:require [hata.codec :as c] [hata.quorum :as q] [ed25519.selfhost :as ed]))
+;; Fresh read for the fixed 4/3 roster (AWAI-103). A replica attests its current
+;; snapshot (hata.replica Snapshot15) and its pending vote under the reader's
+;; nonce. The reader needs three valid attestations from distinct replicas.
+;; Any certificate's 3 voters meet any 3 responders in >= 2 replicas, and at
+;; most 1 is faulty, so an honest responder holds that entry committed or as its
+;; pending vote: the latest certified head is the highest committed seq K seen,
+;; or K+1 when a responder at K holds a pending vote.
+;; Attestation = [1 index nonce4 state-len vote-len] state vote(0|65) signature64.
+;; Batch = [count len1 attestation1 len2 attestation2 ...], at most 8.
+;; Result = [status seq] desc85 tail:
+;;   1 committed head K, tail = its certificate;
+;;   2 certificate for K+1 assembled from 3 pending votes (not yet distributed),
+;;     tail = the certificate;
+;;   3 unresolved K+1 (1-2 pending votes seen), tail = those votes; the reader
+;;     must collect more votes or wait, and must not activate on it;
+;;   4 genesis (nothing certified or pending), no desc;
+;;   [0] rejected (fewer than 3 distinct valid, or two certified heads at a seq).
+;; The writer stays trusted: one writer signature per descriptor, and an
+;; equivocating writer is only bounded by the replicas' one vote per seq.
+(defn- message [cfg :vector-i64 prefix :vector-i64] :vector-i64
+  (c/message "awai.quorum.read.v1" (c/append (q/roster-id cfg) prefix)))
+(defn attestation [cfg :vector-i64 index :i64 seed :vector-i64 nonce :vector-i64
+                   state :vector-i64 vote :vector-i64] :vector-i64
+  (if (or (not (q/config? cfg)) (< index 0) (> index 3) (not= (vector-count nonce) 4)
+          (not (or (= (vector-count vote) 0) (= (vector-count vote) 65)))
+          (not= (vector-count seed) 32) (not (c/bytes? seed)))
+    (vector-i64)
+    (let [prefix (c/append (c/append (vector-i64 1 index) nonce)
+                   (c/append (vector-i64 (vector-count state) (vector-count vote))
+                     (c/append state vote)))
+          sig (vector-alloc 64) signed (ed/sign-into sig seed (message cfg prefix))]
+      (if (not= signed 0) (vector-i64) (c/append prefix sig)))))
+(defn- state [a :vector-i64] :vector-i64 (c/slice a 8 (vector-at a 6)))
+(defn- vote [a :vector-i64] :vector-i64 (c/slice a (+ 8 (vector-at a 6)) (vector-at a 7)))
+(defn- head-desc [s :vector-i64] :vector-i64 (c/slice s 15 85))
+(defn- pending-desc [s :vector-i64] :vector-i64
+  (c/slice s (+ 15 (+ (vector-at s 8) (vector-at s 9))) 85))
+(defn- snapshot? [cfg :vector-i64 index :i64 s :vector-i64] :bool
+  (and (>= (vector-count s) 15) (= (vector-at s 0) 1) (= (vector-at s 1) index)
+       (>= (vector-at s 2) 0) (<= (vector-at s 2) 256) (>= (vector-at s 3) 0)
+       (or (= (vector-at s 8) 0) (= (vector-at s 8) 85))
+       (or (= (vector-at s 9) 0) (= (vector-at s 9) 197) (= (vector-at s 9) 262))
+       (or (= (vector-at s 10) 0) (= (vector-at s 10) 85))
+       (= (vector-count s) (+ 15 (+ (vector-at s 8) (+ (vector-at s 9) (vector-at s 10)))))
+       (c/equal? (c/slice s 11 4) (q/roster-id cfg))
+       (if (= (vector-at s 2) 0)
+         (and (= (vector-at s 3) 0) (= (vector-at s 8) 0) (= (vector-at s 9) 0)
+              (c/equal? (c/slice s 4 4) (vector-i64 0 0 0 0)))
+         (let [desc (head-desc s)]
+           (and (= (vector-at s 8) 85) (= (vector-at desc 1) (vector-at s 2))
+                (= (vector-at desc 2) (vector-at s 3))
+                (c/equal? (c/slice s 4 4) (q/entry-id cfg desc))
+                (q/descriptor-certificate? cfg desc (c/slice s 100 (vector-at s 9))))))))
+(defn- pending? [cfg :vector-i64 index :i64 s :vector-i64 v :vector-i64] :bool
+  ;; The pending vote is the replica's own, for its next seq on its head.
+  (if (= (vector-at s 10) 0) (= (vector-count v) 0)
+    (let [desc (pending-desc s)]
+      (and (= (vector-count v) 65) (= (vector-at v 0) index)
+           (= (vector-at desc 1) (+ (vector-at s 2) 1)) (>= (vector-at desc 2) (vector-at s 3))
+           (c/equal? (c/slice desc 4 4) (c/slice s 4 4))
+           (q/proposal? cfg desc) (q/vote? cfg desc v)))))
+(defn- valid? [cfg :vector-i64 nonce :vector-i64 a :vector-i64] :bool
+  (arena-scope
+    (and (>= (vector-count a) 87) (= (vector-at a 0) 1)
+         (>= (vector-at a 1) 0) (< (vector-at a 1) 4)
+         (c/equal? (c/slice a 2 4) nonce)
+         (>= (vector-at a 6) 15) (<= (vector-at a 6) 447)
+         (or (= (vector-at a 7) 0) (= (vector-at a 7) 65))
+         (= (vector-count a) (+ 72 (+ (vector-at a 6) (vector-at a 7))))
+         (c/bytes? (c/slice a (- (vector-count a) 64) 64))
+         (ed/verify? (c/slice cfg (+ 8 (* (vector-at a 1) 32)) 32)
+           (message cfg (c/slice a 0 (- (vector-count a) 64)))
+           (c/slice a (- (vector-count a) 64) 64))
+         (snapshot? cfg (vector-at a 1) (state a))
+         (pending? cfg (vector-at a 1) (state a) (vote a)))))
+(defn- at [batch :vector-i64 offset :i64] :vector-i64
+  (c/slice batch offset (vector-at batch (- offset 1))))
+(defn- offsets [cfg :vector-i64 nonce :vector-i64 batch :vector-i64] :vector-i64
+  ;; Offsets of the first valid attestation of each distinct replica.
+  (if (or (< (vector-count batch) 1) (< (vector-at batch 0) 0) (> (vector-at batch 0) 8)) (vector-i64)
+    (loop [i 0 cursor 1 mask 0 out (vector-i64)]
+      (cond (= i (vector-at batch 0)) (if (= cursor (vector-count batch)) out (vector-i64))
+            (>= cursor (vector-count batch)) (vector-i64)
+            :else
+            (let [n (vector-at batch cursor) start (+ cursor 1)]
+              (if (or (< n 0) (> (+ start n) (vector-count batch))) (vector-i64)
+                (let [a (c/slice batch start n)]
+                  (if (and (valid? cfg nonce a)
+                           (= (bit-and mask (i64-shift-left 1 (vector-at a 1))) 0))
+                    (recur (+ i 1) (+ start n) (bit-or mask (i64-shift-left 1 (vector-at a 1)))
+                           (vector-conj out start))
+                    (recur (+ i 1) (+ start n) mask out)))))))))
+(defn- seq-of [batch :vector-i64 offset :i64] :i64 (vector-at (state (at batch offset)) 2))
+(defn- forked? [batch :vector-i64 offs :vector-i64] :bool
+  ;; Two different certified heads at one seq: more than one replica is faulty.
+  (loop [i 0]
+    (if (= i (vector-count offs)) false
+      (let [si (state (at batch (vector-at offs i)))]
+        (or (loop [j 0]
+              (if (= j i) false
+                (let [sj (state (at batch (vector-at offs j)))]
+                  (or (and (> (vector-at si 2) 0) (= (vector-at si 2) (vector-at sj 2))
+                           (not (c/equal? (c/slice si 4 4) (c/slice sj 4 4))))
+                      (recur (+ j 1))))))
+            (recur (+ i 1)))))))
+(defn- pending-at? [batch :vector-i64 offset :i64 top :i64] :bool
+  (and (= (seq-of batch offset) top) (= (vector-at (state (at batch offset)) 10) 85)))
+(defn- votes-for [batch :vector-i64 offs :vector-i64 top :i64 desc :vector-i64] :vector-i64
+  (loop [i 0 out (vector-i64)]
+    (if (= i (vector-count offs)) out
+      (let [o (vector-at offs i)]
+        (if (and (pending-at? batch o top) (c/equal? (pending-desc (state (at batch o))) desc))
+          (recur (+ i 1) (c/append out (vote (at batch o))))
+          (recur (+ i 1) out))))))
+(defn latest [cfg :vector-i64 nonce :vector-i64 batch :vector-i64] :vector-i64
+  (if (or (not (q/config? cfg)) (not= (vector-count nonce) 4)) (vector-i64 0)
+    (let [offs (offsets cfg nonce batch) n (vector-count offs)]
+      (if (or (< n 3) (forked? batch offs)) (vector-i64 0)
+        (let [top (loop [i 0 k 0]
+                    (if (= i n) k
+                      (recur (+ i 1) (if (> (seq-of batch (vector-at offs i)) k)
+                                       (seq-of batch (vector-at offs i)) k))))
+              holder (loop [i 0] (if (= (seq-of batch (vector-at offs i)) top) (vector-at offs i)
+                                   (recur (+ i 1))))
+              ;; The pending descriptor with the most votes among responders at top.
+              best (loop [i 0 desc (vector-i64) most 0]
+                     (if (= i n) desc
+                       (let [o (vector-at offs i)]
+                         (if (pending-at? batch o top)
+                           (let [d (pending-desc (state (at batch o)))
+                                 k (quot (vector-count (votes-for batch offs top d)) 65)]
+                             (if (> k most) (recur (+ i 1) d k) (recur (+ i 1) desc most)))
+                           (recur (+ i 1) desc most)))))
+              votes (if (= (vector-count best) 0) (vector-i64) (votes-for batch offs top best))]
+          (cond
+            (>= (vector-count votes) 195)
+            (let [cert (c/append (vector-i64 1 3) (c/slice votes 0 195))]
+              (if (q/descriptor-certificate? cfg best cert)
+                (c/append (vector-i64 2 (+ top 1)) (c/append best cert)) (vector-i64 0)))
+            (> (vector-count votes) 0) (c/append (vector-i64 3 (+ top 1)) (c/append best votes))
+            (= top 0) (vector-i64 4 0)
+            :else
+            (let [s (state (at batch holder))]
+              (c/append (vector-i64 1 top) (c/append (head-desc s) (c/slice s 100 (vector-at s 9)))))))))))

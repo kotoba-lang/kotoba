@@ -1,0 +1,307 @@
+;; mldsa.core -- ML-DSA-65 (NIST FIPS 204) in native .kotoba (JUN-352 P1b).
+;; Bytes are :vector-i64 of 0..255.
+;;   keygen xi              -> pk (1952) ++ sk (4032), empty unless xi is 32 bytes
+;;   sign sk m ctx rnd      -> signature (3309), pure ML-DSA with context ctx (at most
+;;                             255 bytes); rnd is 32 bytes (all zero for the
+;;                             deterministic variant)
+;;   verify pk m ctx sig    -> true for a valid signature
+;;   sign-internal / verify-internal take M' directly (Algorithms 7 and 8);
+;;   sign-mu / verify-mu take the 64-byte mu (the "external mu" form).
+;; Bad lengths or values outside 0..255 give an empty signature or false; so does a
+;; signing loop that has not accepted after 814 iterations.
+;; HashML-DSA (pre-hash) is not implemented. The caller supplies all randomness.
+;; Not constant-time: see the README. The NTT table is 1753^BitRev8(i) mod q; the
+;; native gate recomputes and compares it.
+(ns mldsa.core
+  (:export [keygen sign verify sign-internal verify-internal sign-mu verify-mu zetas])
+  (:require [sha3.core :as sha3]))
+
+;; q = 8380417, d = 13, tau = 49, lambda = 192, gamma1 = 2^19,
+;; gamma2 = (q - 1) / 32 = 261888, (k, l) = (6, 5), eta = 4, beta = 196, omega = 55
+(defn- md [x :i64] :i64 (let [r (rem x 8380417)] (if (< r 0) (+ r 8380417) r)))
+(defn- cent [x :i64] :i64 (let [r (md x)] (if (> r 4190208) (- r 8380417) r)))
+(defn- absv [x :i64] :i64 (if (< x 0) (- 0 x) x))
+
+(defn- slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+(defn- cat [a :vector-i64 b :vector-i64] :vector-i64
+  (let [na (vector-count a) out (vector-alloc (+ na (vector-count b)))]
+    (loop [i 0] (if (= i (vector-count out)) out
+      (let [z (vector-assoc! out i (if (< i na) (vector-at a i) (vector-at b (- i na))))] (recur (+ i 1)))))))
+(defn zetas [] :vector-i64
+  ;; four literals: a vector literal holds at most 64 items
+  (cat (cat (vector-i64 1 4808194 3765607 3761513 5178923 5496691 5234739 5178987 7778734 3542485 2682288 2129892 3764867 7375178 557458 7159240 5010068 4317364 2663378 6705802 4855975 7946292 676590 7044481 5152541 1714295 2453983 1460718 7737789 4795319 2815639 2283733 3602218 3182878 2740543 4793971 5269599 2101410 3704823 1159875 394148 928749 1095468 4874037 2071829 4361428 3241972 2156050 3415069 1759347 7562881 4805951 3756790 6444618 6663429 4430364 5483103 3192354 556856 3870317 2917338 1853806 3345963 1858416)
+            (vector-i64 3073009 1277625 5744944 3852015 4183372 5157610 5258977 8106357 2508980 2028118 1937570 4564692 2811291 5396636 7270901 4158088 1528066 482649 1148858 5418153 7814814 169688 2462444 5046034 4213992 4892034 1987814 5183169 1736313 235407 5130263 3258457 5801164 1787943 5989328 6125690 3482206 4197502 7080401 6018354 7062739 2461387 3035980 621164 3901472 7153756 2925816 3374250 1356448 5604662 2683270 5601629 4912752 2312838 7727142 7921254 348812 8052569 1011223 6026202 4561790 6458164 6143691 1744507))
+       (cat (vector-i64 1753 6444997 5720892 6924527 2660408 6600190 8321269 2772600 1182243 87208 636927 4415111 4423672 6084020 5095502 4663471 8352605 822541 1009365 5926272 6400920 1596822 4423473 4620952 6695264 4969849 2678278 4611469 4829411 635956 8129971 5925040 4234153 6607829 2192938 6653329 2387513 4768667 8111961 5199961 3747250 2296099 1239911 4541938 3195676 2642980 1254190 8368000 2998219 141835 8291116 2513018 7025525 613238 7070156 6161950 7921677 6458423 4040196 4908348 2039144 6500539 7561656 6201452)
+            (vector-i64 6757063 2105286 6006015 6346610 586241 7200804 527981 5637006 6903432 1994046 2491325 6987258 507927 7192532 7655613 6545891 5346675 8041997 2647994 3009748 5767564 4148469 749577 4357667 3980599 2569011 6764887 1723229 1665318 2028038 1163598 5011144 3994671 8368538 7009900 3020393 3363542 214880 545376 7609976 3105558 7277073 508145 7826699 860144 3430436 140244 6866265 6195333 3123762 2358373 6187330 5365997 6663603 2926054 7987710 8077412 3531229 4405932 4606686 1900052 7598542 1054478 7648983))))
+(defn- same? [a :vector-i64 b :vector-i64] :bool
+  (and (= (vector-count a) (vector-count b))
+       (loop [i 0] (if (= i (vector-count a)) true (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false)))))
+(defn- bytes? [v :vector-i64 n :i64] :bool
+  (and (= (vector-count v) n)
+       (loop [i 0] (if (= i n) true (if (and (>= (vector-at v i) 0) (<= (vector-at v i) 255)) (recur (+ i 1)) false)))))
+(defn- all-bytes? [v :vector-i64] :bool (bytes? v (vector-count v)))
+(defn- h-xof [b :vector-i64 n :i64] :vector-i64 (sha3/shake256 b n))
+(defn- poly [v :vector-i64 i :i64] :vector-i64 (slice v (* 256 i) 256))
+
+(defn- ntt [f :vector-i64] :vector-i64
+  ;; Algorithm 41
+  (let [w (slice f 0 256) z (zetas)]
+    (loop [len 128 m 0]
+      (if (< len 1) w
+        (let [next (loop [start 0 m m]
+                     (if (>= start 256) m
+                       (let [zeta (vector-at z (+ m 1))
+                             x (loop [j start]
+                                 (if (>= j (+ start len)) 0
+                                   (let [t (md (* zeta (vector-at w (+ j len)))) wj (vector-at w j)
+                                         a (vector-assoc! w (+ j len) (md (- wj t)))
+                                         b (vector-assoc! w j (md (+ wj t)))]
+                                     (recur (+ j 1)))))]
+                         (recur (+ start (* 2 len)) (+ m 1)))))]
+          (recur (quot len 2) next))))))
+
+(defn- ntt-inv [f :vector-i64] :vector-i64
+  ;; Algorithm 42, then times 8347681 = 256^-1 mod q
+  (let [w (slice f 0 256) z (zetas)
+        done (loop [len 1 m 256]
+               (if (>= len 256) 0
+                 (let [next (loop [start 0 m m]
+                              (if (>= start 256) m
+                                (let [zeta (md (- 0 (vector-at z (- m 1))))
+                                      x (loop [j start]
+                                          (if (>= j (+ start len)) 0
+                                            (let [t (vector-at w j) u (vector-at w (+ j len))
+                                                  a (vector-assoc! w j (md (+ t u)))
+                                                  b (vector-assoc! w (+ j len) (md (* zeta (- t u))))]
+                                              (recur (+ j 1)))))]
+                                  (recur (+ start (* 2 len)) (- m 1)))))]
+                   (recur (* 2 len) next))))]
+    (loop [i 0] (if (= i 256) w (let [x (vector-assoc! w i (md (* (vector-at w i) 8347681)))] (recur (+ i 1)))))))
+
+(defn- pmul [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (md (* (vector-at a i) (vector-at b i))))))))
+(defn- padd [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (md (+ (vector-at a i) (vector-at b i))))))))
+(defn- psub [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (md (- (vector-at a i) (vector-at b i))))))))
+
+;; vectors of n polynomials are flat, polynomial i at 256 i
+(defn- vmap-ntt [v :vector-i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-i64)] (if (= i n) out (recur (+ i 1) (cat out (ntt (poly v i)))))))
+(defn- vmap-inv [v :vector-i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-i64)] (if (= i n) out (recur (+ i 1) (cat out (ntt-inv (poly v i)))))))
+(defn- vscale [c :vector-i64 v :vector-i64 n :i64] :vector-i64
+  ;; NTT^-1(c-hat * v-hat[i]) for each i
+  (loop [i 0 out (vector-i64)] (if (= i n) out (recur (+ i 1) (cat out (ntt-inv (pmul c (poly v i))))))))
+(defn- vadd [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc (vector-count a))] (if (= i (vector-count a)) out (recur (+ i 1) (vector-assoc! out i (md (+ (vector-at a i) (vector-at b i))))))))
+(defn- vsub [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc (vector-count a))] (if (= i (vector-count a)) out (recur (+ i 1) (vector-assoc! out i (md (- (vector-at a i) (vector-at b i))))))))
+(defn- vnorm [v :vector-i64] :i64
+  (loop [i 0 m 0] (if (= i (vector-count v)) m (recur (+ i 1) (let [x (absv (cent (vector-at v i)))] (if (> x m) x m))))))
+
+(defn- pack [v :vector-i64 bits :i64] :vector-i64
+  ;; SimpleBitPack of already non-negative values, least significant bit first
+  (loop [i 0 buf 0 nb 0 o 0 out (vector-alloc (quot (* (vector-count v) bits) 8))]
+    (cond (>= nb 8) (recur i (quot buf 256) (- nb 8) (+ o 1) (vector-assoc! out o (rem buf 256)))
+          (= i (vector-count v)) out
+          :else (recur (+ i 1) (+ buf (* (vector-at v i) (i64-shift-left 1 nb))) (+ nb bits) o out))))
+(defn- unpack [b :vector-i64 start :i64 bits :i64 n :i64] :vector-i64
+  (let [m (i64-shift-left 1 bits)]
+    (loop [i start buf 0 nb 0 o 0 out (vector-alloc n)]
+      (cond (= o n) out
+            (>= nb bits) (recur i (quot buf m) (- nb bits) (+ o 1) (vector-assoc! out o (rem buf m)))
+            :else (recur (+ i 1) (+ buf (* (vector-at b i) (i64-shift-left 1 nb))) (+ nb 8) o out)))))
+(defn- offset-pack [v :vector-i64 top :i64 bits :i64] :vector-i64
+  ;; BitPack(w, a, b) stores b - w
+  (pack (loop [i 0 out (vector-alloc (vector-count v))]
+          (if (= i (vector-count v)) out (recur (+ i 1) (vector-assoc! out i (- top (cent (vector-at v i)))))))
+        bits))
+(defn- offset-unpack [b :vector-i64 start :i64 top :i64 bits :i64 n :i64] :vector-i64
+  (let [u (unpack b start bits n)]
+    (loop [i 0] (if (= i n) u (let [x (vector-assoc! u i (md (- top (vector-at u i))))] (recur (+ i 1)))))))
+
+(defn- rej-ntt-from [buf :vector-i64] :vector-i64
+  ;; Algorithm 30 over a squeezed prefix; empty when it runs out
+  (loop [pos 0 n 0 out (vector-alloc 256)]
+    (cond (= n 256) out
+          (> (+ pos 3) (vector-count buf)) (vector-i64)
+          :else (let [x (+ (vector-at buf pos) (* 256 (vector-at buf (+ pos 1))) (* 65536 (bit-and (vector-at buf (+ pos 2)) 127)))]
+                  (if (< x 8380417) (recur (+ pos 3) (+ n 1) (vector-assoc! out n x)) (recur (+ pos 3) n out))))))
+(defn- rej-ntt [seed :vector-i64] :vector-i64
+  ;; SHAKE output is prefix-consistent (the SHA-3 gate checks it), so a longer
+  ;; one-shot squeeze reads the same bytes as the incremental one
+  (loop [blocks 5]
+    (let [r (rej-ntt-from (sha3/shake128 seed (* 168 blocks)))]
+      (if (> (vector-count r) 0) r (recur (+ blocks 2))))))
+(defn- rej-bounded-from [buf :vector-i64] :vector-i64
+  ;; Algorithm 31 with eta = 4: a half-byte b < 9 gives 4 - b
+  (loop [pos 0 half 0 n 0 out (vector-alloc 256)]
+    (cond (= n 256) out
+          (>= pos (vector-count buf)) (vector-i64)
+          :else (let [z (vector-at buf pos) b (if (= half 0) (rem z 16) (quot z 16))
+                      pos2 (if (= half 0) pos (+ pos 1)) half2 (- 1 half)]
+                  (if (< b 9) (recur pos2 half2 (+ n 1) (vector-assoc! out n (md (- 4 b)))) (recur pos2 half2 n out))))))
+(defn- rej-bounded [seed :vector-i64] :vector-i64
+  (loop [blocks 2]
+    (let [r (rej-bounded-from (h-xof seed (* 136 blocks)))]
+      (if (> (vector-count r) 0) r (recur (+ blocks 1))))))
+
+(defn- expand-a [rho :vector-i64] :vector-i64
+  ;; Algorithm 32: A-hat[r][s] = RejNTTPoly(rho || s || r), flat at (5 r + s) * 256
+  (loop [rs 0 out (vector-i64)]
+    (if (= rs 30) out (recur (+ rs 1) (cat out (rej-ntt (cat rho (vector-i64 (rem rs 5) (quot rs 5)))))))))
+(defn- matvec [a :vector-i64 v :vector-i64] :vector-i64
+  ;; A-hat (6 x 5) times v-hat (5), both in the NTT domain
+  (loop [r 0 out (vector-i64)]
+    (if (= r 6) out
+      (recur (+ r 1)
+             (cat out (loop [s 0 acc (vector-alloc 256)]
+                        (if (= s 5) acc (recur (+ s 1) (padd acc (pmul (poly a (+ (* 5 r) s)) (poly v s)))))))))))
+
+(defn- power2-low [r :i64] :i64
+  ;; Algorithm 35: r0 = r mod+- 2^13
+  (let [x (rem (md r) 8192)] (if (> x 4096) (- x 8192) x)))
+(defn- decompose-high [r :i64] :i64
+  ;; Algorithm 36
+  (let [rp (md r) x (rem rp 523776) r0 (if (> x 261888) (- x 523776) x)]
+    (if (= (- rp r0) 8380416) 0 (quot (- rp r0) 523776))))
+(defn- decompose-low [r :i64] :i64
+  (let [rp (md r) x (rem rp 523776) r0 (if (> x 261888) (- x 523776) x)]
+    (if (= (- rp r0) 8380416) (- r0 1) r0)))
+(defn- use-hint [h :i64 r :i64] :i64
+  ;; Algorithm 40 with m = 16
+  (let [r1 (decompose-high r) r0 (decompose-low r)]
+    (cond (= h 0) r1
+          (> r0 0) (rem (+ r1 1) 16)
+          :else (rem (+ r1 15) 16))))
+(defn- vhigh [v :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc (vector-count v))] (if (= i (vector-count v)) out (recur (+ i 1) (vector-assoc! out i (decompose-high (vector-at v i)))))))
+
+(defn- sample-in-ball-from [b :vector-i64] :vector-i64
+  ;; Algorithm 29 with tau = 49; the signs are bits 0..48 of b[0..8]
+  (let [c (vector-alloc 256)]
+    (loop [i 207 pos 8]
+      (if (= i 256) c
+        (let [j-pos (loop [p pos] (cond (>= p (vector-count b)) -1 (<= (vector-at b p) i) p :else (recur (+ p 1))))]
+          (if (< j-pos 0) (vector-i64)
+            (let [j (vector-at b j-pos) k (- i 207)
+                  sg (bit-and (i64-shift-right (vector-at b (quot k 8)) (rem k 8)) 1)
+                  x (vector-assoc! c i (vector-at c j))
+                  y (vector-assoc! c j (if (= sg 0) 1 8380416))]
+              (recur (+ i 1) (+ j-pos 1)))))))))
+(defn- sample-in-ball [ct :vector-i64] :vector-i64
+  (loop [blocks 1]
+    (let [r (sample-in-ball-from (h-xof ct (* 136 blocks)))]
+      (if (> (vector-count r) 0) r (recur (+ blocks 1))))))
+
+(defn- w1-encode [w1 :vector-i64] :vector-i64 (pack w1 4))
+
+(defn keygen [xi :vector-i64] :vector-i64
+  ;; Algorithm 6: pk ++ sk
+  (if (not (bytes? xi 32)) (vector-i64)
+    (let [h (h-xof (cat xi (vector-i64 6 5)) 128)
+          rho (slice h 0 32) rho2 (slice h 32 64) key (slice h 96 32)
+          a (expand-a rho)
+          s1 (loop [r 0 out (vector-i64)] (if (= r 5) out (recur (+ r 1) (cat out (rej-bounded (cat rho2 (vector-i64 r 0)))))))
+          s2 (loop [r 0 out (vector-i64)] (if (= r 6) out (recur (+ r 1) (cat out (rej-bounded (cat rho2 (vector-i64 (+ r 5) 0)))))))
+          t (vadd (vmap-inv (matvec a (vmap-ntt s1 5)) 6) s2)
+          t0 (loop [i 0 out (vector-alloc 1536)] (if (= i 1536) out (recur (+ i 1) (vector-assoc! out i (md (power2-low (vector-at t i)))))))
+          t1 (loop [i 0 out (vector-alloc 1536)]
+               (if (= i 1536) out (recur (+ i 1) (vector-assoc! out i (quot (- (vector-at t i) (power2-low (vector-at t i))) 8192)))))
+          pk (cat rho (pack t1 10))
+          sk (cat (cat (cat (cat rho key) (h-xof pk 64)) (cat (offset-pack s1 4 4) (offset-pack s2 4 4)))
+                  (offset-pack t0 4096 13))]
+      (cat pk sk))))
+
+(defn sign-mu [sk :vector-i64 mu :vector-i64 rnd :vector-i64] :vector-i64
+  ;; Algorithm 7 from line 7, with mu given
+  (if (or (not (bytes? sk 4032)) (not (bytes? mu 64)) (not (bytes? rnd 32))) (vector-i64)
+    (let [rho (slice sk 0 32) key (slice sk 32 32)
+          s1h (vmap-ntt (offset-unpack sk 128 4 4 1280) 5)
+          s2h (vmap-ntt (offset-unpack sk 768 4 4 1536) 6)
+          t0h (vmap-ntt (offset-unpack sk 1536 4096 13 1536) 6)
+          a (expand-a rho)
+          rho2 (h-xof (cat (cat key rnd) mu) 64)]
+      ;; FIPS 204 lets the rejection loop be bounded if hitting the bound returns an
+      ;; error rather than a signature; 814 iterations is the smallest bound it allows
+      (loop [kappa 0]
+        (if (>= kappa 4070) (vector-i64)
+        (let [y (loop [r 0 out (vector-i64)]
+                  (if (= r 5) out
+                    (recur (+ r 1) (cat out (offset-unpack (h-xof (cat rho2 (vector-i64 (rem (+ kappa r) 256) (quot (+ kappa r) 256))) 640)
+                                                           0 524288 20 256)))))
+              w (vmap-inv (matvec a (vmap-ntt y 5)) 6)
+              ct (h-xof (cat mu (w1-encode (vhigh w))) 48)
+              ch (ntt (sample-in-ball ct))
+              z (vadd y (vscale ch s1h 5))
+              wm (vsub w (vscale ch s2h 6))
+              r0 (loop [i 0 m 0] (if (= i 1536) m (recur (+ i 1) (let [x (absv (decompose-low (vector-at wm i)))] (if (> x m) x m)))))]
+          (if (or (>= (vnorm z) 524092) (>= r0 261692)) (recur (+ kappa 5))
+            (let [ct0 (vscale ch t0h 6)
+                  hints (loop [i 0 out (vector-alloc 1536)]
+                          (if (= i 1536) out
+                            (recur (+ i 1) (vector-assoc! out i (if (= (decompose-high (vector-at wm i))
+                                                                       (decompose-high (md (+ (vector-at wm i) (vector-at ct0 i))))) 0 1)))))
+                  nh (loop [i 0 n 0] (if (= i 1536) n (recur (+ i 1) (+ n (vector-at hints i)))))]
+              (if (or (>= (vnorm ct0) 261888) (> nh 55)) (recur (+ kappa 5))
+                (let [hb (vector-alloc 61)
+                      filled (loop [i 0 idx 0]
+                               (if (= i 6) idx
+                                 (let [idx2 (loop [j 0 idx idx]
+                                              (if (= j 256) idx
+                                                (if (= (vector-at hints (+ (* 256 i) j)) 1)
+                                                  (let [x (vector-assoc! hb idx j)] (recur (+ j 1) (+ idx 1)))
+                                                  (recur (+ j 1) idx))))
+                                       x (vector-assoc! hb (+ 55 i) idx2)]
+                                   (recur (+ i 1) idx2))))]
+                  (cat (cat ct (offset-pack z 524288 20)) hb)))))))))))
+
+(defn- hint-unpack [hb :vector-i64] :vector-i64
+  ;; Algorithm 21; empty when malformed
+  (let [h (vector-alloc 1536)
+        end (loop [i 0 idx 0]
+              (if (= i 6) idx
+                (let [lim (vector-at hb (+ 55 i))]
+                  (if (or (< lim idx) (> lim 55)) -1
+                    (let [r (loop [p idx]
+                              (cond (= p lim) p
+                                    (and (> p idx) (>= (vector-at hb (- p 1)) (vector-at hb p))) -1
+                                    :else (let [x (vector-assoc! h (+ (* 256 i) (vector-at hb p)) 1)] (recur (+ p 1)))))]
+                      (if (< r 0) -1 (recur (+ i 1) r)))))))]
+    (if (< end 0) (vector-i64)
+      (if (loop [p end] (cond (= p 55) true (= (vector-at hb p) 0) (recur (+ p 1)) :else false)) h (vector-i64)))))
+
+(defn- t1-shifted [t1 :vector-i64 r :i64] :vector-i64
+  ;; t1[r] * 2^d
+  (loop [i 0 o (vector-alloc 256)] (if (= i 256) o (recur (+ i 1) (vector-assoc! o i (md (* 8192 (vector-at t1 (+ (* 256 r) i)))))))))
+
+(defn verify-mu [pk :vector-i64 mu :vector-i64 sig :vector-i64] :bool
+  ;; Algorithm 8 from line 7, with mu given
+  (if (or (not (bytes? pk 1952)) (not (bytes? mu 64)) (not (bytes? sig 3309))) false
+    (let [h (hint-unpack (slice sig 3248 61))
+          z (offset-unpack sig 48 524288 20 1280)]
+      (if (or (= (vector-count h) 0) (>= (vnorm z) 524092)) false
+        (let [ct (slice sig 0 48)
+              t1 (unpack pk 32 10 1536)
+              ch (ntt (sample-in-ball ct))
+              az (matvec (expand-a (slice pk 0 32)) (vmap-ntt z 5))
+              w (loop [r 0 out (vector-i64)]
+                  (if (= r 6) out
+                    (recur (+ r 1) (cat out (ntt-inv (psub (poly az r) (pmul ch (ntt (t1-shifted t1 r)))))))))
+              w1 (loop [i 0 out (vector-alloc 1536)] (if (= i 1536) out (recur (+ i 1) (vector-assoc! out i (use-hint (vector-at h i) (vector-at w i))))))]
+          (same? ct (h-xof (cat mu (w1-encode w1)) 48)))))))
+
+(defn sign-internal [sk :vector-i64 mp :vector-i64 rnd :vector-i64] :vector-i64
+  (if (or (not (bytes? sk 4032)) (not (all-bytes? mp))) (vector-i64)
+    (sign-mu sk (h-xof (cat (slice sk 64 64) mp) 64) rnd)))
+(defn verify-internal [pk :vector-i64 mp :vector-i64 sig :vector-i64] :bool
+  (and (bytes? pk 1952) (all-bytes? mp) (verify-mu pk (h-xof (cat (h-xof pk 64) mp) 64) sig)))
+(defn- pure-message [m :vector-i64 ctx :vector-i64] :vector-i64
+  ;; Algorithms 2 and 3: M' = 0 || |ctx| || ctx || M
+  (cat (cat (vector-i64 0 (vector-count ctx)) ctx) m))
+(defn sign [sk :vector-i64 m :vector-i64 ctx :vector-i64 rnd :vector-i64] :vector-i64
+  (if (or (> (vector-count ctx) 255) (not (all-bytes? ctx))) (vector-i64) (sign-internal sk (pure-message m ctx) rnd)))
+(defn verify [pk :vector-i64 m :vector-i64 ctx :vector-i64 sig :vector-i64] :bool
+  (and (<= (vector-count ctx) 255) (all-bytes? ctx) (verify-internal pk (pure-message m ctx) sig)))

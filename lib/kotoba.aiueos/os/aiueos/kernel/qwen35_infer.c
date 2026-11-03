@@ -223,6 +223,12 @@ static float silu(float value) {
   return value * sigmoid(value);
 }
 
+/* In the model-handoff image the read is kotoba/cpu-reads.kotoba (JUN-554, amu ADR 0389's kernel-rdtsc: the same lfence;
+   rdtsc); the parity profiles and the host smokes, which do not link it, keep the C. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_read_cycles(void);
+static uint64_t read_cycles(void) { return (uint64_t)kotoba_aiueos_read_cycles(); }
+#else
 static uint64_t read_cycles(void) {
 #if defined(__x86_64__)
   uint32_t low, high;
@@ -232,6 +238,7 @@ static uint64_t read_cycles(void) {
   return 0;
 #endif
 }
+#endif
 
 static float dot_scalar(const float * left, const float * right,
                         uint64_t count) {
@@ -252,6 +259,13 @@ static float dot_scalar(const float * left, const float * right,
 typedef float qwen_v8f __attribute__((vector_size(32), aligned(1)));
 typedef float qwen_v4f __attribute__((vector_size(16), aligned(1)));
 
+/* In the model-handoff image the extended-state setup and the AVX2 probe are kotoba/xstate-setup.kotoba (JUN-554, over amu
+   ADR 0389 / 0390's CPU and bit-bounded CR4 / XCR0 intrinsics); the parity profiles and the host smokes keep the C. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_prepare_extended_state(void);
+extern int64_t kotoba_aiueos_cpu_has_avx2(void);
+static void prepare_bsp_extended_state(void) { (void)kotoba_aiueos_prepare_extended_state(); }
+#else
 static void prepare_bsp_extended_state(void) {
   uint32_t eax, ebx, ecx, edx;
   __asm__ volatile("cpuid"
@@ -270,6 +284,7 @@ static void prepare_bsp_extended_state(void) {
   __asm__ volatile("xsetbv"
                    : : "a"(xcr0_low), "d"(xcr0_high), "c"(0U));
 }
+#endif
 
 __attribute__((target("avx2")))
 static float dot_avx2(const float *left, const float *right, uint64_t count) {
@@ -301,6 +316,9 @@ static float dot_avx2(const float *left, const float *right, uint64_t count) {
   return sum;
 }
 
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+static int cpu_has_avx2(void) { return kotoba_aiueos_cpu_has_avx2() == 1; }
+#else
 static int cpu_has_avx2(void) {
   uint32_t eax, ebx, ecx, edx;
   __asm__ volatile("cpuid"
@@ -321,6 +339,7 @@ static int cpu_has_avx2(void) {
                    : "a"(7U), "c"(0U));
   return (ebx & (1U << 5)) != 0;
 }
+#endif
 #endif
 
 static float dot(const float *left, const float *right, uint64_t count) {
@@ -416,9 +435,9 @@ static int matvec_range(const struct aiueos_qwen35_tensor *tensor,
    tensor is handed over in row chunks of `2097152 / cols` -- 409 rows of
    an EMBED-wide tensor, 120 of an FFN-wide one -- and a refusal partway
    leaves the output half written, which the return value says. */
-extern uint64_t kotoba_aiueos_qwen35_matvec(uint8_t *arena, uint64_t arena_bytes,
-                                            const uint8_t *plan,
-                                            uint64_t plan_bytes);
+/* JUN-633: the object is now built on amu's native route as a plan check and a
+   row export; qwen_matvec_kotoba (qwen35_matvec_plan.h) keeps this contract. */
+#include "qwen35_matvec_plan.h"
 
 #define QWEN_MATVEC_ARENA_BASE 4096ULL
 #define QWEN_MATVEC_ARENA_END (64ULL * 1024ULL * 1024ULL * 1024ULL)
@@ -469,7 +488,7 @@ static int matvec_range(const struct aiueos_qwen35_tensor *tensor,
     uint64_t stop = end - row < chunk ? end : row + chunk;
     qwen_plan_u64(plan, 64, row);
     qwen_plan_u64(plan, 72, stop);
-    if (kotoba_aiueos_qwen35_matvec((uint8_t *)(uintptr_t)QWEN_MATVEC_ARENA_BASE,
+    if (qwen_matvec_kotoba((uint8_t *)(uintptr_t)QWEN_MATVEC_ARENA_BASE,
                                     QWEN_MATVEC_ARENA_END - QWEN_MATVEC_ARENA_BASE,
                                     plan, 96) != 0)
       return 0;
@@ -669,14 +688,20 @@ static void linear_output_norm_c(float *values, float *gate, uint32_t heads,
 #define QWEN_ACT_CONV4_NEXT 6U
 
 #if AIUEOS_QWEN35_KOTOBA_PARITY == 2 || !defined(AIUEOS_QWEN35_C_REFERENCE_NORM)
-extern uint64_t kotoba_aiueos_qwen35_activation(uint64_t mode, float *a,
-                                                const float *b, uint64_t count,
-                                                uint64_t spare);
-/* Every argument as a word: mode 0 reads `b` as a POINTER (the weights) while
-   modes 1 and 2 read it as a head COUNT, so a typed declaration would have to
-   lie about one of them. */
-extern uint64_t kotoba_aiueos_qwen35_norm(uint64_t mode, uint64_t a, uint64_t b,
-                                          uint64_t c, uint64_t d);
+/* JUN-633: every pointer comes with its own length (amu's native object route).
+   mode_channel is the mode (0..6) | the channel << 8; modes 5 and 6 (the conv)
+   compute that one channel, so conv4 calls once per channel. A length the
+   shape does not give, or a channel past count, is refused (-9). */
+extern uint64_t kotoba_aiueos_qwen35_activation(uint64_t mode_channel, float *a, uint64_t a_length,
+                                                const float *b, uint64_t b_length, float *h,
+                                                uint64_t h_length, uint64_t count);
+/* JUN-633: every pointer comes with its own length (amu's native object route).
+   mode_heads is the mode (0..3) | the head count << 8; count is mode 0's count
+   or modes 1..3's width. A length that is not the one the shape gives is
+   refused (-9). */
+extern uint64_t kotoba_aiueos_qwen35_norm(uint64_t mode_heads, uint64_t a, uint64_t a_length,
+                                          uint64_t w, uint64_t w_length, uint64_t o,
+                                          uint64_t o_length, uint64_t count);
 #endif
 
 #ifdef AIUEOS_QWEN35_C_REFERENCE_NORM
@@ -734,9 +759,9 @@ static int rms_norm(const float *input,
                     uint64_t count, float *output) {
   const float *weight = f32_vector(weights, count);
   if (!weight) return 0;
-  return kotoba_aiueos_qwen35_norm(0, (uint64_t)(uintptr_t)input,
-                                   (uint64_t)(uintptr_t)weight, count,
-                                   (uint64_t)(uintptr_t)output) == 0;
+  return kotoba_aiueos_qwen35_norm(0, (uint64_t)(uintptr_t)input, count * 4U,
+                                   (uint64_t)(uintptr_t)weight, count * 4U,
+                                   (uint64_t)(uintptr_t)output, count * 4U, count) == 0;
 }
 
 static int rms_norm_heads_weighted(float *values, uint32_t heads,
@@ -744,29 +769,36 @@ static int rms_norm_heads_weighted(float *values, uint32_t heads,
                                    const struct aiueos_qwen35_tensor *tensor) {
   const float *weights = f32_vector(tensor, width);
   if (!weights) return 0;
-  return kotoba_aiueos_qwen35_norm(2, (uint64_t)(uintptr_t)values, heads,
-                                   width,
-                                   (uint64_t)(uintptr_t)weights) == 0;
+  return kotoba_aiueos_qwen35_norm(2U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                   (uint64_t)heads * width * 4U, (uint64_t)(uintptr_t)weights,
+                                   (uint64_t)width * 4U, 0, 0, width) == 0;
 }
 
 static int l2_norm_heads(float *values, uint32_t heads, uint32_t width) {
-  return kotoba_aiueos_qwen35_norm(1, (uint64_t)(uintptr_t)values, heads,
-                                   width, 0) == 0;
+  return kotoba_aiueos_qwen35_norm(1U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                   (uint64_t)heads * width * 4U, 0, 0, 0, 0, width) == 0;
 }
 
 static int activate(uint32_t mode, float *values, const float *gate,
                     uint64_t count) {
-  return kotoba_aiueos_qwen35_activation(mode, values, gate, count, 0) == 0;
+  return kotoba_aiueos_qwen35_activation(mode, values, count * 4U, gate, gate ? count * 4U : 0, 0, 0,
+                                         count) == 0;
 }
 
-/* The conv is modes 5 and 6 of the activation object, with the history's
-   address in its fifth word. Mode 6 refuses a null history; a later token
-   without a cache is not a state this pass can reach. */
+/* The conv is modes 5 and 6 of the activation object, one channel per call
+   (each channel touches only its own value, kernel row and history row), with
+   the history as its third region. Mode 6 refuses a null history; a later token
+   without a cache is not a state this pass can reach. The loop makes at least
+   one call, so a zero count is refused by the object as before. */
 static int conv4(float *values, const float *kernel, float *history,
                  uint64_t position, uint64_t count) {
-  return kotoba_aiueos_qwen35_activation(
-    position ? QWEN_ACT_CONV4_NEXT : QWEN_ACT_CONV4_FIRST, values, kernel,
-    count, (uint64_t)(uintptr_t)history) == 0;
+  uint64_t mode = position ? QWEN_ACT_CONV4_NEXT : QWEN_ACT_CONV4_FIRST, channel = 0;
+  do {
+    if (kotoba_aiueos_qwen35_activation(mode | channel << 8, values, count * 4U, kernel, count * 16U,
+                                        history, history ? count * 12U : 0, count) != 0)
+      return 0;
+  } while (++channel < count);
+  return 1;
 }
 
 /* The output norm is mode 3 of the norm object, in place over `values`; the
@@ -777,10 +809,11 @@ static int conv4(float *values, const float *kernel, float *history,
    `values`).  Null is a refusal. */
 static float *linear_output_norm(float *values, float *gate, uint32_t heads,
                                  uint32_t width, const float *weights) {
-  if (kotoba_aiueos_qwen35_norm(3, (uint64_t)(uintptr_t)values, heads, width,
-                                (uint64_t)(uintptr_t)weights) != 0 ||
-      kotoba_aiueos_qwen35_activation(QWEN_ACT_SILU_GATE, gate, values,
-                                      (uint64_t)heads * width, 0) != 0)
+  if (kotoba_aiueos_qwen35_norm(3U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                (uint64_t)heads * width * 4U, (uint64_t)(uintptr_t)weights,
+                                (uint64_t)width * 4U, 0, 0, width) != 0 ||
+      kotoba_aiueos_qwen35_activation(QWEN_ACT_SILU_GATE, gate, (uint64_t)heads * width * 4U, values,
+                                      (uint64_t)heads * width * 4U, 0, 0, (uint64_t)heads * width) != 0)
     return 0;
   return gate;
 }
@@ -983,6 +1016,28 @@ static int linear_zero_coefficient(const float *query, const float *key,
 #endif
 }
 
+/* The residual add each layer ends with, state[i] += x[i] over EMBED floats. In the model-handoff image it is
+   kotoba/qwen35-residual.kotoba (JUN-554, over amu ADR 0391's scalar SSE f32), called per 4096 floats (16 KiB, its
+   window); the parity profiles and the host smokes, which do not link it, keep the C. Every element's add is
+   independent, so the chunks and the C's vectorized loop give the same bits. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_qwen35_residual_add(uint64_t state, uint64_t state_bytes, uint64_t x, uint64_t x_bytes);
+static int residual_add(float *state, const float *x) {
+  for (uint32_t done = 0; done < EMBED; done += 4096U) {
+    uint32_t part = EMBED - done < 4096U ? EMBED - done : 4096U;
+    if (kotoba_aiueos_qwen35_residual_add((uint64_t)(uintptr_t)(state + done), (uint64_t)part * 4,
+                                          (uint64_t)(uintptr_t)(x + done), (uint64_t)part * 4) != 1)
+      return 0;
+  }
+  return 1;
+}
+#else
+static int residual_add(float *state, const float *x) {
+  for (uint32_t index = 0; index < EMBED; index++) state[index] += x[index];
+  return 1;
+}
+#endif
+
 static int ffn(const struct aiueos_qwen35_layer *layer) {
   if (!rms_norm(state, &layer->post_attention_norm, EMBED, normalized) ||
       !matvec(&layer->ffn_gate, normalized, EMBED, scratch_a, FFN) ||
@@ -990,8 +1045,7 @@ static int ffn(const struct aiueos_qwen35_layer *layer) {
       !activate(QWEN_ACT_SILU_GATE, scratch_a, scratch_b, FFN))
     return 0;
   if (!matvec(&layer->ffn_down, scratch_a, FFN, scratch_b, EMBED)) return 0;
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += scratch_b[index];
-  return 1;
+  return residual_add(state, scratch_b);
 }
 
 static const float *resolved_cached_key(
@@ -1138,7 +1192,7 @@ static int linear_attention(const struct aiueos_qwen35_layer *layer,
 
   if (!matvec(&linear->output, gated, LINEAR_INNER, normalized, EMBED))
     return fail_at(AIUEOS_QWEN35_FAILURE_LINEAR_OUTPUT);
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += normalized[index];
+  if (!residual_add(state, normalized)) return fail_at(AIUEOS_QWEN35_FAILURE_LINEAR_OUTPUT);
   return 1;
 }
 
@@ -1428,7 +1482,7 @@ static int full_attention(const struct aiueos_qwen35_layer *layer,
   }
   if (!matvec(&full->output, scratch_c, LINEAR_INNER, normalized, EMBED))
     return fail_at(AIUEOS_QWEN35_FAILURE_FULL_OUTPUT);
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += normalized[index];
+  if (!residual_add(state, normalized)) return fail_at(AIUEOS_QWEN35_FAILURE_FULL_OUTPUT);
   return 1;
 }
 
@@ -1483,6 +1537,56 @@ static void configure_backend(void) {
 /* The logits of `normalized` against the output projection, and the two
    largest of them. Zero on a malformed tensor, a refused matvec or a
    non-finite logit; the caller names the failure stage. */
+/* In the model-handoff image the selection is kotoba/qwen35-select.kotoba (JUN-554, over amu ADR 0391's scalar SSE
+   f32); the parity profiles and the host smokes, which do not link it, keep the C. The object's 24-byte state is the
+   token, the second token, the two logits' bits and the token of the window's first logit; a window is at most 4096
+   logits (16 KiB). It answers 1, or 0 at the first non-finite logit with the state the logits before it left. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_qwen35_select(uint64_t logits, uint64_t bytes, uint64_t state, uint64_t state_bytes);
+static uint32_t select_float_bits(float value) {
+  union { float value; uint32_t bits; } representation = {value};
+  return representation.bits;
+}
+static float select_bits_float(uint32_t bits) {
+  union { uint32_t bits; float value; } representation = {bits};
+  return representation.value;
+}
+static int select_view(const float *logits, uint32_t first, uint32_t count, struct qwen35_token_choice *choice) {
+  uint32_t state[6] = {choice->token, choice->second_token, select_float_bits(choice->logit),
+                       select_float_bits(choice->second_logit), 0, 0};
+  int ok = 1;
+  for (uint32_t done = 0; ok && done < count; done += 4096) {
+    uint32_t part = count - done < 4096 ? count - done : 4096;
+    state[4] = first + done;
+    ok = kotoba_aiueos_qwen35_select((uint64_t)(uintptr_t)(logits + done), (uint64_t)part * 4,
+                                     (uint64_t)(uintptr_t)state, sizeof state) == 1;
+  }
+  choice->token = state[0];
+  choice->second_token = state[1];
+  choice->logit = select_bits_float(state[2]);
+  choice->second_logit = select_bits_float(state[3]);
+  return ok;
+}
+#else
+static int select_view(const float *logits, uint32_t first, uint32_t count, struct qwen35_token_choice *choice) {
+  for (uint32_t offset = 0; offset < count; offset++) {
+    uint32_t token = first + offset;
+    float logit = logits[offset];
+    if (!finite_float(logit)) return 0;
+    if (logit > choice->logit) {
+      choice->second_logit = choice->logit;
+      choice->second_token = choice->token;
+      choice->logit = logit;
+      choice->token = token;
+    } else if (logit > choice->second_logit) {
+      choice->second_logit = logit;
+      choice->second_token = token;
+    }
+  }
+  return 1;
+}
+#endif
+
 static int select_output_token(const struct aiueos_qwen35_tensor *output,
                                uint32_t vocab,
                                struct qwen35_token_choice *choice) {
@@ -1510,20 +1614,7 @@ static int select_output_token(const struct aiueos_qwen35_tensor *output,
     view.data = output->data + (uint64_t)first * row_bytes;
     view.storage_bytes = (uint64_t)count * row_bytes;
     if (!matvec(&view, normalized, EMBED, scratch_a, count)) return 0;
-    for (uint32_t offset = 0; offset < count; offset++) {
-      uint32_t token = first + offset;
-      float logit = scratch_a[offset];
-      if (!finite_float(logit)) return 0;
-      if (logit > choice->logit) {
-        choice->second_logit = choice->logit;
-        choice->second_token = choice->token;
-        choice->logit = logit;
-        choice->token = token;
-      } else if (logit > choice->second_logit) {
-        choice->second_logit = logit;
-        choice->second_token = token;
-      }
-    }
+    if (!select_view(scratch_a, first, count, choice)) return 0;
   }
   return 1;
 }
@@ -2049,7 +2140,7 @@ static int qwen_parity_matvec(uint32_t type) {
   qwen_parity_write_u64(qwen_parity_plan, 56, scratch_offset);
   qwen_parity_write_u64(qwen_parity_plan, 64, 0);
   qwen_parity_write_u64(qwen_parity_plan, 72, QWEN_PARITY_ROWS);
-  if (kotoba_aiueos_qwen35_matvec(qwen_parity_arena, arena_bytes,
+  if (qwen_matvec_kotoba(qwen_parity_arena, arena_bytes,
                                   qwen_parity_plan, 96) != 0)
     return 0;
   {
@@ -2064,7 +2155,7 @@ static int qwen_parity_matvec(uint32_t type) {
      self-test that only ever sees agreement has not shown the object
      discriminates. */
   qwen_parity_write_u32(qwen_parity_plan, 4, 1);
-  if (kotoba_aiueos_qwen35_matvec(qwen_parity_arena, arena_bytes,
+  if (qwen_matvec_kotoba(qwen_parity_arena, arena_bytes,
                                   qwen_parity_plan, 96) !=
       (uint64_t)(int64_t)-4)
     return 0;
@@ -2156,13 +2247,13 @@ static int qwen_parity_activation(void) {
         return 0;
   }
   /* Refusals, so the object is not merely believed to compute. */
-  if (kotoba_aiueos_qwen35_activation(7, qwen_parity_act_obj,
-                                      qwen_parity_act_gate,
-                                      QWEN_PARITY_ACT, 0) != (uint64_t)(int64_t)-2)
+  if (kotoba_aiueos_qwen35_activation(7, qwen_parity_act_obj, QWEN_PARITY_ACT * 4U,
+                                      qwen_parity_act_gate, QWEN_PARITY_ACT * 4U, 0, 0,
+                                      QWEN_PARITY_ACT) != (uint64_t)(int64_t)-2)
     return 0;
-  if (kotoba_aiueos_qwen35_activation(QWEN_ACT_CONV4_NEXT, qwen_parity_act_obj,
-                                      qwen_parity_conv_kernel,
-                                      QWEN_PARITY_ACT, 0) != (uint64_t)(int64_t)-5)
+  if (kotoba_aiueos_qwen35_activation(QWEN_ACT_CONV4_NEXT, qwen_parity_act_obj, QWEN_PARITY_ACT * 4U,
+                                      qwen_parity_conv_kernel, QWEN_PARITY_ACT * 16U, 0, 0,
+                                      QWEN_PARITY_ACT) != (uint64_t)(int64_t)-5)
     return 0;
   return 1;
 }
@@ -2284,8 +2375,8 @@ static int qwen_parity_norm(void) {
       return 0;
 
   /* A refusal: mode 4 does not exist. */
-  if (kotoba_aiueos_qwen35_norm(4, (uint64_t)(uintptr_t)qwen_parity_norm_obj,
-                                1, 8, 0) != (uint64_t)(int64_t)-2)
+  if (kotoba_aiueos_qwen35_norm(4U | 1U << 8, (uint64_t)(uintptr_t)qwen_parity_norm_obj, 32,
+                                0, 0, 0, 0, 8) != (uint64_t)(int64_t)-2)
     return 0;
   return 1;
 }

@@ -1,0 +1,219 @@
+(ns aiueos.native.dapps
+  (:require [aiueos.cid-v1-admit :as cid]
+            [aiueos.sha256 :as sha]
+            [aiueos.ed25519 :as ed]
+            [native.micro-infer :as model])
+  (:export [init local-token murakumo-record yataverse-store aozora-enter
+            aozora-sign]))
+
+;; AWAI-120 / ADR-0282: the offline cores of the installed itonami dapps.
+;; Only the opt-in dapps profile (desktop profile 5) calls these. Each core
+;; runs on bytes already on the machine; none opens a network operation or
+;; resolves a name, and the dapps profile has no network driver at all.
+;;
+;;   1 Murakumo   local inference: the bounded micro bigram model, the same
+;;                one the v5 user domain runs, called in place after the
+;;                Itonami consent. Counts runs and shows the last token.
+;;   3 Yataverse  local content-addressed store: Enter hashes the Goal text,
+;;                names it as a raw CIDv1 and re-admits it with
+;;                aiueos.cid-v1-admit (an independent re-hash).
+;;   4 Aozora     local outbox: Enter asks to sign the Goal text as a post
+;;                with the device key (the sign consent, its own panel text);
+;;                Allow signs and verifies it. Nothing is published.
+;; Itonami (2) keeps the goal-model behaviour of desktop profile 4.
+;;
+;; State is RAM only, browser-context bytes 3744..4095 (words 936..1023),
+;; outside the draft store's scratch 512..2559, the key bytes 1280..3743 and
+;; the Ed25519/SHA workspace 4096..8191:
+;;   word 960 profile marker 0x31505044 ("DPP1")
+;;   word 961 Murakumo runs, 962 last token
+;;   word 963 Yataverse blocks, 992 last admit code (0 admitted)
+;;   bytes 3856..3891 the last raw CIDv1 (01 55 12 20 + SHA-256)
+;;   word 973 Aozora signed posts, 974 last verify result (1 verified)
+;;   bytes 3904..3967 the last post signature
+;; Window bodies are surface words 160 + 64 (id - 1), 64 code points each.
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+(defn ctx-byte [ctx at] (kernel-load-u8 (kernel-subregion ctx 8192 at 1) 1 0))
+(defn put-byte [ctx at v]
+  (let [stored (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 v)]
+    (+ 1 (* 0 stored))))
+
+;; Static text, four code points per word, low byte first; 0 ends a line.
+(defn lit-word [li w]
+  (case li 0 (case w 0 1633906508 1 1869422700 2 7103844 0) 1 (case w 0 1936618834 1 32 0) 2 (case w 0 1935764512 1 8308 0) 3 (case w 0 1818650191 1 6647401 0) 4 (case w 0 1633906508 1 1818370156 2 1936417647 3 32 0) 5 (case w 0 7040800 0) 6 (case w 0 1717924384 1 1684370293 2 0 0) 7 (case w 0 1702129221 1 1953702002 2 1936028271 3 1634682656 4 108 0) 8 (case w 0 1651799375 1 2127983 0) 9 (case w 0 1702129221 1 1769152626 2 544435815 3 1818324807 4 0 0) 10 (case w 0 544501582 1 1953391987 2 0 0) 11 (case w 0 1734964000 1 174351726 2 544826731 3 0 0) 12 (case w 0 1797287758 1 539785573 2 1830828102 3 1936026465 4 1701736224 5 0 0) 0))
+(defn lit-cp [li i]
+  (bit-and (quot (lit-word li (quot i 4)) (case (mod i 4) 0 1 1 256 2 65536 16777216)) 255))
+
+;; Writers return the next body index; a body holds at most 64 code points.
+(defn emit-cp [s slot at cp]
+  (if (>= at 64) at
+    (do (put-word s (+ slot at) cp) (+ at 1))))
+(defn emit-lit [s slot at li i]
+  (let [cp (lit-cp li i)]
+    (if (= cp 0) at
+      (emit-lit s slot (emit-cp s slot at cp) li (+ i 1)))))
+(defn emit-num [s slot at n]
+  (if (< n 10) (emit-cp s slot at (+ 48 n))
+    (emit-cp s slot (emit-num s slot at (quot n 10)) (+ 48 (mod n 10)))))
+(defn hex-digit [v] (if (< v 10) (+ 48 v) (+ 87 v)))
+(defn emit-hex [s slot at v digits]
+  (if (= digits 0) at
+    (emit-hex s slot (emit-cp s slot at (hex-digit (bit-and (u64-shift-right v (* 4 (- digits 1))) 15)))
+              v (- digits 1))))
+(defn end-body [s slot at]
+  (do (if (< at 64) (put-word s (+ slot at) 0) 0) at))
+
+;; Base32 (RFC 4648 lowercase, multibase "b") of the CID bytes at ctx 3856.
+(defn b32-char [v] (if (< v 26) (+ 97 v) (+ 24 v)))
+(defn cid-b32 [ctx k]
+  (let [bit (* 5 k)
+        i (quot bit 8)
+        pair (+ (* 256 (ctx-byte ctx (+ 3856 i))) (ctx-byte ctx (+ 3857 i)))]
+    (bit-and (quot pair (case (mod bit 8) 0 2048 1 1024 2 512 3 256 4 128 5 64 6 32 7 16 1)) 31)))
+(defn emit-cid [s slot at ctx k n]
+  (if (>= k n) at
+    (emit-cid s slot (emit-cp s slot at (b32-char (cid-b32 ctx k))) ctx (+ k 1) n)))
+
+;; The bodies stay no longer than the static cards they replace: the renderer
+;; refuses a whole frame past 259 ops, and four open windows come close.
+;;   Murakumo  "Local model\nRuns 1 last i\nOffline"
+;;   Yataverse "Local blocks 1 ok\nbafkrei<10 more>.." or "...0\nEnter stores Goal"
+;;   Aozora    "Outbox 1 signed\nkey 93894d\nNot sent"
+(defn render-murakumo [s ctx]
+  (let [slot 160
+        a (emit-cp s slot (emit-lit s slot 0 0 0) 10)
+        c (emit-num s slot (emit-lit s slot a 1 0) (word ctx 961))
+        d (emit-lit s slot c 2 0)
+        e (emit-cp s slot d (if (= (word ctx 962) 0) 45 (word ctx 962)))
+        f (emit-cp s slot e 10)]
+    (end-body s slot (emit-lit s slot f 3 0))))
+
+(defn render-yataverse [s ctx]
+  (let [slot 288
+        b (emit-num s slot (emit-lit s slot 0 4 0) (word ctx 963))]
+    (if (= (word ctx 963) 0)
+      (end-body s slot (emit-lit s slot (emit-cp s slot b 10) 7 0))
+      (let [c (if (= (word ctx 992) 0) (emit-lit s slot b 5 0) (emit-lit s slot b 6 0))
+            d (emit-cp s slot (emit-cp s slot c 10) 98)
+            e (emit-cid s slot d ctx 0 16)]
+        (end-body s slot (emit-cp s slot (emit-cp s slot e 46) 46))))))
+
+;; note 1: Enter was pressed with no device key.
+(defn render-aozora [s ctx note]
+  (let [slot 352
+        a (emit-num s slot (emit-lit s slot 0 8 0) (word ctx 973))
+        b (if (= note 1) (emit-lit s slot (emit-cp s slot a 10) 12 0)
+            (if (= (word ctx 973) 0) (emit-lit s slot (emit-cp s slot a 10) 9 0)
+              (if (= (word ctx 974) 1)
+                (emit-hex s slot (emit-lit s slot a 11 0)
+                          (bit-and (quot (word s 2039) 128) 16777215) 6)
+                (emit-lit s slot a 6 0))))
+        c (emit-cp s slot b 10)]
+    (end-body s slot (emit-lit s slot c 10 0))))
+
+(defn init [s ctx]
+  (do (put-word ctx 960 0x31505044)
+      (put-word ctx 961 0) (put-word ctx 962 0) (put-word ctx 963 0)
+      (put-word ctx 973 0) (put-word ctx 974 0) (put-word ctx 992 0)
+      (render-murakumo s ctx) (render-yataverse s ctx) (render-aozora s ctx 0)
+      1))
+
+;; The Goal is the Itonami body after its 12-code-point prefix, surface word
+;; 236 on; its length is word 2038 - 12 (desktop adapter). Code points are
+;; a-z and space, so each is one byte.
+(defn goal-length [s] (- (word s 2038) 12))
+(defn copy-goal [s ctx at i n]
+  (if (>= i n) 0
+    (let [x (put-byte ctx (+ at i) (word s (+ 236 i)))]
+      (copy-goal s ctx at (+ i (+ 1 (* 0 x))) n))))
+
+;; Murakumo: the next token for the Goal's last character, 0 when the model
+;; has no row for it (same refusal as the v5 local-model syscall).
+(defn local-token [s]
+  (let [n (goal-length s)
+        last (if (> n 0) (word s (+ 235 n)) 0)
+        vocab (model/vocab-index last)
+        row (if (and (> n 0) (< vocab 27)) (model/micro-infer-row vocab) 0)]
+    (if (and (> (model/micro-infer-score row) 0) (> (model/micro-infer-total row) 0))
+      (model/micro-infer-token row) 0)))
+
+(defn murakumo-record [s ctx token]
+  (do (put-word ctx 961 (+ (word ctx 961) 1))
+      (put-word ctx 962 token)
+      (render-murakumo s ctx)
+      1))
+
+;; The unit both cores keep is the Goal record: 64 bytes, the Goal text then
+;; zeros. The kernel compiler admits only a literal window length for SHA-256
+;; and Ed25519 input (ADR 0373), so the record has a fixed size.
+(defn wipe [ctx at n i]
+  (if (>= i n) 0
+    (let [x (put-byte ctx (+ at i) 0)]
+      (wipe ctx at n (+ i (+ 1 (* 0 x)))))))
+(defn goal-record [s ctx at n]
+  (let [w (wipe ctx at 64 0)
+        c (copy-goal s ctx at 0 n)]
+    (+ 1 (* 0 (+ w c)))))
+
+;; Yataverse: store the Goal record as one raw block. The CID is built from a
+;; fresh SHA-256 of the bytes, then admitted by cid-v1-admit, which hashes
+;; the same bytes again and compares; only code 0 counts as verified.
+(defn yataverse-store [s ctx]
+  (let [n (goal-length s)]
+    (if (<= n 0) 0
+      (let [copied (goal-record s ctx 2048 n)
+            hashed (sha/aiueos-sha256 (kernel-subregion ctx 8192 2048 64) 64
+                                      (kernel-subregion ctx 8192 3860 32)
+                                      (kernel-subregion ctx 8192 4096 352) 352)
+            p (+ (put-byte ctx 3856 1) (+ (put-byte ctx 3857 85)
+                 (+ (put-byte ctx 3858 18) (put-byte ctx 3859 32))))
+            admitted (if (= hashed 1)
+                       (cid/aiueos-cid-v1-admit (kernel-subregion ctx 8192 3856 36) 36
+                                                (kernel-subregion ctx 8192 2048 64) 64
+                                                (kernel-subregion ctx 8192 4096 416))
+                       7)]
+        (do (put-word ctx 963 (+ (word ctx 963) 1))
+            (put-word ctx 992 admitted)
+            (render-yataverse s ctx)
+            (+ 1 (* 0 (+ copied p))))))))
+
+;; Aozora, Enter: with a device key (word 2039 bit 6) the caller opens the
+;; sign request for a post (returns 1); without one the outbox says how to
+;; make a key and nothing opens (returns 0).
+(defn aozora-enter [s ctx]
+  (if (= (bit-and (quot (word s 2039) 64) 1) 1)
+    (if (> (goal-length s) 0) 1 0)
+    (do (render-aozora s ctx 1) 0)))
+
+(defn copy-bytes [ctx dst src n i]
+  (if (>= i n) 0
+    (let [x (put-byte ctx (+ dst i) (ctx-byte ctx (+ src i)))]
+      (copy-bytes ctx dst src n (+ i (+ 1 (* 0 x)))))))
+
+;; Aozora, Allow: sign the Goal record with the seed (ctx 3712) into 3904..3967,
+;; then check it with the public key (ctx 1280) before it counts. The signing
+;; buffer (ctx 2048..3071: seed at 0, message at 256; for the verifier key at
+;; 0, signature at 32, message at 96) is wiped afterwards.
+(defn aozora-sign [s ctx]
+  (let [n (goal-length s)]
+    (if (<= n 0) 0
+      (let [a (copy-bytes ctx 2048 3712 32 0)
+            b (goal-record s ctx 2304 n)
+            sg (ed/aiueos-ed25519-sign (kernel-subregion ctx 8192 2048 1024) 64
+                                       (kernel-subregion ctx 8192 3904 64)
+                                       (kernel-subregion ctx 8192 4096 4096))
+            c (wipe ctx 2048 1024 0)
+            d (copy-bytes ctx 2048 1280 32 0)
+            e (copy-bytes ctx 2080 3904 64 0)
+            f (goal-record s ctx 2144 n)
+            v (ed/aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 64
+                                        (kernel-subregion ctx 8192 4096 4096))
+            g (wipe ctx 2048 1024 0)]
+        (do (put-word ctx 973 (+ (word ctx 973) 1))
+            (put-word ctx 974 (if (= v 1) 1 0))
+            (render-aozora s ctx 0)
+            (+ 1 (* 0 (+ a (+ b (+ sg (+ c (+ d (+ e (+ f g))))))))))))))

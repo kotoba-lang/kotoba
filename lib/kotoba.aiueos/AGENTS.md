@@ -111,6 +111,122 @@ the expanded FS2 Mac compiler fixed point and merged-root diagnostic VM repeat
 have local evidence, while exact-head native Linux compiler/controller gates,
 release and physical qualification remain open.
 
+## Installed itonami dapps run offline (AWAI-120, ADR-0282)
+
+The dock apps are installed itonami dapps: their code is in the OS image and
+starting them reads only local bytes. A dapp never resolves a DNS name; a
+remote operation names its peer by DID/CID, is declared in
+`distributions/awai/dapps/<id>.json` and keeps its own each-operation consent.
+With no network each dapp runs its local core (desktop profile 5,
+`native/dapps-entry.kotoba` + `native/dapps.kotoba`): Murakumo local
+inference, Itonami Goal and key, Yataverse raw-CIDv1 store, Aozora signed
+outbox. Gate: `build-native-desktop-macos.py --profile dapps`
+(`check-native-dapps-qemu.py`, `-nic none`). Keep each app body no longer
+than the static card it replaces: four open windows with longer bodies
+overflowed the renderer's 259 ops and the whole frame was refused (-5).
+State is RAM only on a machine without the draft medium. The QEMU check does
+not qualify physical hardware, and profile 5 is not the default entry.
+
+## Remote control over the RTL8168 debug link (AWAI-119)
+
+On the 6600H (Realtek RTL8168, direct cable to the operator's Mac), the opt-in
+desktop debug entry sends KDBG records to UDP 7799 and polls one RX
+descriptor for signed commands on UDP 7798: ping, reboot (port 0xCF9), key
+(a make code handled as a keyboard press) and screenshot (UDP 7797). Each
+command carries the boot nonce (KDBG 0xc000) and a rising counter, signed
+with Ed25519 under the key pinned in `native/remote_cmd.kotoba`; the seed
+stays on the operator's Mac. Use `os/aiueos/scripts/aiueos-remote.py`.
+Package the image with `--netlog v1 --watchdog v1` and keep UEFI PXE first in
+the boot order: every watchdog reset then boots the served image, so hardware
+iterations need no power cycle. Evidence:
+`docs/evidence/awai119-remote-control-6600h-20261030`. The channel is
+Ed25519 only (below the post-quantum floor) and exists only in the debug
+entry; KDBG tags 0x2000.. are taken by the blur timing log.
+
+## Verified network update, stage 1: read-only NVMe (AWAI-122)
+
+A network update is verified only if the installed OS boots from disk, fetches
+the signed image itself, checks it and then writes the ESP. A PXE-served
+`--install v1` image is unverified and cannot be made safe by a loader check,
+since a hostile image is a loader too. Stage 1 is `native/nvme.kotoba`: a
+polled, read-only NVMe driver (Identify, I/O queues, Read; no write command)
+in the debug entry only. It reports KDBG 0xc100..0xc108 and context words
+600..663; DMA is owned window slot 4 (five pages). Gate:
+`build-native-desktop-macos.py --profile nvme` (`check-native-nvme-qemu.py`).
+Its NVMe boots need `-cpu max,phys-bits=37`: with QEMU's default, OVMF puts
+the 64-bit BAR at 768 GiB and the loader's PCI collector, which admits
+addresses below 512 GiB, refuses the boot. On the 6600H it identified the
+256 GB controller (04:00.0) and read LBA 1 (`EFI PART`):
+`docs/evidence/awai122-nvme-read-6600h-20261031`.
+Stage 2 is `native/esp.kotoba`: the GPT's ESP entry, FAT16/FAT32 and the
+SHA-256 of `\EFI\ITONAMI\BOOTX64.EFI` (else `\EFI\BOOT\BOOTX64.EFI`),
+reported as KDBG 0xc110..0xc115 and context words 650..699. It hashes with
+`aiueos.lib.sha256-stream`; that library's `sha-final` is admitted by the
+kernel compiler only with a literal tail length, so the file's padding is
+built in esp.kotoba and `sha-final` runs once as an "abc" self-test. The
+gate's FAT32 ESP is made with hdiutil, and its NVMe boots carry a writable
+OVMF variable store: without one OVMF writes `\NvVars` to the fixture ESP.
+On the 6600H it hashed the installed `\EFI\ITONAMI\BOOTX64.EFI` (FAT32) to
+exactly the SHA-256 of the image installed on 2026-10-30:
+`docs/evidence/awai122-esp-read-6600h-20261031`.
+Stage 3 is `native/update.kotoba`: remote command 5 makes the board pull a
+signed image over the RTL8168 link (requests to UDP 7796, answers on 7795, in
+1024-byte chunks) and verify it while nothing is written. A signed image is a
+64-byte manifest ("AIUEIMG1", version, size, reserved, SHA-256), its Ed25519
+signature under the image-signing key pinned in update.kotoba (seed on the
+operator's Mac, outside the repository), then the image. The signature is
+checked before any image byte is taken; the image must then match the
+manifest's size and SHA-256. Sign and serve with
+`os/aiueos/scripts/aiueos-image.py`, then start the pull with
+`aiueos-remote.py update`; results are KDBG 0xc120..0xc127 and 0xc005, state
+in context words 180..207, and the page is owned window slot 14. QEMU has no
+RTL8168, so the gate checks the verifier's boot self-test (KDBG 0xc118): it
+accepts a 5000-byte fixture signed with the published RFC 8032 test-1 seed,
+and refuses it when one manifest byte or one image byte is changed, through
+the chunk path the network uses. The network pull is checked only on the
+board. On the 6600H the self-test passed and one boot pulled the 6 MB image in
+13.3 s (result 15, digest equal to the signed SHA-256), refused it under
+another key (1, no image bytes taken) and refused it with one byte changed
+(7): `docs/evidence/awai122-signed-image-6600h-20261031`. That run found an
+RTL8168 RX stall: a frame arriving while the single RX descriptor is the
+kernel's raises RxDescUnavail and the chip receives nothing more until
+IntrStatus is cleared, which the boot-time NVMe/ESP work made happen every
+boot (signed commands were dead on main since stage 1). `rx-release` now
+clears IntrStatus; KDBG 0xc00f (frames seen, last frame) and 0xc00e (RX
+descriptor, ChipCmd, RxConfig) are logged with the nonce heartbeat.
+Hardware iterations need no power cycle while a `--watchdog v1` debug image
+runs: it resets about every 100 s into whatever PXE serves, so swap the served
+image and wait for KDBG 0008 (desktop loop up) before sending commands; a
+command sent during boot is lost with that boot's nonce. A board running
+the installed OS, powered off, or on an image without the watchdog still
+needs a manual (or switched-outlet) power cycle.
+Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
+protection beyond version >= 1, since no installed version is kept.
+Stage 4 writes the ESP (FAT32 only): remote command 6 (`aiueos-remote.py
+install`) pulls and verifies the image as stage 3 and also writes it into the
+staging file `\EFI\ITONAMI\UPDATE.BIN`. `native/esp.kotoba` creates that
+file on first use, with its entry in the same disk block as BOOTX64.EFI's and
+clusters from every FAT copy, and fits its chain to the image (cut and free,
+or extend) so the FAT stays consistent. Only if the stream's SHA-256 matches
+is the staging file flushed, read back from disk and hashed; only if that
+matches too does one block write swap the two entries' first cluster and
+size (BOOTX64.EFI becomes the new image, UPDATE.BIN keeps the old one), and
+the ESP walk must then hash BOOTX64.EFI to the manifest digest (KDBG
+0xc130..0xc136, 0xc006, word 208). NVMe Write and Flush exist but are
+refused outside a write window that only esp opens, to the ESP partition.
+FSInfo is not updated, and a power loss between the FAT and entry writes can
+leave lost clusters (never a changed BOOTX64.EFI). The QEMU gate drives it
+through fw_cfg file `opt/aiueos/install`, read only under a hypervisor
+(CPUID.1:ECX bit 31), which installs the self-test fixture ("1") or a
+tampered copy ("2"). Three boots install, install again (UPDATE.BIN reused,
+no new clusters) and refuse the tampered image; the disk is then parsed on
+the Mac (contents, FAT copies equal, chain lengths, writes inside the ESP).
+On the 6600H it installed the already-installed loader re-signed as version 3
+(result 15 in 52 s; BOOTX64.EFI moved to the new chain and hashed to the
+manifest), and after a signed reboot with PXE stopped the board booted it
+from NVMe: `docs/evidence/awai122-esp-install-6600h-20261031`.
+Disk-first boot is stage 5.
+
 ## CDCI migration: native only (2026-10-24)
 
 Owner instruction and workspace `AGENTS.md` supersede the historical KBB,

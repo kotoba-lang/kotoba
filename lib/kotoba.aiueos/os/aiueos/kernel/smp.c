@@ -11,6 +11,8 @@
 extern const uint8_t aiueos_ap_trampoline_start[], aiueos_ap_trampoline_end[];
 extern const uint64_t aiueos_ap_trampoline_cr3, aiueos_ap_trampoline_entry;
 extern const uint64_t aiueos_ap_trampoline_stack;
+extern void aiueos_load_gdt(void);
+extern void aiueos_ap_load_idt(void);
 extern volatile uint32_t *aiueos_apic_mmio_base;
 extern uint32_t aiueos_acpi_cpu_count(void);
 extern uint32_t aiueos_acpi_apic_id(uint32_t index);
@@ -69,6 +71,13 @@ static void ap_enable_extended_state(void) {
 }
 
 __attribute__((noreturn)) void aiueos_ap_entry(void) {
+  /* Descriptor tables first (JUN-35): the trampoline enters long mode with
+     its own 4-entry GDT and IDTR base 0, so a fault here is undeliverable and
+     escalates to a triple fault.  Load the kernel GDT (0x08 = 64-bit code,
+     matching the IDT gates' selector) and the BSP's shared IDT before any C
+     code that can fault runs. */
+  aiueos_load_gdt();
+  aiueos_ap_load_idt();
   uint32_t id = aiueos_apic_mmio_base[APIC_ID / 4] >> 24;
   ap_enable_extended_state();
   ap_observed_id = id;

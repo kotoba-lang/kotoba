@@ -100,10 +100,10 @@ def repository_bootstrap(amu, args):
     verified_file(manifest)
     names = [line for line in manifest.read_text().splitlines()
              if line and not line.startswith("#")]
-    # The signed Mac root has shipped with both the 47-module and 48-module
-    # source graphs. The descriptor's fullSource digest below binds the exact
+    # The signed Mac root has shipped with 47-, 48- and 49-module source
+    # graphs. The descriptor's fullSource digest below binds the exact
     # ordered graph; a stale or truncated manifest must still be refused.
-    if len(names) not in (47, 48) or len(set(names)) != len(names):
+    if len(names) not in (47, 48, 49) or len(set(names)) != len(names):
         raise ValueError("Mac bootstrap manifest is not a complete native source graph")
     source_hash = hashlib.sha256()
     source_bytes = 0
@@ -138,6 +138,7 @@ def main(args):
     sys.path.insert(0, str(HERE))
     import native_regions
     native_regions.verify_amu(amu)
+    native_regions.verify_layout(amu, OS / "native/layout-table.json")
     owners = args.owner_repo_root.resolve(strict=True)
     if not amu.is_dir() or not owners.is_dir():
         raise ValueError("source roots must be directories")
@@ -166,10 +167,11 @@ def main(args):
         name: HERE / name for name in (
             "build-kotoba-native-desktop.sh", "build-native-desktop-macos.py",
             "build-native-font-macos.py", "build-native-kernel-macos.py",
-            "build-native-media-macos.py", "check-native-desktop-qemu.py",
+            "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py",
+            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}
@@ -245,6 +247,8 @@ def main(args):
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
+                        else "dapps-entry.kotoba" if args.profile == "dapps"
+                        else "desktop-debug-entry.kotoba" if args.profile == "nvme"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -256,7 +260,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (36 if args.profile == "cid" else 35)
+                or kernel_state["sourceModuleCount"] != 45
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -291,11 +295,17 @@ def main(args):
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
                         else "check-native-keystore-qemu.py" if args.profile == "keystore"
+                        else "check-native-dapps-qemu.py" if args.profile == "dapps"
+                        else "check-native-nvme-qemu.py" if args.profile == "nvme"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
             "--qemu", qemu, "--firmware", firmware, "--font", padded,
             "--output", guest]
+        if args.expect_stuck_entropy:
+            if args.profile != "consent":
+                raise ValueError("--expect-stuck-entropy needs --profile consent")
+            guest_args.append("--expect-stuck-entropy")
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
                         else "native-consent-qemu.json" if args.profile == "consent"
@@ -306,9 +316,12 @@ def main(args):
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
                         else "native-keystore-qemu.json" if args.profile == "keystore"
+                        else "native-dapps-qemu.json" if args.profile == "dapps"
+                        else "native-nvme-qemu.json" if args.profile == "nvme"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
-        expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
+        expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
+                           else "PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
@@ -317,13 +330,18 @@ def main(args):
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
+                           else "PASS_NATIVE_DAPPS_QEMU" if args.profile == "dapps"
+                           else "PASS_NATIVE_NVME_READ_QEMU" if args.profile == "nvme"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 20 if args.profile == "consent"
+                           else 18 if args.expect_stuck_entropy
+                           else 22 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 15)
+                           else 11 if args.profile == "dapps"
+                           else 7 if args.profile == "nvme"
+                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -388,6 +406,28 @@ def main(args):
                     or not observed["persistedAcrossReboot"] or not observed["wrongPassphraseRefused"]
                     or observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("keystore verdict is incomplete")
+        elif args.profile == "dapps":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != [
+                        "first-frame", "dapps-initial", "itonami-local-refusal", "itonami-local-model", "murakumo-run-recorded",
+                        "yataverse-store", "aozora-no-key", "device-key-create", "aozora-sign-deny",
+                        "aozora-panel-text", "aozora-sign-allow"]
+                    or observed["network"] != "none (-nic none)" or observed["dnsResolved"]
+                    or observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("dapps verdict is incomplete")
+        elif args.profile == "nvme":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["nvme-fat32", "nvme-fat16-media", "nvme-4096", "nvme-absent",
+                                                                       "nvme-install", "nvme-install-again", "nvme-install-tampered"]
+                    or [row["result"] for row in observed["events"][:4]] != [15, 15, 15, 1]
+                    or [row["esp"] for row in observed["events"][:4]] != [15, 15, 3, 1]
+                    or not all(row["desktopKeptRunning"] for row in observed["events"][:4])
+                    or not all(row.get("diskUnchanged") for row in observed["events"][:3])
+                    or [row["updateSelfTest"] for row in observed["events"][:4]] != [[15, 1, 7]] * 4
+                    or [row["install"] for row in observed["events"][4:]] != [15, 15, 7]
+                    or not observed["events"][5].get("noNewClusters")
+                    or not observed["writesOnlyThroughInstallHook"] or observed["physicalHardware"]):
+                raise ValueError("nvme verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
@@ -395,16 +435,20 @@ def main(args):
                 raise ValueError("keyseal verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
+                    or observed["transportObserver"] != script_pins["check-native-draft-restart-qemu.py"]
+                    or observed["desktopObserver"] != script_pins["check-native-desktop-qemu.py"]
+                    or not observed["inputSynchronizedWithCompletedFrames"]
                     or [row["name"] for row in observed["events"]] != [
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
-                        "launcher-key-ignored", "launcher-click-ignored", "key-deny",
-                        "pointer-deny", "esc-deny", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel", "key-allow",
-                        "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
+                        "launcher-key-ignored", "launcher-click-ignored", "minimize-and-dock-blocked-by-consent", "key-deny",
+                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel"]
+                       + (["stuck-entropy-refused"] if args.expect_stuck_entropy else
+                          ["key-allow", "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"])
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
-              or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98]
+              or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98, 97]
               or any(row["inkPixels"] <= 0 for row in observed["renderedGoalGlyphs"])):
             raise ValueError("normal desktop visible Goal verdict is incomplete")
         iso_observed = None
@@ -415,15 +459,61 @@ def main(args):
                 "--output", guest_iso])
             iso_observed = json.loads((guest_iso / "native-desktop-qemu.json").read_text())
             if (iso_observed["status"] != "PASS_NATIVE_DESKTOP_INPUT_QEMU"
-                    or len(iso_observed["events"]) != 15
+                    or len(iso_observed["events"]) != expected_events
                     or iso_observed["kernel"] != kernel_state["kernel"]
                     or iso_observed["efi"] != kernel_state["efi"]
                     or iso_observed["iso"] != media_state["iso"]
                     or iso_observed["independentISO"]["status"] !=
                        "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"
                     or iso_observed["observer"] != script_pins["check-native-desktop-qemu.py"]
-                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98]):
+                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98, 97]):
                 raise ValueError("ISO QEMU guest observation is not bound to this build")
+        material_observed = None
+        if args.profile == "desktop":
+            call("qemu-material", scripts["check-native-shell-material-qemu.py"], [
+                "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                "--qemu", qemu, "--firmware", firmware, "--output", output / "qemu-material"])
+            material_observed = json.loads((output / "qemu-material/native-shell-material-qemu.json").read_text())
+            if (material_observed["status"] != "PASS_NATIVE_SHELL_MATERIAL_QEMU"
+                    or material_observed["kernel"] != kernel_state["kernel"]
+                    or material_observed["efi"] != kernel_state["efi"]
+                    or material_observed["media"] != media_state["image"]
+                    or material_observed["observer"] != script_pins["check-native-shell-material-qemu.py"]
+                    or material_observed["desktopObserver"] != script_pins["check-native-desktop-qemu.py"]
+                    or material_observed["transportObserver"] != script_pins["check-native-draft-restart-qemu.py"]
+                    or [row["name"] for row in material_observed["events"]] != [
+                        "first-frame-materials", "dock-keyboard-focus", "dock-keyboard-launch",
+                        "dock-pointer-hover", "dock-pointer-press", "dock-pointer-release",
+                        "reduced-effects", "effects-restored", "home-pointer-launch"]
+                    or material_observed["physicalHardware"] or material_observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("native shell materials observation is not bound to this build")
+        gui_observed = []
+        if args.profile == "desktop":
+            for name, options in (("absent", []), ("audio", ["--audio"]),
+                                  ("muted", ["--audio", "--muted"])):
+                destination = output / ("qemu-effects-" + name)
+                call("qemu-effects-" + name, scripts["check-native-gui-effects-qemu.py"], [
+                    "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                    "--qemu", qemu, "--firmware", firmware, "--output", destination, *options])
+                effect = json.loads((destination / "native-gui-effects.json").read_text())
+                if (effect["status"] != "PASS_NATIVE_GUI_EFFECTS_QEMU"
+                        or len(effect["events"]) != 8
+                        or effect["kernel"] != kernel_state["kernel"]
+                        or effect["efi"] != kernel_state["efi"]
+                        or effect["media"] != media_state["image"]
+                        or effect["font"] != font_state["padded"]
+                        or effect["qemu"] != qemu_pin or effect["firmware"] != firmware_pin
+                        or effect["observer"] != script_pins["check-native-gui-effects-qemu.py"]
+                        or effect["transport"] != script_pins["check-native-draft-restart-qemu.py"]
+                        or effect["physicalHardware"] or effect["smooth60FPSQualified"]
+                        or effect["trustedHumanConsent"]):
+                    raise ValueError("GUI effects observation is not bound to this build: " + name)
+                if name == "absent" and effect["audio"] is not None:
+                    raise ValueError("missing-device control unexpectedly has audio")
+                if name != "absent" and (effect["audio"] is None
+                        or (effect["audio"]["peak"] == 0) != (name == "muted")):
+                    raise ValueError("native WAV positive/mute control failed")
+                gui_observed.append(effect)
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
@@ -447,12 +537,19 @@ def main(args):
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
                             else "MACOS_NATIVE_KEYSTORE_QEMU_CANDIDATE" if args.profile == "keystore"
+                            else "MACOS_NATIVE_DAPPS_QEMU_CANDIDATE" if args.profile == "dapps"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
                      isoBootQualified=iso_observed is not None,
+                     nativeShellMaterialsQualified=material_observed is not None,
+                     nativeGUIEffectsQualified=len(gui_observed) == 3,
+                     nativeGUIEffectsEvents=sum(len(g["events"]) for g in gui_observed),
+                     nativePCMDevice="Intel 8086:2415 AC97" if gui_observed else None,
+                     native60FPSQualified=False,
+                     nativeShellMaterialEvents=len(material_observed["events"]) if material_observed else 0,
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"
                                     if args.profile == "local-draft"
@@ -472,6 +569,8 @@ def main(args):
                                     if args.profile == "keyseal"
                                     else "Mac native sealed device key survives a reboot; a wrong passphrase is refused (two boots, QEMU)"
                                     if args.profile == "keystore"
+                                    else "Mac native installed itonami dapps run their offline cores with no NIC (QEMU)"
+                                    if args.profile == "dapps"
                                     else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -498,8 +597,11 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
+    parser.add_argument("--expect-stuck-entropy", action="store_true",
+                        help="JUN-482 negative control: the native sources draw from a constant entropy source; "
+                             "the consent gate must see the device-key draw refused")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
     # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below

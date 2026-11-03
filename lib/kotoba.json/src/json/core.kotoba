@@ -1,0 +1,385 @@
+;; Native JSON implementation derived from the Kotoba branch of json/core.cljk.
+(ns json.core (:export [decode encode json]))
+
+(defn- utf8-width [cp :i64] :i64
+     (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+
+(defn- conj-utf8 [out :vector-i64 cp :i64] :vector-i64
+     (cond
+       (< cp 128) (vector-conj out cp)
+       (< cp 2048) (vector-conj (vector-conj out (bit-or 192 (i64-shift-right cp 6)))
+                                (bit-or 128 (bit-and cp 63)))
+       (< cp 65536) (vector-conj (vector-conj (vector-conj out (bit-or 224 (i64-shift-right cp 12)))
+                                              (bit-or 128 (bit-and (i64-shift-right cp 6) 63)))
+                                 (bit-or 128 (bit-and cp 63)))
+       :else (vector-conj (vector-conj (vector-conj (vector-conj out (bit-or 240 (i64-shift-right cp 18)))
+                                                    (bit-or 128 (bit-and (i64-shift-right cp 12) 63)))
+                                       (bit-or 128 (bit-and (i64-shift-right cp 6) 63)))
+                          (bit-or 128 (bit-and cp 63)))))
+
+(defn- hex-digit [n :i64] :string
+     (string-substring "0123456789abcdef" n (+ n 1)))
+
+(defn- hex4 [n :i64] :string
+     (string-concat
+      (string-concat (hex-digit (bit-and (i64-shift-right n 12) 15)) (hex-digit (bit-and (i64-shift-right n 8) 15)))
+      (string-concat (hex-digit (bit-and (i64-shift-right n 4) 15)) (hex-digit (bit-and n 15)))))
+
+(defn- esc [s :string] :string
+     (let [n (string-byte-length s)]
+       (loop [i 0 out ""]
+         (if (>= i n)
+           out
+           (let [c (string-code-point-at s i)
+                 w (utf8-width c)]
+             (recur (+ i w)
+                    (string-concat
+                     out
+                     (cond (= c 34) "\\\""
+                           (= c 92) "\\\\"
+                           (= c 8) "\\b"
+                           (= c 12) "\\f"
+                           (= c 10) "\\n"
+                           (= c 13) "\\r"
+                           (= c 9) "\\t"
+                           (< c 32) (string-concat "\\u" (hex4 c))
+                           :else (string-substring s i (+ i w))))))))))
+
+(defn- kw-text [t :string] :string
+     (let [n (string-byte-length t)]
+       (loop [i 0 start 1]
+         (if (>= i n)
+           (string-substring t start n)
+           (recur (+ i 1) (if (= 47 (string-code-point-at t i)) (+ i 1) start))))))
+
+(defn- kstr [k :document] :string
+     (if (= (document-kind k) :keyword)
+       (kw-text (document-edn-print k))
+       (if (= (document-kind k) :string)
+         (option-or (document-string-value k) "")
+         (document-edn-print k))))
+
+(defn- elem-at [d :document i :i64] :document
+     (if (= (document-kind d) :list)
+       (option-or (document-list-at d i) (document-null))
+       (option-or (document-vector-at d i) (document-null))))
+
+(defn- entry-key [d :document i :i64] :document
+     (option-or (document-vector-at (option-or (document-map-entry-at d i) (document-null)) 0) (document-null)))
+
+(defn- entry-val [d :document i :i64] :document
+     (option-or (document-vector-at (option-or (document-map-entry-at d i) (document-null)) 1) (document-null)))
+
+(defn- text-less? [a :string b :string] :bool
+     (let [na (string-byte-length a)
+           nb (string-byte-length b)]
+       (loop [i 0]
+         (if (>= i na)
+           (< i nb)
+           (if (>= i nb)
+             false
+             (let [x (string-code-point-at a i)
+                   y (string-code-point-at b i)]
+               (if (= x y)
+                 (recur (+ i (utf8-width x)))
+                 (< x y))))))))
+
+(defn- insert-entry [d :document order :vector-i64 x :i64] :vector-i64
+     (let [n (vector-count order)
+           kx (kstr (entry-key d x))]
+       (loop [j 0 out (vector-i64) placed false]
+         (if (>= j n)
+           (if placed out (vector-conj out x))
+           (let [y (vector-at order j)]
+             (if (if placed false (text-less? kx (kstr (entry-key d y))))
+               (recur (+ j 1) (vector-conj (vector-conj out x) y) true)
+               (recur (+ j 1) (vector-conj out y) placed)))))))
+
+(defn- entry-order [d :document sorted? :bool] :vector-i64
+     (let [n (document-count d)]
+       (loop [i 0 order (vector-i64)]
+         (if (>= i n)
+           order
+           (recur (+ i 1) (if sorted? (insert-entry d order i) (vector-conj order i)))))))
+
+(defn- repeat-text [t :string n :i64] :string
+     (loop [i 0 out ""]
+       (if (>= i n) out (recur (+ i 1) (string-concat out t)))))
+
+(defn- float-text [x :document] :string
+     (let [t (document-edn-print x)
+           n (string-byte-length t)]
+       (if (if (>= n 3) (= 48 (string-code-point-at t (- n 1))) false)
+         (if (= 46 (string-code-point-at t (- n 2)))
+           (string-substring t 0 (- n 2))
+           t)
+         t)))
+
+(defn- emit [x :document ind :i64 pretty? :bool] :string
+     (let [pad (repeat-text "  " ind)
+           pad+ (string-concat pad "  ")
+           sep (if pretty? ",\n" ",")
+           kv (if pretty? ": " ":")
+           kind (document-kind x)]
+       (cond
+         (= kind :null) "null"
+         (= kind :bool) (if (option-or (document-bool-value x) false) "true" "false")
+         (= kind :i64) (string-from-i64 (option-or (document-i64-value x) 0))
+         (= kind :f64) (float-text x)
+         (= kind :string) (string-concat "\"" (string-concat (esc (option-or (document-string-value x) "")) "\""))
+         (= kind :keyword) (string-concat "\"" (string-concat (esc (kstr x)) "\""))
+         (= kind :map) (emit-map x ind pretty? pad pad+ sep kv)
+         (= kind :vector) (emit-seq x ind pretty? pad pad+ sep)
+         (= kind :list) (emit-seq x ind pretty? pad pad+ sep)
+         :else (string-concat "\"" (string-concat (esc (document-edn-print x)) "\"")))))
+
+(defn- emit-map [x :document ind :i64 pretty? :bool pad :string pad+ :string sep :string kv :string] :string
+     (let [n (document-count x)]
+       (if (= n 0)
+         "{}"
+         (let [order (entry-order x (not pretty?))
+               body (loop [p 0 out ""]
+                      (if (>= p n)
+                        out
+                        (let [i (vector-at order p)
+                              piece (string-concat
+                                     (if pretty? pad+ "")
+                                     (string-concat
+                                      "\""
+                                      (string-concat
+                                       (esc (kstr (entry-key x i)))
+                                       (string-concat "\"" (string-concat kv (emit (entry-val x i) (+ ind 1) pretty?))))))]
+                          (recur (+ p 1) (if (= p 0) piece (string-concat out (string-concat sep piece)))))))]
+           (string-concat
+            (string-concat "{" (if pretty? "\n" ""))
+            (string-concat body (string-concat (if pretty? (string-concat "\n" pad) "") "}")))))))
+
+(defn- emit-seq [x :document ind :i64 pretty? :bool pad :string pad+ :string sep :string] :string
+     (let [n (document-count x)]
+       (if (= n 0)
+         "[]"
+         (let [body (loop [p 0 out ""]
+                      (if (>= p n)
+                        out
+                        (let [piece (string-concat
+                                     (if pretty? pad+ "")
+                                     (emit (elem-at x p) (+ ind 1) pretty?))]
+                          (recur (+ p 1) (if (= p 0) piece (string-concat out (string-concat sep piece)))))))]
+           (string-concat
+            (string-concat "[" (if pretty? "\n" ""))
+            (string-concat body (string-concat (if pretty? (string-concat "\n" pad) "") "]")))))))
+
+(defn json [x :document] :string
+     (emit x 0 true))
+
+(defn encode [x :document] :string
+     (emit x 0 false))
+
+(defn- ch-at [s :string i :i64] :i64
+     (if (if (>= i 0) (< i (string-byte-length s)) false) (string-code-point-at s i) -1))
+
+(defn- skip-ws [s :string i0 :i64] :i64
+     (loop [i i0]
+       (let [c (ch-at s i)]
+         (if (if (= c 32) true (if (= c 9) true (if (= c 10) true (= c 13))))
+           (recur (+ i 1))
+           i))))
+
+(defn- vpair [v :document j :i64] :document
+     (document-vector (document-string (document-edn-print v)) (document-i64 j)))
+
+(defn- vp-text [p :document] :string
+     (option-or (document-string-value (option-or (document-vector-at p 0) (document-null))) ""))
+
+(defn- spair [v :string j :i64] :document
+     (document-vector (document-string v) (document-i64 j)))
+
+(defn- vp-pos [p :document] :i64
+     (option-or (document-i64-value (option-or (document-vector-at p 1) (document-null))) 0))
+
+(defn- hex-val [c :i64] :i64
+     (cond (if (>= c 48) (<= c 57) false) (- c 48)
+           (if (>= c 97) (<= c 102) false) (- c 87)
+           (if (>= c 65) (<= c 70) false) (- c 55)
+           :else -1))
+
+(defn- hex4-at [s :string i :i64] :i64
+     (let [a (hex-val (ch-at s i))
+           b (hex-val (ch-at s (+ i 1)))
+           c (hex-val (ch-at s (+ i 2)))
+           d (hex-val (ch-at s (+ i 3)))]
+       (if (if (>= a 0) (if (>= b 0) (if (>= c 0) (>= d 0) false) false) false)
+         (+ (* a 4096) (+ (* b 256) (+ (* c 16) d)))
+         -1)))
+
+(defn- bytes->text [out :vector-i64] :string
+     (string-from-utf8 (bytes-from-vector-i64 out)))
+
+(defn- read-string* [s :string i0 :i64] :document
+     (loop [i (+ i0 1) out (vector-i64)]
+       (let [c (ch-at s i)]
+         (cond
+           (= c -1) (throw (ex-info "unterminated JSON string" {:pos i}))
+           (< c 32) (throw (ex-info "unescaped JSON control character" {:pos i}))
+           (= c 34) (vpair (document-string (bytes->text out)) (+ i 1))
+           (= c 92)
+           (let [e (ch-at s (+ i 1))]
+             (cond
+               (= e 34) (recur (+ i 2) (vector-conj out 34))
+               (= e 92) (recur (+ i 2) (vector-conj out 92))
+               (= e 47) (recur (+ i 2) (vector-conj out 47))
+               (= e 98) (recur (+ i 2) (vector-conj out 8))
+               (= e 102) (recur (+ i 2) (vector-conj out 12))
+               (= e 110) (recur (+ i 2) (vector-conj out 10))
+               (= e 114) (recur (+ i 2) (vector-conj out 13))
+               (= e 116) (recur (+ i 2) (vector-conj out 9))
+               (= e 117)
+               (let [u (hex4-at s (+ i 2))]
+                 (if (< u 0)
+                   (throw (ex-info "invalid JSON unicode escape" {:pos (+ i 2)}))
+                   (if (if (>= u 55296) (< u 56320) false)
+                     (let [lo (if (= 92 (ch-at s (+ i 6))) (if (= 117 (ch-at s (+ i 7))) (hex4-at s (+ i 8)) -1) -1)]
+                       (if (if (>= lo 56320) (< lo 57344) false)
+                         (recur (+ i 12) (conj-utf8 out (+ 65536 (+ (* (- u 55296) 1024) (- lo 56320)))))
+                         (throw (ex-info "invalid JSON unicode escape" {:pos (+ i 2)}))))
+                     (if (if (>= u 56320) (< u 57344) false)
+                       (throw (ex-info "invalid JSON unicode escape" {:pos (+ i 2)}))
+                       (recur (+ i 6) (conj-utf8 out u))))))
+               :else (throw (ex-info "invalid JSON escape" {:pos i :escape e}))))
+           :else (recur (+ i (utf8-width c)) (conj-utf8 out c))))))
+
+(defn- digit-at? [s :string i :i64] :bool
+     (let [c (ch-at s i)] (if (>= c 48) (<= c 57) false)))
+
+(defn- skip-digits [s :string i0 :i64] :i64
+     (loop [j i0] (if (digit-at? s j) (recur (+ j 1)) j)))
+
+(defn- json-number? [s :string] :bool
+     (let [i0 (if (= 45 (ch-at s 0)) 1 0)
+           i1 (cond (= 48 (ch-at s i0)) (+ i0 1)
+                    (digit-at? s i0) (skip-digits s i0)
+                    :else -1)
+           i2 (if (= 46 (ch-at s i1))
+                (if (digit-at? s (+ i1 1)) (skip-digits s (+ i1 1)) -1)
+                i1)
+           i3 (if (if (= 101 (ch-at s i2)) true (= 69 (ch-at s i2)))
+                (let [j (if (if (= 43 (ch-at s (+ i2 1))) true (= 45 (ch-at s (+ i2 1)))) (+ i2 2) (+ i2 1))]
+                  (if (digit-at? s j) (skip-digits s j) -1))
+                i2)]
+       (= i3 (string-byte-length s))))
+
+(defn- number-char? [c :i64] :bool
+     (if (if (>= c 48) (<= c 57) false)
+       true
+       (if (= c 101) true (if (= c 69) true (if (= c 43) true (if (= c 45) true (= c 46)))))))
+
+(defn- float-token? [t :string] :bool
+     (let [n (string-byte-length t)]
+       (loop [i 0]
+         (if (>= i n)
+           false
+           (let [c (string-code-point-at t i)]
+             (if (if (= c 46) true (if (= c 101) true (= c 69))) true (recur (+ i 1))))))))
+
+(defn- integer-value [t :string] :document
+     (let [r (string-parse-i64 t)]
+       (if (result-ok?-of [:result :i64 :keyword] r)
+         (document-i64 (result-value-of [:result :i64 :keyword] r 0))
+         (document-null))))
+
+(defn- read-number [s :string i :i64] :document
+     (let [n (string-byte-length s)
+           end (loop [j i] (if (number-char? (ch-at s j)) (recur (+ j 1)) j))
+           token (string-substring s i end)]
+       (if (json-number? token)
+         (if (float-token? token)
+           (vpair (document-edn-read token) end)
+           (let [v (integer-value token)]
+             (if (document-equal? v (document-null))
+               (throw (ex-info "invalid JSON number" {:pos i :token token}))
+               (vpair v end))))
+         (throw (ex-info "invalid JSON number" {:pos i :token token})))))
+
+(defn- starts? [s :string i :i64 lit :string] :bool
+     (let [n (string-byte-length lit)]
+       (loop [k 0]
+         (if (>= k n)
+           true
+           (if (= (ch-at s (+ i k)) (string-code-point-at lit k)) (recur (+ k 1)) false)))))
+
+(defn- literal [s :string i :i64 lit :string v :document] :document
+     (if (starts? s i lit)
+       (vpair v (+ i (string-byte-length lit)))
+       (throw (ex-info "invalid JSON token" {:pos i}))))
+
+(defn- array-items [s :string i :i64 acc :string] :document
+     (if (= 93 (ch-at s i))
+       (spair (string-concat acc "]") (+ i 1))
+       (let [vp (read-value s i)
+             j (skip-ws s (vp-pos vp))
+             next-acc (string-concat acc (string-concat (vp-text vp) " "))
+             ch (ch-at s j)]
+         (cond
+           (= ch 44) (let [next (skip-ws s (+ j 1))]
+                       (if (= 93 (ch-at s next))
+                         (throw (ex-info "trailing JSON array comma" {:pos next}))
+                         (array-items s next next-acc)))
+           (= ch 93) (spair (string-concat next-acc "]") (+ j 1))
+           :else (throw (ex-info "expected comma or array end" {:pos j :char ch}))))))
+
+(defn- object-text [acc :document] :string
+     (loop [i 0 out "{"]
+       (if (>= i (document-count acc))
+         (string-concat out "}")
+         (let [entry (option-or (document-map-entry-at acc i) (document-null))
+               k (option-or (document-vector-at entry 0) (document-null))
+               v (option-or (document-vector-at entry 1) (document-null))
+               text (option-or (document-string-value v) "")]
+           (recur (+ i 1) (string-concat out (string-concat (document-edn-print k) (string-concat " " (string-concat text " ")))))))))
+
+(defn- object-items [s :string i :i64 acc :document] :document
+     (if (= 125 (ch-at s i))
+       (spair (object-text acc) (+ i 1))
+       (let [kp (if (= 34 (ch-at s i)) (read-string* s i)
+                  (throw (ex-info "JSON object key must be a string" {:pos i})))
+             j (skip-ws s (vp-pos kp))]
+         (if (= 58 (ch-at s j))
+           (let [vp (read-value s (skip-ws s (+ j 1)))
+                 next-acc (document-assoc acc (document-edn-read (vp-text kp)) (document-string (vp-text vp)))
+                 j2 (skip-ws s (vp-pos vp))
+                 ch (ch-at s j2)]
+             (cond
+               (= ch 44) (let [next (skip-ws s (+ j2 1))]
+                           (if (= 125 (ch-at s next))
+                             (throw (ex-info "trailing JSON object comma" {:pos next}))
+                             (object-items s next next-acc)))
+               (= ch 125) (spair (object-text next-acc) (+ j2 1))
+               :else (throw (ex-info "expected comma or object end" {:pos j2 :char ch}))))
+           (throw (ex-info "expected object colon" {:pos j}))))))
+
+(defn- read-value [s :string i0 :i64] :document
+     (let [i (skip-ws s i0)
+           c (ch-at s i)]
+       (cond
+         (= c 34) (read-string* s i)
+         (= c 123) (object-items s (skip-ws s (+ i 1)) (document-map))
+         (= c 91) (array-items s (skip-ws s (+ i 1)) "[")
+         (= c 116) (literal s i "true" (document-bool true))
+         (= c 102) (literal s i "false" (document-bool false))
+         (= c 110) (literal s i "null" (document-null))
+         (if (= c 45) true (if (>= c 48) (<= c 57) false)) (read-number s i)
+         :else (throw (ex-info "invalid JSON value" {:pos i :char c})))))
+
+(defn- decode-value [s :string] :document
+     (let [p (read-value s 0)
+           i (skip-ws s (vp-pos p))]
+       (if (= i (string-byte-length s))
+         (document-edn-read (vp-text p))
+         (throw (ex-info "trailing JSON input" {:pos i})))))
+
+(defn decode
+     "Decode JSON as an explicit result. Invalid input carries its error data."
+     [s :string] [:result :document :document]
+     (try
+       (result-ok-of [:result :document :document] (decode-value s))
+       (catch error (result-err-of [:result :document :document] error))))

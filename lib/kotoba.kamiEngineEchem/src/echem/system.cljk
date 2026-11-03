@@ -1,0 +1,199 @@
+(ns echem.system
+  "Net system-level operating point for the ROM PEM fuel cell
+  (:rom-fc-system) — the bridge between the stack ROM's :eff-LHV
+  (stack-only, polarization-curve basis) and the vehicle plane's
+  :fc-elec-eff (H2(LHV) → electric *system* efficiency, stack + BoP).
+
+  Boundary advanced: `:pem-fuel-cell` + `:dc-dc-and-dc-bus` of the
+  magnesium-hydrogen-PEMFC electric-drive boundary — the vehicle plane
+  consumes H2 through `:fc-elec-eff` (kami-engine-vehicle-designer
+  vdesign.powertrain/tech, vdesign.hydrogen/consumption-profile,
+  vdesign.endurance), and its own docstrings declare the operating-point
+  dependence (polarization, BoP parasitics) UNMEASURED. On main there is
+  no executable contract that decomposes a system efficiency into the
+  stack part (the ROM's own number) and the BoP part, so a vehicle-plane
+  :fc-elec-eff can silently claim a stack efficiency the ROM never
+  produced. This contract is that decomposition, inverted:
+
+    gross stack power  P-stack = ṁ·LHV·eta-stack      (ROM identity)
+    BoP parasitic load P-bop   = caller-supplied (kW or fraction)
+    net bus power      P-net    = P-stack − P-bop
+    system efficiency  eta-sys  = P-net / (ṁ·LHV)
+                              = eta-stack · (1 − P-bop/P-stack)
+
+  The identity is exact given the caller's numbers — the ROM's :eff-LHV
+  and :stack-kW are reused verbatim (echem.solver/solve-at-power output),
+  no efficiency or parasitic constant is invented here.
+
+  BoP input forms (exactly one):
+    :bop-kw      — absolute parasitic power at this operating point
+    :bop-frac    — parasitic power as a fraction of GROSS stack power
+
+  An optional :dc-dc-eff in (0, 1] composes the DC/DC stage:
+    P-bus = P-net · dc-dc-eff,  eta-bus = eta-sys · dc-dc-eff
+
+  Refusals (fail closed, never guessed): non-finite/non-positive stack
+  power, :eff-lhv outside (0, 1), :bop-kw negative or ≥ gross stack
+  power (net power must stay positive — a BoP that eats the whole stack
+  is an infeasible operating point, reported by refusing, mirroring
+  echem.stack-thermal's discipline), :bop-frac outside [0, 1), both or
+  neither BoP form supplied, :dc-dc-eff outside (0, 1].
+
+  Unmeasured (declared on every result, never numeric): BoP's own
+  operating-point dependence (compressor/turbine/coolant-pump power
+  curves vs current density), startup/shutdown parasitics, purge and
+  recirculation flows, DC/DC part-load efficiency curve. The caller's
+  provenance strings (:bop-source, :dc-dc-source) are REQUIRED and
+  echoed — an efficiency claim travels with its evidence or the call
+  fails."
+  (:require [kotoba.lang.text :as str]
+            [echem.solver :as fc]
+            [cae.solver :as cae]))
+
+(def ^:const h2-lhv-j-per-kg fc/h2-lhv-j-per-kg)
+(def ^:const faraday-const fc/faraday-const)
+
+(defn- finite? [x]
+  ;; NaN check without java.lang.Double so the .cljc stays portable:
+  ;; NaN is the only value not equal to itself.
+  (and (number? x) (== x x) (not= x ##Inf) (not= x ##-Inf)))
+
+(defn- pos-num [x]
+  (and (finite? x) (pos? x)))
+
+(defn- require-provenance [x k]
+  (when-not (and (string? x) (not (str/blank? x)))
+    (throw (ex-info (str "system: non-blank provenance string required for " k)
+                    {k x}))))
+
+(defn- require-bop-form [{:keys [bop-kw bop-frac]}]
+  (when (and (some? bop-kw) (some? bop-frac))
+    (throw (ex-info "system: supply exactly one of :bop-kw or :bop-frac"
+                    {:bop-kw bop-kw :bop-frac bop-frac})))
+  (when-not (or (some? bop-kw) (some? bop-frac))
+    (throw (ex-info "system: one of :bop-kw or :bop-frac is required"
+                    {:bop-kw bop-kw :bop-frac bop-frac}))))
+
+(defn- bop-power-kw
+  "Parasitic power in kW from whichever form the caller supplied."
+  [stack-kw {:keys [bop-kw bop-frac]}]
+  (if (some? bop-kw)
+    (do (when-not (and (finite? bop-kw) (not (neg? bop-kw)))
+          (throw (ex-info "system: :bop-kw must be a finite number ≥ 0 (kW)"
+                          {:bop-kw bop-kw})))
+        (when-not (< bop-kw stack-kw)
+          (throw (ex-info "system: :bop-kw must be < gross stack power — net power must stay positive"
+                          {:bop-kw bop-kw :stack-kw stack-kw})))
+        bop-kw)
+    (do (when-not (and (finite? bop-frac) (<= 0.0 bop-frac) (< bop-frac 1.0))
+          (throw (ex-info "system: :bop-frac must be in [0, 1)"
+                          {:bop-frac bop-frac})))
+        (* bop-frac stack-kw))))
+
+(defn system-point
+  "case: {:stack-kw    gross electrical stack power (kW), > 0
+          :eff-lhv    stack LHV efficiency (fraction), 0 < eta < 1
+          :bop-kw | :bop-frac  parasitic load, exactly one form
+          :bop-source provenance string for the BoP figure, required
+          :dc-dc-eff  DC/DC converter efficiency (0, 1], optional
+          :dc-dc-source provenance string, required when :dc-dc-eff given}
+  Returns the net system operating point with :provenance and
+  :unmeasured envelopes; exact identities checked in tests."
+  [{:keys [stack-kw eff-lhv bop-source dc-dc-eff dc-dc-source] :as case}]
+  (when-not (pos-num stack-kw)
+    (throw (ex-info "system: :stack-kw must be a positive finite number (kW)"
+                    {:stack-kw stack-kw})))
+  (when-not (and (finite? eff-lhv) (< 0.0 eff-lhv 1.0))
+    (throw (ex-info "system: :eff-lhv must be in (0, 1) — stack LHV fraction"
+                    {:eff-lhv eff-lhv})))
+  (require-provenance bop-source :bop-source)
+  (require-bop-form case)
+  (when dc-dc-eff
+    (when-not (and (finite? dc-dc-eff) (< 0.0 dc-dc-eff) (<= dc-dc-eff 1.0))
+      (throw (ex-info "system: :dc-dc-eff must be in (0, 1]"
+                      {:dc-dc-eff dc-dc-eff})))
+    (require-provenance dc-dc-source :dc-dc-source))
+  (let [bop-kw   (bop-power-kw stack-kw case)
+        net-kw   (- stack-kw bop-kw)
+        bop-frac-actual (/ bop-kw stack-kw)
+        eta-sys  (* eff-lhv (- 1.0 bop-frac-actual))
+        ;; H2 rate implied by the ROM's own stack efficiency at this power
+        h2-kg-per-s (/ (* stack-kw 1000.0)
+                       (* eff-lhv h2-lhv-j-per-kg))]
+    (cond-> {:solver :rom-fc-system
+             :stack-kw stack-kw
+             :eff-lhv eff-lhv
+             :bop-kw bop-kw
+             :bop-frac bop-frac-actual
+             :net-kw net-kw
+             :eta-sys eta-sys
+             :h2-kg-per-s h2-kg-per-s
+             :dc-dc-eff (or dc-dc-eff 1.0)
+             :bus-kw (if dc-dc-eff (* net-kw dc-dc-eff) net-kw)
+             :provenance {:bop-source bop-source
+                          :dc-dc-source dc-dc-source}
+             :unmeasured {:bop-operating-point true
+                          :startup-shutdown-parasitics true
+                          :purge-recirculation true
+                          :dc-dc-part-load-curve true}}
+      dc-dc-eff
+      (assoc :eta-bus (* eta-sys dc-dc-eff)))))
+
+(defn from-solver-result
+  "Compose with `echem.solver/solve` / `solve-at-power`: pass the ROM
+  result map straight in — :stack-kW and :eff-LHV are reused verbatim,
+  never recomputed. `opts` carries the BoP group (+ optional DC/DC)."
+  [rom-result opts]
+  (system-point (merge {:stack-kw (:stack-kW rom-result)
+                        :eff-lhv (:eff-LHV rom-result)}
+                       opts)))
+
+(defn demand-point
+  "Full vehicle-plane closure: given a required NET bus power and the
+  same BoP group, invert to the gross stack operating point. The stack
+  must produce (bus / dc-dc-eff / (1 − bop-frac)) gross — with an absolute :bop-kw
+  the inversion is direct; with a fractional :bop-frac it solves
+  P-net = P-stack·(1 − frac) exactly. Uses echem.solver/solve-at-power
+  on the polarization curve for the gross point, so the operating
+  current density and H2 rate are the ROM's own numbers.
+
+  Returns the ROM's operating point plus the :system envelope (net
+  power, system/bus efficiency). An infeasible gross target returns
+  the ROM's :feasible false — never a fabricated solution."
+  [case p-net-kw]
+  (let [{:keys [bop-kw bop-frac] :as c} (select-keys case
+                                                     [:bop-kw :bop-frac
+                                                      :bop-source
+                                                      :dc-dc-eff
+                                                      :dc-dc-source])]
+    (require-bop-form c)
+    (require-provenance (:bop-source c) :bop-source)
+    (let [frac (if (some? bop-frac)
+                 (do (when-not (and (finite? bop-frac)
+                                    (<= 0.0 bop-frac) (< bop-frac 1.0))
+                       (throw (ex-info "demand-point: :bop-frac must be in [0, 1)"
+                                       {:bop-frac bop-frac})))
+                     bop-frac)
+                 0.0)
+          dc-eff (if (some? (:dc-dc-eff c))
+                   (let [eff (:dc-dc-eff c)]
+                     (when-not (and (finite? eff) (< 0.0 eff) (<= eff 1.0))
+                       (throw (ex-info "demand-point: :dc-dc-eff must be in (0, 1]"
+                                       {:dc-dc-eff eff})))
+                     (require-provenance (:dc-dc-source c) :dc-dc-source)
+                     eff)
+                   1.0)
+          ;; Invert the full bus chain, including DC/DC loss and BoP draw.
+          bop-abs (or bop-kw 0.0)
+          p-gross (/ (+ (/ p-net-kw dc-eff) bop-abs) (- 1.0 frac))
+          rom (fc/solve-at-power (select-keys case
+                                              [:cells :area-cm2 :T-K
+                                               :pt-loading :E0 :tafel-b
+                                               :i0 :R-ohm :i-lim :conc-c])
+                                 p-gross)]
+      (merge rom
+             (system-point (merge {:stack-kw (:stack-kW rom)
+                                   :eff-lhv (:eff-LHV rom)}
+                                  c))))))
+
+(defmethod cae/solve :rom-fc-system [case] (system-point case))

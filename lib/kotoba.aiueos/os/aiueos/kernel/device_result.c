@@ -8,13 +8,15 @@
 #define DEVICE_CANONICAL_MAX AIUEOS_DEVICE_WORKER_CANONICAL_MAX
 #define DEVICE_WORKER_CTX_BYTES AIUEOS_DEVICE_WORKER_CTX_BYTES
 #define DEVICE_BODY_MAX 1024U
+#define DEVICE_RESULT_TEXT_RECORD 288U
+extern int64_t kotoba_aiueos_device_result_text(const uint8_t *, uint64_t, uint64_t, uint8_t *, uint64_t);
 
 extern uint64_t kotoba_aiueos_sha256(
     const uint8_t *, uint64_t, uint8_t[32], uint8_t *, uint64_t);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(
-    const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint8_t *);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in, uint64_t in_length, uint8_t *out, uint64_t out_length, uint8_t *workspace, uint64_t workspace_length);
+static __attribute__((unused)) uint64_t ecdsa_p256_sign_block(const uint8_t *priv, const uint8_t *digest, const uint8_t *k, uint8_t *out, uint8_t *workspace, uint64_t workspace_length) { uint8_t in[96]; for (int i = 0; i < 32; i++) { in[i] = priv[i]; in[32 + i] = digest[i]; in[64 + i] = k[i]; } uint64_t r = kotoba_aiueos_ecdsa_p256_sign(in, 96, out, 64, workspace, workspace_length); for (int i = 0; i < 96; i++) ((volatile uint8_t *)in)[i] = 0; return r; }
 extern uint64_t kotoba_aiueos_ecdsa_p256_public(
-    const uint8_t *, uint8_t *, uint8_t *);
+    const uint8_t *, uint64_t, uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int aiueos_device_p256_key_load(uint8_t key[32]);
 extern int aiueos_device_p256_key_save(const uint8_t key[32]);
 
@@ -24,8 +26,6 @@ static const uint8_t p256_order[32] = {
   0xbc,0xe6,0xfa,0xad,0xa7,0x17,0x9e,0x84,
   0xf3,0xb9,0xca,0xc2,0xfc,0x63,0x25,0x51
 };
-static const char base58_alphabet[] =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const char hex_alphabet[] = "0123456789abcdef";
 #if defined(__GNUC__) && !defined(AIUEOS_DEVICE_RESULT_TESTING)
 #define AIUEOS_DEVICE_HIGH_BSS __attribute__((section(".high_bss")))
@@ -79,37 +79,10 @@ static void hex_encode(const uint8_t *in, uint32_t bytes, char *out) {
 }
 
 #ifndef AIUEOS_DEVICE_RESULT_TESTING
-static void cpuid(uint32_t leaf, uint32_t subleaf,
-                  uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
-  __asm__ volatile("cpuid"
-                   : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
-                   : "a"(leaf), "c"(subleaf));
-}
-
-static int rdrand64(uint64_t *value) {
-  for (uint32_t attempt = 0; attempt < 32; attempt++) {
-    uint8_t ready;
-    uint64_t candidate;
-    __asm__ volatile("rdrand %0; setc %1" : "=r"(candidate), "=qm"(ready));
-    if (ready) { *value = candidate; return 1; }
-    __asm__ volatile("pause");
-  }
-  return 0;
-}
-
+/* CPUID.1:ECX[30] and the RDRAND words are kotoba/cpu-reads.kotoba (JUN-554, over amu ADR 0389's CPU intrinsics). */
+extern int64_t kotoba_aiueos_cpu_random_bytes(uint8_t *, uint64_t);
 int aiueos_cpu_random_bytes(uint8_t *out, uint32_t bytes) {
-  uint32_t a, b, c, d;
-  if (!out || !bytes) return 0;
-  cpuid(1, 0, &a, &b, &c, &d);
-  if (!(c & (1U << 30))) return 0;
-  uint32_t offset = 0;
-  while (offset < bytes) {
-    uint64_t word;
-    if (!rdrand64(&word)) return 0;
-    for (uint32_t i = 0; i < 8 && offset < bytes; i++, offset++)
-      out[offset] = (uint8_t)(word >> (i * 8));
-  }
-  return 1;
+  return kotoba_aiueos_cpu_random_bytes(out, bytes) == 1;
 }
 #else
 extern int aiueos_device_test_random_bytes(uint8_t *, uint32_t);
@@ -152,47 +125,18 @@ static int device_boot_id_ensure(void) {
   return device_boot_id_refresh();
 }
 
-static int base58_encode(const uint8_t *input, uint32_t input_bytes,
-                         char *out, uint32_t capacity) {
-  uint8_t digits[64] = {0};
-  uint32_t digit_count = 1;
-  for (uint32_t j = 0; j < input_bytes; j++) {
-    uint32_t carry = input[j];
-    for (uint32_t i = 0; i < digit_count; i++) {
-      uint32_t value = (uint32_t)digits[i] * 256U + carry;
-      digits[i] = (uint8_t)(value % 58U);
-      carry = value / 58U;
-    }
-    while (carry) {
-      if (digit_count >= sizeof(digits)) return 0;
-      digits[digit_count++] = (uint8_t)(carry % 58U);
-      carry /= 58U;
-    }
-  }
-  uint32_t leading = 0;
-  while (leading < input_bytes && !input[leading]) leading++;
-  uint32_t needed = leading + digit_count;
-  if (needed + 1 > capacity) return 0;
-  uint32_t at = 0;
-  for (uint32_t i = 0; i < leading; i++) out[at++] = '1';
-  while (digit_count) out[at++] = base58_alphabet[digits[--digit_count]];
-  out[at] = 0;
-  return 1;
+/* A 409 means (did,boot,sequence) was reused with different content.  The
+   caller (poll scheduler loop, main.c) resolves it by moving to a new
+   identity namespace: a fresh boot id makes every later (boot,sequence) key
+   new.  Mechanism only; WHEN to refresh is the scheduler's call. */
+void aiueos_device_worker_identity_refresh(void) {
+  (void)device_boot_id_refresh();
 }
 
+/* The did:key text (base58btc of the P-256 multikey) is kotoba/p256-did.kotoba (JUN-554). */
+extern int64_t kotoba_aiueos_p256_did(const uint8_t *, uint64_t, char *, uint64_t);
 static int p256_did(const uint8_t public_key[64], char *out, uint32_t capacity) {
-  uint8_t multikey[35];
-  char encoded[64];
-  multikey[0] = 0x80;
-  multikey[1] = 0x24;
-  multikey[2] = (public_key[63] & 1U) ? 0x03 : 0x02;
-  for (uint32_t i = 0; i < 32; i++) multikey[3 + i] = public_key[i];
-  if (!base58_encode(multikey, sizeof(multikey), encoded, sizeof(encoded))) return 0;
-  struct bounded_buffer b = {(uint8_t *)out, 0, capacity, 1};
-  put_text(&b, "did:key:z");
-  put_text(&b, encoded);
-  put_byte(&b, 0);
-  return b.ok;
+  return kotoba_aiueos_p256_did(public_key, 64, out, capacity) == 1;
 }
 
 /* The 576-byte fixed-layout record `contracts/device-worker-canonical-v1.edn`
@@ -232,16 +176,6 @@ static void worker_context_numbers(
   ctx_number(ctx, AIUEOS_DWC_WORKER_THREADS, worker_threads);
   ctx_number(ctx, AIUEOS_DWC_TSC_HZ, tsc_hz);
   ctx_number(ctx, AIUEOS_DWC_OUTPUT_TOKEN_COUNT, output_token_count);
-}
-
-static void canonical_field(struct bounded_buffer *b, const char *text) {
-  put_byte(b, '\n');
-  put_text(b, text);
-}
-
-static void canonical_number(struct bounded_buffer *b, uint64_t number) {
-  put_byte(b, '\n');
-  put_decimal(b, number);
 }
 
 static int decode_metrics_valid(uint32_t generated_tokens,
@@ -294,84 +228,43 @@ uint32_t aiueos_device_result_http_request(
      per native boot, so refresh here and let all worker requests from this
      boot reuse the resulting id. */
   if (!device_private_key(private_key) ||
-      !kotoba_aiueos_ecdsa_p256_public(private_key, public_key, p256_workspace) ||
+      !kotoba_aiueos_ecdsa_p256_public(private_key, 32, public_key, 64, p256_workspace, sizeof(p256_workspace)) ||
       !random_scalar(nonce_k) ||
       !device_boot_id_refresh() ||
       !aiueos_cpu_random_bytes(nonce, sizeof(nonce))) goto cleanup;
   if (!p256_did(public_key, did_out, did_capacity)) goto cleanup;
 
-  char node[32] = "aiueos-k16-";
-  for (uint32_t i = 0; i < 6; i++) {
-    node[11 + i * 2] = hex_alphabet[result->mac[i] >> 4];
-    node[12 + i * 2] = hex_alphabet[result->mac[i] & 15U];
+  /* The signed canonical text and the JSON body are kotoba/device-result-text.kotoba (JUN-554): this function fills its
+     288-byte record with the raw values, hashes and signs the text, puts the signature in the record and asks for the
+     body. A zero length is a text that did not fit, as the bounded_buffer this replaced refused. */
+  uint8_t rec[DEVICE_RESULT_TEXT_RECORD];
+  secure_zero(rec, sizeof(rec));
+  for (uint32_t i = 0; i < 6; i++) rec[i] = result->mac[i];
+  for (uint32_t i = 0; i < 64; i++) rec[8 + i] = public_key[i];
+  for (uint32_t i = 0; i < 8; i++) rec[72 + i] = device_boot_id[i];
+  for (uint32_t i = 0; i < 32; i++) rec[80 + i] = result->boot->model_sha256[i];
+  for (uint32_t i = 0; i < 16; i++) rec[112 + i] = nonce[i];
+  {
+    const uint64_t numbers[11] = {
+      result->token, result->second_token, result->generated_tokens, result->decode_tokens,
+      result->boot->model_load_cycles, result->first_token_cycles, result->decode_cycles,
+      result->inference_cycles, result->vector_bits, result->worker_threads, result->boot->tsc_hz};
+    for (uint32_t k = 0; k < 11; k++) ctx_number(rec, 192 + k * 8, numbers[k]);
   }
-  node[23] = 0;
-  char public_hex[129], boot_hex[17], model_hex[65], nonce_hex[33];
-  hex_encode(public_key, 64, public_hex);
-  hex_encode(device_boot_id, 8, boot_hex);
-  hex_encode(result->boot->model_sha256, 32, model_hex);
-  hex_encode(nonce, 16, nonce_hex);
-
   uint8_t canonical_bytes[DEVICE_CANONICAL_MAX];
-  struct bounded_buffer canonical = {
-    canonical_bytes, 0, sizeof(canonical_bytes), 1
-  };
-  put_text(&canonical, "aiueos-k16-result-v2");
-  canonical_field(&canonical, node);
-  canonical_field(&canonical, public_hex);
-  canonical_field(&canonical, boot_hex);
-  canonical_field(&canonical, model_hex);
-  canonical_field(&canonical, "Qwen3.8-27B-UD-IQ3_XXS.gguf");
-  canonical_number(&canonical, 2);
-  canonical_number(&canonical, result->token);
-  canonical_number(&canonical, result->second_token);
-  canonical_number(&canonical, result->generated_tokens);
-  canonical_number(&canonical, result->decode_tokens);
-  canonical_number(&canonical, result->boot->model_load_cycles);
-  canonical_number(&canonical, result->first_token_cycles);
-  canonical_number(&canonical, result->decode_cycles);
-  canonical_number(&canonical, result->inference_cycles);
-  canonical_number(&canonical, result->vector_bits);
-  canonical_number(&canonical, result->worker_threads);
-  canonical_number(&canonical, result->boot->tsc_hz);
-  canonical_field(&canonical, nonce_hex);
-  if (!canonical.ok ||
-      !kotoba_aiueos_sha256(canonical.bytes, canonical.length, digest,
+  int64_t canonical_length = kotoba_aiueos_device_result_text(rec, sizeof(rec), 0, canonical_bytes,
+                                                              sizeof(canonical_bytes));
+  if (canonical_length <= 0 ||
+      !kotoba_aiueos_sha256(canonical_bytes, (uint64_t)canonical_length, digest,
                             sha_workspace, sizeof(sha_workspace)) ||
-      !kotoba_aiueos_ecdsa_p256_sign(private_key, digest, nonce_k,
-                                     signature, p256_workspace)) goto cleanup;
-  char signature_hex[129];
-  hex_encode(signature, 64, signature_hex);
+      !ecdsa_p256_sign_block(private_key, digest, nonce_k,
+                                     signature, p256_workspace, sizeof(p256_workspace))) goto cleanup;
+  for (uint32_t i = 0; i < 64; i++) rec[128 + i] = signature[i];
 
   uint8_t body_bytes[DEVICE_BODY_MAX];
-  struct bounded_buffer body = {body_bytes, 0, sizeof(body_bytes), 1};
-  put_text(&body, "{\"node\":\""); put_text(&body, node);
-  put_text(&body, "\",\"public-key\":\""); put_text(&body, public_hex);
-  put_text(&body, "\",\"boot\":\""); put_text(&body, boot_hex);
-  put_text(&body, "\",\"model-sha256\":\""); put_text(&body, model_hex);
-  put_text(&body, "\",\"model\":\"Qwen3.8-27B-UD-IQ3_XXS.gguf\",\"protocol\":2,\"token\":");
-  put_decimal(&body, result->token);
-  put_text(&body, ",\"second-token\":"); put_decimal(&body, result->second_token);
-  put_text(&body, ",\"generated-tokens\":");
-  put_decimal(&body, result->generated_tokens);
-  put_text(&body, ",\"decode-tokens\":");
-  put_decimal(&body, result->decode_tokens);
-  put_text(&body, ",\"model-load-cycles\":");
-  put_decimal(&body, result->boot->model_load_cycles);
-  put_text(&body, ",\"first-token-cycles\":");
-  put_decimal(&body, result->first_token_cycles);
-  put_text(&body, ",\"decode-cycles\":");
-  put_decimal(&body, result->decode_cycles);
-  put_text(&body, ",\"inference-cycles\":");
-  put_decimal(&body, result->inference_cycles);
-  put_text(&body, ",\"vector-bits\":"); put_decimal(&body, result->vector_bits);
-  put_text(&body, ",\"worker-threads\":");
-  put_decimal(&body, result->worker_threads);
-  put_text(&body, ",\"tsc-hz\":"); put_decimal(&body, result->boot->tsc_hz);
-  put_text(&body, ",\"nonce\":\""); put_text(&body, nonce_hex);
-  put_text(&body, "\",\"signature\":\""); put_text(&body, signature_hex);
-  put_text(&body, "\"}");
-  if (!body.ok) goto cleanup;
+  int64_t body_written = kotoba_aiueos_device_result_text(rec, sizeof(rec), 1, body_bytes, sizeof(body_bytes));
+  if (body_written <= 0) goto cleanup;
+  struct bounded_buffer body = {body_bytes, (uint32_t)body_written, sizeof(body_bytes), 1};
 
   struct bounded_buffer request = {out, 0, capacity, 1};
   put_text(&request, "POST /infer/nodes/device-p256-result HTTP/1.1\r\n");
@@ -432,7 +325,7 @@ uint32_t aiueos_device_worker_http_request(
   uint8_t nonce[16] = {0}, digest[32] = {0}, signature[64] = {0};
   uint32_t request_length = 0;
   if (!device_private_key(private_key) ||
-      !kotoba_aiueos_ecdsa_p256_public(private_key, public_key, p256_workspace) ||
+      !kotoba_aiueos_ecdsa_p256_public(private_key, 32, public_key, 64, p256_workspace, sizeof(p256_workspace)) ||
       !random_scalar(nonce_k) || !device_boot_id_ensure() ||
       !aiueos_cpu_random_bytes(nonce, sizeof(nonce))) goto cleanup;
   if (!p256_did(public_key, did_out, did_capacity)) goto cleanup;
@@ -479,8 +372,8 @@ uint32_t aiueos_device_worker_http_request(
   if (canonical_length <= 0 ||
       !kotoba_aiueos_sha256(canonical_bytes, (uint64_t)canonical_length, digest,
                             sha_workspace, sizeof(sha_workspace)) ||
-      !kotoba_aiueos_ecdsa_p256_sign(private_key, digest, nonce_k,
-                                     signature, p256_workspace)) goto cleanup;
+      !ecdsa_p256_sign_block(private_key, digest, nonce_k,
+                                     signature, p256_workspace, sizeof(p256_workspace))) goto cleanup;
   char signature_hex[129];
   hex_encode(signature, 64, signature_hex);
 

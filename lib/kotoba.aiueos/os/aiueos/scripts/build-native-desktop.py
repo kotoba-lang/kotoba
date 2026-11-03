@@ -15,7 +15,7 @@ def main(amu,out,*,profile='desktop',distribution='aiueos'):
  out.mkdir(parents=True,exist_ok=False)
  (out/'distribution.json').write_bytes(descriptor_bytes)
  spec=importlib.util.spec_from_file_location('native_kernel',HERE/'build-native-kernel.py');driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
- compiler,digest=driver.select_native_compiler(amu);env=dict(os.environ,AIUEOS_AMU_SELFHOST_BIN=str(compiler),AIUEOS_AMU_SELFHOST_SHA256=digest)
+ compiler,digest,_=driver.select_native_compiler(amu);env=dict(os.environ,AIUEOS_AMU_SELFHOST_BIN=str(compiler),AIUEOS_AMU_SELFHOST_SHA256=digest)
  calls=[]
  def run(name,args,custom=env):
   r=subprocess.run([sys.executable,*map(str,args)],env=custom,capture_output=True,timeout=10800)
@@ -27,8 +27,8 @@ def main(amu,out,*,profile='desktop',distribution='aiueos'):
  env.update(AIUEOS_NATIVE_OUT=str(kernel),AIUEOS_NATIVE_KERNEL_SOURCE=str(HERE.parent/'native'/entry),AIUEOS_NATIVE_FUEL=str(DESKTOP_FUEL),AIUEOS_NATIVE_BOOT_PAYLOAD=str(font),AIUEOS_NATIVE_BOOT_PAYLOAD_SHA256=hashlib.sha256(font.read_bytes()).hexdigest())
  run('kernel',[HERE/'build-native-kernel.py',amu])
  run('media',[HERE/'build-native-media.py','--amu-source',amu,'--compiler',compiler,'--compiler-sha256',digest,'--efi',kernel/'BOOTX64.EFI','--output',media])
- state=json.loads((kernel/'build-state.json').read_text());assert state['state']=='NATIVE_IMAGE_CANDIDATE' and state['sourceModuleCount']==31
- result=dict(schema='aiueos.native-desktop-candidate.v1',state='NATIVE_DESKTOP_MEDIA_CANDIDATE',profile=profile,localDraftCandidate=profile=='local-draft',D2WorkspaceCodec=False,signedHeadAuthority=False,kernel=state['images'][0],efi=state['efiImages'][0],media=json.loads((media/'native-media.json').read_text())['image'],font=json.loads((out/'font/native-font.json').read_text())['padded'],compiler=state['compiler'],sourceModuleCount=31,kernelFuelInitial=DESKTOP_FUEL,JVMNodeOrGraalFallback=False,cCompilerOrLoader=False,guestBoot=False,desktopInput=False,BrowserCSSOMParity=False,dappsExecuted=False,physicalHardware=False)
+ state=json.loads((kernel/'build-state.json').read_text());assert state['state']=='NATIVE_IMAGE_CANDIDATE' and state['sourceModuleCount']==33
+ result=dict(schema='aiueos.native-desktop-candidate.v1',state='NATIVE_DESKTOP_MEDIA_CANDIDATE',profile=profile,localDraftCandidate=profile=='local-draft',D2WorkspaceCodec=False,signedHeadAuthority=False,kernel=state['images'][0],efi=state['efiImages'][0],media=json.loads((media/'native-media.json').read_text())['image'],font=json.loads((out/'font/native-font.json').read_text())['padded'],compiler=state['compiler'],sourceModuleCount=33,kernelFuelInitial=DESKTOP_FUEL,JVMNodeOrGraalFallback=False,cCompilerOrLoader=False,guestBoot=False,desktopInput=False,BrowserCSSOMParity=False,dappsExecuted=False,physicalHardware=False)
  result['distribution']=dict(id=distribution,descriptor=dict(path='distribution.json',bytes=len(descriptor_bytes),sha256=hashlib.sha256(descriptor_bytes).hexdigest()))
  (out/'native-desktop.json').write_text(json.dumps(result,indent=2)+'\n');print(result['state'])
 if __name__=='__main__':

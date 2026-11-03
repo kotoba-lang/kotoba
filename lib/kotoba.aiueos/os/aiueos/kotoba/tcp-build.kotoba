@@ -1,0 +1,57 @@
+;; net_build_tcp of kernel/pci.c in Kotoba (JUN-552): one Ethernet / IPv4 / TCP segment, no options.
+;;
+;; build(frame, n, rec, rec-len, payload, plen): writes frame[0..54 + plen) and answers 54 + plen, the C's 14 + total.
+;; rec is 48 bytes: [0..6) the peer's MAC (destination), [6..12) ours, then little-endian u32s -- [12] src, [16] dst,
+;; [20] sport | dport << 16, [24] sequence, [28] acknowledgement, [32] flags (low byte), [36] the IPv4 identification
+;; (low 16 bits), [40] the window (low 16 bits). The header is the C's: version 4 IHL 5, total 40 + plen, DF, TTL 64,
+;; protocol 6, data offset 5, urgent 0; the IPv4 checksum over the header, the TCP checksum over the pseudo header and
+;; the segment, both as kotoba_aiueos_ipv4_checksum answers them -- so a segment past 2036 bytes gets 0xffff, the
+;; checksum object's refusal, as it did in C. The pseudo header is summed in place (net_tcp_scratch is no longer written).
+;; n must be 54 + plen (<= 16384, amu ADR 0386's windows) and rec-len 48; else, or for a null pointer or a non-canonical
+;; value, nothing is written and the answer is 0. The C keeps net_ip_id's increment and the globals.
+(ns aiueos.tcp-build (:export [kotoba_aiueos_tcp_build]))
+(defn- canonical? [x :i64] :bool (= (u64-shift-right x 32) 0))
+(defn- b [f :i64 n :i64 i :i64] :i64 (kernel-load-u8-16k f n i))
+(defn- put [f :i64 n :i64 i :i64 v :i64] :i64 (kernel-store-u8-16k f n i (bit-and v 255)))
+(defn- put16 [f :i64 n :i64 i :i64 v :i64] :i64 (+ (put f n i (u64-shift-right v 8)) (put f n (+ i 1) v)))
+(defn- put32 [f :i64 n :i64 i :i64 v :i64] :i64 (+ (put16 f n i (u64-shift-right v 16)) (put16 f n (+ i 2) (bit-and v 65535))))
+(defn- r32 [r :i64 rn :i64 i :i64] :i64 (kernel-load-u32 r rn i))
+;; the RFC 1071 words of w[off..wn), a trailing odd byte the high half, added to acc
+(defn- sum16 [w :i64 wn :i64 off :i64 acc :i64] :i64
+  (if (>= off wn) acc
+    (let [hi (b w wn off) lo (if (>= (+ off 1) wn) 0 (b w wn (+ off 1)))]
+      (sum16 w wn (+ off 2) (+ acc (+ (* 256 hi) lo))))))
+(defn- fold [t :i64] :i64 (if (< t 65536) t (fold (+ (bit-and t 65535) (quot t 65536)))))
+;; kotoba_aiueos_ipv4_checksum's answer for a range of len bytes whose words sum to s
+(defn- csum [s :i64 len :i64] :i64 (if (> len 2048) 65535 (- 65535 (fold s))))
+;; frame[i..i+k) = src[0..k)
+(defn- copy [f :i64 n :i64 s :i64 sn :i64 i :i64] :i64
+  (if (>= i sn) 0 (let [v (b s sn i) w (put f n (+ 54 i) v)] (copy f n s sn (+ (+ i 1) (* 0 w))))))
+(defn- macs [f :i64 n :i64 r :i64 rn :i64 i :i64] :i64
+  (if (>= i 12) 0 (let [v (kernel-load-u8 r rn i) w (put f n i v)] (macs f n r rn (+ (+ i 1) (* 0 w))))))
+(defn- head [f :i64 n :i64 r :i64 rn :i64 plen :i64] :i64
+  (let [ports (r32 r rn 20)
+        a1 (put16 f n 12 2048) a2 (put f n 14 69) a3 (put f n 15 0) a4 (put16 f n 16 (+ 40 plen))
+        a5 (put16 f n 18 (bit-and (r32 r rn 36) 65535)) a6 (put16 f n 20 16384) a7 (put f n 22 64) a8 (put f n 23 6)
+        a9 (put16 f n 24 0) b1 (put32 f n 26 (r32 r rn 12)) b2 (put32 f n 30 (r32 r rn 16))
+        b3 (put16 f n 34 (bit-and ports 65535)) b4 (put16 f n 36 (u64-shift-right ports 16))
+        b5 (put32 f n 38 (r32 r rn 24)) b6 (put32 f n 42 (r32 r rn 28)) b7 (put f n 46 80) b8 (put f n 47 (r32 r rn 32))
+        b9 (put16 f n 48 (bit-and (r32 r rn 40) 65535)) c1 (put16 f n 50 0) c2 (put16 f n 52 0)]
+    (+ (+ (+ (+ a1 a2) (+ a3 a4)) (+ (+ a5 a6) (+ a7 a8))) (+ (+ (+ a9 b1) (+ b2 b3)) (+ (+ (+ b4 b5) (+ b6 b7)) (+ (+ b8 b9) (+ c1 c2)))))))
+;; the TCP checksum over the pseudo header and frame[34..34+tl); tl is a parameter so the window's length has a source
+(defn- tcp-csum [f :i64 n :i64 tl :i64 src :i64 dst :i64] :i64
+  (let [t (kernel-subregion f n 34 tl)
+        pseudo (+ (+ (u64-shift-right src 16) (bit-and src 65535)) (+ (+ (u64-shift-right dst 16) (bit-and dst 65535)) (+ 6 tl)))]
+    (csum (sum16 t tl 0 pseudo) (+ 12 tl))))
+(defn- checksums [f :i64 n :i64 src :i64 dst :i64] :i64
+  (let [h (kernel-subregion f n 14 20) ip (csum (sum16 h 20 0 0) 20)
+        w1 (put16 f n 24 ip)
+        tcp (tcp-csum f n (- n 34) src dst)]
+    (+ (put16 f n 50 tcp) (* 0 w1))))
+(defn kotoba_aiueos_tcp_build [frame :i64 n :i64 rec :i64 rec-len :i64 payload :i64 plen :i64] :i64
+  (if (or (= frame 0) (= rec 0) (not (canonical? n)) (not (canonical? plen)) (> n 16384) (not= n (+ 54 plen))
+          (not= rec-len 48) (and (= payload 0) (> plen 0))) 0
+    (let [w1 (macs frame n rec rec-len 0) w2 (head frame n rec rec-len plen)
+          w3 (copy frame n payload plen 0)
+          w4 (checksums frame n (r32 rec rec-len 12) (r32 rec rec-len 16))]
+      (+ n (* 0 (+ (+ w1 w2) (+ w3 w4)))))))

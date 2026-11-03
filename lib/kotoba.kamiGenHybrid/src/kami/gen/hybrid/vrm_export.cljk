@@ -1,0 +1,357 @@
+(ns kami.gen.hybrid.vrm-export
+  "Body (`character/generate-character-tagged`, minus its `clothing` part —
+  see `kami.gen.hybrid/bare-body`) + generated textures
+  (`kami.gen.hybrid.workflow`/`kami.gen.hybrid.nodes` output) -> a real
+  `.vrm` file, via `kotoba-lang/vrm`'s data types (`vrm.vrm-types`) and GLB
+  serializer (`vrm.export/export-glb`).
+
+  `kotoba-lang/vrm`'s own `vrm.compose`/`vrm.part` operate on ALREADY-glTF
+  `VrmDocument`s (merging existing avatars) — there is no published
+  `character` -> glTF adapter anywhere in the dependency graph, so building
+  one (this namespace) is this repo's real, disclosed value-add, not a
+  reimplementation of either dependency's own job: geometry/buffer/accessor
+  encoding follows `character.export/export-glb`'s proven technique
+  (per-material vertex/index merging, GLB chunk layout) but emits a plain
+  EDN glTF-JSON map (camelCase keys, per `vrm.gltf-types`'s convention)
+  instead of hand-built JSON strings, since `vrm.export/export-glb` expects
+  that shape, plus adds the skin/joints/inverseBindMatrices/humanoid/image/
+  texture data `character.export` doesn't produce at all."
+  (:require [kotoba.io :as kio] [character.body :as body]
+            [character.material :as material]
+            [character.bin :as bin]
+            [character.space :as cspace]
+            [vrm.gltf-types :as gt]
+            [vrm.vrm-types :as vt]
+            [vrm.export :as vrm-export])
+  (:import [java.io File FileOutputStream]))
+
+;; ── head-local parts -> world space, via the general tagged-point
+;; convention (ADR-0048 §1, com-junkawasaki/root) — replaces the earlier
+;; ad-hoc `to-world-space` (commit 848012e) that detected head-local parts
+;; by NAME and blindly `vec3+`'d an offset with no space check at all ──
+;;
+;; Original root cause (848012e, still accurate): `character/generate-
+;; character` mixes TWO coordinate conventions in one `:parts` vector —
+;; `character.body/generate-body`/`generate-clothing` bake WORLD-space
+;; positions in directly, but `character.base-mesh/generate-head`/
+;; `generate-eyes`/`generate-eyebrows` and `character.hair/generate-hair`
+;; are HEAD-LOCAL (centred at local origin). Feeding untranslated
+;; head-local vertices into `character.body/skin-weights` alongside
+;; genuinely world-space bone positions compared two different coordinate
+;; spaces as if they were one — a head-local eye vertex sits within ~0.08
+;; units of the WORLD origin, so `leftShoulder`/`rightShoulder` came out
+;; numerically "nearest" instead of `head`. The same untranslated positions
+;; also got written directly as the primitive's `POSITION` accessor data,
+;; silently rendering head/eyes/eyebrows/hair squashed into the chest/neck
+;; region.
+;;
+;; ADR-0048 follow-up (this version): `kami.gen.hybrid/bare-body` now calls
+;; `character/generate-character-tagged`, so every part arriving here
+;; already carries a `character.space` `:space` tag (`:head-local` or
+;; `:world`) on both the part itself and every vertex `:position`. Instead
+;; of a downstream consumer (this namespace) re-deriving "which parts are
+;; head-local" by NAME — a hardcoded set that a future `character` change
+;; could silently invalidate — `to-world-space` now trusts `character`'s
+;; OWN tag (`character` is the authority on its own output spaces) and
+;; converts via `character.space/head-local->world`, which itself asserts
+;; (via `kotoba.lang.spec`) that a point claiming `:head-local` really is
+;; shaped like a tagged point before converting. A part with a missing or
+;; unrecognized `:space` tag throws here rather than silently skinning it
+;; in whatever space it happens to already be in — the exact failure mode
+;; a future format/generator change could otherwise reintroduce.
+
+(defn- head-bone-world-position
+  "The `head` bone's world-space rest position (from `bone-world-pos`,
+  index-aligned with `bones`) — throws loudly rather than silently skinning
+  against a missing/renamed bone if `character.body/generate-humanoid-
+  skeleton` ever stops naming a bone `\"head\"`."
+  [bones bone-world-pos]
+  (if-let [idx (first (keep-indexed (fn [i b] (when (= (:name b) "head") i)) bones))]
+    (nth bone-world-pos idx)
+    (throw (ex-info "vrm-export: no \"head\" bone found in skeleton — cannot place head-local parts in world space"
+                     {:bone-names (mapv :name bones)}))))
+
+(defn- to-world-space
+  "Converts `part` (a `character.space`-TAGGED MeshPart — see the namespace
+  comment above) to plain, bare-`[x y z]`-vector `:position`s in WORLD
+  space, ready for the space-agnostic skin-weights/GLB-export machinery
+  below. `:head-local` parts are translated by `head-world-pos` via
+  `character.space/head-local->world` (asserted en route); `:world` parts
+  are passed through (already correct, just untagged). Any other/missing
+  `:space` throws — no silent fallback to \"assume it's already right\"."
+  [part head-world-pos]
+  (case (:space part)
+    :head-local (cspace/untag-part :world
+                                    (cspace/retag-part :world
+                                                        (partial cspace/head-local->world head-world-pos)
+                                                        part))
+    :world (cspace/untag-part :world part)
+    (throw (ex-info "vrm-export/to-world-space: part has no recognized :space tag"
+                     {:part-name (:name part) :space (:space part)}))))
+
+;; ── skinning every part (not just "body") ──────────────────────────────
+
+(defn- ensure-skinned
+  "Parts other than `\"body\"` (head/eyes/eyebrows/hair) come out of
+  `character/generate-character` with no `:joint-indices`/`:joint-weights`
+  (only `body/skin-body` is applied, to the body part, upstream). Since
+  this exporter merges ALL parts sharing a material into one glTF
+  primitive (see `group-parts-by-material` below) and a primitive's
+  JOINTS_0/WEIGHTS_0 accessors must cover every one of its vertices, every
+  part needs weights. `character.body/skin-weights` is the same public
+  inverse-square-distance auto-skinning function `character.body/skin-
+  body` already applies to the body part — this just applies it to the
+  remaining parts too (mostly binding head/neck-area geometry to the
+  `head`/`neck` bones), the natural extension of an approximation
+  `character.body` already documents and uses, not a new one invented
+  here."
+  [part bone-world-pos]
+  (if (contains? (first (:vertices part)) :joint-indices)
+    part
+    (update part :vertices
+            (fn [vs] (mapv merge vs (body/skin-weights vs bone-world-pos))))))
+
+;; ── per-material vertex/index merge (character.export's technique,
+;; adapted to also carry joints/weights and to emit data maps instead of
+;; JSON strings) ─────────────────────────────────────────────────────────
+
+(def material-order [:skin :eye-white :iris :pupil :lip :eyebrow :hair :clothing :eyelash])
+
+(defn- group-parts-by-material [parts]
+  (reduce
+   (fn [groups {:keys [material vertices indices]}]
+     (let [existing (get groups material {:vertices [] :indices []})
+           offset (count (:vertices existing))]
+       (assoc groups material
+              {:vertices (into (:vertices existing) vertices)
+               :indices (into (:indices existing) (map #(+ % offset) indices))})))
+   {} parts))
+
+;; ── binary buffer + accessor builders (byte-int vectors, per vrm.glb's
+;; own convention) ───────────────────────────────────────────────────────
+
+(defn- pad4 [v] (loop [v v] (if (zero? (mod (count v) 4)) v (recur (conj v 0)))))
+
+(defn- minmax3 [vertices]
+  (reduce (fn [[[mnx mny mnz] [mxx mxy mxz]] {[x y z] :position}]
+            [[(min mnx x) (min mny y) (min mnz z)] [(max mxx x) (max mxy y) (max mxz z)]])
+          [[Double/MAX_VALUE Double/MAX_VALUE Double/MAX_VALUE]
+           [(- Double/MAX_VALUE) (- Double/MAX_VALUE) (- Double/MAX_VALUE)]]
+          vertices))
+
+(defn- append-primitive
+  "Appends one material-group's vertex/index/joint/weight data to the
+  running GLB build state; returns the updated state plus the glTF
+  `primitive` map (attributes/indices/material)."
+  [{:keys [buf buffer-views accessors] :as st} mat-idx {:keys [vertices indices]}]
+  (let [[vmin vmax] (minmax3 vertices)
+        vdata (reduce (fn [vd {:keys [position normal uv]}]
+                        (let [[px py pz] position [nx ny nz] normal [u v] uv]
+                          (-> vd (bin/write-f32-le px) (bin/write-f32-le py) (bin/write-f32-le pz)
+                              (bin/write-f32-le nx) (bin/write-f32-le ny) (bin/write-f32-le nz)
+                              (bin/write-f32-le u) (bin/write-f32-le v))))
+                      [] vertices)
+        vdata (pad4 vdata)
+        v-bv (count buffer-views)
+        v-off (count buf)
+        buf (into buf vdata)
+        buffer-views (conj buffer-views {:buffer 0 :byteOffset v-off :byteLength (count vdata)
+                                          :byteStride 32 :target gt/buffer-target-array-buffer})
+        jwdata (reduce (fn [d {:keys [joint-indices joint-weights]}]
+                         (let [[j0 j1 j2 j3] joint-indices [w0 w1 w2 w3] joint-weights]
+                           (-> d (bin/write-u8 j0) (bin/write-u8 j1) (bin/write-u8 j2) (bin/write-u8 j3)
+                               (bin/write-f32-le w0) (bin/write-f32-le w1) (bin/write-f32-le w2) (bin/write-f32-le w3))))
+                       [] vertices)
+        jwdata (pad4 jwdata)
+        jw-bv (count buffer-views)
+        jw-off (count buf)
+        buf (into buf jwdata)
+        buffer-views (conj buffer-views {:buffer 0 :byteOffset jw-off :byteLength (count jwdata)
+                                          :byteStride 20 :target gt/buffer-target-array-buffer})
+        idata (pad4 (reduce (fn [id i] (bin/write-u32-le id i)) [] indices))
+        i-bv (count buffer-views)
+        i-off (count buf)
+        buf (into buf idata)
+        buffer-views (conj buffer-views {:buffer 0 :byteOffset i-off :byteLength (count idata)
+                                          :target gt/buffer-target-element-array-buffer})
+        pos-a (count accessors)
+        accessors (conj accessors {:bufferView v-bv :componentType gt/component-type-float
+                                    :count (count vertices) :type "VEC3" :byteOffset 0
+                                    :min vmin :max vmax})
+        norm-a (count accessors)
+        accessors (conj accessors {:bufferView v-bv :componentType gt/component-type-float
+                                    :count (count vertices) :type "VEC3" :byteOffset 12})
+        uv-a (count accessors)
+        accessors (conj accessors {:bufferView v-bv :componentType gt/component-type-float
+                                    :count (count vertices) :type "VEC2" :byteOffset 24})
+        joints-a (count accessors)
+        accessors (conj accessors {:bufferView jw-bv :componentType gt/component-type-unsigned-byte
+                                    :count (count vertices) :type "VEC4" :byteOffset 0})
+        weights-a (count accessors)
+        accessors (conj accessors {:bufferView jw-bv :componentType gt/component-type-float
+                                    :count (count vertices) :type "VEC4" :byteOffset 4})
+        idx-a (count accessors)
+        accessors (conj accessors {:bufferView i-bv :componentType gt/component-type-unsigned-int
+                                    :count (count indices) :type "SCALAR"})
+        primitive {:attributes {:POSITION pos-a :NORMAL norm-a :TEXCOORD_0 uv-a
+                                 :JOINTS_0 joints-a :WEIGHTS_0 weights-a}
+                   :indices idx-a :material mat-idx}]
+    [(assoc st :buf buf :buffer-views buffer-views :accessors accessors) primitive]))
+
+;; ── skeleton -> glTF joint nodes ────────────────────────────────────────
+
+(defn- bone-nodes
+  "`{:bones [...]}` (a `character.body/generate-humanoid-skeleton`-shaped
+  skeleton) -> a glTF `:nodes` prefix, one node per bone, `:children`
+  computed from `:parent` indices (bones are translation/rotation-only —
+  `character.body`'s own documented convention — so `:translation`/
+  `:rotation` map straight across, no scale/TRS-compose needed)."
+  [bones]
+  (let [nodes (mapv (fn [{:keys [name local-position local-rotation]}]
+                       {:name name :translation local-position :rotation local-rotation :children []})
+                     bones)]
+    (reduce (fn [nodes [i {:keys [parent]}]]
+              (if parent
+                (update-in nodes [parent :children] conj i)
+                nodes))
+            nodes
+            (map-indexed vector bones))))
+
+(defn- inverse-bind-matrices
+  "Column-major 4x4 translate(-worldPos) per bone — the correct inverse
+  bind matrix for a translation-only rest pose (matches `character.body`'s
+  own bones: `identity-rot` everywhere, only `:local-position` composes)."
+  [bone-world-pos]
+  (mapv (fn [[x y z]]
+          [1.0 0.0 0.0 0.0
+           0.0 1.0 0.0 0.0
+           0.0 0.0 1.0 0.0
+           (- x) (- y) (- z) 1.0])
+        bone-world-pos))
+
+;; ── texture image embedding ─────────────────────────────────────────────
+
+(defn- read-file-bytes [path]
+  (vec (map #(bit-and (int %) 0xFF) (kio/read-all-bytes path))))
+
+(defn- append-image
+  [{:keys [buf buffer-views images] :as st} path]
+  (let [bytes (read-file-bytes path)
+        bv-idx (count buffer-views)
+        off (count buf)
+        buf (into buf bytes)
+        buffer-views (conj buffer-views {:buffer 0 :byteOffset off :byteLength (count bytes)})
+        img-idx (count images)
+        images (conj images {:mimeType "image/png" :bufferView bv-idx})]
+    [(assoc st :buf buf :buffer-views buffer-views :images images) img-idx]))
+
+;; ── top-level assembly ──────────────────────────────────────────────────
+
+(defn assemble-vrm
+  "`body`: `{:parts :skeleton :blendshape-targets :character-def}` (see
+  `kami.gen.hybrid/bare-body`). `textures`: `{:albedo :normal :roughness}`
+  real PNG file paths (see `kami.gen.hybrid.nodes/save-texture-image-type`).
+  `opts`: `{:output-dir :filename}`.
+
+  Returns `{:doc <VrmDocument> :path <written .vrm file path>
+  :glb-bytes <byte vector>}`. `:doc`'s `:skin`/`:humanoid` material/texture
+  wiring is what tests inspect to confirm the generated textures are
+  actually ATTACHED (glTF material -> texture -> image -> embedded PNG
+  bytes), not merely sitting next to the export as separate files."
+  [{:keys [parts skeleton character-def]} textures
+   {:keys [output-dir filename] :or {filename "kami_gen_hybrid.vrm"}}]
+  (let [bones (:bones skeleton)
+        bwp (body/bone-world-positions bones)
+        head-wp (head-bone-world-position bones bwp)
+        parts (mapv #(to-world-space % head-wp) parts)
+        parts (mapv #(ensure-skinned % bwp) parts)
+        groups (group-parts-by-material parts)
+        {:keys [skin eyes mouth hair clothing]} character-def
+        used-materials (filter #(seq (:vertices (get groups % {:vertices []}))) material-order)
+
+        ;; geometry + per-material primitives
+        [geom-st primitives materials-plain]
+        (reduce
+         (fn [[st prims mats] mid]
+           (let [mat-idx (count mats)
+                 [st' prim] (append-primitive st mat-idx (get groups mid))
+                 pbr (material/for-part mid skin eyes mouth hair clothing)]
+             [st' (conj prims prim)
+              (conj mats {:name (:name pbr)
+                          :pbrMetallicRoughness {:baseColorFactor (:base-color pbr)
+                                                  :metallicFactor (:metallic pbr)
+                                                  :roughnessFactor (:roughness pbr)}
+                          :doubleSided true})]))
+         [{:buf [] :buffer-views [] :accessors [] :images []} [] []]
+         used-materials)
+
+        ;; costume textures embedded and attached to the :skin material only
+        skin-mat-idx (or (first (keep-indexed (fn [i m] (when (= m :skin) i)) used-materials)) -1)
+        [img-st albedo-img] (append-image geom-st (:albedo textures))
+        [img-st normal-img] (append-image img-st (:normal textures))
+        [img-st rough-img] (append-image img-st (:roughness textures))
+        textures-arr [{:source albedo-img} {:source normal-img} {:source rough-img}]
+        materials-plain (if (>= skin-mat-idx 0)
+                           (update materials-plain skin-mat-idx
+                                   (fn [m]
+                                     (-> m
+                                         (assoc-in [:pbrMetallicRoughness :baseColorTexture] {:index 0})
+                                         (assoc-in [:pbrMetallicRoughness :metallicRoughnessTexture] {:index 2})
+                                         (assoc :normalTexture {:index 1}))))
+                           materials-plain)
+        {:keys [buf buffer-views accessors images]} img-st
+
+        ;; skeleton -> nodes, mesh node, skin
+        skel-nodes (bone-nodes bones)
+        mesh-node-idx (count skel-nodes)
+        mesh-node {:name "character" :mesh 0 :skin 0}
+        all-nodes (conj skel-nodes mesh-node)
+        ibms (inverse-bind-matrices bwp)
+        ibm-data (reduce (fn [d m] (reduce bin/write-f32-le d m)) [] ibms)
+        ibm-bv (count buffer-views)
+        ibm-off (count buf)
+        buf (into buf (pad4 ibm-data))
+        buffer-views (conj buffer-views {:buffer 0 :byteOffset ibm-off :byteLength (count ibm-data)})
+        ibm-acc (count accessors)
+        accessors (conj accessors {:bufferView ibm-bv :componentType gt/component-type-float
+                                    :count (count bones) :type "MAT4"})
+        skin {:joints (vec (range (count bones))) :inverseBindMatrices ibm-acc}
+
+        human-bones (vec (keep (fn [[i {:keys [name]}]]
+                                  (when-let [bk (vt/str->human-bone-name name)]
+                                    (vt/vrm-human-bone bk i)))
+                                (map-indexed vector bones)))
+
+        gltf (gt/gltf-document
+              {:asset (gt/asset {:generator "kami-gen-hybrid"})
+               :scene 0
+               :scenes [{:nodes [0 mesh-node-idx]}]
+               :nodes all-nodes
+               :meshes [{:primitives primitives}]
+               :accessors accessors
+               :bufferViews buffer-views
+               :buffers [{:byteLength (count buf)}]
+               :materials materials-plain
+               :textures textures-arr
+               :images images
+               :samplers []
+               :skins [skin]})
+
+        doc (vt/vrm-document
+             {:gltf gltf
+              :bin buf
+              :version :v1-0
+              :meta (vt/vrm-meta {:name "kami-gen-hybrid character"
+                                   :version "0.1.0"
+                                   :authors ["kami-gen-hybrid"]
+                                   :avatar-permission "everyone"
+                                   :commercial-usage "allow"})
+              :humanoid (vt/vrm-humanoid human-bones)})
+
+        glb-bytes (vrm-export/export-glb doc)
+        path (str output-dir File/separator filename)]
+    (let [f (File. ^String path)]
+      (when-let [parent (.getParentFile f)] (.mkdirs parent))
+      (with-open [os (FileOutputStream. f)]
+        (.write os (byte-array (map unchecked-byte glb-bytes)))))
+    {:doc doc :path path :glb-bytes glb-bytes}))

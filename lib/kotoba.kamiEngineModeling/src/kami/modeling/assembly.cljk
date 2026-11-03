@@ -1,0 +1,398 @@
+(ns kami.modeling.assembly
+  "Immutable assembly definitions, occurrences, configurations, mates and
+  deterministic translational solving. Rotational/kinematic mate expansion
+  builds on the same explicit constraint graph."
+  (:require [kami.modeling.document :as document]
+            #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])))
+
+(def mate-kinds #{:coincident :distance :parallel :concentric :angle :gear :rack-pinion :limit})
+(def joint-kinds #{:fixed :revolute :prismatic})
+(defn- vec3? [v] (and (vector? v) (= 3 (count v)) (every? number? v)))
+(defn- v+ [a b] (mapv + a b))
+(defn- v- [a b] (mapv - a b))
+(defn- v* [v k] (mapv #(* % k) v))
+(defn- dot [a b] (reduce + (map * a b)))
+(defn- magnitude [v] (#?(:clj Math/sqrt :cljs js/Math.sqrt) (dot v v)))
+(defn- absolute [v] (#?(:clj Math/abs :cljs js/Math.abs) v))
+(defn- normalize [v]
+  (let [m (magnitude v)] (when (zero? m) (throw (ex-info "zero direction" {}))) (v* v (/ 1.0 m))))
+
+(def identity-transform {:translation [0 0 0] :rotation [0 0 0] :scale [1 1 1]})
+
+(defn part [id revision name bounds]
+  (when-not (and (uuid? id) (string? revision) (seq name)
+                 (vec3? (:min bounds)) (vec3? (:max bounds))
+                 (every? true? (map < (:min bounds) (:max bounds))))
+    (throw (ex-info "invalid part definition" {:id id :bounds bounds})))
+  {:part/id id :part/revision revision :part/name name :part/bounds bounds})
+
+(defn occurrence
+  ([id part-id] (occurrence id part-id {}))
+  ([id part-id {:keys [transform grounded? configuration suppressed?]
+                :or {transform identity-transform grounded? false configuration :default suppressed? false}}]
+   (when-not (and (uuid? id) (uuid? part-id) (vec3? (:translation transform))
+                  (vec3? (:rotation transform)) (vec3? (:scale transform)))
+     (throw (ex-info "invalid occurrence" {:id id :part part-id})))
+   {:occurrence/id id :occurrence/part part-id :occurrence/transform transform
+    :occurrence/grounded? grounded? :occurrence/configuration configuration
+    :occurrence/suppressed? suppressed?}))
+
+(defn mate [id kind a b parameters]
+  (when-not (and (uuid? id) (mate-kinds kind) (uuid? a) (uuid? b) (not= a b))
+    (throw (ex-info "invalid assembly mate" {:id id :kind kind :a a :b b})))
+  (when (and (#{:coincident :distance} kind)
+             (not (and (vec3? (:a-point parameters)) (vec3? (:b-point parameters))
+                       (or (= kind :coincident)
+                           (and (number? (:distance parameters)) (vec3? (:direction parameters)))))))
+    (throw (ex-info "invalid translational mate parameters" {:id id :parameters parameters})))
+  {:mate/id id :mate/kind kind :mate/a a :mate/b b :mate/parameters parameters})
+
+(defn- unique-index [label id-key values]
+  (let [values (vec values) indexed (into {} (map (juxt id-key identity) values))]
+    (when-not (= (count values) (count indexed))
+      (throw (ex-info (str "duplicate " (name label) " identity")
+                      {:error :duplicate-identity :kind label
+                       :ids (->> values (map id-key) frequencies (keep (fn [[id n]] (when (> n 1) id))) vec)})))
+    indexed))
+
+(declare valid-assembly? validation-errors)
+
+(defn assembly [id parts occurrences mates configurations]
+  {:assembly/id id :assembly/parts (unique-index :part :part/id parts)
+   :assembly/occurrences (unique-index :occurrence :occurrence/id occurrences)
+   :assembly/mates (unique-index :mate :mate/id mates)
+   :assembly/configurations (or configurations {:default {}})})
+
+(def assembly-exchange-schema 1)
+
+(defn export-package
+  "Canonical EDN exchange envelope. UUID identities are preserved, never
+  regenerated from ordering or names."
+  [assembly]
+  (when-not (valid-assembly? assembly)
+    (throw (ex-info "cannot export invalid assembly" {:errors (validation-errors assembly)})))
+  (let [payload (document/canonical-form assembly)]
+    {:assembly-package/schema assembly-exchange-schema
+     :assembly-package/format :kotoba.edn
+     :assembly-package/revision (document/revision-id {:assembly payload})
+     :assembly-package/payload payload}))
+
+(defn encode-package [assembly]
+  (pr-str (document/canonical-form (export-package assembly))))
+
+(defn import-package [encoded]
+  (let [package (if (string? encoded) (edn/read-string encoded) encoded)
+        payload (:assembly-package/payload package)
+        expected (document/revision-id {:assembly (document/canonical-form payload)})]
+    (when-not (= assembly-exchange-schema (:assembly-package/schema package))
+      (throw (ex-info "unsupported assembly exchange schema"
+                      {:schema (:assembly-package/schema package) :supported assembly-exchange-schema})))
+    (when-not (= expected (:assembly-package/revision package))
+      (throw (ex-info "assembly exchange integrity check failed"
+                      {:expected expected :actual (:assembly-package/revision package)})))
+    (when-not (valid-assembly? payload)
+      (throw (ex-info "imported assembly is invalid" {:errors (validation-errors payload)})))
+    payload))
+
+(defn validation-errors [assembly]
+  (let [parts (:assembly/parts assembly) occurrences (:assembly/occurrences assembly)
+        errors (transient []) add! #(conj! errors %)]
+    (when-not (uuid? (:assembly/id assembly)) (add! {:error :invalid-assembly-id}))
+    (doseq [[id o] occurrences]
+      (when-not (contains? parts (:occurrence/part o))
+        (add! {:error :missing-part :occurrence id :part (:occurrence/part o)})))
+    (doseq [[id m] (:assembly/mates assembly)]
+      (doseq [endpoint [(:mate/a m) (:mate/b m)]]
+        (when-not (contains? occurrences endpoint)
+          (add! {:error :missing-mate-occurrence :mate id :occurrence endpoint}))))
+    (persistent! errors)))
+(defn valid-assembly? [assembly] (empty? (validation-errors assembly)))
+
+(defn apply-configuration [assembly configuration]
+  (when-not (contains? (:assembly/configurations assembly) configuration)
+    (throw (ex-info "configuration not found" {:configuration configuration})))
+  (let [overrides (get-in assembly [:assembly/configurations configuration :occurrences] {})]
+    (update assembly :assembly/occurrences
+            (fn [occurrences]
+              (into {} (map (fn [[id o]] [id (merge o (get overrides id))]) occurrences))))))
+
+(defn- target-translation [known unknown mate known-is-a?]
+  (let [{:keys [a-point b-point distance direction]} (:mate/parameters mate)
+        known-local (if known-is-a? a-point b-point)
+        unknown-local (if known-is-a? b-point a-point)
+        known-world (v+ (get-in known [:occurrence/transform :translation]) known-local)
+        offset (if (= :distance (:mate/kind mate))
+                 (v* (normalize direction) (* (if known-is-a? 1 -1) distance)) [0 0 0])]
+    (v- (v+ known-world offset) unknown-local)))
+
+(defn solve
+  "Solve coincident/distance translational mates from grounded occurrences.
+  Returns poses, remaining DOF and structured conflicts; unsupported mate kinds
+  remain explicit unsolved constraints rather than being silently ignored."
+  [assembly tolerance]
+  (when-not (valid-assembly? assembly) (throw (ex-info "invalid assembly" {:errors (validation-errors assembly)})))
+  (when-not (pos? tolerance) (throw (ex-info "solver tolerance must be positive" {})))
+  (let [active (into {} (remove (comp :occurrence/suppressed? val) (:assembly/occurrences assembly)))
+        grounded (set (map key (filter (comp :occurrence/grounded? val) active)))
+        initial-poses (into {} (map (fn [[id o]] [id (get-in o [:occurrence/transform :translation])]) active))]
+    (loop [known grounded poses initial-poses pending (vec (vals (:assembly/mates assembly))) conflicts []]
+      (let [[known' poses' pending' conflicts' progressed?]
+            (reduce (fn [[k ps todo cs progressed] m]
+                      (let [a (:mate/a m) b (:mate/b m) ka (contains? k a) kb (contains? k b)
+                            supported? (#{:coincident :distance} (:mate/kind m))]
+                        (cond
+                          (not supported?) [k ps (conj todo m) cs progressed]
+                          (and ka kb)
+                          (let [occ-a (assoc-in (get active a) [:occurrence/transform :translation] (get ps a))
+                                expected (target-translation occ-a (get active b) m true)
+                                residual (magnitude (v- expected (get ps b)))]
+                            [k ps todo (cond-> cs (> residual tolerance)
+                                             (conj {:error :over-constrained :mate (:mate/id m) :residual residual})) progressed])
+                          (or ka kb)
+                          (let [known-id (if ka a b) unknown-id (if ka b a)
+                                known-o (assoc-in (get active known-id) [:occurrence/transform :translation] (get ps known-id))
+                                target (target-translation known-o (get active unknown-id) m ka)]
+                            [(conj k unknown-id) (assoc ps unknown-id target) todo cs true])
+                          :else [k ps (conj todo m) cs progressed])))
+                    [known poses [] conflicts false] pending)]
+        (if progressed?
+          (recur known' poses' pending' conflicts')
+          {:solve/status (cond (seq conflicts') :conflict (seq pending') :under-constrained :else :solved)
+           :solve/poses poses' :solve/conflicts conflicts'
+           :solve/unsolved-mates (mapv :mate/id pending')
+           :solve/dof (into {} (map (fn [id] [id (if (contains? known' id) 0 3)]) (keys active)))})))))
+
+(defn solved-assembly [assembly solution]
+  (update assembly :assembly/occurrences
+          (fn [occurrences]
+            (into {} (map (fn [[id o]]
+                            [id (if-let [p (get-in solution [:solve/poses id])]
+                                  (assoc-in o [:occurrence/transform :translation] p) o)])
+                          occurrences)))))
+
+(defn solve-closed-loop
+  "Deterministic iterative projection for cyclic coincident/distance point
+  mates. Unlike `solve`, both free endpoints can move, so consistent closed
+  loops converge instead of remaining under-constrained."
+  [assembly tolerance max-iterations]
+  (when-not (and (valid-assembly? assembly) (pos? tolerance) (pos-int? max-iterations))
+    (throw (ex-info "invalid closed-loop solve request" {:errors (validation-errors assembly)})))
+  (let [active (into {} (remove (comp :occurrence/suppressed? val) (:assembly/occurrences assembly)))
+        grounded (set (map key (filter (comp :occurrence/grounded? val) active)))
+        supported (filterv #(#{:coincident :distance} (:mate/kind %))
+                           (sort-by (comp str :mate/id) (vals (:assembly/mates assembly))))
+        unsupported (remove #(#{:coincident :distance} (:mate/kind %))
+                            (vals (:assembly/mates assembly)))
+        initial (into {} (map (fn [[id o]] [id (mapv double (get-in o [:occurrence/transform :translation]))]) active))
+        mate-error (fn [poses m]
+                     (let [a (:mate/a m) b (:mate/b m)
+                           oa (assoc-in (get active a) [:occurrence/transform :translation] (get poses a))
+                           target-b (target-translation oa (get active b) m true)]
+                       (v- target-b (get poses b))))
+        project (fn [poses m]
+                  (let [a (:mate/a m) b (:mate/b m) error (mate-error poses m)
+                        ga (grounded a) gb (grounded b)]
+                    (cond
+                      (and ga gb) poses
+                      ga (update poses b v+ error)
+                      gb (update poses a v- error)
+                      :else (-> poses (update a v- (v* error 0.5))
+                                      (update b v+ (v* error 0.5))))))]
+    (loop [poses initial iteration 0]
+      (let [residuals (mapv (fn [m] {:mate (:mate/id m) :residual (magnitude (mate-error poses m))}) supported)
+            max-residual (apply max 0.0 (map :residual residuals))]
+        (if (or (<= max-residual tolerance) (= iteration max-iterations))
+          (let [conflicts (vec (for [r residuals :when (> (:residual r) tolerance)]
+                                 {:error :closed-loop-residual :mate (:mate r) :residual (:residual r)}))]
+            {:closed-loop/status (cond (seq unsupported) :unsupported
+                                       (seq conflicts) :conflict :else :solved)
+             :closed-loop/poses poses :closed-loop/iterations iteration
+             :closed-loop/max-residual max-residual :closed-loop/conflicts conflicts
+             :closed-loop/unsupported-mates (mapv :mate/id unsupported)})
+          (recur (reduce project poses supported) (inc iteration)))))))
+
+(defn occurrence-bounds [assembly occurrence-id]
+  (let [o (get-in assembly [:assembly/occurrences occurrence-id])
+        part (get-in assembly [:assembly/parts (:occurrence/part o)])
+        t (get-in o [:occurrence/transform :translation])]
+    {:min (v+ (get-in part [:part/bounds :min]) t) :max (v+ (get-in part [:part/bounds :max]) t)}))
+
+(defn interference [assembly tolerance]
+  (let [ids (vec (map key (remove (comp :occurrence/suppressed? val) (:assembly/occurrences assembly))))]
+    (vec (for [i (range (count ids)) j (range (inc i) (count ids))
+               :let [a (nth ids i) b (nth ids j) ba (occurrence-bounds assembly a) bb (occurrence-bounds assembly b)
+                     overlap (mapv (fn [amin amax bmin bmax] (- (min amax bmax) (max amin bmin)))
+                                   (:min ba) (:max ba) (:min bb) (:max bb))]
+               :when (every? #(> % tolerance) overlap)]
+           {:occurrences [a b] :overlap overlap :volume (reduce * overlap)}))))
+
+(defn joint [id kind parent child axis origin coordinate limits]
+  (when-not (and (uuid? id) (joint-kinds kind) (uuid? parent) (uuid? child) (not= parent child)
+                 (vec3? axis) (vec3? origin) (number? coordinate)
+                 (or (nil? limits) (and (= 2 (count limits)) (every? number? limits) (apply <= limits))))
+    (throw (ex-info "invalid kinematic joint" {:id id :kind kind})))
+  {:joint/id id :joint/kind kind :joint/parent parent :joint/child child
+   :joint/axis (normalize axis) :joint/origin origin :joint/coordinate coordinate :joint/limits limits})
+
+(defn coupling [id kind driver driven ratio offset]
+  (when-not (and (uuid? id) (#{:gear :rack-pinion} kind) (uuid? driver) (uuid? driven)
+                 (number? ratio) (not (zero? ratio)) (number? offset))
+    (throw (ex-info "invalid kinematic coupling" {:id id :kind kind})))
+  {:coupling/id id :coupling/kind kind :coupling/driver driver :coupling/driven driven
+   :coupling/ratio ratio :coupling/offset offset})
+
+(defn kinematic-model [assembly joints couplings]
+  {:kinematic/assembly assembly :kinematic/joints (into {} (map (juxt :joint/id identity) joints))
+   :kinematic/couplings (into {} (map (juxt :coupling/id identity) couplings))})
+
+(defn kinematic-errors [model]
+  (let [occurrences (get-in model [:kinematic/assembly :assembly/occurrences])
+        joints (:kinematic/joints model) errors (transient []) add! #(conj! errors %)]
+    (doseq [[id j] joints]
+      (doseq [occurrence [(:joint/parent j) (:joint/child j)]]
+        (when-not (contains? occurrences occurrence)
+          (add! {:error :missing-joint-occurrence :joint id :occurrence occurrence})))
+      (when-let [[lower upper] (:joint/limits j)]
+        (when-not (<= lower (:joint/coordinate j) upper)
+          (add! {:error :joint-limit :joint id :coordinate (:joint/coordinate j) :limits [lower upper]}))))
+    (doseq [[id c] (:kinematic/couplings model)]
+      (doseq [joint-id [(:coupling/driver c) (:coupling/driven c)]]
+        (when-not (contains? joints joint-id)
+          (add! {:error :missing-coupling-joint :coupling id :joint joint-id}))))
+    ;; One parent joint per child keeps the forward graph a tree/forest.
+    (doseq [[child linked] (group-by :joint/child (vals joints)) :when (> (count linked) 1)]
+      (add! {:error :multiple-joint-parents :occurrence child :joints (mapv :joint/id linked)}))
+    (letfn [(walk [occurrence visiting visited]
+              (cond (visiting occurrence) [visited [{:error :kinematic-cycle :occurrence occurrence}]]
+                    (visited occurrence) [visited []]
+                    :else (reduce (fn [[seen es] j]
+                                    (let [[seen' found] (walk (:joint/child j) (conj visiting occurrence) seen)]
+                                      [seen' (into es found)]))
+                                  [(conj visited occurrence) []]
+                                  (filter #(= occurrence (:joint/parent %)) (vals joints)))))]
+      (let [[_ found] (reduce (fn [[visited es] occurrence]
+                                (let [[visited' found] (walk occurrence #{} visited)] [visited' (into es found)]))
+                              [#{} []] (keys occurrences))]
+        (doseq [e (distinct found)] (add! e))))
+    (persistent! errors)))
+
+(defn set-joint-coordinate [model joint-id coordinate]
+  (when-not (number? coordinate) (throw (ex-info "joint coordinate must be numeric" {})))
+  (assoc-in model [:kinematic/joints joint-id :joint/coordinate] coordinate))
+
+(defn- apply-couplings [model tolerance]
+  (reduce (fn [{:keys [coordinates conflicts] :as state} c]
+            (let [driver (get coordinates (:coupling/driver c))
+                  expected (+ (* driver (:coupling/ratio c)) (:coupling/offset c))
+                  current (get coordinates (:coupling/driven c))]
+              (if (and (number? current) (> (absolute (- current expected)) tolerance))
+                (assoc state :coordinates (assoc coordinates (:coupling/driven c) expected)
+                             :conflicts (conj conflicts {:error :coupling-overridden
+                                                        :coupling (:coupling/id c) :previous current :solved expected}))
+                (assoc state :coordinates (assoc coordinates (:coupling/driven c) expected)))))
+          {:coordinates (into {} (map (juxt :joint/id :joint/coordinate) (vals (:kinematic/joints model))))
+           :conflicts []} (sort-by (comp str :coupling/id) (vals (:kinematic/couplings model)))))
+
+(defn solve-kinematics [model tolerance]
+  (let [structural-errors (remove #(= :joint-limit (:error %)) (kinematic-errors model))]
+    (when (seq structural-errors) (throw (ex-info "invalid kinematic model" {:errors structural-errors})))
+    (let [{:keys [coordinates conflicts]} (apply-couplings model tolerance)
+          joints (into {} (map (fn [[id j]] [id (assoc j :joint/coordinate (get coordinates id))])
+                               (:kinematic/joints model)))
+          limit-conflicts (vec (keep (fn [[id j]]
+                                       (when-let [[lower upper] (:joint/limits j)]
+                                         (when-not (<= lower (:joint/coordinate j) upper)
+                                           {:error :joint-limit :joint id :coordinate (:joint/coordinate j)
+                                            :limits [lower upper]}))) joints))
+          occurrences (get-in model [:kinematic/assembly :assembly/occurrences])
+          child-joints (group-by :joint/child (vals joints))
+          pose (memoize
+                (fn pose [occurrence-id]
+                  (if-let [j (first (get child-joints occurrence-id))]
+                    (let [parent-pose (pose (:joint/parent j)) q (:joint/coordinate j)
+                          delta (case (:joint/kind j) :prismatic (v* (:joint/axis j) q) [0 0 0])
+                          rotation (case (:joint/kind j) :revolute (v* (:joint/axis j) q) [0 0 0])]
+                      {:translation (v+ (:translation parent-pose) (v+ (:joint/origin j) delta))
+                       :rotation (v+ (:rotation parent-pose) rotation)})
+                    (let [o (get occurrences occurrence-id)]
+                      {:translation (get-in o [:occurrence/transform :translation])
+                       :rotation (get-in o [:occurrence/transform :rotation])}))))
+          poses (into {} (map (fn [id] [id (pose id)]) (keys occurrences)))
+          all-conflicts (into conflicts limit-conflicts)]
+      {:kinematic/status (if (seq all-conflicts) :conflict :solved)
+       :kinematic/coordinates coordinates :kinematic/poses poses :kinematic/conflicts all-conflicts})))
+
+(defn assembly-instance [id assembly-id translation configuration suppressed?]
+  (when-not (and (uuid? id) (uuid? assembly-id) (vec3? translation) (keyword? configuration) (boolean? suppressed?))
+    (throw (ex-info "invalid nested assembly instance" {:id id :assembly assembly-id})))
+  {:assembly-instance/id id :assembly-instance/assembly assembly-id
+   :assembly-instance/translation translation :assembly-instance/configuration configuration
+   :assembly-instance/suppressed? suppressed?})
+
+(defn nested-model [root-assembly-id assemblies children]
+  (when-not (and (uuid? root-assembly-id) (every? uuid? (keys assemblies))
+                 (contains? assemblies root-assembly-id))
+    (throw (ex-info "invalid nested assembly model" {:root root-assembly-id})))
+  {:nested/root root-assembly-id :nested/assemblies assemblies
+   :nested/children (into {} (map (fn [[id xs]] [id (vec xs)]) children))})
+
+(defn nested-errors [model]
+  (let [assemblies (:nested/assemblies model) children (:nested/children model)
+        errors (transient []) add! #(conj! errors %)]
+    (doseq [[parent instances] children instance instances]
+      (when-not (contains? assemblies parent) (add! {:error :missing-parent-assembly :assembly parent}))
+      (when-not (contains? assemblies (:assembly-instance/assembly instance))
+        (add! {:error :missing-child-assembly :instance (:assembly-instance/id instance)
+               :assembly (:assembly-instance/assembly instance)})))
+    (letfn [(visit [assembly-id path]
+              (if (some #{assembly-id} path)
+                [{:error :nested-assembly-cycle :path (conj path assembly-id)}]
+                (mapcat #(visit (:assembly-instance/assembly %) (conj path assembly-id))
+                        (remove :assembly-instance/suppressed? (get children assembly-id)))))]
+      (doseq [e (visit (:nested/root model) [])] (add! e)))
+    (persistent! errors)))
+
+(defn flatten-nested
+  "Resolve nested subassemblies to leaf part occurrences. Stable path IDs are
+  vectors of assembly-instance UUIDs followed by the leaf occurrence UUID."
+  [model]
+  (let [errors (nested-errors model)]
+    (when (seq errors) (throw (ex-info "invalid nested assembly model" {:errors errors})))
+    (letfn [(walk [assembly-id translation path]
+              (let [assembly (get-in model [:nested/assemblies assembly-id])
+                    leaves (for [[id occurrence] (:assembly/occurrences assembly)
+                                 :when (not (:occurrence/suppressed? occurrence))]
+                             (-> occurrence
+                                 (assoc :occurrence/path (conj path id))
+                                 (update-in [:occurrence/transform :translation] #(v+ translation %))))
+                    nested (mapcat (fn [instance]
+                                     (walk (:assembly-instance/assembly instance)
+                                           (v+ translation (:assembly-instance/translation instance))
+                                           (conj path (:assembly-instance/id instance))))
+                                   (remove :assembly-instance/suppressed? (get-in model [:nested/children assembly-id])))]
+                (concat leaves nested)))]
+      (vec (walk (:nested/root model) [0 0 0] [])))))
+
+(defn part-mass-properties [part density]
+  (when-not (and (number? density) (pos? density)) (throw (ex-info "density must be positive" {})))
+  (let [bounds (:part/bounds part) dimensions (mapv - (:max bounds) (:min bounds))
+        volume (reduce * dimensions) mass (* density volume)
+        center (mapv #(/ (+ %1 %2) 2.0) (:min bounds) (:max bounds))
+        [x y z] dimensions
+        inertia [(/ (* mass (+ (* y y) (* z z))) 12.0)
+                 (/ (* mass (+ (* x x) (* z z))) 12.0)
+                 (/ (* mass (+ (* x x) (* y y))) 12.0)]]
+    {:mass/value mass :mass/volume volume :mass/center center :mass/inertia-diagonal inertia}))
+
+(defn assembly-mass-properties [assembly density-by-part]
+  (let [active (remove :occurrence/suppressed? (vals (:assembly/occurrences assembly)))
+        entries (mapv (fn [occurrence]
+                        (let [part (get-in assembly [:assembly/parts (:occurrence/part occurrence)])
+                              props (part-mass-properties part (get density-by-part (:part/id part)))
+                              world-center (v+ (:mass/center props) (get-in occurrence [:occurrence/transform :translation]))]
+                          (assoc props :mass/world-center world-center :occurrence/id (:occurrence/id occurrence)))) active)
+        mass (reduce + (map :mass/value entries))
+        center (if (zero? mass) [0 0 0]
+                 (mapv #(/ % mass) (reduce #(mapv + %1 %2) [0 0 0]
+                                           (map (fn [entry] (v* (:mass/world-center entry) (:mass/value entry))) entries))))]
+    {:assembly/mass mass :assembly/center-of-mass center :assembly/parts entries}))

@@ -39,9 +39,10 @@ This is source compatibility, not JVM Clojure or ClojureScript runtime
 compatibility. Code still has to compile to the Kotoba compiler subset.
 
 Inline expressions are also part of the compiler conformance vocabulary:
-`kotoba -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles it
-through the same Kotoba -> core Wasm path, and runs `main`. This is
-compile-and-run sugar, not runtime `eval`; the lower-level implementation
+`kotoba -e '(+ 1 2)'` wraps the expression as the body of `main` in a
+throwaway module and runs it through the ordinary `run` path (safe gate,
+policy and the step-bounded interpreter `kotoba.runtime/run`). It does not
+emit Wasm. This is sugar for `run`, not runtime `eval`; the lower-level implementation
 binary keeps a compatibility `-e` path only for crate-local testing and existing
 integrations.
 

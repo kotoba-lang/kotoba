@@ -1,0 +1,302 @@
+(ns real-anime-douga-ffmpeg-proof
+  "Real cross-repo proof: anime.production cut-sequence -> anime.timeline's
+  REAL cut-sequence->timeline adapter -> a real kami.eizo.timeline EDL ->
+  the REAL douga.eizo-timeline/render-plan + douga.ffmpeg command builders
+  -> a real ffmpeg subprocess -> a correct playable video, verified with
+  real ffprobe + real pixel sampling. This exercises anime + kami-eizo-timeline
+  + douga's actual code together for the first time; nothing here is
+  hand-simulated. Pattern mirrors douga's own
+  `test/e2e/real_ffmpeg_proof.cljs` (Wave-8 real-ffmpeg-execution-proof) —
+  same subprocess helpers, same ffprobe/pixel-sample verification technique,
+  applied one level up the stack at the anime-producer end.
+
+  GENUINE INTEGRATION GAP this script has to bridge (not simulated away):
+  `anime.timeline/cut-sequence->timeline` deliberately only knows about
+  anime's own vocabulary — a clip's `:clip/source-id` is the cut's
+  `:cut/id` itself (an opaque production identifier, not a renderable
+  asset path), and clips carry no `:douga/scene-index` (a douga-specific
+  key anime's adapter has no reason to know about — see its docstring:
+  it produces a *generic* kami.eizo.timeline value, not a douga-flavored
+  one). `douga.eizo-timeline/render-plan` requires both. So a real
+  end-to-end pipeline needs a real \"asset resolution + scene numbering\"
+  bridging step between the two adapters — exactly the kind of seam a
+  real production pipeline has (cut id -> rendered/composited asset blob
+  key is always a separate resolution step). That bridge is written out
+  explicitly below (see `attach-douga-keys`), not hidden inside either
+  library.
+
+  Requires: system `ffmpeg` + `ffprobe` on PATH, run from the anime repo
+  root with douga's and kami-eizo-timeline's `src/` on classpath:
+
+    kbb --backend sci -cp src:test/e2e:<path-to-douga>/src:<path-to-kami-eizo-timeline>/src \\
+        test/e2e/real_anime_douga_ffmpeg_proof.cljk
+
+  Exits 0 with a PASS report on success, 1 with the failing checks printed
+  on failure. Never fabricates a pass: every check is a real measurement
+  of a real file produced by a real ffmpeg subprocess."
+  (:require [kotoba.lang.text :as str]
+            [anime.production :as production]
+            [anime.timeline :as at]
+            [kami.eizo.timeline :as tl]
+            [kami.eizo.timeline.timecode :as tc]
+            [douga.eizo-timeline :as det]
+            [douga.ffmpeg :as ffmpeg]
+            ["child_process" :refer [execFileSync]]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]))
+
+;; ---------------------------------------------------------------------------
+;; subprocess helpers (same shape as douga's own test/e2e/real_ffmpeg_proof.cljs)
+
+(defn- exec! [argv]
+  (println (str "\n$ " (str/join " " (map (fn [a] (if (str/includes? a " ") (str "'" a "'") a)) argv))))
+  (execFileSync (first argv) (clj->js (vec (rest argv))) #js {:stdio "inherit"}))
+
+(defn- capture-text! [argv]
+  (str (execFileSync (first argv) (clj->js (vec (rest argv)))
+                      #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]})))
+
+(defn- capture-bytes! [argv]
+  (execFileSync (first argv) (clj->js (vec (rest argv)))
+                #js {:stdio #js ["ignore" "pipe" "ignore"] :maxBuffer (* 16 1024 1024)}))
+
+;; ---------------------------------------------------------------------------
+;; report bookkeeping
+
+(def ^:private checks (atom []))
+
+(defn- check! [label pass? detail]
+  (swap! checks conj {:label label :pass pass? :detail detail})
+  (println (str (if pass? "  [PASS] " "  [FAIL] ") label " -- " detail)))
+
+(defn- byte-hex [n] (let [s (.toString n 16)] (if (= 1 (count s)) (str "0" s) s)))
+(defn- rgb-hex [[r g b]] (str "#" (byte-hex r) (byte-hex g) (byte-hex b)))
+
+;; ---------------------------------------------------------------------------
+;; the bridge: anime.timeline's generic EDL -> douga.eizo-timeline's contract
+;;
+;; douga.eizo-timeline/render-plan reads two things anime.timeline's adapter
+;; never produces: :douga/scene-index per video clip, and a resolved,
+;; renderable :clip/source-id (anime hands back the bare :cut/id). This is
+;; the real "cut id -> rendered asset" resolution step a production caller
+;; owns; cut-index->asset below stands in for it (a real pipeline would look
+;; this up from a composite/finish blob store keyed by cut id).
+
+(defn- attach-douga-keys
+  "timeline: the raw kami.eizo.timeline value from anime.timeline/cut-sequence->timeline.
+  cut-order: the same ordered cut-def seq used to build it (for scene-index + asset lookup).
+  cut-index->asset: cut-id -> resolved frame-blob-key (real file path).
+  resolution: \"WxH\" string for :douga/resolution.
+  bgm-marker: a douga.eizo-timeline/bgm-marker* value to attach."
+  [timeline cut-order cut-index->asset resolution bgm-marker]
+  (let [scene-index-by-id (into {} (map-indexed (fn [i c] [(:cut/id c) i])) cut-order)
+        video-track (first (:timeline/tracks timeline))
+        new-clips (mapv (fn [c]
+                           (let [cut-id (:clip/id c)]
+                             (assoc c
+                                    :douga/scene-index (get scene-index-by-id cut-id)
+                                    :clip/source-id (get cut-index->asset cut-id))))
+                         (:track/clips video-track))
+        new-video-track (assoc video-track :track/clips new-clips)]
+    (-> timeline
+        (assoc :timeline/tracks [new-video-track])
+        (update :timeline/markers (fnil conj []) bgm-marker)
+        (assoc :douga/resolution resolution))))
+
+(defn -main []
+  (let [workdir (fs/mkdtempSync (path/join (os/tmpdir) "anime-douga-real-ffmpeg-proof-"))
+        res-w 64 res-h 64
+        fps 24
+        did "did:web:example.com"
+        nsid "jp.anime.demo"
+        work-id (production/slug "Spring Storm")
+        episode-id (str work-id "-ep01")
+        scene-id (str episode-id "-sc01")
+        retake-status (assoc production/default-stage-status "layout" "retake")
+        approved-status (into {} (map (fn [s] [s "approved"])) production/stages)
+        ;; four cuts, real anime.production-shaped entities (schema keys:
+        ;; :cut/id unique, :cut/scene-id back-pointer), each carrying a
+        ;; distinct color + duration + stage-status so placement, retake
+        ;; markers, and priority derivation are all real, not stubbed.
+        cut-defs [{:cut/id (str scene-id "-cut01") :cut/scene-id scene-id
+                   :color "red" :rgb [255 0 0] :dur-s 2.5
+                   :cut/stage-status production/default-stage-status}
+                  {:cut/id (str scene-id "-cut02") :cut/scene-id scene-id
+                   :color "lime" :rgb [0 255 0] :dur-s 1.5
+                   :cut/stage-status retake-status}
+                  {:cut/id (str scene-id "-cut03") :cut/scene-id scene-id
+                   :color "blue" :rgb [0 0 255] :dur-s 2.0
+                   :cut/stage-status production/default-stage-status}
+                  {:cut/id (str scene-id "-cut04") :cut/scene-id scene-id
+                   :color "yellow" :rgb [255 255 0] :dur-s 1.75
+                   :cut/stage-status approved-status}]]
+    (println (str "workdir: " workdir))
+    (println (str "work/episode/scene ids (via anime.production/slug): "
+                   work-id " / " episode-id " / " scene-id))
+    (println "cut vertex-uris (via anime.production/vertex-uri): ")
+    (doseq [{:keys [cut/id]} cut-defs]
+      (println (str "  " (production/vertex-uri did nsid "cut" id))))
+    (try
+      ;; -- 1. generate real per-cut source media locally via ffmpeg lavfi ---
+      (doseq [{:keys [cut/id color]} cut-defs]
+        (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+                "-i" (str "color=c=" color ":size=" res-w "x" res-h)
+                "-frames:v" "1" (path/join workdir (str (production/slug id) "-frame.png"))]))
+      ;; silent per-cut audio, built via the REAL douga.ffmpeg/silent-audio-cmd
+      ;; (anime's video-only EDL has no audio track / voice lines; a video
+      ;; track with no matching audio still needs an -i for -shortest).
+      (doseq [{:keys [cut/id dur-s]} cut-defs]
+        (exec! (ffmpeg/silent-audio-cmd (path/join workdir (str (production/slug id) "-silent.wav"))
+                                         {:seconds dur-s :sample-rate 24000})))
+      (let [total-dur-s (reduce + (map :dur-s cut-defs))]
+        (exec! (ffmpeg/silent-audio-cmd (path/join workdir "bgm.wav") {:seconds total-dur-s :sample-rate 24000})))
+
+      ;; -- 2. build the cut-sequence via anime.production's own vocabulary,
+      ;;       drive it through the REAL anime.timeline/cut-sequence->timeline --
+      (let [cuts (mapv (fn [{:keys [cut/id cut/scene-id cut/stage-status dur-s]}]
+                          {:cut/id id
+                           :cut/scene-id scene-id
+                           :cut/duration-frames (Math/round (* dur-s fps))
+                           :cut/stage-status stage-status})
+                        cut-defs)
+            raw-timeline (at/cut-sequence->timeline cuts {:timebase tc/film-24
+                                                           :default-duration-frames fps})
+            raw-validation (tl/validate-timeline raw-timeline)]
+        (println "\n=== anime.timeline/cut-sequence->timeline output (raw kami.eizo.timeline EDL) ===")
+        (println (pr-str raw-timeline))
+        (println "\n=== validate-timeline (raw, pre-douga-bridge) ===")
+        (println (pr-str raw-validation))
+        (check! "raw adapter output is a valid timeline (tl/validate-timeline)"
+                (:valid? raw-validation) (pr-str (:errors raw-validation)))
+        (check! "raw adapter placed 4 clips on 1 video track"
+                (= 4 (count (:track/clips (first (:timeline/tracks raw-timeline)))))
+                (str (count (:track/clips (first (:timeline/tracks raw-timeline))))))
+        (check! "retake cut (cut02, layout=retake) produced exactly 1 marker"
+                (= 1 (count (:timeline/markers raw-timeline)))
+                (pr-str (:timeline/markers raw-timeline)))
+        (check! "approved cut (cut04) did not produce a second marker"
+                (= :red (:marker/color (first (:timeline/markers raw-timeline))))
+                (pr-str (:timeline/markers raw-timeline)))
+
+        ;; -- 3. bridge: attach douga's required keys (the real resolution
+        ;;       step — cut id -> rendered asset path — a caller owns) ------
+        (let [cut-index->asset (into {} (map (fn [{:keys [cut/id]}]
+                                                [id (path/join workdir (str (production/slug id) "-frame.png"))]))
+                                      cut-defs)
+              total-frames (reduce + (map (fn [{:keys [dur-s]}] (Math/round (* dur-s fps))) cut-defs))
+              bgm-marker (det/bgm-marker* {:bgm-blob-key (path/join workdir "bgm.wav")
+                                           :duration-frames total-frames})
+              timeline (attach-douga-keys raw-timeline cuts cut-index->asset
+                                          (str res-w "x" res-h) bgm-marker)
+              bridged-validation (tl/validate-timeline timeline)]
+          (println "\n=== after attach-douga-keys bridge (:douga/scene-index + resolved :clip/source-id + bgm marker) ===")
+          (println (pr-str timeline))
+          (println "\n=== validate-timeline (post-bridge) ===")
+          (println (pr-str bridged-validation))
+          (check! "bridged timeline is still valid (tl/validate-timeline)"
+                  (:valid? bridged-validation) (pr-str (:errors bridged-validation)))
+
+          ;; -- 4. drive the REAL douga.eizo-timeline/render-plan ------------
+          (let [plan (det/render-plan timeline)]
+            (println "\n=== douga.eizo-timeline/render-plan output ===")
+            (println (pr-str plan))
+            (check! "render-plan produced 4 segments" (= 4 (count (:segments plan))) (str (count (:segments plan))))
+            (check! "render-plan segments in cut order [0 1 2 3]"
+                    (= [0 1 2 3] (mapv :scene-index (:segments plan)))
+                    (pr-str (mapv :scene-index (:segments plan))))
+            (check! "render-plan width matches EDL resolution" (= res-w (:width plan)) (str (:width plan)))
+            (check! "render-plan height matches EDL resolution" (= res-h (:height plan)) (str (:height plan)))
+            (check! "render-plan fps matches timebase" (= fps (:fps plan)) (str (:fps plan)))
+            (check! "render-plan carries the bridged bgm-blob-key"
+                    (= (path/join workdir "bgm.wav") (:bgm-blob-key plan)) (str (:bgm-blob-key plan)))
+
+            ;; -- 5. execute the REAL douga.ffmpeg command vectors ------------
+            (let [seg-paths
+                  (mapv (fn [seg]
+                          (let [{:keys [dur-s]} (nth cut-defs (:scene-index seg))
+                                out-path (path/join workdir (str "seg-" (:scene-index seg) ".mp4"))
+                                audio-path (path/join workdir (str (production/slug (:cut/id (nth cuts (:scene-index seg)))) "-silent.wav"))
+                                cmd (ffmpeg/scene-segment-cmd (:frame-blob-key seg) audio-path out-path
+                                                               {:width (:width plan) :height (:height plan) :fps (:fps plan)})]
+                            (println (str "\n=== douga.ffmpeg/scene-segment-cmd for cut " (:scene-index seg) " ==="))
+                            (println (pr-str cmd))
+                            (exec! cmd)
+                            (check! (str "cut-" (:scene-index seg) " (" dur-s "s) segment file produced")
+                                    (and (fs/existsSync out-path) (> (.-size (fs/statSync out-path)) 0))
+                                    out-path)
+                            out-path))
+                        (:segments plan))
+                  list-path (path/join workdir "concat-list.txt")
+                  _ (fs/writeFileSync list-path (ffmpeg/concat-list-text seg-paths))
+                  concat-path (path/join workdir "concat.mp4")
+                  concat-cmd (ffmpeg/concat-segments-cmd list-path concat-path)
+                  _ (println "\n=== douga.ffmpeg/concat-segments-cmd ===")
+                  _ (println (pr-str concat-cmd))
+                  _ (exec! concat-cmd)
+                  _ (check! "concat output produced"
+                            (and (fs/existsSync concat-path) (> (.-size (fs/statSync concat-path)) 0))
+                            concat-path)
+                  final-path (path/join workdir "final.mp4")
+                  bgm-cmd (ffmpeg/bgm-mix-cmd concat-path (:bgm-blob-key plan) final-path)
+                  _ (println "\n=== douga.ffmpeg/bgm-mix-cmd ===")
+                  _ (println (pr-str bgm-cmd))
+                  _ (exec! bgm-cmd)
+                  _ (check! "final bgm-mixed output produced"
+                            (and (fs/existsSync final-path) (> (.-size (fs/statSync final-path)) 0))
+                            final-path)
+
+                  ;; -- 6. verify with REAL ffprobe -----------------------------
+                  probe-json (js/JSON.parse
+                              (capture-text! ["ffprobe" "-v" "error" "-print_format" "json"
+                                              "-show_entries" "format=duration:stream=width,height,codec_type"
+                                              final-path]))
+                  _ (println "\n=== ffprobe output (real, on final.mp4) ===")
+                  _ (println (js/JSON.stringify probe-json nil 2))
+                  v-stream (first (filter #(= "video" (.-codec_type %)) (.-streams probe-json)))
+                  probed-w (.-width v-stream)
+                  probed-h (.-height v-stream)
+                  probed-dur (js/parseFloat (.-duration (.-format probe-json)))
+                  expected-dur (/ total-frames fps)
+                  new-video-track (first (:timeline/tracks timeline))]
+              (check! "ffprobe width == EDL resolution width" (= res-w probed-w) (str probed-w))
+              (check! "ffprobe height == EDL resolution height" (= res-h probed-h) (str probed-h))
+              (check! (str "ffprobe duration ~= " expected-dur "s (concat -c copy DTS rounding tolerance 0.25s)")
+                      (< (Math/abs (- probed-dur expected-dur)) 0.25)
+                      (str probed-dur "s"))
+
+              ;; -- 7. verify REAL sampled pixel colors at specific timestamps,
+              ;; cross-referenced against kami.eizo.timeline/clip-at-frame --
+              ;; including right before/after each of the 3 cut boundaries.
+              (println "\n=== pixel-sample proof (crop=2:2 -- see douga's real_ffmpeg_proof.cljs for why not 1:1) ===")
+              (let [cx (- (quot res-w 2) 1) cy (- (quot res-h 2) 1)
+                    sample-times [0.10 2.35 2.55 3.90 4.10 5.90 6.10 7.60 7.70]]
+                (doseq [t sample-times]
+                  (let [frame (Math/round (* t fps))
+                        expected-clip (tl/clip-at-frame new-video-track (min frame (dec total-frames)))
+                        expected-cut-id (:clip/id expected-clip)
+                        expected-rgb (:rgb (first (filter #(= expected-cut-id (:cut/id %)) cut-defs)))
+                        raw (capture-bytes! ["ffmpeg" "-hide_banner" "-loglevel" "error" "-i" final-path
+                                             "-ss" (str t) "-vf" (str "crop=2:2:" cx ":" cy ":exact=1")
+                                             "-frames:v" "1" "-f" "rawvideo" "-pix_fmt" "rgb24" "-"])
+                        actual-rgb [(aget raw 0) (aget raw 1) (aget raw 2)]
+                        diff (reduce max (map (fn [a b] (Math/abs (- a b))) actual-rgb expected-rgb))]
+                    (check! (str "t=" t "s (frame " frame ") clip-at-frame -> " expected-cut-id
+                                 " expected " (rgb-hex expected-rgb) " actual " (rgb-hex actual-rgb))
+                            (<= diff 40)
+                            (str "max channel diff " diff)))))))))
+
+      (let [all @checks
+            pass? (every? :pass all)]
+        (println (str "\n=== SUMMARY: " (count (filter :pass all)) "/" (count all) " checks passed ==="))
+        (println (str "workdir (artifacts kept for inspection): " workdir))
+        (println (if pass? "\nRESULT: PASS" "\nRESULT: FAIL"))
+        (js/process.exit (if pass? 0 1)))
+
+      (catch :default e
+        (println "\nERROR:" (.-message e))
+        (println (str "workdir (kept for inspection): " workdir))
+        (println "\nRESULT: FAIL (exception)")
+        (js/process.exit 1)))))
+
+(-main)

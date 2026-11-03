@@ -24,7 +24,7 @@ struct user_result {
   char message[8];
 };
 
-extern uint64_t aiueos_gdt_tss[2];
+extern uint64_t aiueos_gdt_tss[2]; extern int64_t kotoba_aiueos_tss_descriptor_build(int64_t base, int64_t limit, int64_t out, int64_t out_length);
 extern uint8_t aiueos_kernel_stack_top[];
 extern void aiueos_syscall_entry(void);
 extern uint64_t aiueos_sysret_count, aiueos_sysret_validation_count;
@@ -430,10 +430,9 @@ int aiueos_process_initialize(void) {
   aiueos_syscall_kernel_stack_top=tss.rsp0;
   tss.iomap=sizeof(tss);
   if (!syscall_transport_initialize()) return 0x20;
-  uint64_t b=(uint64_t)(uintptr_t)&tss, limit=sizeof(tss)-1;
-  aiueos_gdt_tss[0]=(limit & 0xffff) | ((b & 0xffffff)<<16) |
-    (0x89ULL<<40) | ((limit & 0xf0000)<<32) | ((b & 0xff000000)<<32);
-  aiueos_gdt_tss[1]=b>>32;
+  uint64_t b=(uint64_t)(uintptr_t)&tss, limit=sizeof(tss)-1; /* JUN-599: the descriptor is kotoba/tss-descriptor.o */
+  if (kotoba_aiueos_tss_descriptor_build((int64_t)b, (int64_t)limit,
+      (int64_t)(uintptr_t)aiueos_gdt_tss, (int64_t)sizeof(aiueos_gdt_tss)) != 1) return 0x40;
   for (unsigned p=0;p<PROCESS_CAPACITY;p++) processes[p]=(struct process_descriptor){0};
   process_lifecycle_evidence=0;
   process_results_valid=0;

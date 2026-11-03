@@ -370,11 +370,25 @@ mapping the surface into a user component, ambient display authority, and an
 invented browser runtime are intentionally excluded.
 
 ```sh
+sh scripts/fetch-native-amu.sh   # once per kotoba checkout, from the kotoba root
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh
 ./os/aiueos/scripts/build-release-image.sh
 ./os/aiueos/scripts/smoke-qemu-release-image.sh
 ```
+
+`build-uefi.sh` writes its generated headers, sources and the initramfs with
+Kotoba programs (`os/aiueos/native/*.kotoba`) through
+`scripts/run-native-generator.sh` (JUN-555). The runner compiles each one with
+the Amu that kotoba itself pins: the revision and file digests in kotoba's
+`scripts/native-ci-inputs.json`, the same checkout kotoba's CI uses. It uses the
+Mac root on Apple Silicon, `seed/bootstrap/aarch64-linux-static-root.elf` on
+Linux aarch64 and `bin/amu-linux-x86_64` on Linux x86_64.
+`scripts/fetch-native-amu.sh` (kotoba root) fetches that revision into
+`_native/amu`, the runner's default; `AIUEOS_AMU_SOURCE` names another
+checkout. A missing or different Amu, or any other host, refuses; there is no
+Python fallback. On a Linux host without seccomp(2), such as qemu-user, set
+`AIUEOS_NATIVE_SECCOMP=if-available`.
 
 The plain `smoke-qemu-uefi.sh` run arms the test-only final exception probe and
 checks its terminal `AIUEOS_EXCEPTION_OK` marker. To check a persistent desktop

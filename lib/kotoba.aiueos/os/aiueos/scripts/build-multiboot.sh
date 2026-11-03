@@ -21,6 +21,9 @@ kotoba_msr_write_object=${AIUEOS_KOTOBA_MSR_WRITE_OBJECT:-"$aiueos/kotoba/msr-wr
 # Same shape as the apic.c/MSR omission the comment above records.
 kotoba_acpi_checksum_object=${AIUEOS_KOTOBA_ACPI_CHECKSUM_OBJECT:-"$aiueos/kotoba/acpi-checksum-ok.o"}
 kotoba_acpi_table_valid_object=${AIUEOS_KOTOBA_ACPI_TABLE_VALID_OBJECT:-"$aiueos/kotoba/acpi-table-valid.o"}
+# JUN-709: kernel/acpi.c calls the DMAR and MADT walks, which build-uefi.sh links; the multiboot link needs them too.
+kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
+kotoba_acpi_madt_object=${AIUEOS_KOTOBA_ACPI_MADT_OBJECT:-"$aiueos/kotoba/acpi-madt-parse.o"}
 # multiboot/main.c's `legacy_pic_disable` is now a call into this object rather
 # than ten `out8`s -- the same object kernel/main.c calls on the UEFI path, which
 # is the point: ADR-0028's fix existed only here, and the UEFI path had the same
@@ -74,21 +77,25 @@ mkdir -p "$mb"
 # The compiler-emitted Kotoba probe object is admitted by the same fail-closed
 # verifier the UEFI path uses; a hosted or import-bearing object is rejected.
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$probe" \
-  3f7409bff00efaa79ec2e260b6734f740e9d7da002a9eb22a747344591e5d327
+  6853e9de59784ce12caf4ee6582bd7e8f4615f249fce033082f129a3fb92c41b
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_read_object" \
-  da3add0a82de4562a8da117105e9a40a67e87c8086ca9b71851c4a9d9e673e0c \
+  bd9203d4d6021700fdcd473cf70f2579a544e0c8260f3b1c899e943bf76f4879 \
   kotoba_aiueos_msr_read
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_object" \
-  a6ae6efbe7c3a7543b391b01a9203906532b3c4328fb38bafb2d093b37bfe20d \
+  02d1cb87b65945911ca0ad627b3744a0a190024e904bf7e0b32bd98d6b6c475d \
   kotoba_aiueos_msr_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_checksum_object" \
-  f92dd1922a7d4dd2bb30614d3f8058da671b5f154bd9b5c452174ae8a17a5978 \
+  fa74f733deac18f7c1a0bc126c2bcbc0ab5d3e5f9a9825c9ff1c0a78c2a38d10 \
   kotoba_aiueos_acpi_checksum_ok
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_table_valid_object" \
-  66e621af0bbd4f7436a03a52e945d10f99a87b2608554aa1f9e997b36b1de1f6 \
+  e0892a0b0da830e332f7c4f0e6204f6d4d65575eb066aa4f3fd9a9a9136e7887 \
   kotoba_aiueos_acpi_table_valid
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
+  458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_madt_object" \
+  e5899fc554b156b4bd3c1a9268c70eac290f464fa3ad333644fd621d75332736 kotoba_aiueos_acpi_madt_parse
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pic_disable_object" \
-  c88ff01d1eb89f9cf549f4c0ca24f34928f948cab4a96cad82a8ab518bf7fad1 \
+  77e0b58183e383b81d6b98ecf7179103222612154a57bdaa38c505b79f807e16 \
   kotoba_aiueos_pic_disable
 
 zig cc -target x86_64-freestanding-none \
@@ -109,6 +116,7 @@ zig ld.lld -T "$aiueos/multiboot/linker.ld" -o "$kernel64" \
   "$mb/entry.o" "$mb/main.o" "$mb/acpi.o" "$mb/apic.o" "$probe" \
   "$kotoba_msr_read_object" "$kotoba_msr_write_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
+  "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" \
   "$kotoba_pic_disable_object"
 
 # QEMU's Multiboot loader wants an ELFCLASS32/EM_386 container; wrap the linked

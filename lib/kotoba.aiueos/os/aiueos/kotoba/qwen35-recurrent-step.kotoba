@@ -1,5 +1,5 @@
 (ns aiueos.qwen35-recurrent-step
-  (:export [aiueos-qwen35-recurrent-step main]))
+  (:export [kotoba_aiueos_qwen35_recurrent_step]))
 
 ;; `recurrent_step` (`kernel/qwen35_infer.c:493`) as one kernel object: the
 ;; gated DeltaNet update of ONE linear-attention head's recurrent state.
@@ -116,158 +116,146 @@
 ;; rank-one update touches every cell exactly once, so it is one flat loop over
 ;; `c` with `k = c / d` and `v = c - k*d`. Neither depends on a ceiling.
 
-(defn f32w [u]
+;; ## amu native object route (JUN-633)
+;;
+;; The native route takes a window's length only from the window's own region: a literal or the length its owner was
+;; given, never a computed one. Every region's length here is computed from dim ((* dim 4), (* dim (* dim 4))), so each
+;; element is addressed as a 4-byte window of the arena itself, at the region's offset from the plan plus four times
+;; its index; no region-sized window is formed. The kotoba-compiler/1 source's region windows only ever held in-range
+;; accesses, and regions-fit still admits every region inside the arena first, so the cells and vectors read and
+;; written are the same ones. The plan is read through the length the export was given (plan-length, checked to be
+;; 96). A private helper takes at most five parameters, so a region's plan slot shares a word with its index
+;; (slot | i << 8), a store's target with its value (si | bits << 32), and a column's position with its running sum
+;; (rc | acc << 32). The arithmetic and its order are unchanged.
+
+(defn- f32w [u]
   (if (> u 2147483647) (- u 4294967296) u))
 
-(defn u32w [v]
+(defn- u32w [v]
   (bit-and v 4294967295))
 
-(defn plan-u32 [plan slot]
-  (kernel-load-u32 plan 96 slot))
+(defn- plan-u32 [plan pn slot]
+  (kernel-load-u32 plan pn slot))
 
-(defn plan-u64 [plan slot]
-  (+ (kernel-load-u32 plan 96 slot)
-     (* 4294967296 (kernel-load-u32 plan 96 (+ slot 4)))))
+(defn- plan-u64 [plan pn slot]
+  (+ (kernel-load-u32 plan pn slot)
+     (* 4294967296 (kernel-load-u32 plan pn (+ slot 4)))))
 
-;; `finite_float` (:92): the exponent field is not all ones.
-(defn nonfinite [bits]
+(defn- nonfinite [bits]
   (if (= (bit-and (u32w bits) 2139095040) 2139095040) 1 0))
 
-;; ------------------------------------------------------------- the two shapes
+(defn- dim-of [plan pn] (plan-u64 plan pn 8))
 
-;; A cell by its FLAT index, so the caller owns the `key * d + value` layout
-;; and this reader owns no geometry.
-(defn cell-at [state dim c]
-  (f32w (kernel-load-u32 (kernel-subregion state (* dim (* dim 4)) (* c 4) 4) 4 0)))
+;; element i of the region whose offset is at plan slot `slot` (16 the state, 24 key, 32 query, 40 value, 48 the
+;; correction, 56 the output); si = slot | i << 8
+(defn- ix [slot i] (bit-or slot (i64-shift-left i 8)))
 
-(defn cell-put [state dim c bits]
-  (kernel-store-u32 (kernel-subregion state (* dim (* dim 4)) (* c 4) 4) 4 0
-                    (u32w bits)))
+(defn- at [arena alen plan pn si]
+  (f32w (kernel-load-u32 (kernel-subregion arena alen (+ (plan-u64 plan pn (bit-and si 255)) (* (u64-shift-right si 8) 4)) 4) 4 0)))
 
-(defn vec-at [r dim i]
-  (f32w (kernel-load-u32 (kernel-subregion r (* dim 4) (* i 4) 4) 4 0)))
+;; sib = si | bits << 32
+(defn- put [arena alen plan pn sib]
+  (let [si (bit-and sib 16777215)]
+    (kernel-store-u32 (kernel-subregion arena alen (+ (plan-u64 plan pn (bit-and si 255)) (* (u64-shift-right si 8) 4)) 4) 4 0
+                      (u64-shift-right sib 32))))
 
-(defn vec-put [r dim i bits]
-  (kernel-store-u32 (kernel-subregion r (* dim 4) (* i 4) 4) 4 0 (u32w bits)))
+(defn- with [si bits] (bit-or si (i64-shift-left (u32w bits) 32)))
 
-;; --------------------------------------------------------------------- passes
+(defn- scale-state [arena alen plan pn c]
+  (let [dim (dim-of plan pn)]
+    (if (>= c (* dim dim))
+      0
+      (do (put arena alen plan pn
+               (with (ix 16 c)
+                     (f32-to-bits (f32-mul (f32-from-bits (at arena alen plan pn (ix 16 c)))
+                                           (f32-from-bits (f32w (plan-u32 plan pn 64)))))))
+          (scale-state arena alen plan pn (+ c 1))))))
 
-;; `*cell *= decay` for every cell. See the note above on why this is a loop
-;; split rather than a reassociation.
-(defn scale-state [state dim decay c]
-  (if (>= c (* dim dim))
+;; sum over the column c, c + dim, ... of the state times the vector at plan slot r; st = (r | c << 8) | acc << 32
+(defn- dot-col [arena alen plan pn st]
+  (let [dim (dim-of plan pn) rc (bit-and st 16777215) r (bit-and rc 255) c (u64-shift-right rc 8)
+        acc (f32w (u64-shift-right st 32))]
+    (if (>= c (* dim dim))
+      acc
+      (dot-col arena alen plan pn
+               (with (ix r (+ c dim))
+                     (f32-to-bits
+                      (f32-add (f32-from-bits acc)
+                               (f32-mul (f32-from-bits (at arena alen plan pn (ix 16 c)))
+                                        (f32-from-bits (at arena alen plan pn (ix r (quot c dim))))))))))))
+
+(defn- remembered-pass [arena alen plan pn v]
+  (if (>= v (dim-of plan pn))
     0
-    (do (cell-put state dim c
-                  (f32-to-bits (f32-mul (f32-from-bits (cell-at state dim c))
-                                        (f32-from-bits decay))))
-        (scale-state state dim decay (+ c 1)))))
+    (do (put arena alen plan pn (with (ix 48 v) (dot-col arena alen plan pn (with (ix 24 v) 0))))
+        (remembered-pass arena alen plan pn (+ v 1)))))
 
-;; `sum over k of state[k*d + v] * r[k]`, binary32, left to right. Serves both
-;; `remembered` (r = key) and `value_out` (r = query): the C spells them
-;; separately but they are the same reduction down the same column.
-(defn dot-col [state r dim c acc]
-  (if (>= c (* dim dim))
-    acc
-    (dot-col state r dim (+ c dim)
-             (f32-to-bits
-              (f32-add (f32-from-bits acc)
-                       (f32-mul (f32-from-bits (cell-at state dim c))
-                                (f32-from-bits (vec-at r dim (quot c dim)))))))))
-
-(defn remembered-pass [state keyr corr dim v]
-  (if (>= v dim)
+(defn- correction-pass [arena alen plan pn v]
+  (if (>= v (dim-of plan pn))
     0
-    (do (vec-put corr dim v (dot-col state keyr dim v 0))
-        (remembered-pass state keyr corr dim (+ v 1)))))
+    (do (put arena alen plan pn
+             (with (ix 48 v)
+                   (f32-to-bits
+                    (f32-mul (f32-sub (f32-from-bits (at arena alen plan pn (ix 40 v)))
+                                      (f32-from-bits (at arena alen plan pn (ix 48 v))))
+                             (f32-from-bits (f32w (plan-u32 plan pn 72)))))))
+        (correction-pass arena alen plan pn (+ v 1)))))
 
-;; `correction[v] = (value[v] - remembered) * beta`
-(defn correction-pass [valr corr beta dim v]
-  (if (>= v dim)
+(defn- rank1-pass [arena alen plan pn c]
+  (let [dim (dim-of plan pn)]
+    (if (>= c (* dim dim))
+      0
+      (do (put arena alen plan pn
+               (with (ix 16 c)
+                     (f32-to-bits
+                      (f32-add (f32-from-bits (at arena alen plan pn (ix 16 c)))
+                               (f32-mul (f32-from-bits (at arena alen plan pn (ix 24 (quot c dim))))
+                                        (f32-from-bits
+                                         (at arena alen plan pn (ix 48 (- c (* dim (quot c dim)))))))))))
+          (rank1-pass arena alen plan pn (+ c 1))))))
+
+(defn- output-pass [arena alen plan pn v]
+  (if (>= v (dim-of plan pn))
     0
-    (do (vec-put corr dim v
-                 (f32-to-bits
-                  (f32-mul (f32-sub (f32-from-bits (vec-at valr dim v))
-                                    (f32-from-bits (vec-at corr dim v)))
-                           (f32-from-bits beta))))
-        (correction-pass valr corr beta dim (+ v 1)))))
+    (do (put arena alen plan pn
+             (with (ix 56 v)
+                   (f32-to-bits
+                    (f32-mul (f32-from-bits (dot-col arena alen plan pn (with (ix 32 v) 0)))
+                             (f32-from-bits 1035273459)))))
+        (output-pass arena alen plan pn (+ v 1)))))
 
-;; `row[v] += k * correction[v]`, over every cell in row-major order -- which
-;; is the order the C's nested loops visit them in, and every cell is touched
-;; exactly once either way. The key element is re-read per column rather than
-;; hoisted, which loads the same four bytes `d` times and changes no
-;; arithmetic.
-(defn rank1-pass [state keyr corr dim c]
-  (if (>= c (* dim dim))
-    0
-    (do (cell-put state dim c
-                  (f32-to-bits
-                   (f32-add (f32-from-bits (cell-at state dim c))
-                            (f32-mul (f32-from-bits (vec-at keyr dim (quot c dim)))
-                                     (f32-from-bits
-                                      (vec-at corr dim (- c (* dim (quot c dim)))))))))
-        (rank1-pass state keyr corr dim (+ c 1)))))
-
-;; `output[v] = value_out * INV_SQRT_LINEAR_HEAD_DIM`. The constant is
-;; 0.08838834764831845f = 1/sqrt(128), and it is the CONSTANT the C multiplies
-;; by, not a function of the dimension field: `INV_SQRT_LINEAR_HEAD_DIM` is a
-;; `#define` and does not move when this object is verified at another width.
-(defn output-pass [state qryr outr dim v]
-  (if (>= v dim)
-    0
-    (do (vec-put outr dim v
-                 (f32-to-bits
-                  (f32-mul (f32-from-bits (dot-col state qryr dim v 0))
-                           (f32-from-bits 1035273459))))
-        (output-pass state qryr outr dim (+ v 1)))))
-
-;; ------------------------------------------------------------------- the walk
-
-;; The six region bounds, checked here rather than left to `kernel-subregion`:
-;; a subregion that runs past its parent TRAPS (`ud2`), and a trap is a triple
-;; fault with no reason code, where this object's whole convention is that a
-;; caller is told what was wrong. The subregion checks still run underneath and
-;; are the belt to this suspenders.
-(defn fits [alen off len]
+(defn- fits [alen off len]
   (if (< off 0) 0 (if (< len 0) 0 (if (> (+ off len) alen) 0 1))))
 
-(defn regions-fit [alen plan]
-  (if (= 0 (fits alen (plan-u64 plan 16)
-                 (* (plan-u64 plan 8) (* (plan-u64 plan 8) 4)))) 0
-    (if (= 0 (fits alen (plan-u64 plan 24) (* (plan-u64 plan 8) 4))) 0
-      (if (= 0 (fits alen (plan-u64 plan 32) (* (plan-u64 plan 8) 4))) 0
-        (if (= 0 (fits alen (plan-u64 plan 40) (* (plan-u64 plan 8) 4))) 0
-          (if (= 0 (fits alen (plan-u64 plan 48) (* (plan-u64 plan 8) 4))) 0
-            (fits alen (plan-u64 plan 56) (* (plan-u64 plan 8) 4))))))))
+(defn- regions-fit [alen plan pn]
+  (let [dim (plan-u64 plan pn 8)]
+    (if (= 0 (fits alen (plan-u64 plan pn 16) (* dim (* dim 4)))) 0
+      (if (= 0 (fits alen (plan-u64 plan pn 24) (* dim 4))) 0
+        (if (= 0 (fits alen (plan-u64 plan pn 32) (* dim 4))) 0
+          (if (= 0 (fits alen (plan-u64 plan pn 40) (* dim 4))) 0
+            (if (= 0 (fits alen (plan-u64 plan pn 48) (* dim 4))) 0
+              (fits alen (plan-u64 plan pn 56) (* dim 4)))))))))
 
-(defn run [arena alen plan]
-  (let [dim (plan-u64 plan 8)
-        state (kernel-subregion arena alen (plan-u64 plan 16) (* dim (* dim 4)))
-        keyr (kernel-subregion arena alen (plan-u64 plan 24) (* dim 4))
-        qryr (kernel-subregion arena alen (plan-u64 plan 32) (* dim 4))
-        valr (kernel-subregion arena alen (plan-u64 plan 40) (* dim 4))
-        corr (kernel-subregion arena alen (plan-u64 plan 48) (* dim 4))
-        outr (kernel-subregion arena alen (plan-u64 plan 56) (* dim 4))]
-    (do (scale-state state dim (f32w (plan-u32 plan 64)) 0)
-        (remembered-pass state keyr corr dim 0)
-        (correction-pass valr corr (f32w (plan-u32 plan 72)) dim 0)
-        (rank1-pass state keyr corr dim 0)
-        (output-pass state qryr outr dim 0))))
+(defn- run [arena alen plan pn]
+  (do (scale-state arena alen plan pn 0)
+      (remembered-pass arena alen plan pn 0)
+      (correction-pass arena alen plan pn 0)
+      (rank1-pass arena alen plan pn 0)
+      (output-pass arena alen plan pn 0)))
 
-(defn aiueos-qwen35-recurrent-step [arena arena-length plan plan-length]
+(defn kotoba_aiueos_qwen35_recurrent_step [arena arena-length plan plan-length]
   (if (= arena 0) -1
     (if (= plan 0) -2
       (if (not (= plan-length 96)) -3
-        (if (not (= (plan-u32 plan 0) 0)) -4
-          (if (not (= (plan-u32 plan 4) 0)) -4
-            (if (not (= (plan-u32 plan 68) 0)) -4
-              (if (not (= (plan-u32 plan 76) 0)) -4
-                (if (not (= (plan-u64 plan 80) 0)) -4
-                  (if (not (= (plan-u64 plan 88) 0)) -4
-                    (if (< (plan-u64 plan 8) 1) -5
-                      (if (> (plan-u64 plan 8) 128) -5
-                        (if (= 1 (nonfinite (plan-u32 plan 64))) -6
-                          (if (= 1 (nonfinite (plan-u32 plan 72))) -6
-                            (if (= 0 (regions-fit arena-length plan)) -7
-                              (run arena arena-length plan))))))))))))))))
-
-(defn main [] 0)
+        (if (not (= (plan-u32 plan plan-length 0) 0)) -4
+          (if (not (= (plan-u32 plan plan-length 4) 0)) -4
+            (if (not (= (plan-u32 plan plan-length 68) 0)) -4
+              (if (not (= (plan-u32 plan plan-length 76) 0)) -4
+                (if (not (= (plan-u64 plan plan-length 80) 0)) -4
+                  (if (not (= (plan-u64 plan plan-length 88) 0)) -4
+                    (if (< (plan-u64 plan plan-length 8) 1) -5
+                      (if (> (plan-u64 plan plan-length 8) 128) -5
+                        (if (= 1 (nonfinite (plan-u32 plan plan-length 64))) -6
+                          (if (= 1 (nonfinite (plan-u32 plan plan-length 72))) -6
+                            (if (= 0 (regions-fit arena-length plan plan-length)) -7
+                              (run arena arena-length plan plan-length))))))))))))))))

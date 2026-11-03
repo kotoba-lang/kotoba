@@ -5,8 +5,8 @@
 #include "job_protocol.h"
 #include "device_result.h"
 #include "device_worker_protocol.h"
+#include "device_poll_scheduler.h"
 #include "kototama_runtime.h"
-
 #define VIRTIO_VENDOR_ID 0x1af4
 #define VIRTIO_RNG_MODERN_ID 0x1044
 #define VIRTIO_RNG_TRANSITIONAL_ID 0x1005
@@ -296,7 +296,7 @@ static uint64_t user_object_value[2];
 static uint8_t user_object_ready,user_object_write_evidence,user_object_replay_evidence;
 static volatile uint64_t user_object_pending[2];
 extern uint64_t kotoba_aiueos_journal_plan(uint64_t valid0, uint64_t sequence0,
-                                           uint64_t valid1, uint64_t sequence1);
+                                           uint64_t valid1, uint64_t sequence1); extern uint64_t kotoba_aiueos_blk_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t target, uint64_t msix, uint64_t start, uint64_t rounds);
 volatile uint64_t aiueos_virtio_blk_irq_count;
 static int blk_msix_active;
 /* Recorded when the completion wait proves futile rather than merely slow.
@@ -328,8 +328,8 @@ extern uint64_t kotoba_aiueos_app_lookup_plan(
 int aiueos_kotoba_app_object(const uint8_t id[16],const uint8_t **data,uint64_t *length) {
   if (!id || !data || !length) return 0;
   uint64_t plan=kotoba_aiueos_app_lookup_plan(
-    id,kotoba_apps,kotoba_app_count,sizeof(kotoba_apps[0]),
-    kotoba_app_count*sizeof(kotoba_apps[0]));
+    id,kotoba_apps,kotoba_app_count*sizeof(kotoba_apps[0]),
+    kotoba_app_count,sizeof(kotoba_apps[0]));
   if (!plan) return 0;
   uint64_t one_based=plan&7,length_plan=plan>>3;
   if (!one_based||one_based>kotoba_app_count||!length_plan||length_plan>98304) return 0;
@@ -365,8 +365,8 @@ extern uint64_t kotoba_aiueos_digest_equal(
   const uint8_t[32],const uint8_t[32],uint64_t);
 extern uint64_t kotoba_aiueos_app_catalog_valid(
   const uint8_t *,uint64_t,uint64_t,const uint32_t[2],uint64_t);
-extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(
-  const uint8_t[256],const uint8_t[32],uint8_t*,uint64_t,uint64_t);
+extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(const uint8_t[256],uint64_t,
+  const uint8_t[32],uint64_t,uint8_t*,uint64_t,uint64_t);
 /* `.high_bss`: both are CPU-only scratch for the Kotoba hash/verify calls,
    reached from the boot selftests after the section is zeroed; the low region
    was one page over its 0x1f4000 budget once main and the scorecard branch
@@ -381,7 +381,7 @@ static int sha256(const uint8_t *bytes,uint64_t length,uint8_t digest[32]) {
 }
 static int rsa2048_sha256_verify(const uint8_t signature[256],const uint8_t digest[32]) {
   return (int)kotoba_aiueos_rsa2048_sha256_verify(
-    signature,digest,rsa2048_workspace,sizeof(rsa2048_workspace),0);
+    signature,256,digest,32,rsa2048_workspace,sizeof(rsa2048_workspace),0);
 }
 /* Admit an initramfs recovery payload through the identical Kotoba SHA-256 +
    RSA-2048 public-key policy used for object-store application admission.
@@ -484,15 +484,17 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
   desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   avail->index = target; *doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if ((!blk_msix_active || aiueos_virtio_blk_irq_count >= target) && used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)used, 4096,
+        (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, blk_msix_active != 0, budget,
+        100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected || *status != VIRTIO_BLK_S_OK)
         return 0;
-      if (budget >= blk_slowest_iters) {
-        blk_slowest_iters = budget; blk_slow_used = used->index;
+      if ((got >> 2) >= blk_slowest_iters) {
+        blk_slowest_iters = got >> 2; blk_slow_used = used->index;
         blk_slow_target = target;
       }
       *submitted = target;
@@ -500,17 +502,15 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
         aiueos_storage_unwrap_sector(sector, disk_sector);
       return 1;
     }
-    /* Futile, not slow: the used index has passed the value this wait is
-       looking for, so no future completion can make the equality true. Fail
-       now with the numbers instead of spinning until the harness times out. */
-    if (used->index != target &&
-        (uint16_t)(used->index - target) < 0x8000) {
-      blk_wait_used = used->index; blk_wait_target = target;
+    /* Futile, not slow: kotoba_aiueos_blk_wait (kotoba/blk-wait.o) saw the used index pass
+       the value this wait is looking for, so no future completion can make the equality
+       true. Fail now with the numbers instead of spinning until the harness times out. */
+    if ((got & 3U) == 2U) {
+      blk_wait_used = (uint16_t)(got >> 2); blk_wait_target = target;
       blk_wait_irq = aiueos_virtio_blk_irq_count; blk_wait_overshot = 1;
       return 0;
     }
-    if (blk_msix_active) __asm__ volatile("sti; hlt; cli" ::: "memory");
-    else __asm__ volatile("pause");
+    if (got != 3U) return 0;
   }
   return 0;
 }
@@ -747,9 +747,9 @@ static int crash_sector_io_polled(uint32_t type) {
   b->desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   b->avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   b->avail->index = target; *b->doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if (b->used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {   /* kotoba/blk-wait.o, polled (no MSI-X) */
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)b->used, 4096, (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, 0, budget, 100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &b->used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected ||
@@ -757,7 +757,7 @@ static int crash_sector_io_polled(uint32_t type) {
       b->submitted = target;
       return 1;
     }
-    __asm__ volatile("pause");
+    if (got != 3U) return 0;   /* the index passed target (2): no completion can make them equal, so fail now */
   }
   return 0;
 }
@@ -853,12 +853,12 @@ int aiueos_uhci_probe(void) {
         for (volatile int spin = 0; spin < 100000; spin++) { }
         out16(uhci_iobase + 0x00, 0x0000);      /* stopped */
         out16(uhci_iobase + 0x04, 0x003f);      /* USBSTS: clear all */
-        /* count the ports from PORTSC1/2 (offsets 0x10/0x12) */
+        /* count the ports from PORTSC1/2 (offsets 0x10/0x12): a port's reserved bit 7 reads 1, and a bus with nothing there reads 0xffff (JUN-598: this was ||, which counted every value) */
         uint16_t p1 = in16(uhci_iobase + 0x10);
         uint16_t p2 = in16(uhci_iobase + 0x12);
         uhci_ports = 0;
-        if ((p1 & 0x0080u) || (p1 != 0xffffu)) uhci_ports++;
-        if ((p2 & 0x0080u) || (p2 != 0xffffu)) uhci_ports++;
+        if ((p1 & 0x0080u) && (p1 != 0xffffu)) uhci_ports++;
+        if ((p2 & 0x0080u) && (p2 != 0xffffu)) uhci_ports++;
         if (uhci_ports) return 1;
       }
     }
@@ -1234,26 +1234,26 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length);
-extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state); extern uint64_t kotoba_aiueos_msix_program(uint64_t entry, uint64_t entry_length, uint64_t cfg, uint64_t cfg_length, uint64_t address, uint64_t data, uint64_t vector);
+extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size); extern int64_t kotoba_aiueos_virtio_window(int64_t bar, int64_t offset, int64_t length);
 extern uint64_t kotoba_aiueos_pci_region_valid(
-  uint64_t offset, uint64_t bytes, uint64_t bar_length);
-static int cap_selftest(void) {
-  return kotoba_aiueos_virtio_cap_valid(0x40,20,0,0x1000,0x38) &&
-         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0xfffffff0U,0x40) &&
-         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0,0);
+  uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
+static int cap_selftest(void) { /* JUN-600: and kotoba/virtio-window.o, which forms map_transport's windows */
+  return kotoba_aiueos_virtio_cap_valid(0x40,20,0,0x1000,0x38) && kotoba_aiueos_virtio_window(0xfe000000LL,0x1000,0x38) == 0xfe001000LL &&
+         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0xfffffff0U,0x40) && !kotoba_aiueos_virtio_window((int64_t)0xffffffff00000000ULL,0x1000,0x38) &&
+         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0,0) && !kotoba_aiueos_virtio_window(0,0x1000,0x38);
 }
 static int read_bar(uint8_t b, uint8_t d, uint8_t f, uint8_t index, uint64_t *base) {
   if (index >= 6 || !base) return 0;
   uint32_t low = config_read(b,d,f,(uint8_t)(0x10 + index * 4));
-  if (low & 1) return 0; /* Port BARs cannot carry modern virtio capabilities. */
-  uint32_t type = (low >> 1) & 3;
-  uint64_t value = low & ~0xfU;
-  if (type == 2) {
-    if (index == 5) return 0;
-    value |= (uint64_t)config_read(b,d,f,(uint8_t)(0x14 + index * 4)) << 32;
-  } else if (type != 0) return 0;
-  if (!value || value == 0xfffffff0ULL) return 0;
+  /* JUN-598: the decode is kotoba/pci-bar.o (an I/O BAR, another type, a
+     64-bit BAR at index 5, a base of 0 or 0xfffffff0 refuse); the next word is
+     read only for a 64-bit BAR, as before. Port BARs cannot carry modern
+     virtio capabilities. */
+  uint32_t high = kotoba_aiueos_pci_bar_kind(low, index) == 2 ?
+    config_read(b,d,f,(uint8_t)(0x14 + index * 4)) : 0;
+  uint64_t value = (uint64_t)kotoba_aiueos_pci_bar_base(low, high, index);
+  if (!value) return 0;
   *base = value; return 1;
 }
 static int parse_cap(uint8_t b, uint8_t d, uint8_t f, uint8_t pointer,
@@ -1269,37 +1269,37 @@ static int parse_cap(uint8_t b, uint8_t d, uint8_t f, uint8_t pointer,
 
 static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
                             struct virtio_caps *caps) {
-  uint16_t status = (uint16_t)(config_read(b,d,f,0x04) >> 16);
-  if (!(status & PCI_STATUS_CAPABILITIES)) return 0;
-  *caps = (struct virtio_caps){0};
-  uint8_t pointer = config8(b,d,f,0x34) & ~3U;
-  uint64_t seen = 0;
-  unsigned steps = 0;
-  for (; pointer && steps < 48; steps++) {
-    if (pointer < 0x40 || pointer > 0xfc || (pointer & 3)) return 0;
-    uint64_t bit = 1ULL << ((pointer - 0x40) >> 2);
-    if (seen & bit) return 0; seen |= bit;
-    uint8_t next = config8(b,d,f,pointer + 1) & ~3U;
-    if (config8(b,d,f,pointer) == PCI_CAP_MSIX) {
-      if (pointer > 0xf4 || caps->msix_pointer) return 0;
-      caps->msix_pointer = pointer;
-    }
-    if (config8(b,d,f,pointer) == PCI_CAP_VENDOR) {
-      uint8_t kind = config8(b,d,f,pointer + 3);
-      if (kind == VIRTIO_CAP_COMMON || kind == VIRTIO_CAP_NOTIFY || kind == VIRTIO_CAP_DEVICE) {
-        struct virtio_pci_cap parsed;
-        if (!parse_cap(b,d,f,pointer,&parsed)) return 0;
-        if (kind == VIRTIO_CAP_COMMON) { caps->common = parsed; caps->have_common = 1; }
-        if (kind == VIRTIO_CAP_NOTIFY) { caps->notify = parsed; caps->have_notify = 1; }
-        if (kind == VIRTIO_CAP_DEVICE) { caps->device = parsed; caps->have_device = 1; }
-      }
-    }
-    pointer = next;
+  /* JUN-598: the bounded capability walk is kotoba/virtio-caps.o, over a
+     snapshot of the 256-byte configuration header (configuration reads have
+     no side effects, so this is the walk the C made read by read). The
+     object refuses the same chains: a pointer outside 0x40..0xfc or not
+     dword-aligned, a pointer seen twice, more than 48 steps, a second MSI-X
+     or one past 0xf4, a common / notify / device capability that
+     kotoba_aiueos_virtio_cap_valid would refuse; and it requires the common
+     configuration (>= 56 bytes) and a notify capability with a multiplier.
+     Its record is the three capabilities, their presence and the MSI-X
+     pointer, little-endian u32s; caps is written only when the walk is
+     admitted, which is the only case a caller reads it. This function keeps
+     the line count it had, so the __LINE__ sites below keep their numbers
+     (the virtio-input failure lines are part of the qualified baseline). */
+  uint8_t header[256];
+  uint32_t record[16];
+  for (unsigned at = 0; at < 256; at += 4) {
+    uint32_t word = config_read(b,d,f,(uint8_t)at);
+    header[at] = (uint8_t)word; header[at + 1] = (uint8_t)(word >> 8);
+    header[at + 2] = (uint8_t)(word >> 16); header[at + 3] = (uint8_t)(word >> 24);
   }
-  if (pointer) return 0; /* Capability chain exceeded the bounded walk. */
-  return caps->have_common && caps->have_notify &&
-         caps->common.length >= sizeof(struct virtio_common_cfg) &&
-         caps->notify.length >= 2 && caps->notify.notify_multiplier;
+  if (!kotoba_aiueos_virtio_caps_find((uint64_t)(uintptr_t)header, sizeof header,
+                                      (uint64_t)(uintptr_t)record, sizeof record))
+    return 0;
+  caps->common = (struct virtio_pci_cap){(uint8_t)record[0], record[1], record[2], record[3]};
+  caps->notify = (struct virtio_pci_cap){(uint8_t)record[4], record[5], record[6], record[7]};
+  caps->device = (struct virtio_pci_cap){(uint8_t)record[8], record[9], record[10], record[11]};
+  caps->have_common = (int)record[12];
+  caps->have_notify = (int)record[13];
+  caps->have_device = (int)record[14];
+  caps->msix_pointer = (uint8_t)record[15];
+  return 1;
 }
 
 static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,
@@ -1308,19 +1308,19 @@ static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,
   uint8_t offset = (uint8_t)(0x10 + index * 4);
   uint32_t command = config_read(b,d,f,0x04);
   uint32_t low = config_read(b,d,f,offset), high = 0;
-  if ((low & 1) || (((low >> 1) & 3) != 0 && ((low >> 1) & 3) != 2)) return 0;
-  int wide = ((low >> 1) & 3) == 2;
-  if (wide) { if (index == 5) return 0; high = config_read(b,d,f,offset + 4); }
+  /* JUN-598: the type check and the size are kotoba/pci-bar.o; the sizing protocol stays here. */
+  uint64_t kind = kotoba_aiueos_pci_bar_kind(low, index);
+  if (!kind) return 0;
+  int wide = kind == 2;
+  if (wide) high = config_read(b,d,f,offset + 4);
   config_write(b,d,f,0x04,command & ~3U);
   config_write(b,d,f,offset,0xffffffffU);
   if (wide) config_write(b,d,f,offset + 4,0xffffffffU);
-  uint64_t mask = (uint64_t)(config_read(b,d,f,offset) & ~0xfU);
-  if (wide) mask |= (uint64_t)config_read(b,d,f,offset + 4) << 32;
+  uint32_t mask_low = config_read(b,d,f,offset), mask_high = wide ? config_read(b,d,f,offset + 4) : 0;
   config_write(b,d,f,offset,low);
   if (wide) config_write(b,d,f,offset + 4,high);
   config_write(b,d,f,0x04,command);
-  uint64_t value = (uint64_t)(low & ~0xfU) | ((uint64_t)high << 32);
-  uint64_t size = wide ? (~mask) + 1 : (uint64_t)(~(uint32_t)mask + 1U);
+  uint64_t value = (uint64_t)kotoba_aiueos_pci_bar_value(low, high), size = (uint64_t)kotoba_aiueos_pci_bar_size(mask_low, mask_high, kind);
   if (!kotoba_aiueos_pci_extent_valid(value,size) || value + size < value) return 0;
   *base = value; *length = size; return 1;
 }
@@ -1352,23 +1352,23 @@ static struct {
    Returns 1 on a completed 32-byte fill. */
 static int rng_refill(void) {
   if (!rng_backend.ready) return 0;
-  rng_backend.desc[0].address = (uint64_t)(uintptr_t)rng_backend.page;
-  rng_backend.desc[0].length = 32;
-  rng_backend.desc[0].flags = VIRTQ_DESC_F_WRITE;
-  rng_backend.desc[0].next = 0;
+  /* JUN-598: descriptor 0 -> the page (32 bytes, device-writable), ring[0] = 0,
+     then the available index: kotoba/virtq-ring.o, in that order. */
   uint64_t before = aiueos_virtio_rng_irq_count;
-  rng_backend.avail->ring[0] = 0;
-  __asm__ volatile("" ::: "memory");
   rng_backend.posted++;
-  rng_backend.avail->index = rng_backend.posted;
+  uint64_t record[6] = {0, (uint64_t)(uintptr_t)rng_backend.page, 32, VIRTQ_DESC_F_WRITE, 0,
+                        (uint64_t)rng_backend.posted << 16};
+  if (!kotoba_aiueos_virtq_post((uint64_t)(uintptr_t)rng_backend.desc, 4096, (uint64_t)(uintptr_t)rng_backend.avail,
+                                4096, (uint64_t)(uintptr_t)record, sizeof record)) return 0;
+  __asm__ volatile("" ::: "memory");
   *rng_backend.doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if (aiueos_virtio_rng_irq_count != before &&
-        rng_backend.used->index == rng_backend.posted) {
-      return rng_backend.used->ring[0].length == 32;
+  for (uint32_t budget = 0; budget < 100000000U; budget += 65536U) {   /* kotoba/virtq-wait.o: check, then sti; hlt; cli */
+    int64_t got = kotoba_aiueos_virtq_wait((uint64_t)(uintptr_t)rng_backend.used, 4096, (uint64_t)(uintptr_t)&aiueos_virtio_rng_irq_count, 8,
+                                           before, rng_backend.posted, 100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if (got == 1) {
+      return (uint32_t)kotoba_aiueos_virtq_used_elem((uint64_t)(uintptr_t)rng_backend.used, 4096, 0) == 32;
     }
-    __asm__ volatile("sti; hlt; cli" ::: "memory");
+    if (got != 2) return 0;
   }
   return 0;
 }
@@ -1428,15 +1428,15 @@ static int setup_rng_msix(uint8_t b, uint8_t d, uint8_t f,
   if (!aiueos_map_pci_mmio(table_base + table_offset,table_bytes) ||
       !aiueos_map_pci_mmio(pba_base + pba_offset,pba_bytes)) return 0;
   struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
-  entry[0].vector_control = 1;
-  entry[0].address_low =
-    0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12);
-  entry[0].address_high = 0;
-  entry[0].data = 34;
+  /* kotoba/msix-entry.o: mask entry 0, write its message (the local APIC,
+     vector 34), assign the queue to MSI-X vector 0 and read it back, then
+     unmask -- one access of each register's width, in this order; 1 only when
+     the device kept the vector (the entry stays masked otherwise). */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[0], sizeof(entry[0]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12), 34, 0) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 0;
-  if (cfg->queue_msix_vector != 0) return 0;
-  entry[0].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31)); /* enable; function mask clear */
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_rng_irq_count = 0;
@@ -1476,14 +1476,14 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
   if (aiueos_vtd_translation_enabled() &&
       !aiueos_vtd_program_msix(((uint16_t)b << 8) | ((uint16_t)d << 3) | f,
                                1,35,destination,&message_address,&message_data)) return 0;
-  entry[1].vector_control = 1;
-  entry[1].address_low = message_address;
-  entry[1].address_high = 0;
-  entry[1].data = message_data;
+  /* kotoba/msix-entry.o, as for the rng: entry 1 with the (possibly remapped)
+     message, queue vector 1, read back, then unmask; a vector the device did
+     not keep fails the setup with the entry still masked. */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[1], sizeof(entry[1]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        message_address, message_data, 1) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 1;
-  if (cfg->queue_msix_vector != 1) return 0;
-  entry[1].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31));
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_blk_irq_count = 0;
@@ -1495,28 +1495,28 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
 static int map_transport(uint8_t b, uint8_t d, uint8_t f, const struct virtio_caps *caps,
                          volatile struct virtio_common_cfg **cfg_out,
                          uint64_t *notify_base_out) {
-  uint64_t common_bar, notify_bar;
+  uint64_t common_bar, notify_bar, common = 0, notify = 0; /* JUN-600: the windows are kotoba/virtio-window.o */
   if (!read_bar(b,d,f,caps->common.bar,&common_bar) ||
       !read_bar(b,d,f,caps->notify.bar,&notify_bar) ||
-      common_bar + caps->common.offset < common_bar ||
-      notify_bar + caps->notify.offset < notify_bar ||
-      !aiueos_map_pci_mmio(common_bar + caps->common.offset, caps->common.length) ||
-      !aiueos_map_pci_mmio(notify_bar + caps->notify.offset, caps->notify.length)) return 0;
-  *cfg_out = (volatile void *)(uintptr_t)(common_bar + caps->common.offset);
-  *notify_base_out = notify_bar + caps->notify.offset;
+      !(common = (uint64_t)kotoba_aiueos_virtio_window((int64_t)common_bar, caps->common.offset, caps->common.length)) ||
+      !(notify = (uint64_t)kotoba_aiueos_virtio_window((int64_t)notify_bar, caps->notify.offset, caps->notify.length)) ||
+      !aiueos_map_pci_mmio(common, caps->common.length) ||
+      !aiueos_map_pci_mmio(notify, caps->notify.length)) return 0;
+  *cfg_out = (volatile void *)(uintptr_t)common;
+  *notify_base_out = notify;
   return 1;
 }
 
 static int negotiate(volatile struct virtio_common_cfg *cfg) {
-  cfg->device_status = 0;
-  cfg->device_status = VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER;
-  cfg->device_feature_select = 1;
-  if (!(cfg->device_feature & 1U)) return 0; /* VIRTIO_F_VERSION_1, bit 32 */
-  cfg->driver_feature_select = 1; cfg->driver_feature = 1U;
-  cfg->driver_feature_select = 0; cfg->driver_feature = 0;
-  cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
-  if (!(cfg->device_status & VIRTIO_STATUS_FEATURES_OK)) return 0;
-  return 1;
+  /* JUN-598: the sequence is kotoba/virtio-negotiate.o, one access of each
+     register's width in this order: device_status = 0, = ACK | DRIVER;
+     device_feature_select = 1; refuse without VIRTIO_F_VERSION_1 (bit 32);
+     driver_feature_select = 1, driver_feature = 1, select = 0, feature = 0;
+     device_status |= FEATURES_OK, and it must read back set. The function
+     keeps its line count, so the __LINE__ sites below keep their numbers
+     (the virtio-input failure lines are part of the qualified baseline). */
+  return kotoba_aiueos_virtio_negotiate((uint64_t)(uintptr_t)cfg,
+                                        sizeof(struct virtio_common_cfg)) == 1;
 }
 
 /* Every device before virtio-net used exactly one queue, so `prepare_queue`
@@ -1530,16 +1530,16 @@ static volatile uint16_t *prepare_queue_index(volatile struct virtio_common_cfg 
                                               struct virtq_desc *desc,
                                               struct virtq_avail *avail,
                                               struct virtq_used *used) {
-  cfg->queue_select = index;
-  if (cfg->queue_size < size || cfg->queue_enable) return 0;
-  cfg->queue_size = size;
-  cfg->queue_desc = (uint64_t)(uintptr_t)desc;
-  cfg->queue_driver = (uint64_t)(uintptr_t)avail;
-  cfg->queue_device = (uint64_t)(uintptr_t)used;
-  cfg->queue_enable = 1;
-  uint64_t delta = (uint64_t)cfg->queue_notify_off * caps->notify.notify_multiplier;
-  if (delta + 2 < delta || delta + 2 > caps->notify.length) return 0;
-  return (volatile void *)(uintptr_t)(notify_base + delta);
+  /* JUN-598: the register sequence is kotoba/virtio-queue.o (select, refuse a
+     too-small or already-enabled queue, size, the three rings, enable, the
+     doorbell offset bounded by the notify capability); it answers the offset
+     + 1, or 0. The function keeps its line count for the __LINE__ sites below. */
+  uint64_t record[7] = {index, size, (uint64_t)(uintptr_t)desc, (uint64_t)(uintptr_t)avail,
+                        (uint64_t)(uintptr_t)used, caps->notify.notify_multiplier, caps->notify.length};
+  int64_t at = kotoba_aiueos_virtio_queue_setup((uint64_t)(uintptr_t)cfg, sizeof(struct virtio_common_cfg),
+                                                (uint64_t)(uintptr_t)record, sizeof record);
+  if (at <= 0) return 0;
+  return (volatile void *)(uintptr_t)(notify_base + (uint64_t)(at - 1));
 }
 
 static volatile uint16_t *prepare_queue(volatile struct virtio_common_cfg *cfg,
@@ -1562,17 +1562,17 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
   struct virtq_used *used = aiueos_allocate_physical_page();
   uint8_t *random = aiueos_allocate_physical_page();
   if (!desc || !avail || !used || !random) return 0;
-  desc[0].address = (uint64_t)(uintptr_t)random; desc[0].length = 32;
-  desc[0].flags = VIRTQ_DESC_F_WRITE; desc[0].next = 0;
-  avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
+  uint64_t first[6] = {0, (uint64_t)(uintptr_t)random, 32, VIRTQ_DESC_F_WRITE, 0, (uint64_t)1 << 16};
+  if (!kotoba_aiueos_virtq_post((uint64_t)(uintptr_t)desc, 4096, (uint64_t)(uintptr_t)avail, 4096,
+                                (uint64_t)(uintptr_t)first, sizeof first)) return 0;
   volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
   if (!doorbell || !setup_rng_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   *doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if (aiueos_virtio_rng_irq_count && used->index == 1) {
-      int ok = used->ring[0].id == 0 && used->ring[0].length == 32;
+  for (uint32_t budget = 0; budget < 100000000U; budget += 65536U) {   /* kotoba/virtq-wait.o: check, then sti; hlt; cli */
+    int64_t got = kotoba_aiueos_virtq_wait((uint64_t)(uintptr_t)used, 4096, (uint64_t)(uintptr_t)&aiueos_virtio_rng_irq_count, 8, 0, 1, 100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if (got == 1) {
+      int ok = kotoba_aiueos_virtq_used_elem((uint64_t)(uintptr_t)used, 4096, 0) == 32;   /* id 0, 32 bytes */
       if (ok) {
         /* Keep the queue alive so aiueos_random_bytes can request more. The
            first batch already sits in `random`; posted is 1 (one avail entry
@@ -1583,7 +1583,7 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
       }
       return ok;
     }
-    __asm__ volatile("sti; hlt; cli" ::: "memory");
+    if (got != 2) return 0;
   }
   return 0;
 }
@@ -2022,22 +2022,22 @@ static uint32_t kbd_recycle(int want_press) {
   __asm__ volatile("" ::: "memory");
   uint16_t n = kbd_used->index;
   while (kbd_seen != n) {
-    uint32_t id = kbd_used->ring[kbd_seen % 4].id;
+    /* kotoba/kbd-reap.o reads used element kbd_seen % 4, skips an id past 3 (1),
+       else reads its event and hands the buffer back on the available ring, ring
+       entry before index (2 | key << 2: the press or key event want_press asks for). */
+    uint64_t got = kotoba_aiueos_kbd_reap((uint64_t)(uintptr_t)kbd_used, 4096, (uint64_t)(uintptr_t)kbd_avail, 4096,
+        (uint64_t)(uintptr_t)kbd_event, 4096, (uint64_t)kbd_seen | (uint64_t)(want_press & 3) << 16);
     kbd_seen++;
-    if (id > 3) continue;
-    struct virtio_input_event *ev = kbd_event + id;
+    /* kbd_seen, the event counter, the doorbell and the break stay here, in the
+       order the C had them. */
+    if (got < 2) continue;
     /* Every used entry the reap path touches is counted here, and only here
        (JUN-34, measured 2026-10-23: the boot probe used to count its own read
        of ring slot 0 and the poll path then re-read the same entry, so the
        ring evidence double-counted and lagged what the desktop actually saw). */
     aiueos_input_ring_events++;
-    if (want_press == 1 && !press && ev->type == 1 && ev->value == 1 && ev->code)
-      press = ev->code;
-    if (want_press == 2 && !press && ev->type == 1 && ev->value <= 2 && ev->code)
-      press = (uint32_t)ev->code * 4U + ev->value;
-    kbd_avail->ring[kbd_avail->index % 4] = (uint16_t)id;
+    press = (uint32_t)(got >> 2);
     __asm__ volatile("" ::: "memory");
-    kbd_avail->index++;
     *kbd_doorbell = 0;
     if (press) break;
   }
@@ -2437,6 +2437,8 @@ static void gpu_drain_now(struct virtq_desc *desc, struct virtq_avail *avail,
   }
 }
 
+extern uint64_t kotoba_aiueos_gpu_reap(uint64_t used, uint64_t used_length, uint64_t resp, uint64_t resp_length,
+                                       uint64_t state, uint64_t resp_len, uint64_t expect);
 static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
                     struct virtq_used *used, volatile uint16_t *doorbell,
                     uint16_t *submitted,
@@ -2455,9 +2457,12 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
     __asm__ volatile("" ::: "memory");
     int responded = 0;
     while (gpu_used_consumed != used->index) {
-      struct virtq_used_element *done = &used->ring[gpu_used_consumed & 3];
+      /* kotoba/gpu-reap.o: what this used entry is -- 1 the event buffer, the response (2 as expected, 3 short,
+         4 long, 5 the wrong type; only the first), 6 anything else */
+      uint64_t act = kotoba_aiueos_gpu_reap((uint64_t)(uintptr_t)used, 4096, (uint64_t)(uintptr_t)resp, 24,
+          (uint64_t)gpu_used_consumed | (uint64_t)responded << 16, resp_len, expect_type);
       gpu_used_consumed++;
-      if (done->id == 2) {
+      if (act == 1) {
         /* the event buffer: record, clear, re-post */
         gpu_display_events |= gpu_event_buf.events;
         gpu_event_buf.events = 0;
@@ -2468,19 +2473,19 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
         __asm__ volatile("" ::: "memory");
         avail->index = gpu_avail_next;
         *doorbell = 0;
-      } else if (done->id == 0 && !responded) {
+      } else if (act >= 2 && act <= 5) {
         responded = 1;
-        if (done->length < sizeof(*resp)) {
+        if (act == 3) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL short\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (done->length > resp_len) {
+        if (act == 4) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL long\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (resp->type != expect_type) {
+        if (act == 5) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL type\r\n");
           *submitted = gpu_avail_next; return 0;
@@ -2904,8 +2909,11 @@ extern uint64_t kotoba_aiueos_ipv4_checksum(uint64_t buffer, uint64_t length);
 extern uint64_t kotoba_aiueos_ipv4_icmp_reply_valid(uint64_t frame, uint64_t length,
                                                     uint64_t expected_src, uint64_t ident,
                                                     uint64_t sequence);
-extern uint64_t kotoba_aiueos_tcp_checksum_ok(uint64_t frame, uint64_t ip_total_length,
-                                              uint64_t src, uint64_t dst);
+/* JUN-552: on amu's native object route a frame is a window with its own length, so tcp-checksum-ok takes the
+   frame's readable extent beside it. Both callers' frames sit in a 4 KiB page; they pass 2048, the extent the
+   kotoba-compiler/1 object assumed, so the answer is unchanged. */
+extern uint64_t kotoba_aiueos_tcp_checksum_ok(uint64_t frame, uint64_t frame_length,
+                                              uint64_t ip_total_length, uint64_t src, uint64_t dst);
 extern uint64_t kotoba_aiueos_tcp_segment_valid(uint64_t frame, uint64_t length,
                                                 uint64_t expected_src, uint64_t expected_ack,
                                                 uint64_t expected_flags);
@@ -3052,19 +3060,15 @@ static uint32_t net_load_be32(const uint8_t *at) {
    device's own config space. */
 static uint8_t net_mac[6] = {0x52,0x54,0x00,0xa1,0xe0,0x51};
 
+/* JUN-552: the ARP request and the ICMP echo request are kotoba/arp-icmp-build.o; it takes the frame's 42 bytes and
+   the peer's MAC then ours (12 bytes), and answers 42. */
+extern int64_t kotoba_aiueos_arp_request_build(uint64_t frame, uint64_t length, uint64_t macs, uint64_t macs_length);
+extern int64_t kotoba_aiueos_icmp_echo_build(uint64_t frame, uint64_t length, uint64_t macs, uint64_t macs_length);
 static uint32_t net_build_arp_request(uint8_t *frame) {
-  for (unsigned i = 0; i < 6; i++) frame[i] = 0xff;          /* broadcast */
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0806);                        /* EtherType ARP */
-  net_store_be16(frame + 14, 1);                             /* Ethernet */
-  net_store_be16(frame + 16, 0x0800);                        /* IPv4 */
-  frame[18] = 6; frame[19] = 4;
-  net_store_be16(frame + 20, 1);                             /* request */
-  for (unsigned i = 0; i < 6; i++) frame[22 + i] = net_mac[i];
-  net_store_be32(frame + 28, NET_GUEST_IP);
-  for (unsigned i = 0; i < 6; i++) frame[32 + i] = 0;        /* unknown target */
-  net_store_be32(frame + 38, NET_PEER_IP);
-  return 42;
+  uint8_t macs[12] = {0};
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  return (uint32_t)kotoba_aiueos_arp_request_build((uint64_t)(uintptr_t)frame, 42,
+                                                   (uint64_t)(uintptr_t)macs, sizeof macs);
 }
 
 /* The ARP cache, which at this point in the stack's life holds exactly one
@@ -3076,33 +3080,13 @@ static uint8_t net_peer_mac[6];
 static int net_peer_mac_known;
 
 static uint32_t net_build_icmp_echo(uint8_t *frame) {
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  frame[15] = 0;                                             /* no DSCP, no ECN */
-  net_store_be16(frame + 16, 28);                            /* 20 IPv4 + 8 ICMP */
-  /* Identification 0 with DF set: RFC 6864 permits it precisely because a
-     datagram that may not be fragmented can never need to be reassembled. */
-  net_store_be16(frame + 18, 0);
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 1;                                             /* ICMP */
-  net_store_be16(frame + 24, 0);                             /* checksum covers itself as 0 */
-  net_store_be32(frame + 26, NET_GUEST_IP);
-  net_store_be32(frame + 30, NET_PEER_IP);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  frame[34] = 8;                                             /* echo request */
-  frame[35] = 0;
-  net_store_be16(frame + 36, 0);
-  net_store_be16(frame + 38, NET_ICMP_IDENT);
-  net_store_be16(frame + 40, NET_ICMP_SEQUENCE);
-  net_store_be16(frame + 36,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 34), 8));
+  uint8_t macs[12];
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
   /* 42 bytes, the same length as the ARP request the device already accepted,
      so nothing here depends on a minimum-frame rule that has not been tested. */
-  return 42;
+  return (uint32_t)kotoba_aiueos_icmp_echo_build((uint64_t)(uintptr_t)frame, 42,
+                                                 (uint64_t)(uintptr_t)macs, sizeof macs);
 }
 
 /* Everything needed to drive one virtqueue, kept together because the IPv4
@@ -3255,74 +3239,37 @@ static uint16_t net_ip_id = 1;
 static const uint8_t net_tcp_payload[NET_TCP_PAYLOAD] =
   {'a','i','u','e','o','s','\r','\n'};
 
-/* The TCP checksum covers a 12-byte pseudo-header that cannot be overlaid on
-   the frame: to be contiguous with the TCP header it would have to start at
-   frame offset 22, which puts its address fields at 22..29, while the IPv4
-   header carries them at 26..33 -- four bytes off. So the two are laid out
-   contiguously here instead, and `aiueos-ipv4-checksum` sums them as one range.
-   Laying bytes out is mechanism; the arithmetic stays in the object that
-   already computes exactly this sum for the ICMP path.
-   Static rather than an allocated page because a failed allocation would have
-   to fail the whole NIC probe that ARP and IPv4 have already passed, and this
-   buffer is never touched by DMA -- only the CPU reads it. */
-static uint8_t net_tcp_scratch[4096] __attribute__((section(".high_bss"), aligned(4096)));
-
-static uint16_t net_tcp_checksum(const uint8_t *frame, uint32_t tcp_length,
-                                 uint32_t src, uint32_t dst) {
-  net_store_be32(net_tcp_scratch, src);
-  net_store_be32(net_tcp_scratch + 4, dst);
-  net_tcp_scratch[8] = 0;
-  net_tcp_scratch[9] = 6;                                    /* protocol TCP */
-  net_store_be16(net_tcp_scratch + 10, (uint16_t)tcp_length);
-  for (uint32_t i = 0; i < tcp_length; i++) net_tcp_scratch[12 + i] = frame[34 + i];
-  return (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_tcp_scratch, 12 + tcp_length);
-}
-
+/* JUN-552: the segment is built by kotoba/tcp-build.o. Its 48-byte record carries what the C read from its arguments
+   and globals: the peer's MAC then ours, then little-endian u32s -- src, dst, sport | dport << 16, sequence,
+   acknowledgement, flags, the IPv4 identification, the window. The object writes frame[0..54 + payload_length) with
+   both checksums (the TCP pseudo header summed in place, so there is no scratch copy any more) and answers 54 +
+   payload_length. 54 bytes without a payload, 62 with the echo, 196 with a ClientHello; the first is under Ethernet's
+   60-byte minimum and is emitted unpadded, which the ARP request at 42 bytes already showed this device and SLIRP both
+   accept. The identification still increments here: distinct IDs help SLIRP tell later TCP segments apart from the
+   ClientHello. */
+extern int64_t kotoba_aiueos_tcp_build(uint64_t frame, uint64_t length, uint64_t record, uint64_t record_length,
+                                       uint64_t payload, uint64_t payload_length);
 static uint32_t net_build_tcp(uint8_t *frame, uint32_t src, uint32_t dst,
                               uint16_t sport, uint16_t dport,
                               uint32_t sequence, uint32_t acknowledgement,
                               uint8_t flags, const uint8_t *payload,
                               uint32_t payload_length) {
-  uint32_t total = 40 + payload_length;                      /* 20 IPv4 + 20 TCP */
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  frame[15] = 0;
-  net_store_be16(frame + 16, (uint16_t)total);
-  /* Identification 0 with DF set, as for the echo: RFC 6864 permits it because
-     a datagram that may not be fragmented can never need reassembly. Distinct
-     IDs still help SLIRP tell later TCP segments apart from the ClientHello. */
-  net_store_be16(frame + 18, net_ip_id);
+  uint32_t record[12] = {0};
+  uint8_t *macs = (uint8_t *)record;
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  record[3] = src;
+  record[4] = dst;
+  record[5] = (uint32_t)sport | (uint32_t)dport << 16;
+  record[6] = sequence;
+  record[7] = acknowledgement;
+  record[8] = flags;
+  record[9] = net_ip_id;
+  record[10] = net_tx_window;
   net_ip_id++;
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 6;                                             /* TCP */
-  net_store_be16(frame + 24, 0);                             /* checksum covers itself as 0 */
-  net_store_be32(frame + 26, src);
-  net_store_be32(frame + 30, dst);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, sport);
-  net_store_be16(frame + 36, dport);
-  net_store_be32(frame + 38, sequence);
-  net_store_be32(frame + 42, acknowledgement);
-  frame[46] = 0x50;                                          /* data offset 5, no options */
-  frame[47] = flags;
-  net_store_be16(frame + 48, net_tx_window);
-  net_store_be16(frame + 50, 0);                             /* checksum covers itself as 0 */
-  net_store_be16(frame + 52, 0);                             /* no urgent data */
-  for (uint32_t i = 0; i < payload_length; i++) frame[54 + i] = payload[i];
-  net_store_be16(frame + 50, net_tcp_checksum(frame, 20 + payload_length, src, dst));
-  /* 54 bytes without a payload, 62 with the echo, 196 with a ClientHello. The
-     first is under Ethernet's 60-byte minimum and is emitted unpadded, which
-     the ARP request at 42 bytes already showed this device and SLIRP both
-     accept -- so nothing here depends on padding that has never been
-     exercised. A real NIC on a real wire pads it itself, and the receiver
-     ignores the difference because the IPv4 total length, not the frame
-     length, says where the datagram ends. */
-  return 14 + total;
+  return (uint32_t)kotoba_aiueos_tcp_build((uint64_t)(uintptr_t)frame, 54 + (uint64_t)payload_length,
+                                           (uint64_t)(uintptr_t)record, sizeof record,
+                                           (uint64_t)(uintptr_t)payload, payload_length);
 }
 
 static int net_tcp_send(struct net_ring *tx, uint8_t *tx_page, uint32_t src,
@@ -3342,7 +3289,7 @@ static int net_tcp_send(struct net_ring *tx, uint8_t *tx_page, uint32_t src,
      the same way in both derivations; only the peer can, by dropping the
      segment, and a dropped segment is indistinguishable from a peer that never
      answered until a whole second boot has been spent finding out. */
-  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame,
+  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame, 2048,
                                      40 + payload_length, src, dst)) {
     tcp_stage = NET_TCP_STAGE_TX_CHECKSUM;
     tcp_cloud_stage = NET_TCP_STAGE_TX_CHECKSUM;
@@ -3510,11 +3457,11 @@ static int net_ssh_id_prefix_ok(const uint8_t *p, uint32_t len) {
    client verified end-to-end; here the crypto comes from the kernel's Kotoba
    objects: X25519 for Q_S/K, SHA-256 for H, and the ECDSA-P256 sign object for
    the host-key signature over H. Assembly is decision-free byte layout. */
-extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                     uint8_t *, uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *, const uint8_t *,
-                                              const uint8_t *, uint8_t *,
-                                              uint8_t *);
+extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                     uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in, uint64_t in_length, uint8_t *out, uint64_t out_length, uint8_t *workspace, uint64_t workspace_length);
+static __attribute__((unused)) uint64_t ecdsa_p256_sign_block(const uint8_t *priv, const uint8_t *digest, const uint8_t *k, uint8_t *out, uint8_t *workspace, uint64_t workspace_length) { uint8_t in[96]; for (int i = 0; i < 32; i++) { in[i] = priv[i]; in[32 + i] = digest[i]; in[64 + i] = k[i]; } uint64_t r = kotoba_aiueos_ecdsa_p256_sign(in, 96, out, 64, workspace, workspace_length); for (int i = 0; i < 96; i++) ((volatile uint8_t *)in)[i] = 0; return r; }
+
 /* Fixed ecdsa-sha2-nistp256 host key: d is the private scalar; (x,y)=d*G is the
    public point (precomputed offline -- the kernel has no P-256 base multiply of
    its own). The client harness pins this public key. A per-device key is the
@@ -3533,7 +3480,7 @@ static uint8_t ssh_host_y[32] = {
     defined(AIUEOS_MURAKUMO_DEVICE_RESULT)
 extern int aiueos_device_p256_key_load(uint8_t key[32]);
 extern uint64_t kotoba_aiueos_ecdsa_p256_public(
-  const uint8_t *private_key, uint8_t *public_key, uint8_t *workspace);
+  const uint8_t *private_key, uint64_t private_key_length, uint8_t *public_key, uint64_t public_key_length, uint8_t *workspace, uint64_t workspace_length);
 static uint8_t ssh_host_public_workspace[2048]
   __attribute__((section(".high_bss")));
 static int ssh_device_host_key_ready;
@@ -3550,7 +3497,7 @@ static int ssh_use_device_host_key(void) {
   if (ssh_device_host_key_ready) return 1;
   if (aiueos_device_p256_key_load(private_key) &&
       kotoba_aiueos_ecdsa_p256_public(
-        private_key, public_key, ssh_host_public_workspace)) {
+        private_key, 32, public_key, 64, ssh_host_public_workspace, sizeof(ssh_host_public_workspace))) {
     for (uint32_t i = 0; i < 32; i++) {
       ssh_host_d[i] = private_key[i];
       ssh_host_x[i] = public_key[i];
@@ -3591,8 +3538,8 @@ extern int aiueos_aes128_gcm_encrypt(const uint8_t[16], const uint8_t[12],
 extern int aiueos_aes128_gcm_decrypt(const uint8_t[16], const uint8_t[12],
                                      const uint8_t *, uint32_t,
                                      const uint8_t *, uint32_t, const uint8_t[16], uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, const uint8_t *,
-                                                       const uint8_t *, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                                       const uint8_t *, uint64_t, uint8_t *, uint64_t);
 static const uint8_t ssh_v_s[] = "SSH-2.0-aiueos_0.1";  /* V_S without CR-LF */
 #define SSH_V_S_LEN (sizeof(ssh_v_s) - 1)
 static uint8_t ssh_v_c[128] AIUEOS_SSH_HIGH_BSS; /* captured client id line */
@@ -3878,22 +3825,19 @@ static int net_ssh_syn_valid(struct aiueos_ssh_io *io, uint32_t received) {
            io->peer_ip, 0, NET_TCP_SYN | NET_TCP_ECE | NET_TCP_CWR);
 }
 
+/* The publickey userauth parsing is kotoba/ssh-userauth.kotoba (JUN-552): which method a USERAUTH_REQUEST names, the
+   publickey request's fields (returned as offsets into the payload) and the authorized-key check of the offered blob. */
+extern int64_t kotoba_aiueos_ssh_userauth_method(const uint8_t *, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_ssh_userauth_publickey(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_ssh_authorized_blob(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
+static uint32_t ssh_le32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 static int ssh_userauth_method_is(const uint8_t *payload,
                                   uint32_t payload_length,
                                   const char *expected) {
-  uint32_t offset = 1;
-  const uint8_t *username, *service, *method;
-  uint32_t username_length, service_length, method_length;
-  return payload && payload_length > 1U && payload[0] == 50U &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &username, &username_length) &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &service, &service_length) &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &method, &method_length) &&
-    ssh_text_equal(username, username_length, "runtime") &&
-    ssh_text_equal(service, service_length, "ssh-connection") &&
-    ssh_text_equal(method, method_length, expected);
+  uint64_t which = (expected[0] == 'n') ? 0 : 1;   /* "none" or "publickey", the two this file asks for */
+  return kotoba_aiueos_ssh_userauth_method(payload, payload_length, which) == 1;
 }
 
 static int ssh_userauth_publickey_fields(
@@ -3901,57 +3845,26 @@ static int ssh_userauth_publickey_fields(
     int *has_signature, const uint8_t **algorithm,
     uint32_t *algorithm_length, const uint8_t **public_key_blob,
     uint32_t *public_key_blob_length, uint32_t *after_key) {
-  uint32_t offset = 1;
-  const uint8_t *username, *service, *method;
-  uint32_t username_length, service_length, method_length;
+  uint8_t fields[24];
   if (!has_signature || !algorithm || !algorithm_length ||
       !public_key_blob || !public_key_blob_length || !after_key ||
-      !payload || payload_length <= 1U || payload[0] != 50U ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &username, &username_length) ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &service, &service_length) ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &method, &method_length) ||
-      !ssh_text_equal(username, username_length, "runtime") ||
-      !ssh_text_equal(service, service_length, "ssh-connection") ||
-      !ssh_text_equal(method, method_length, "publickey") ||
-      offset >= payload_length) return 0;
-  *has_signature = payload[offset++] != 0;
-  if (!ssh_take_string(payload, payload_length, &offset,
-                       algorithm, algorithm_length) ||
-      !ssh_text_equal(*algorithm, *algorithm_length,
-                      "ecdsa-sha2-nistp256") ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       public_key_blob, public_key_blob_length)) return 0;
-  *after_key = offset;
+      kotoba_aiueos_ssh_userauth_publickey(payload, payload_length, fields, sizeof(fields)) != 1) return 0;
+  *has_signature = fields[0] != 0;
+  *algorithm = payload + ssh_le32(fields + 4);
+  *algorithm_length = ssh_le32(fields + 8);
+  *public_key_blob = payload + ssh_le32(fields + 12);
+  *public_key_blob_length = ssh_le32(fields + 16);
+  *after_key = ssh_le32(fields + 20);
   return 1;
 }
 
 static int ssh_authorized_publickey_blob(const uint8_t *blob,
                                          uint32_t blob_length,
                                          uint8_t public_point[64]) {
-  uint32_t offset = 0;
-  const uint8_t *algorithm, *curve, *point;
-  uint32_t algorithm_length, curve_length, point_length;
-  if (!blob || !public_point ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &algorithm, &algorithm_length) ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &curve, &curve_length) ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &point, &point_length) ||
-      offset != blob_length || point_length != 65U || point[0] != 4U ||
-      !ssh_text_equal(algorithm, algorithm_length,
-                      "ecdsa-sha2-nistp256") ||
-      !ssh_text_equal(curve, curve_length, "nistp256")) return 0;
-  for (uint32_t i = 0; i < 32U; i++) {
-    public_point[i] = point[1U + i];
-    public_point[32U + i] = point[33U + i];
-    if (public_point[i] != ssh_auth_x[i] ||
-        public_point[32U + i] != ssh_auth_y[i]) return 0;
-  }
-  return 1;
+  uint8_t authorized[64];
+  if (!blob || !public_point) return 0;
+  for (uint32_t i = 0; i < 32U; i++) { authorized[i] = ssh_auth_x[i]; authorized[32U + i] = ssh_auth_y[i]; }
+  return kotoba_aiueos_ssh_authorized_blob(blob, blob_length, authorized, 64, public_point, 64) == 1;
 }
 
 /* Drive publickey userauth after NEWKEYS. Derives the session keys, receives the
@@ -4157,7 +4070,7 @@ static int net_ssh_userauth(struct aiueos_ssh_io *io, uint16_t cport,
           ssh_mpint_to_32(r, rn, rs);
           ssh_mpint_to_32(s, sn, rs + 32);
 
-          if (!kotoba_aiueos_ecdsa_p256_sha256_verify(rs, digest, pub, ssh_verify_ws, 2048)) return 0;
+          if (!kotoba_aiueos_ecdsa_p256_sha256_verify(rs, 64, digest, 32, pub, 64, ssh_verify_ws, sizeof(ssh_verify_ws))) return 0;
           ssh_kex_stage = 11;
         }
       }
@@ -4360,8 +4273,8 @@ static int net_ssh_kex(struct aiueos_ssh_io *io, uint16_t cport,
   /* 5. ephemeral X25519, shared secret, host-key blob, exchange hash H. */
   uint8_t eph[32], q_s[32], k[32];
   aiueos_random_bytes(eph, 32);
-  if (!kotoba_aiueos_x25519(eph, x25519_base9, q_s, ssh_x25519_ws)) return 0;
-  if (!kotoba_aiueos_x25519(eph, q_c, k, ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, x25519_base9, 32, q_s, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, q_c, 32, k, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
 
   static uint8_t ks[128] AIUEOS_SSH_HIGH_BSS;
   uint32_t kslen = 0;
@@ -4401,7 +4314,7 @@ static int net_ssh_kex(struct aiueos_ssh_io *io, uint16_t cport,
     uint8_t nonce[32];
     aiueos_random_bytes(nonce, 32);
     nonce[0] &= 0x7f;
-    if (kotoba_aiueos_ecdsa_p256_sign(ssh_host_d, e, nonce, rs, ssh_sign_ws))
+    if (ecdsa_p256_sign_block(ssh_host_d, e, nonce, rs, ssh_sign_ws, sizeof(ssh_sign_ws)))
       signed_ok = 1;
   }
   if (!signed_ok) return 0;
@@ -4573,12 +4486,6 @@ static int net_ssh_listen(struct aiueos_ssh_io *io, unsigned listen_rounds) {
 #define NET_DHCP_STAGE_ACK 4
 #define NET_DHCP_STAGE_DONE 5
 
-/* Never touched by the device's own rings -- the CPU composes the UDP
-   checksum here and net_send copies it into the transmit frame -- so it is
-   static rather than an allocated page, for the reason net_tcp_scratch is.
-   `.high_bss` since 2026-10-26: same CPU-only argument as the TLS scratch,
-   and the payload the NIC reads is ordinary RAM at 4..6 MiB either way. */
-static uint8_t net_dhcp_scratch[2048] __attribute__((aligned(16), section(".high_bss")));
 static uint32_t dhcp_frame_length;
 
 static uint64_t net_mac_value(void) {
@@ -4593,70 +4500,30 @@ static uint64_t net_mac_value(void) {
    the two are laid out contiguously here and summed as one range by the object
    that already computes exactly this sum for ICMP and TCP. Laying bytes out is
    mechanism; the arithmetic is not. */
+/* JUN-552: the pseudo header and the datagram are summed by kotoba/udp-checksum.o in place, rather than copied
+   into net_dhcp_scratch first; it answers kotoba_aiueos_ipv4_checksum's value over that range. */
+extern int64_t kotoba_aiueos_udp_checksum_sum(uint64_t frame, uint64_t length, uint64_t udp_length);
 static uint16_t net_udp_checksum(const uint8_t *frame, uint32_t udp_length) {
-  net_store_be32(net_dhcp_scratch, net_load_be32(frame + 26));
-  net_store_be32(net_dhcp_scratch + 4, net_load_be32(frame + 30));
-  net_dhcp_scratch[8] = 0;
-  net_dhcp_scratch[9] = 17;                                  /* protocol UDP */
-  net_store_be16(net_dhcp_scratch + 10, (uint16_t)udp_length);
-  for (uint32_t i = 0; i < udp_length; i++) net_dhcp_scratch[12 + i] = frame[34 + i];
-  uint16_t sum = (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_dhcp_scratch, 12 + udp_length);
+  uint16_t sum = (uint16_t)kotoba_aiueos_udp_checksum_sum((uint64_t)(uintptr_t)frame, 34 + (uint64_t)udp_length,
+                                                          udp_length);
   /* RFC 768: a computed checksum of zero goes on the wire as all ones, because
      zero already means "not computed". The admission accepts both. */
   return sum ? sum : 0xffff;
 }
 
+/* JUN-552: the DISCOVER / REQUEST frame is built by kotoba/dhcp-build.o: zeroed, broadcast from 0.0.0.0 to
+   255.255.255.255 (this machine has no address to send from and does not know who to send to, which is the whole
+   reason the exchange exists), BOOTREQUEST with the broadcast flag (RFC 2131: a client with no address cannot
+   receive a unicast reply), our MAC as chaddr, the cookie, option 53, and for a REQUEST options 50 and 54 -- the
+   address being accepted and the server that offered it, so a second server's offer is declined by omission -- then
+   the parameter request list (mask, router, DNS, lease; asking is not receiving) and END, both checksums included. */
+extern int64_t kotoba_aiueos_dhcp_build(uint64_t frame, uint64_t length, uint64_t mac, uint64_t mac_length,
+                                        uint64_t message_type, uint64_t requested, uint64_t server);
 static uint32_t net_build_dhcp(uint8_t *frame, uint8_t message_type,
                                uint32_t requested, uint32_t server) {
-  uint32_t udp_length = 8 + NET_DHCP_BOOTP;
-  uint32_t total = 20 + udp_length;
-  for (uint32_t i = 0; i < 14 + total; i++) frame[i] = 0;
-  for (unsigned i = 0; i < 6; i++) frame[i] = 0xff;          /* broadcast */
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  net_store_be16(frame + 16, (uint16_t)total);
-  net_store_be16(frame + 20, 0x4000);                        /* DF, id 0 (RFC 6864) */
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 17;                                            /* UDP */
-  /* 0.0.0.0 to 255.255.255.255: this machine has no address to send from and
-     does not know who to send to, which is the whole reason the exchange
-     exists. */
-  net_store_be32(frame + 26, 0);
-  net_store_be32(frame + 30, 0xffffffffU);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, 68);                            /* client port */
-  net_store_be16(frame + 36, 67);                            /* server port */
-  net_store_be16(frame + 38, (uint16_t)udp_length);
-  frame[42] = 1;                                             /* BOOTREQUEST */
-  frame[43] = 1;                                             /* Ethernet */
-  frame[44] = 6;                                             /* 6-byte address */
-  net_store_be32(frame + 46, NET_DHCP_XID);
-  /* The broadcast flag. A client with no address configured cannot receive a
-     unicast datagram addressed to an address it does not yet hold, so RFC 2131
-     has it ask for the reply to be broadcast. */
-  net_store_be16(frame + 52, 0x8000);
-  for (unsigned i = 0; i < 6; i++) frame[70 + i] = net_mac[i];
-  net_store_be32(frame + 278, 0x63825363U);                  /* magic cookie */
-  uint32_t at = 282;
-  frame[at++] = 53; frame[at++] = 1; frame[at++] = message_type;
-  if (message_type == NET_DHCP_REQUEST) {
-    /* Both are required in a REQUEST that answers an OFFER: the address being
-       accepted, and which server offered it, so that a second server's offer is
-       declined by omission rather than by silence. */
-    frame[at++] = 50; frame[at++] = 4; net_store_be32(frame + at, requested); at += 4;
-    frame[at++] = 54; frame[at++] = 4; net_store_be32(frame + at, server); at += 4;
-  }
-  /* Parameter request list: subnet mask, router, DNS, lease time. Asking is not
-     receiving -- the admission requires the mask, the server identifier and the
-     lease regardless of what was asked for. */
-  frame[at++] = 55; frame[at++] = 4;
-  frame[at++] = 1; frame[at++] = 3; frame[at++] = 6; frame[at++] = 51;
-  frame[at++] = 255;                                         /* END */
-  net_store_be16(frame + 40, net_udp_checksum(frame, udp_length));
-  return 14 + total;
+  return (uint32_t)kotoba_aiueos_dhcp_build((uint64_t)(uintptr_t)frame, 14 + 20 + 8 + NET_DHCP_BOOTP,
+                                            (uint64_t)(uintptr_t)net_mac, sizeof net_mac,
+                                            message_type, requested, server);
 }
 
 static int net_dhcp_send(struct net_ring *tx, uint8_t *tx_page,
@@ -4827,101 +4694,54 @@ static uint32_t net_dns_server(void) {
   return dhcp_dns ? dhcp_dns : NET_DNS_IP;
 }
 
+/* JUN-552: the query is built by kotoba/dns-query.o. Its 24-byte record is the peer's MAC then ours, then
+   little-endian u32s: src, dst, the server port. It zeroes and writes frame[0..54 + question_length), both checksums
+   included (the UDP pseudo header summed in place), and answers that length; a question shorter than 5 or longer than
+   255 bytes is refused (0) with nothing written. */
+extern int64_t kotoba_aiueos_dns_query_build(uint64_t frame, uint64_t length, uint64_t record, uint64_t record_length,
+                                             uint64_t question, uint64_t question_length);
 static uint32_t net_build_dns_query_named(uint8_t *frame, uint32_t src,
                                           uint32_t dst, uint16_t server_port,
                                           const uint8_t *question,
                                           uint32_t question_length) {
-  uint32_t udp_length = 8 + 12 + question_length;
-  uint32_t total = 20 + udp_length;
-  if (!frame || !question || question_length < 5 || question_length > 255)
-    return 0;
-  for (uint32_t i = 0; i < 14 + total; i++) frame[i] = 0;
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);
-  frame[14] = 0x45;
-  net_store_be16(frame + 16, (uint16_t)total);
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;
-  frame[23] = 17;
-  net_store_be32(frame + 26, src);
-  net_store_be32(frame + 30, dst);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, NET_DNS_CLIENT_PORT);
-  net_store_be16(frame + 36, server_port);
-  net_store_be16(frame + 38, (uint16_t)udp_length);
-  net_store_be16(frame + 42, NET_DNS_XID);
-  net_store_be16(frame + 44, 0x0100);                        /* RD */
-  net_store_be16(frame + 46, 1);                             /* QDCOUNT */
-  for (uint32_t i = 0; i < question_length; i++)
-    frame[54 + i] = question[i];
-  net_store_be16(frame + 40, net_udp_checksum(frame, udp_length));
-  return 14 + total;
+  uint32_t record[6] = {0};
+  uint8_t *macs = (uint8_t *)record;
+  if (!frame || !question) return 0;
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  record[3] = src;
+  record[4] = dst;
+  record[5] = server_port;
+  return (uint32_t)kotoba_aiueos_dns_query_build((uint64_t)(uintptr_t)frame, 54 + (uint64_t)question_length,
+                                                 (uint64_t)(uintptr_t)record, sizeof record,
+                                                 (uint64_t)(uintptr_t)question, question_length);
 }
 
 static int net_udp_rx_checksum_ok(const uint8_t *frame, uint32_t udp_length) {
-  net_store_be32(net_dhcp_scratch, net_load_be32(frame + 26));
-  net_store_be32(net_dhcp_scratch + 4, net_load_be32(frame + 30));
-  net_dhcp_scratch[8] = 0;
-  net_dhcp_scratch[9] = 17;
-  net_store_be16(net_dhcp_scratch + 10, (uint16_t)udp_length);
-  for (uint32_t i = 0; i < udp_length; i++) net_dhcp_scratch[12 + i] = frame[34 + i];
-  return (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_dhcp_scratch, 12 + udp_length) == 0;
+  return (uint16_t)kotoba_aiueos_udp_checksum_sum((uint64_t)(uintptr_t)frame, 34 + (uint64_t)udp_length,
+                                                 udp_length) == 0;
 }
 
 /* Constant-offset A admission for one caller-owned bounded QNAME. Two layouts:
-   RFC 1035 pointer 0xc00c, or the question copied uncompressed. Anything with
-   an options-style walk stays unwritten -- that would need a Kotoba object
-   and a kotoba-native export that this pin does not list. */
+   RFC 1035 pointer 0xc00c, or the question copied uncompressed. JUN-552: the
+   admission is kotoba/dns-answer.o; it answers 2^32 + A when the A address is
+   reached (the C wrote *out_a there and admitted it only when non-zero), else 0.
+   The UDP checksum is summed over the pseudo header in place, so
+   net_dhcp_scratch is no longer written here. */
+extern int64_t kotoba_aiueos_dns_answer(uint64_t frame, uint64_t length, uint64_t src, uint64_t dst,
+                                        uint64_t server_port, uint64_t question, uint64_t question_length);
 static int net_dns_answer_ok_named(const uint8_t *frame, uint32_t length,
                                    uint32_t src, uint32_t dst,
                                    uint16_t server_port,
                                    const uint8_t *question,
                                    uint32_t question_length,
                                    uint32_t *out_a) {
-  uint32_t total, udp_length, answer;
-  unsigned i;
-  if (!frame || !question || !out_a || question_length < 5 ||
-      question_length > 255 || length < 70 + question_length) return 0;
-  if (net_load_be16(frame + 12) != 0x0800) return 0;
-  if (frame[14] != 0x45 || frame[23] != 17) return 0;
-  total = net_load_be16(frame + 16);
-  if (total < 58 || 14 + total > length) return 0;
-  if (kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20) != 0)
-    return 0;
-  if (net_load_be32(frame + 26) != src) return 0;
-  if (net_load_be32(frame + 30) != dst) return 0;
-  if (net_load_be16(frame + 34) != server_port) return 0;
-  if (net_load_be16(frame + 36) != NET_DNS_CLIENT_PORT) return 0;
-  udp_length = net_load_be16(frame + 38);
-  if (udp_length < 20 + question_length || 20 + udp_length != total) return 0;
-  if (net_load_be16(frame + 40) != 0 && !net_udp_rx_checksum_ok(frame, udp_length))
-    return 0;
-  if (net_load_be16(frame + 42) != NET_DNS_XID) return 0;
-  if ((net_load_be16(frame + 44) & 0x8000) == 0) return 0;   /* QR */
-  if ((net_load_be16(frame + 44) & 0x000f) != 0) return 0;   /* RCODE */
-  if (net_load_be16(frame + 46) != 1) return 0;              /* QDCOUNT */
-  if (net_load_be16(frame + 48) == 0) return 0;              /* ANCOUNT */
-  for (i = 0; i < question_length; i++) {
-    if (frame[54 + i] != question[i]) return 0;
-  }
-  answer = 54 + question_length;
-  if (frame[answer] == 0xc0 && frame[answer + 1] == 0x0c) {
-    if (length < answer + 16) return 0;
-    if (net_load_be16(frame + answer + 2) != 1) return 0;
-    if (net_load_be16(frame + answer + 4) != 1) return 0;
-    if (net_load_be16(frame + answer + 10) != 4) return 0;
-    *out_a = net_load_be32(frame + answer + 12);
-    return *out_a != 0;
-  }
-  if (length < answer + question_length + 10) return 0;
-  for (i = 0; i < question_length; i++) {
-    if (frame[answer + i] != question[i]) return 0;
-  }
-  if (net_load_be16(frame + answer + question_length + 4) != 4) return 0;
-  *out_a = net_load_be32(frame + answer + question_length + 6);
+  int64_t answer;
+  if (!frame || !question || !out_a) return 0;
+  answer = kotoba_aiueos_dns_answer((uint64_t)(uintptr_t)frame, length, src, dst, server_port,
+                                    (uint64_t)(uintptr_t)question, question_length);
+  if (answer < (int64_t)4294967296LL) return 0;
+  *out_a = (uint32_t)answer;
   return *out_a != 0;
 }
 
@@ -4977,20 +4797,14 @@ static int net_tcp_data(const uint8_t *frame, const uint8_t **payload,
   return 1;
 }
 
+/* JUN-552: the HTTP response heads are kotoba/http-head.o: the status line and header terminator here (the body's
+   offset, or 0), and rtl8125_http_success's status line. The body's SHA-256 and the digest comparison stay below. */
+extern int64_t kotoba_aiueos_http_cid_body(uint64_t app, uint64_t length);
+extern int64_t kotoba_aiueos_http_success(uint64_t bytes, uint64_t length);
 static int net_http_cid_admit(const uint8_t *app, uint32_t n) {
-  uint32_t i, body = 0;
+  uint32_t body;
   uint8_t digest[32];
-  /* Mechanism: find the compiled status line and header terminator. */
-  if (n < 12) return 0;
-  if (app[0] != 'H' || app[1] != 'T' || app[2] != 'T' || app[3] != 'P') return 0;
-  if (app[5] != '1' || app[9] != '2' || app[10] != '0' || app[11] != '0') return 0;
-  for (i = 0; i + 3 < n; i++) {
-    if (app[i] == '\r' && app[i + 1] == '\n' &&
-        app[i + 2] == '\r' && app[i + 3] == '\n') {
-      body = i + 4;
-      break;
-    }
-  }
+  body = (uint32_t)kotoba_aiueos_http_cid_body((uint64_t)(uintptr_t)app, n);
   if (body == 0) return 0;
   {
     static const uint8_t empty[1] = {0};
@@ -5502,7 +5316,7 @@ static uint64_t rtl8125_boot_nonce(void) {
 #define AIUEOS_RELAY_HELLO_CAPACITY 160U
 extern uint64_t kotoba_aiueos_relay_hello_payload(uint64_t out,uint64_t capacity,
                                                   uint64_t nonce_hi,uint64_t nonce_lo,
-                                                  uint64_t mac);
+                                                  uint64_t mac,uint64_t mac_length);
 extern uint64_t kotoba_aiueos_relay_ack_payload_valid(uint64_t payload,uint64_t length,
                                                       uint64_t nonce_hi,uint64_t nonce_lo);
 
@@ -5510,7 +5324,7 @@ static uint32_t rtl8125_build_relay_hello(uint8_t *frame,uint64_t nonce) {
   uint8_t payload[AIUEOS_RELAY_HELLO_CAPACITY];
   uint32_t payload_length=(uint32_t)kotoba_aiueos_relay_hello_payload(
     (uint64_t)(uintptr_t)payload,sizeof(payload),nonce>>32,nonce&0xffffffffULL,
-    (uint64_t)(uintptr_t)rtl8125_qualification_device.mac);
+    (uint64_t)(uintptr_t)rtl8125_qualification_device.mac,sizeof(rtl8125_qualification_device.mac));
   if(!payload_length)return 0;
   uint32_t udp_length=8U+payload_length,total=20U+udp_length;
   for(unsigned i=0;i<6;i++)frame[i]=rtl8125_peer_mac[i];
@@ -5656,16 +5470,19 @@ static int rtl8125_qualify_device(uint8_t b,uint8_t d,uint8_t f) {
   return 0;
 }
 
+/* JUN-598: the enumeration decisions (kotoba/pci-enum.o), shared by this scan and aiueos_virtio_probe. */
+extern int64_t kotoba_aiueos_pci_present(int64_t id); extern int64_t kotoba_aiueos_pci_functions(int64_t header);
+extern int64_t kotoba_aiueos_virtio_driver(int64_t id); extern int64_t kotoba_aiueos_pci_rtl8125(int64_t id);
+extern int64_t kotoba_aiueos_virtio_probe_result(int64_t rng, int64_t blk, int64_t input, int64_t gpu, int64_t present, int64_t virtio);
 int aiueos_rtl8125_physical_qualification(void) {
   rtl8125_qualification_error=1;
   rtl8125_qualification_rx_length=0;
   for(uint16_t bus=0;bus<256;bus++)for(uint8_t dev=0;dev<32;dev++) {
-    uint32_t id0=config_read((uint8_t)bus,dev,0,0);
-    if((id0&0xffffU)==0xffffU)continue;
-    uint8_t functions=(config8((uint8_t)bus,dev,0,0x0e)&0x80)?8:1;
+    if(!kotoba_aiueos_pci_present(config_read((uint8_t)bus,dev,0,0)))continue;
+    uint8_t functions=(uint8_t)kotoba_aiueos_pci_functions(config8((uint8_t)bus,dev,0,0x0e));
     for(uint8_t fn=0;fn<functions;fn++) {
       uint32_t id=config_read((uint8_t)bus,dev,fn,0);
-      if((id&0xffffU)==0x10ecU&&(id>>16)==0x8125U&&
+      if(kotoba_aiueos_pci_rtl8125(id)&&
          rtl8125_qualify_device((uint8_t)bus,dev,fn))return 1;
     }
   }
@@ -5961,7 +5778,7 @@ static int rtl8125_tcp_send(uint32_t dst, uint16_t local_port,
                                  local_port, remote_port,
                                  sequence, acknowledgement, flags,
                                  payload, payload_length);
-  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame,
+  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame, 2048,
                                      40 + payload_length,
                                      RTL_DIRECT_IP, dst)) return 0;
   return rtl8125_direct_tx(bytes);
@@ -6201,12 +6018,7 @@ static int rtl8125_direct_dns(void) {
 }
 
 static int rtl8125_http_success(const uint8_t *bytes, uint32_t length) {
-  return bytes && length >= 12 &&
-    bytes[0] == 'H' && bytes[1] == 'T' && bytes[2] == 'T' && bytes[3] == 'P' &&
-    bytes[4] == '/' && bytes[5] == '1' && bytes[6] == '.' && bytes[7] == '1' &&
-    bytes[8] == ' ' && bytes[9] == '2' &&
-    bytes[10] >= '0' && bytes[10] <= '9' &&
-    bytes[11] >= '0' && bytes[11] <= '9';
+  return kotoba_aiueos_http_success((uint64_t)(uintptr_t)bytes, length) == 1;
 }
 
 static int rtl8125_direct_tls_pump(uint32_t dst, uint16_t local_port,
@@ -6588,12 +6400,25 @@ static int rtl8125_direct_device_request(uint32_t request_length,
   return 0;
 }
 
+/* What the last poll attempt came back as, for the scheduler's failure
+   classification (main.c reads this after aiueos_rtl8125_device_worker_poll
+   returns 0).  TRANSPORT until a response was actually read.  Classifying
+   the status line here is mechanism for the poll scheduler; what a response
+   MEANS for jobs stays in the kotoba poll-response object (ADR-0219). */
+static enum aiueos_poll_outcome rtl8125_direct_worker_poll_outcome =
+  AIUEOS_POLL_OUTCOME_TRANSPORT;
+
+enum aiueos_poll_outcome aiueos_rtl8125_device_worker_poll_outcome(void) {
+  return rtl8125_direct_worker_poll_outcome;
+}
+
 int aiueos_rtl8125_device_worker_poll(
     const struct aiueos_boot_info *boot, uint32_t sequence,
     uint64_t *job_id, uint32_t *bos_token, int *ready,
     uint64_t *control_id, int *reboot_pxe, int *restart_runtime) {
   if (!boot || !job_id || !bos_token || !ready ||
       !control_id || !reboot_pxe || !restart_runtime) return 0;
+  rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_TRANSPORT;
   struct aiueos_device_worker_request request = {
     .boot = boot,
     .mac = rtl8125_qualification_device.mac,
@@ -6613,9 +6438,19 @@ int aiueos_rtl8125_device_worker_poll(
   if (!aiueos_device_worker_poll_response(
         aiueos_tls13_app(), aiueos_tls13_app_len(), &poll)) {
     rtl8125_direct_https_error = 60;
+    /* The kotoba object refused the response.  A non-2xx is still readable
+       as a scheduling disposition (404 enroll / 409 sequence conflict); a
+       2xx the object refused is understood by nothing and retries as
+       HTTP_ERROR.  Replay ("replay":true on a 2xx) is a body field the
+       poll-response record does not extract yet. */
+    rtl8125_direct_worker_poll_outcome = aiueos_poll_sched_status_disposition(
+      aiueos_tls13_app(), (uint32_t)aiueos_tls13_app_len());
+    if (rtl8125_direct_worker_poll_outcome == AIUEOS_POLL_OUTCOME_OK)
+      rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_HTTP_ERROR;
     rtl8125_direct_worker_rx_report(sequence, 'P');
     return 0;
   }
+  rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_OK;
   rtl8125_direct_worker_rx_report(sequence, 'O');
   *job_id = poll.job_id;
   *control_id = poll.control_id;
@@ -6921,41 +6756,34 @@ int aiueos_pci_enumerate(void) {
   virtio_input_devices_seen = 0;
   virtio_input_fail_line = 0;
   virtio_input_fail_reason = 0;
+  /* JUN-598: which functions exist, how many a device has, which virtio driver
+     an ID selects and the result cascade are kotoba/pci-enum.o; the scan, the
+     reads and the driver calls stay here. */
   for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) {
-    uint32_t id0 = config_read((uint8_t)bus,dev,0,0);
-    if ((id0 & 0xffffU) == 0xffffU) continue;
-    uint8_t functions = (config8((uint8_t)bus,dev,0,0x0e) & 0x80) ? 8 : 1;
+    if (!kotoba_aiueos_pci_present(config_read((uint8_t)bus,dev,0,0))) continue;
+    uint8_t functions = (uint8_t)kotoba_aiueos_pci_functions(config8((uint8_t)bus,dev,0,0x0e));
     for (uint8_t fn = 0; fn < functions; fn++) {
       uint32_t id = config_read((uint8_t)bus,dev,fn,0);
-      if ((id & 0xffffU) == 0xffffU) continue; present++;
-      if ((id & 0xffffU) == VIRTIO_VENDOR_ID) {
-        virtio++;
-        uint16_t device_id = (uint16_t)(id >> 16);
-        if ((device_id == VIRTIO_RNG_MODERN_ID || device_id == VIRTIO_RNG_TRANSITIONAL_ID) &&
-            virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
-        if ((device_id == VIRTIO_BLK_MODERN_ID || device_id == VIRTIO_BLK_TRANSITIONAL_ID) &&
-            virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
-        if (device_id == VIRTIO_INPUT_MODERN_ID || device_id == VIRTIO_INPUT_TRANSITIONAL_ID) {
-          virtio_input_devices_seen++;
-          if (virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
-        }
-        if ((device_id == VIRTIO_GPU_MODERN_ID || device_id == VIRTIO_GPU_TRANSITIONAL_ID) &&
-            virtio_gpu((uint8_t)bus,dev,fn)) gpu_ok = 1;
-        /* Reported through `aiueos_virtio_net_ready` rather than the return
-           cascade below, which main.c reads bit by bit: a NIC is optional, and
-           folding it into that cascade would make every existing gate that
-           boots without one start failing. */
-        if (device_id == VIRTIO_NET_MODERN_ID || device_id == VIRTIO_NET_TRANSITIONAL_ID)
-          virtio_net((uint8_t)bus,dev,fn);
-#ifdef AIUEOS_AUDIO
-        if (device_id == VIRTIO_SND_MODERN_ID) (void)virtio_sound((uint8_t)bus,dev,fn);
-#endif
+      if (!kotoba_aiueos_pci_present(id)) continue; present++;
+      int64_t driver = kotoba_aiueos_virtio_driver(id);
+      if (!driver) continue;
+      virtio++;
+      if (driver == 2 && virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
+      if (driver == 3 && virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
+      if (driver == 4) {
+        virtio_input_devices_seen++;
+        if (virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
       }
+      if (driver == 5 && virtio_gpu((uint8_t)bus,dev,fn)) gpu_ok = 1;
+      /* Reported through `aiueos_virtio_net_ready` rather than the return
+         cascade below, which main.c reads bit by bit: a NIC is optional, and
+         folding it into that cascade would make every existing gate that
+         boots without one start failing. */
+      if (driver == 6) virtio_net((uint8_t)bus,dev,fn);
+#ifdef AIUEOS_AUDIO
+      if (driver == 7) (void)virtio_sound((uint8_t)bus,dev,fn);
+#endif
     }
   }
-  if (rng_ok && blk_ok && input_ok && gpu_ok) return 15;
-  if (rng_ok && blk_ok && input_ok) return 7;
-  if (rng_ok && blk_ok) return 3;
-  if (rng_ok) return 2;
-  return present && virtio ? 1 : 0;
+  return (int)kotoba_aiueos_virtio_probe_result(rng_ok, blk_ok, input_ok, gpu_ok, present, virtio);
 }

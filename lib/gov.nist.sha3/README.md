@@ -55,6 +55,92 @@ halves, so the same code is correct under int32 and int64 bit operators. Measure
 2026-10-23 on one machine: about 3 ms per permutation on nbb/sci and 0.5 ms on the
 JVM. It favours clarity over speed.
 
+## Native port and gate (JUN-352 P1b)
+
+`kotoba/sha3/core.kotoba` is the native `.kotoba` port: `sha3-224`, `sha3-256`,
+`sha3-384`, `sha3-512`, `shake128`, `shake256` and the general `sponge` (rate, domain
+suffix, output length; bad parameters return an empty vector). Bytes are
+`:vector-i64` of 0..255. The Keccak-f[1600] permutation is transcribed from
+`kotoba.vm.evm.native-keccak` (Keccak-256 only, fixed rate and the Ethereum suffix);
+this module adds the general sponge. One lane is one native i64.
+
+`kotoba/sha3/native_gate.kotoba` returns a bitmask (63 = pass) of FIPS 202 known
+answers (SHA3-224/256/384/512 of "" and "abc", SHA3-256 of 200 × 0xA3, SHAKE128/256
+of ""), SHAKE prefix consistency across the rate boundary, output shape, and refusal
+of bad parameters. It also prints 126 oracle lines (all six functions at 21 lengths
+around every rate, SHAKE squeezed to 200 / 300 bytes) for an independent comparison.
+
+```sh
+G=/Users/junkawasaki/github/workspaces/<agent>/<task>   # a new task-owned directory
+{ echo '(ns sha3-gate (:export [main]))'
+  sed '/^(ns /,/))$/d' kotoba/sha3/core.kotoba
+  sed '/^(ns /,/))$/d' kotoba/sha3/native_gate.kotoba; } > "$G/gate.kotoba"
+sed 's/0x0000000000008082/0x0000000000008083/' "$G/gate.kotoba" > "$G/ctl-constant.kotoba"
+sed 's/(sponge bytes 136 6 32))/(sponge bytes 136 1 32))/' "$G/gate.kotoba" > "$G/ctl-suffix.kotoba"
+# compile each with the Amu root (Mac: --target aarch64-macos, extract-native main,
+# package fs2-cli-stdio-general, sign) and run with FD 3 = $G
+```
+
+Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
+(`amu-full-root.macho`, packaged `fs2-cli-stdio-general`):
+
+| image | exit |
+|---|---|
+| gate | **63** (all six groups) |
+| ctl-constant (one round constant changed) | 56 |
+| ctl-suffix (SHA3-256 with the Keccak suffix 0x01) | 60 |
+
+All 126 oracle lines equal Python `hashlib` (`sha3_*`, `shake_128`, `shake_256`) for
+the same inputs (byte i = (7i + 3) mod 256). Python only compared the printed lines;
+the image computed every digest.
+
+Since AWAI-117 (2026-11-01) `scripts/check-pq-native.py` makes this comparison on every
+run of the printing gate (`sweep_compare`), so it is no longer a manual step. It reads the
+21 lengths from this gate's own `g-len`, recomputes the 126 expected lines with `hashlib`,
+and requires all 126 lines, no duplicates, `lines 126`, and 0 mismatches. It also has
+controls: a copy of the pass lines with one hex digit changed must give exactly 1
+mismatch, and each mutant's lines must disagree with `hashlib` (ctl-constant: 126 of 126
+lines, ctl-suffix: the 21 SHA3-256 lines). Each result is in `evidence.json` under
+`gates.sha3.sweep`. Checked against the Linux arm64 stdout of main run 41238963645 and on
+the Mac (Amu Mac root image sha256 `dd71f394…`, packager `7691467c…`).
+
+On Linux x86_64 (KX64 under the native runner) the gate cannot print: amu's locked
+x86 project adapter refuses every capability, `:io/write` included (E7101 OP-CAP), and
+that refusal is deliberate. So x86_64 runs a print-free variant, `sha3-x86` in
+`scripts/check-pq-native.py` (AWAI-117, owner decision 2026-10-31). It is not a second
+file. The script builds it from this gate's source at build time with one rewrite:
+`g-say` returns the line's length (`string-length`) instead of writing it. The
+rewrite must match the source exactly once, and the result must name no capability.
+Everything else is unchanged: the same known answers and checks, the same bitmask
+(63 = pass), and the same library body. Both mutants above apply to it unchanged,
+and the 126 sweep digests are still computed but not printed. The gate answers only
+through main's result.
+
+| lane | gate run |
+|---|---|
+| Linux arm64 (PRs, main, nightly) | `sha3`, the printing gate as committed |
+| macOS (local, `native_gate.py`) | `sha3`, the printing gate as committed |
+| Linux x86_64 `pq-unity` lane (main, nightly, dispatch; not PRs, JUN-629) | `sha3-x86`, the print-free variant |
+
+The script refuses `sha3` on x86_64, and `sha3-x86` is not in its default selection.
+Each run's `evidence.json` records, for each gate, the variant it ran, the sha256 of
+the gate source and the generated unity source, and every mutant's result. Measured
+2026-10-31 with the Amu Mac root of main `a4c16e7c`:
+
+- **On the Mac,** `sha3-x86` gives the same results as `sha3`: pass 63, ctl-constant
+  56, ctl-suffix 60, and it writes no stdout.
+- **Cross-compiled to KX64** (`--target x86_64-linux --format kx64-v1`), the variant
+  and both mutants compile (44090 bytes each). The printing gate is refused with
+  `seed: E7101`.
+
+The x86_64 run itself is the CI `pq-unity` lane.
+
+Not yet: the incremental XOF, and running the CAVP files under `test/sha3/cavp/`
+natively (the gate embeds the published examples; the `.cljk` suite runs the CAVP
+files). The x86_64 variant prints no sweep lines, so it has nothing to compare with
+`hashlib`; the Linux arm64 lane (PRs, main, nightly) compares them in CI. This gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since
+kotoba#1014), and its print-free variant on Linux x86_64.
+
 ## Non-claims
 
 - **Not constant time.** Persistent vectors and data-dependent allocation make no
@@ -63,9 +149,9 @@ JVM. It favours clarity over speed.
 - **`.cljk` is a migration input.** Amu's contract (2026-10-22, `docs/selfhost-priority.md`)
   makes `.kotoba` the canonical source and builds one native image in which the
   runtime and providers are Kotoba code linked with the program; there is no separate
-  host. This library is not yet in `.kotoba`, so it does not compile with `amu` to a
-  native image. The algorithm and the known-answer tests are settled here first; the
-  `.kotoba` port is the next step (JUN-352, P1b).
+  host. The native port is `kotoba/sha3/core.kotoba` (JUN-352 P1b, below). It covers the
+  one-shot functions; the incremental XOF of `sha3.core` (`xof-absorb` / `xof-squeeze`)
+  is not ported yet.
 - Byte-oriented only: inputs and outputs are whole bytes. SHA-3 variants with
   non-byte bit lengths (the `Len` values that are not multiples of 8) are not
   implemented, and neither are `cSHAKE`, `KMAC`, `TupleHash` or `ParallelHash`

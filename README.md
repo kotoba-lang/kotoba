@@ -4,6 +4,20 @@
 
 # Kotoba
 
+**A modern Lisp machine, built for safety and machine speed.**
+
+Lisp's power begins with programs as data: simple forms to read, compose and
+reason about. Kotoba carries that spirit into a Lisp machine in development,
+for people and AI agents. Amu is its native compiler; Kototama and AIUEOS own
+the execution contract and OS direction. Integrated live system modification
+and a complete machine remain separate work.
+
+In one Apple M4 measurement, translated Kotoba ports ran in **0.80× the time
+of C** across 19 Embench workloads. The exploratory compiler snapshot included
+audited algorithm substitutions; this is one sample per workload, not a
+released-toolchain result or a universal speed ranking. [See the measurements
+and audit](https://kotoba-lang.org/blog/embench-c-parity-20261015/).
+
 > **A language AI agents can use, not abuse.**
 
 AI writes freely. Kotoba draws the boundary.
@@ -55,12 +69,29 @@ or node membership, or qualify a release. Awai Node and Itonami also have
 independently qualified paths on other hosts. Common fixes stay in their
 existing owners; Awai presets do not create another language or OS fork.
 
-## Install
+## Try Kotoba with Amu
 
-```sh
-brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
-kotoba -e '(+ 1 2)'
-```
+On an Apple Silicon Mac, use the [native Mac ARM64 first-run guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/MACOS-ARM64.md).
+Amu's `bin/amu`, `bin/kotoba` and `bin/kotoba-compiler` are native ARM64
+Mach-O entries. The guide checks image digests and signatures, then checks,
+compiles, packages and executes a small program returning 42 and 43 with
+an explicit directory scope. No Linux VM, hosted runtime, account, model
+download or payment is required.
+
+Linux users can use the [pinned Linux starter](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md)
+for its separate fuel/capability controls. Current Linux x86_64 entries have
+explicit `*-linux-x86_64` names; the immutable starter snapshot retains its
+original names. The [Linux ARM64 diagnostic guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/ARM64-PREVIEW.md)
+and Mac first run each state their own limited qualification. A successful
+first run does not qualify the complete runtime or an independent-user release.
+
+This repository's `bin/kotoba` still dispatches to retired KBB/Clojure host
+routes. Do not use that source launcher for the native first run or install
+a hosted runtime to work around a refusal. The former Homebrew and
+`kotoba -e` quick start is not the native starter. The CLI examples below
+describe separate implementation contracts; full native CLI command parity
+and the older package's qualification remain open. Keep the first run on
+the single pinned Amu entry above.
 
 Web3 identity starts from a chain-neutral Kotoba principal controlled by a
 Passkey. EVM smart accounts are explicit CAIP-10 links verified by ERC-1271 or
@@ -140,9 +171,11 @@ describes a compatibility account alias; it never replaces the principal.
 IPNS namespace and artifact signing. It is not the default human login ID.
 
 An empty policy denies every host effect, including `:host/http`. Hosted billed
-deploy of those grants is not live. Wasm Component is the primary portable
-profile. The compiler CLI defaults to the host native target; browser/Worker
-builds select their Wasm target explicitly. Bounded native AOT
+deploy of those grants is not live. `kotoba compile` defaults to the host
+native target (`<isa>-<os>`, e.g. `aarch64-macos`; an unknown host is refused
+by name, never defaulted to Wasm). Web and Wasm, including Wasm Component, are
+explicitly selected targets: Wasm is one target, not the foundation
+(KOTOBA-174). Bounded native AOT
 (x86-64/AArch64) still requires admitted capabilities; an ambient OS process
 is not the application execution model.
 
@@ -1082,9 +1115,10 @@ above (contract delta vs the current `lang/cli.edn` pin).
   `wasm-exec`. Kit `:wasm-aot` stays pending. The launcher and kbb v1 bootstrap
   host are still JVM; `bin/kbb` exists but is not yet a self-hosted native
   executable.
-  `kotoba -e '(+ 1 2)'` is compile-and-run
-  sugar (wraps the expression as an exported `main`, compiles Kotoba → core
-  Wasm, runs it) — not a runtime `eval`. Amu additionally emits sealed KEXE
+  `kotoba -e '(+ 1 2)'` is sugar for `run` (wraps the expression as the
+  body of `main` in a throwaway module and runs it through the ordinary
+  `run` path: safe gate, policy and the step-bounded interpreter
+  `kotoba.runtime/run`) — not a runtime `eval`, and it does not emit Wasm. Amu additionally emits sealed KEXE
   artifacts for x86-64 and AArch64 and executes admitted, signed artifacts
   through `tender-native`; see [Native compilation and execution](#native-compilation-and-execution).
 - **Safety model — "safe Kotoba."** Three formal soundness goals: **T1
@@ -1119,7 +1153,22 @@ above (contract delta vs the current `lang/cli.edn` pin).
 ### Current memory-safety position
 
 Current Kotoba is **strongly host-contained but not yet a Rust-equivalent
-ownership/borrow proof**. The safe Wasm profile combines a checked subset,
+ownership/borrow proof**. The position differs by target.
+
+**Native (the default target).** The native backend lowers only the qualified
+checked-KIR slice and refuses everything else. The verifier treats embedded
+KIR as hostile, regenerates the machine code and compares the sealed bytes.
+Each KEXE declares bounded limits (`:memory-bytes`, `:stack-bytes`, `:fuel`)
+and fixed arena capacities (pairs, vectors, string pool) in its context ABI,
+and runs in a supervised loader process whose capability callbacks come only
+from the policy allow bitmap. What native does **not** yet have: there is no
+Wasm-style linear-memory sandbox, so guest code shares the loader process's
+address space and containment rests on the verifier, the bounded arenas and
+process isolation; the raw-memory profiles and the provider evidence below
+were measured on the Wasm profile and are not qualified on native; and there
+is no ownership/borrow proof on either target.
+
+**Wasm (one explicitly selected profile).** The safe Wasm profile combines a checked subset,
 Wasm linear-memory bounds and a policy-derived maximum, bounds-respecting
 accessors, deny-by-default raw dereference and a no-free bump allocator. The
 opt-in `{:kotoba/raw-memory :checked-extents}` profile additionally requires
@@ -1472,9 +1521,13 @@ amu run app.signed.kexe --trust pinned-trust.edn \
 ```
 
 Native compilation supports generic and explicit x86-64/AArch64 targets for
-Linux, macOS, Windows, Android, and iOS. `--run` remains limited to `web` and
-`wasm`; the CLI refuses native `--run` rather than silently using a different
-runtime or an unmeasured loader.
+Linux, macOS, Windows, Android, and iOS; an omitted `--target` (or
+`--target native`) is the host's own `<isa>-<os>` target. `--run` supports
+`web`, `wasm` and the host native target. A native `--run` signs the artifact
+with an ephemeral key and executes it under the measured `kexe_loader`
+supervisor (`kotoba.kbb-native/run-artifact!`) with no capability granted; a
+policy that grants any capability, or a native target that is not the host,
+is refused rather than routed to a different runtime.
 
 The verifier treats embedded KIR as hostile, independently validates its
 structure, lexical scope, call arities, transitive capability effects, ABI and
@@ -1488,9 +1541,9 @@ loader process, and produce an executor-signed receipt.
 Native support is real but deliberately bounded. The qualified scalar,
 control-flow, string, pair, record, and sealed-variant slices run on the host
 ISA; unsupported aggregates, effects, ABIs, or targets fail closed until their
-lowering and verifier rules exist. Wasm Component remains the primary portable
-artifact for ordinary applications, while direct native AOT is supported for
-explicit targets and trusted low-level/aiueos paths. See Amu's
+lowering and verifier rules exist. Native is the default target; Wasm and
+Wasm Component are explicitly selected targets, for example for browser and
+Worker builds. See Amu's
 [`Execution policy`](https://github.com/kotoba-lang/amu#execution-policy) for the
 current boundary.
 

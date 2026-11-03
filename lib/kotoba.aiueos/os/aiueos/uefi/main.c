@@ -18,7 +18,9 @@
 #define EFI_VARIABLE_BOOTSERVICE_ACCESS 2U
 #define EFI_VARIABLE_RUNTIME_ACCESS 4U
 #define PAGE_SIZE 4096ULL
-#define KERNEL_BUFFER_SIZE (1024ULL * 1024ULL)
+/* 2 MiB since JUN-552 (owner decision 2026-10-30): the default kernel had reached the old 1 MiB as C moved into
+   native-emitted Kotoba objects, which are several times the size of the C they replace until KOTOBA-168. */
+#define KERNEL_BUFFER_SIZE (2ULL * 1024ULL * 1024ULL)
 #define INITRAMFS_BUFFER_SIZE (1024ULL * 1024ULL)
 #define MEMORY_MAP_BUFFER_SIZE (128ULL * 1024ULL)
 #define EFI_ALLOCATE_MAX_ADDRESS 1U
@@ -1046,6 +1048,16 @@ static efi_status read_verified_file(struct efi_file *root, const char16 *path,
     file->close(file);
     debug_string(kind_read); return EFI_INVALID_PARAMETER;
   }
+  /* A read that filled the buffer may have stopped short of the file: the digest of the prefix would then fail as a
+     sha256 mismatch, naming the wrong cause. One more byte tells the two apart. */
+  if (*size == buffer_size) {
+    uint8_t extra = 0;
+    uint64_t one = 1;
+    if (file->read(file, &one, &extra) == EFI_SUCCESS && one) {
+      file->close(file);
+      debug_string("AIUEOS_LOADER_FAIL file-too-large\n"); return EFI_INVALID_PARAMETER;
+    }
+  }
   file->close(file);
   uint8_t digest[32];
   sha256(buffer, *size, digest);
@@ -1694,6 +1706,14 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
           __asm__ volatile("rdtsc" : "=a"(tsc_a), "=d"(tsc_b));
           info.data_key[i] = (uint8_t)((tsc_a >> ((i % 8) * 8)) & 0xff);
         }
+#ifdef AIUEOS_PHYSICAL_QUALIFICATION
+        /* The qualification medium may change only inside its result partition
+           (smoke-qemu-physical-qualification.sh compares every other byte with the
+           pristine image, so the Mac can trust what it reads back). The key is
+           therefore kept for this boot only and nothing is written to the ESP. */
+        have_key = 1;
+        debug_string("AIUEOS_DATA_KEY_EPHEMERAL tsc-entropy weak qualification-medium-unwritten\n");
+#else
         if (kroot->open(kroot, &kfile, data_key_path,
                         3 | 0x8000000000000000ULL, 0x20) == EFI_SUCCESS && kfile) {
           uint64_t w = 16;
@@ -1702,6 +1722,7 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
         }
         have_key = 1;
         debug_string("AIUEOS_DATA_KEY_CREATED tsc-entropy weak\n");
+#endif
       } else {
         debug_string("AIUEOS_DATA_KEY_LOADED\n");
       }

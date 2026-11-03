@@ -1,0 +1,427 @@
+(ns aiueos.native.esp
+  ;; AWAI-122 stage 2: find the EFI System Partition on the NVMe disk, walk its
+  ;; FAT16/FAT32 directories to the installed loader and take the SHA-256 of
+  ;; that file. Read only, through native/nvme.kotoba (which must have probed
+  ;; successfully first). Later stages compare this digest with a signed image
+  ;; before anything is written.
+  ;;
+  ;; Every on-disk structure is read by absolute disk byte offset through one
+  ;; cached 4096-byte page (nvme read-4k into DMA page 4 of owned window slot
+  ;; 4). A FAT sector is 512-aligned, so a 64-byte hash block never straddles
+  ;; the cached page.
+  ;;
+  ;; GPT: header at LBA 1, the first entry whose type is the ESP GUID
+  ;; C12A7328-F81F-11D2-BA4B-00A0C93EC93B (at most 128 entries scanned). The
+  ;; header and entry CRCs are not checked yet. FAT12 is refused.
+  ;; Path: \EFI\ITONAMI\BOOTX64.EFI (what the --install loader writes), else
+  ;; \EFI\BOOT\BOOTX64.EFI, matched on 8.3 short names.
+  ;;
+  ;; Context words 650..699 (after nvme's 600..645):
+  ;;   650/651 cached page offset + 1 (0 = none), 652 read failures,
+  ;;   660/661 ESP byte offset, 662 FAT type (16/32), 663 bytes per sector,
+  ;;   665 cluster bytes, 666/667 FAT byte offset, 668/669 FAT16 root
+  ;;   directory byte offset, 670 FAT16 root entries, 671/672 data byte offset,
+  ;;   673 FAT32 root cluster, 674 file first cluster, 675 file size,
+  ;;   676 result (see run), 677 path (1 ITONAMI, 2 BOOT), 680..687 digest
+  ;;   words, big-endian. Context bytes 3072..3583 are the SHA-256 state and
+  ;;   3584..3647 the padding block.
+  ;;
+  ;; AWAI-122 stage 4 (FAT32 only): `prepare`, `stage-write`, `swap`. The
+  ;; staging file \EFI\ITONAMI\UPDATE.BIN must have its directory entry in the
+  ;; same disk block as BOOTX64.EFI's; `prepare` creates it once (a free entry
+  ;; in that block, clusters taken from the FAT in every FAT copy, written and
+  ;; flushed before the entry), `stage-write` writes the image into its
+  ;; clusters, and `swap` exchanges the two entries' first cluster and size in
+  ;; one block write: BOOTX64.EFI becomes the new image and UPDATE.BIN keeps the
+  ;; old one. Writes go through nvme/write-span inside the ESP window
+  ;; (open-window). The cached page is written back when dirty (word 653)
+  ;; before another page is read, and by `sync`. FSInfo is not updated.
+  ;; More words: 653 dirty, 664 last cluster + 1, 688 FAT copies, 689 FAT
+  ;; bytes, 690/691 the ESP's last LBA, 692/693 staging cursor (cluster,
+  ;; byte in it), 695/696 BOOTX64.EFI entry offset, 697/698 UPDATE.BIN entry
+  ;; offset, 699 staging first cluster.
+  (:require [aiueos.native.nvme :as nvme]
+            [aiueos.lib.sha256-stream :as sha])
+  (:export [run open-window prepare stage-write sync swap hash-chain]))
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+(defn word64 [ctx i] (+ (word ctx i) (* (word ctx (+ i 1)) 4294967296)))
+(defn put-word64 [ctx i value]
+  (do (put-word ctx i (bit-and value 4294967295))
+      (put-word ctx (+ i 1) (u64-shift-right value 32))))
+(defn put-byte [ctx at value] (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 value))
+
+;; The cached page: make the page holding disk byte `offset` current.
+(defn data-address [] (+ (kernel-owned-window 4 20480) 16384))
+;; Write the cached page back if it is dirty: 1 done, 0 failed.
+(defn sync [ctx]
+  (if (= (word ctx 653) 0) 1
+    (if (= (nvme/write-span ctx (- (word64 ctx 650) 1) (data-address) 4096) 0)
+      (do (put-word ctx 653 0) 1)
+      (do (put-word ctx 652 (+ (word ctx 652) 1)) 0))))
+(defn ensure [ctx offset]
+  (let [page (- offset (bit-and offset 4095))]
+    (if (= (word64 ctx 650) (+ page 1)) 1
+      (if (and (= (sync ctx) 1) (= (nvme/read-4k ctx page) 0))
+        (do (put-word64 ctx 650 (+ page 1)) 1)
+        (do (put-word64 ctx 650 0) (put-word ctx 652 (+ (word ctx 652) 1)) 0)))))
+(defn data-u8 [offset]
+  (kernel-load-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 16384 4096) 4096 offset))
+(defn u8 [ctx offset]
+  (do (ensure ctx offset) (data-u8 (bit-and offset 4095))))
+(defn u16 [ctx offset] (+ (u8 ctx offset) (* (u8 ctx (+ offset 1)) 256)))
+(defn u32 [ctx offset] (+ (u16 ctx offset) (* (u16 ctx (+ offset 2)) 65536)))
+(defn u64 [ctx offset] (+ (u32 ctx offset) (* (u32 ctx (+ offset 4)) 4294967296)))
+
+(defn fail [ctx code] (do (put-word ctx 676 code) code))
+
+;; ESP partition type GUID as four little-endian words.
+(defn esp-entry? [ctx at]
+  (and (= (u32 ctx at) 3240784680) (= (u32 ctx (+ at 4)) 299038751)
+       (= (u32 ctx (+ at 8)) 2684373946) (= (u32 ctx (+ at 12)) 1003044553)))
+(defn find-esp [ctx table size i count]
+  (if (>= i count) -1
+    (let [at (+ table (* i size))]
+      (if (esp-entry? ctx at) (do (put-word64 ctx 690 (u64 ctx (+ at 40))) (u64 ctx (+ at 32)))
+        (find-esp ctx table size (+ i 1) count)))))
+
+;; 11-byte 8.3 names: 0 "EFI", 1 "ITONAMI", 2 "BOOT", 3 "BOOTX64 EFI",
+;; 4 "UPDATE  BIN".
+(defn name-byte [n i]
+  (if (= n 0) (case i 0 69 1 70 2 73 32)
+    (if (= n 1) (case i 0 73 1 84 2 79 3 78 4 65 5 77 6 73 32)
+      (if (= n 2) (case i 0 66 1 79 2 79 3 84 32)
+        (if (= n 3) (case i 0 66 1 79 2 79 3 84 4 88 5 54 6 52 8 69 9 70 10 73 32)
+          (case i 0 85 1 80 2 68 3 65 4 84 5 69 8 66 9 73 10 78 32))))))
+(defn name-match [ctx at n i]
+  (if (>= i 11) 1
+    (if (= (u8 ctx (+ at i)) (name-byte n i)) (name-match ctx at n (+ i 1)) 0)))
+
+;; One 32-byte directory entry: -3 end of directory, -1 no match, else
+;; first cluster + size << 32.
+(defn entry [ctx at n]
+  (let [first (u8 ctx at)]
+    (if (= first 0) -3
+      (if (or (= first 229) (= (u8 ctx (+ at 11)) 15)) -1
+        (if (= (name-match ctx at n 0) 1)
+          (+ (+ (u16 ctx (+ at 26)) (* (u16 ctx (+ at 20)) 65536)) (* (u32 ctx (+ at 28)) 4294967296))
+          -1)))))
+
+;; The FAT16 root directory: a fixed run of entries.
+(defn scan-fixed [ctx at remaining n]
+  (if (= remaining 0) -2
+    (let [r (entry ctx at n)]
+      (if (= r -3) -2
+        (if (= r -1) (scan-fixed ctx (+ at 32) (- remaining 1) n) r)))))
+
+(defn cluster-offset [ctx c] (+ (word64 ctx 671) (* (- c 2) (word ctx 665))))
+(defn next-cluster [ctx c]
+  (if (= (word ctx 662) 32)
+    (bit-and (u32 ctx (+ (word64 ctx 666) (* c 4))) 268435455)
+    (u16 ctx (+ (word64 ctx 666) (* c 2)))))
+(defn last-cluster? [ctx c]
+  (if (= (word ctx 662) 32) (>= c 268435448) (>= c 65528)))
+(defn valid-cluster? [ctx c]
+  (and (>= c 2) (if (= (word ctx 662) 32) (< c 268435447) (< c 65527))))
+
+;; A directory in a cluster chain; `guard` bounds the clusters followed.
+(defn scan-chain [ctx c pos n guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) -2
+    (if (>= pos (word ctx 665))
+      (let [next (next-cluster ctx c)]
+        (if (last-cluster? ctx next) -2 (scan-chain ctx next 0 n (- guard 1))))
+      (let [r (entry ctx (+ (cluster-offset ctx c) pos) n)]
+        (if (= r -3) -2
+          (if (= r -1) (scan-chain ctx c (+ pos 32) n guard) r))))))
+
+(defn root-lookup [ctx n]
+  (if (= (word ctx 662) 32) (scan-chain ctx (word ctx 673) 0 n 65536)
+    (scan-fixed ctx (word64 ctx 668) (word ctx 670) n)))
+(defn dir-lookup [ctx found n]
+  (if (< found 0) -2 (scan-chain ctx (bit-and found 4294967295) 0 n 65536)))
+
+;; SHA-256 over the file: runs of whole 64-byte blocks with sha-blocks straight
+;; from the cached page; the 0..63-byte tail is copied to context bytes 3584..3647
+;; for sha-final. Regions are built where they are used: one returned from a
+;; function loses its extent (amu ADR 0373).
+;; k whole blocks from `offset`, all inside the cached page.
+(defn absorb [ctx offset k]
+  (let [first (quot (bit-and offset 4095) 64)]
+    (do (ensure ctx offset)
+        (sha/sha-blocks (kernel-subregion ctx 8192 3072 512)
+                        (kernel-subregion (kernel-owned-window 4 20480) 20480 16384 4096) 4096
+                        first (+ first k)))))
+(defn least [a b] (if (< a b) a b))
+(defn zero-pad [ctx i]
+  (if (>= i 64) 1 (do (put-byte ctx (+ 3584 i) 0) (zero-pad ctx (+ i 1)))))
+(defn copy-tail [ctx offset i r]
+  (if (>= i r) 1 (do (put-byte ctx (+ 3584 i) (u8 ctx (+ offset i))) (copy-tail ctx offset (+ i 1) r))))
+(defn put-length [ctx bits i]
+  (if (>= i 8) 1
+    (do (put-byte ctx (+ 3584 (- 63 i)) (bit-and (u64-shift-right bits (* i 8)) 255))
+        (put-length ctx bits (+ i 1)))))
+;; After the last compression the chaining words H0..H7 (state words 64..71)
+;; are the digest.
+(defn digest-words [ctx i]
+  (if (>= i 8) 1
+    (do (put-word ctx (+ 680 i) (sha/load32 (kernel-subregion ctx 8192 3072 512) (+ 64 i)))
+        (digest-words ctx (+ i 1)))))
+;; The library's sha-final reads its tail with the tail length as the region
+;; extent, which the kernel compiler admits only as a literal; the file tail
+;; length is not one, so the padding is built here and compressed with
+;; sha-block (which, unlike sha-absorb, does not count the bytes).
+(defn finish [ctx offset r size]
+  (do (zero-pad ctx 0)
+      (copy-tail ctx offset 0 r)
+      (put-byte ctx (+ 3584 r) 128)
+      (if (< r 56)
+        (do (put-length ctx (* size 8) 0)
+            (sha/sha-block (kernel-subregion ctx 8192 3072 512) (kernel-subregion ctx 8192 3584 64)))
+        (do (sha/sha-block (kernel-subregion ctx 8192 3072 512) (kernel-subregion ctx 8192 3584 64))
+            (zero-pad ctx 0) (put-length ctx (* size 8) 0)
+            (sha/sha-block (kernel-subregion ctx 8192 3072 512) (kernel-subregion ctx 8192 3584 64))))
+      (digest-words ctx 0)))
+
+;; Known answer first: SHA-256("abc") through sha-init/sha-final begins
+;; ba7816bf 8f01cfea (FIPS 180-2 B.1). sha-final leaves the digest in state
+;; words 106..113.
+(defn self-test [ctx]
+  (do (put-byte ctx 3584 97) (put-byte ctx 3585 98) (put-byte ctx 3586 99)
+      (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+      (sha/sha-final (kernel-subregion ctx 8192 3072 512) (kernel-subregion ctx 8192 3584 3) 3)
+      (and (= (sha/load32 (kernel-subregion ctx 8192 3072 512) 106) 3128432319)
+           (= (sha/load32 (kernel-subregion ctx 8192 3072 512) 107) 2399260650))))
+
+;; c the current cluster, pos the byte within it, remain bytes still to hash.
+(defn hash-run [ctx c pos remain size guard]
+  (if (= guard 0) -1
+    (if (and (>= pos (word ctx 665)) (> remain 0))
+      (let [next (next-cluster ctx c)]
+        (if (not (valid-cluster? ctx next)) -1 (hash-run ctx next 0 remain size (- guard 1))))
+      (if (< remain 64)
+        (finish ctx (+ (cluster-offset ctx c) pos) remain size)
+        (let [offset (+ (cluster-offset ctx c) pos)
+              k (least (quot remain 64)
+                       (least (quot (- (word ctx 665) pos) 64) (quot (- 4096 (bit-and offset 4095)) 64)))]
+          (do (absorb ctx offset k)
+              (hash-run ctx c (+ pos (* k 64)) (- remain (* k 64)) size guard)))))))
+
+;; The BPB at the ESP's first byte. Returns 1 when it is a usable FAT16/32.
+(defn bpb [ctx base]
+  (let [bps (u16 ctx (+ base 11))
+        spc (u8 ctx (+ base 13))
+        reserved (u16 ctx (+ base 14))
+        fats (u8 ctx (+ base 16))
+        root-entries (u16 ctx (+ base 17))
+        total (if (= (u16 ctx (+ base 19)) 0) (u32 ctx (+ base 32)) (u16 ctx (+ base 19)))
+        fat-size (if (= (u16 ctx (+ base 22)) 0) (u32 ctx (+ base 36)) (u16 ctx (+ base 22)))
+        root-sectors (quot (+ (* root-entries 32) (- bps 1)) (if (> bps 0) bps 1))
+        data-sector (+ reserved (+ (* fats fat-size) root-sectors))
+        clusters (if (> spc 0) (quot (- total data-sector) spc) 0)]
+    (if (or (not (or (= bps 512) (= bps 1024) (= bps 2048) (= bps 4096)))
+            (= spc 0) (> spc 128) (= fats 0) (= fat-size 0) (<= total data-sector)
+            (< clusters 4085))
+      0
+      (do (put-word ctx 662 (if (< clusters 65525) 16 32))
+          (put-word ctx 663 bps)
+          (put-word ctx 665 (* bps spc))
+          (put-word64 ctx 666 (+ base (* reserved bps)))
+          (put-word64 ctx 668 (+ base (* (+ reserved (* fats fat-size)) bps)))
+          (put-word ctx 670 root-entries)
+          (put-word64 ctx 671 (+ base (* data-sector bps)))
+          (put-word ctx 673 (u32 ctx (+ base 44)))
+          (put-word ctx 664 (+ clusters 2))
+          (put-word ctx 688 fats)
+          (put-word ctx 689 (* fat-size bps))
+          1))))
+
+;; Result word 676: 1 NVMe probe did not pass, 2 no GPT header, 3 no ESP entry,
+;; 4 ESP is not FAT16/FAT32, 5 no \EFI, 7 no BOOTX64.EFI under \EFI\ITONAMI or
+;; \EFI\BOOT, 8 a disk read failed, 9 the file's cluster chain is broken,
+;; 10 the SHA-256 self-test failed, 15 the file was found and hashed.
+(defn hash-file [ctx found]
+  (let [c (bit-and found 4294967295) size (u64-shift-right found 32)]
+    (do (put-word ctx 674 c) (put-word ctx 675 size)
+        (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+        (if (and (> size 0) (not (valid-cluster? ctx c))) (fail ctx 9)
+          (if (< (hash-run ctx c 0 size size 1048576) 0) (fail ctx 9)
+            (if (> (word ctx 652) 0) (fail ctx 8) (fail ctx 15)))))))
+
+(defn walk [ctx]
+  (let [efi (root-lookup ctx 0)]
+    (if (< efi 0) (fail ctx 5)
+      (let [own (dir-lookup ctx (dir-lookup ctx efi 1) 3)]
+        (if (>= own 0) (do (put-word ctx 677 1) (hash-file ctx own))
+          (let [boot (dir-lookup ctx (dir-lookup ctx efi 2) 3)]
+            (if (>= boot 0) (do (put-word ctx 677 2) (hash-file ctx boot))
+              (fail ctx 7))))))))
+
+(defn run [ctx]
+  (do (put-word64 ctx 650 0) (put-word ctx 652 0) (put-word ctx 653 0) (put-word ctx 677 0)
+      (if (not (= (word ctx 600) 15)) (fail ctx 1)
+      (if (not (self-test ctx)) (fail ctx 10)
+        (let [block (i64-shift-left 1 (word ctx 609))]
+          (if (not (= (u64 ctx block) 6075990659671082565)) (fail ctx 2)
+            (let [table (* (u64 ctx (+ block 72)) block)
+                  count (u32 ctx (+ block 80))
+                  size (u32 ctx (+ block 84))
+                  first (find-esp ctx table (if (< size 128) 128 size) 0 (if (> count 128) 128 count))]
+              (if (<= first 0) (fail ctx 3)
+                (let [base (* first block)]
+                  (do (put-word64 ctx 660 base)
+                      (if (= (bpb ctx base) 0) (fail ctx 4) (walk ctx))))))))))))
+
+;; ---- AWAI-122 stage 4: write (FAT32 only) ----
+(defn data-store [at value] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 16384 4096) 4096 at value))
+(defn poke8 [ctx offset value]
+  (if (= (ensure ctx offset) 0) 0
+    (do (data-store (bit-and offset 4095) (bit-and value 255)) (put-word ctx 653 1) 1)))
+(defn poke16 [ctx offset value]
+  (do (poke8 ctx offset value) (poke8 ctx (+ offset 1) (u64-shift-right value 8))))
+(defn poke32 [ctx offset value]
+  (do (poke16 ctx offset (bit-and value 65535)) (poke16 ctx (+ offset 2) (u64-shift-right value 16))))
+
+;; The write window is the ESP partition (run must have found it).
+(defn open-window [ctx]
+  (let [block (i64-shift-left 1 (word ctx 609))]
+    (nvme/open-window ctx (word64 ctx 660) (* (+ (word64 ctx 690) 1) block))))
+
+;; The disk offset of entry n in the directory at cluster c, or -2.
+(defn locate [ctx c pos n guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) -2
+    (if (>= pos (word ctx 665))
+      (let [next (next-cluster ctx c)]
+        (if (last-cluster? ctx next) -2 (locate ctx next 0 n (- guard 1))))
+      (let [at (+ (cluster-offset ctx c) pos)
+            r (entry ctx at n)]
+        (if (= r -3) -2 (if (= r -1) (locate ctx c (+ pos 32) n guard) at))))))
+;; A free entry (first byte 0 or 0xE5) in [at, end), or -1.
+(defn free-slot [ctx at end]
+  (if (>= at end) -1
+    (let [b (u8 ctx at)] (if (or (= b 0) (= b 229)) at (free-slot ctx (+ at 32) end)))))
+
+(defn fat-at [ctx c k] (+ (word64 ctx 666) (+ (* k (word ctx 689)) (* c 4))))
+(defn set-fat [ctx c value k]
+  (if (>= k (word ctx 688)) 1
+    (do (poke32 ctx (fat-at ctx c k) (bit-or (bit-and (u32 ctx (fat-at ctx c k)) 4026531840) value))
+        (set-fat ctx c value (+ k 1)))))
+(defn free? [ctx c] (= (bit-and (u32 ctx (fat-at ctx c 0)) 268435455) 0))
+(defn count-free [ctx c acc need]
+  (if (or (>= acc need) (>= c (word ctx 664))) acc
+    (count-free ctx (+ c 1) (if (free? ctx c) (+ acc 1) acc) need)))
+;; Link `need` free clusters from c on; returns the first. prev 0 = none yet.
+(defn alloc [ctx c need prev first]
+  (if (= need 0) (do (set-fat ctx prev 268435455 0) first)
+    (if (>= c (word ctx 664)) -1
+      (if (free? ctx c)
+        (do (if (> prev 0) (set-fat ctx prev c 0) 0)
+            (alloc ctx (+ c 1) (- need 1) c (if (= first 0) c first)))
+        (alloc ctx (+ c 1) need prev first)))))
+(defn entry-first [ctx at] (+ (u16 ctx (+ at 26)) (* (u16 ctx (+ at 20)) 65536)))
+(defn set-entry [ctx at first size]
+  (do (poke16 ctx (+ at 20) (u64-shift-right first 16))
+      (poke16 ctx (+ at 26) (bit-and first 65535))
+      (poke32 ctx (+ at 28) size)))
+(defn new-entry [ctx at i first size]
+  (if (< i 32)
+    (do (poke8 ctx (+ at i) (if (< i 11) (name-byte 4 i) (if (= i 11) 32 0))) (new-entry ctx at (+ i 1) first size))
+    (set-entry ctx at first size)))
+(defn flushed [ctx] (and (= (sync ctx) 1) (= (nvme/flush ctx) 0)))
+;; Free the chain from c on (every FAT copy).
+(defn free-rest [ctx c guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) 1
+    (let [n (next-cluster ctx c)]
+      (do (set-fat ctx c 0 0) (if (last-cluster? ctx n) 1 (free-rest ctx n (- guard 1)))))))
+;; Make the chain whose k-th cluster is c exactly `need` clusters long: end it
+;; there and free the rest, or extend it from free clusters. 0 done, 43 too
+;; few free clusters, 44 a broken chain.
+(defn fit-chain [ctx c k need guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) 44
+    (let [n (next-cluster ctx c)]
+      (if (= k need)
+        (do (set-fat ctx c 268435455 0) (if (last-cluster? ctx n) 0 (do (free-rest ctx n 1048576) 0)))
+        (if (last-cluster? ctx n)
+          (if (< (count-free ctx 2 0 (- need k)) (- need k)) 43
+            (if (< (alloc ctx 2 (- need k) c 0) 2) 43 0))
+          (fit-chain ctx n (+ k 1) need (- guard 1)))))))
+
+;; Ready the staging file for `size` bytes. run must have passed with path 1
+;; on FAT32. 0 ready, else 40 not FAT32 \EFI\ITONAMI\BOOTX64.EFI, 41 no free
+;; entry in BOOTX64.EFI's block, 42 UPDATE.BIN is in another block, 43 too few
+;; free clusters, 44 UPDATE.BIN's chain is broken, 45 a write failed. The
+;; staging chain is then fitted to the image (fit-chain) and its entry's size
+;; set to the chain, so the FAT stays consistent after the swap.
+(defn provision [ctx own size]
+  (let [block (i64-shift-left 1 (word ctx 609))
+        start (- own (bit-and own (- block 1)))
+        slot (free-slot ctx start (+ start block))
+        need (quot (+ size (- (word ctx 665) 1)) (word ctx 665))]
+    (if (< slot 0) 41
+      (if (< (count-free ctx 2 0 need) need) 43
+        (let [first (alloc ctx 2 need 0 0)]
+          (if (< first 2) 43
+            (if (not (flushed ctx)) 45
+              (do (new-entry ctx slot 0 first (* need (word ctx 665)))
+                  (if (flushed ctx) (do (put-word64 ctx 697 slot) 0) 45)))))))))
+(defn prepare [ctx size]
+  (if (or (not (= (word ctx 676) 15)) (not (= (word ctx 677) 1)) (not (= (word ctx 662) 32))) 40
+    (let [dir (dir-lookup ctx (root-lookup ctx 0) 1)
+          c (bit-and dir 4294967295)
+          own (if (< dir 0) -2 (locate ctx c 0 3 65536))
+          staged (if (< dir 0) -2 (locate ctx c 0 4 65536))
+          block (i64-shift-left 1 (word ctx 609))]
+      (if (< own 0) 40
+        (do (open-window ctx)
+            (put-word64 ctx 695 own)
+            (let [r (if (< staged 0) (provision ctx own size)
+                      (if (= (- staged (bit-and staged (- block 1))) (- own (bit-and own (- block 1))))
+                        (do (put-word64 ctx 697 staged) 0) 42))]
+              (if (> r 0) r
+                (let [first (entry-first ctx (word64 ctx 697))
+                      cb (word ctx 665)
+                      need (quot (+ size (- cb 1)) cb)
+                      fitted (fit-chain ctx first 1 need 1048576)]
+                  (if (> fitted 0) fitted
+                    (if (not (flushed ctx)) 45
+                      (do (poke32 ctx (+ (word64 ctx 697) 28) (* need cb))
+                          (if (flushed ctx)
+                            (do (put-word ctx 699 first) (put-word ctx 692 first) (put-word ctx 693 0) 0)
+                            45))))))))))))
+
+(defn stage-piece [ctx src off len]
+  (if (>= off len) 0
+    (let [c (word ctx 692) pos (word ctx 693) cb (word ctx 665)
+          block (i64-shift-left 1 (word ctx 609))]
+      (if (>= pos cb)
+        (let [next (next-cluster ctx c)]
+          (if (not (valid-cluster? ctx next)) -1
+            (do (put-word ctx 692 next) (put-word ctx 693 0) (stage-piece ctx src off len))))
+        (let [n (least (- len off) (- cb pos))
+              span (* (quot (+ n (- block 1)) block) block)]
+          (if (= (nvme/write-span ctx (+ (cluster-offset ctx c) pos) (+ src off) span) 0)
+            (do (put-word ctx 693 (+ pos n)) (stage-piece ctx src (+ off n) len))
+            -1))))))
+
+;; Write len bytes (<= 4096) from DMA address src into the staging chain at the
+;; cursor. 0 done, -1 the chain ended or a write failed.
+(defn stage-write [ctx src len]
+  (stage-piece ctx src 0 len))
+
+;; SHA-256 of `size` bytes of the chain from `first` (digest words 680..687,
+;; result word 676 as hash-file).
+(defn hash-chain [ctx first size]
+  (hash-file ctx (+ first (* size 4294967296))))
+
+;; BOOTX64.EFI := (staging first cluster, size); UPDATE.BIN := its old
+;; (first cluster, size). Both entries share one block, so this is one block
+;; write. 1 done, 0 a write failed.
+(defn swap [ctx size]
+  (let [own (word64 ctx 695) staged (word64 ctx 697)
+        old-first (entry-first ctx own) old-size (u32 ctx (+ own 28))
+        new-first (entry-first ctx staged)]
+    (do (set-entry ctx own new-first size)
+        (set-entry ctx staged old-first old-size)
+        (if (flushed ctx) 1 0))))

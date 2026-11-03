@@ -16,27 +16,6 @@ static void bytes_zero(uint8_t *bytes, uint64_t length) {
   for (uint64_t i = 0; i < length; i++) bytes[i] = 0;
 }
 
-static int text_is(const uint8_t *bytes, uint32_t length, const char *text) {
-  uint32_t at = 0;
-  if (!bytes || !text) return 0;
-  while (text[at]) {
-    if (at >= length || bytes[at] != (uint8_t)text[at]) return 0;
-    at++;
-  }
-  return at == length;
-}
-
-static uint32_t text_put(uint8_t *out, uint32_t capacity, const char *text) {
-  uint32_t length = 0;
-  if (!out || !capacity || !text) return 0;
-  while (text[length]) {
-    if (length >= capacity) return 0;
-    out[length] = (uint8_t)text[length];
-    length++;
-  }
-  return length;
-}
-
 uint64_t aiueos_kototama_runtime_required_bytes(void) {
 #ifdef AIUEOS_QWEN38_MODEL_HANDOFF
   uint64_t model_bytes =
@@ -169,32 +148,21 @@ const char *aiueos_kototama_runtime_state_name(
   }
 }
 
+/* The management protocol -- which of the three commands a line is, and the reply text -- is
+   kotoba/kototama-management.kotoba (JUN-554). This function keeps the side effects between the two calls. */
+extern int64_t kotoba_aiueos_kototama_command(const uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_kototama_reply(uint64_t, uint64_t, uint8_t *, uint64_t);
+
 uint32_t aiueos_kototama_runtime_management_command(
     const uint8_t *command, uint32_t command_length,
     uint8_t *output, uint32_t output_capacity) {
-  if (text_is(command, command_length, "runtime status")) {
-    const char *state = aiueos_kototama_runtime_state_name(runtime.status.state);
-    if (runtime.status.state == AIUEOS_KOTOTAMA_RUNTIME_EMPTY)
-      state = "unavailable";
-    uint32_t at = text_put(output, output_capacity, "aiueos: runtime ");
-    if (!at) return 0;
-    uint32_t more = text_put(output + at, output_capacity - at, state);
-    if (!more) return 0;
-    at += more;
-    more = text_put(output + at, output_capacity - at, "\n");
-    return more ? at + more : 0;
+  uint64_t reply;
+  switch (kotoba_aiueos_kototama_command(command, command_length)) {
+    case 1: reply = 1; break;
+    case 2: reply = aiueos_kototama_runtime_restart() ? 2 : 3; break;
+    case 3: reboot_pxe_requested = 1; reply = 4; break;
+    default: reply = 5; break;
   }
-  if (text_is(command, command_length, "runtime restart")) {
-    return text_put(output, output_capacity,
-      aiueos_kototama_runtime_restart()
-        ? "aiueos: runtime restarted\n"
-        : "aiueos: runtime restart refused unavailable\n");
-  }
-  if (text_is(command, command_length, "system reboot-pxe")) {
-    reboot_pxe_requested = 1;
-    return text_put(output, output_capacity,
-                    "aiueos: reboot-pxe scheduled\n");
-  }
-  return text_put(output, output_capacity,
-                  "aiueos: refused unsupported management command\n");
+  return (uint32_t)kotoba_aiueos_kototama_reply(reply, (uint64_t)runtime.status.state,
+                                                output, output_capacity);
 }

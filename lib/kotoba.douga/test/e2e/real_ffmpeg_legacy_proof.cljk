@@ -1,0 +1,321 @@
+(ns real-ffmpeg-legacy-proof
+  "Real-ffmpeg-subprocess proof for douga's ORIGINAL/LEGACY entry point,
+  `douga.ffmpeg/build-render-plan` -- the scene/lines/assets shape that
+  the live, deployed `yukkuri` production pipeline actually uses today
+  (ADR-2607051600). This is the counterpart to `test/e2e/real_ffmpeg_proof.cljk`
+  / `test/e2e/real_dissolve_proof.cljk`, which prove the newer
+  `douga.eizo-timeline` (`kami.eizo.timeline` EDL) entry point -- until this
+  file, `build-render-plan` had only ever been proven at the *shape* level
+  (`test/douga/ffmpeg_test.cljk`), never against a real `ffmpeg` execution.
+
+  This harness does NOT modify `build-render-plan` or any other production
+  code path -- it feeds real, hand-built \"scene/lines/assets\" timeline data
+  (in the exact lenient shape `test/douga/ffmpeg_test.cljk` already assumes:
+  `:scenes`/`:assets`/`:lines` with `:index`/`:sceneIndex`/`:lineIndex`/
+  `:voiceBlobKey`/`:blobKey`/`:kind`/`:meta` keys) through the REAL,
+  UNMODIFIED `douga.ffmpeg/build-render-plan`, executes the REAL command
+  vectors it and the other REAL `douga.ffmpeg` builders
+  (`concat-audio-cmd`, `silent-audio-cmd`, `scene-segment-cmd`,
+  `concat-segments-cmd`, `bgm-mix-cmd`) return, against real ffmpeg
+  lavfi-generated source media, with a real synchronous `ffmpeg` child
+  process for every step, and verifies with real `ffprobe` + real sampled
+  pixels.
+
+  Key structural difference from the newer path being proven here for the
+  first time: `build-render-plan`'s output segments carry NO duration field
+  at all (contrast `douga.eizo-timeline/render-plan`'s
+  `:duration-frames`) -- each segment's actual length is 100% emergent at
+  render time from `scene-segment-cmd`'s `-shortest` flag against
+  whatever real audio duration the caller happens to hand it. This script
+  proves that emergent behavior directly: it measures each segment's real
+  audio input duration BEFORE rendering, then confirms after rendering that
+  the segment's real (ffprobe'd) video duration follows that audio, not
+  some plan-supplied value (there is no such value to follow).
+
+  Also exercises a real multi-line scene (concat-audio-cmd concatenating
+  2 real voice takes into 1 continuous track for a single scene) and a real
+  zero-line \"silent\" scene (silent-audio-cmd, mirroring how a caller must
+  supply silence for a scene the plan reports zero voice-blob-keys for --
+  build-render-plan does not synthesize silence itself).
+
+  Requires: system `ffmpeg` + `ffprobe` on PATH. No external deps beyond
+  `douga.ffmpeg` itself (this path has no kami-eizo-timeline dependency).
+  Run from the douga repo root:
+
+    kbb --backend sci -cp src test/e2e/real_ffmpeg_legacy_proof.cljk
+
+  Exits 0 and prints a PASS report on success, exits 1 with the failing
+  assertion(s) printed on failure. Never fabricates a pass: every check
+  below is a real measurement of a real file produced by a real ffmpeg
+  subprocess."
+  (:require [kotoba.lang.text :as str]
+            [douga.ffmpeg :as ffmpeg]
+            ["child_process" :refer [execFileSync]]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]))
+
+;; ---------------------------------------------------------------------------
+;; subprocess helpers (same pattern as test/e2e/real_ffmpeg_proof.cljk)
+
+(defn- exec!
+  [argv]
+  (println (str "\n$ " (str/join " " (map (fn [a] (if (str/includes? a " ") (str "'" a "'") a)) argv))))
+  (execFileSync (first argv) (clj->js (vec (rest argv))) #js {:stdio "inherit"}))
+
+(defn- capture-text!
+  [argv]
+  (str (execFileSync (first argv) (clj->js (vec (rest argv)))
+                      #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]})))
+
+(defn- capture-bytes!
+  [argv]
+  (execFileSync (first argv) (clj->js (vec (rest argv)))
+                #js {:stdio #js ["ignore" "pipe" "ignore"] :maxBuffer (* 16 1024 1024)}))
+
+(defn- ffprobe-duration!
+  "Real ffprobe -- returns the container duration (seconds, float) of path."
+  [path]
+  (js/parseFloat
+   (str/trim
+    (capture-text! ["ffprobe" "-v" "error" "-show_entries" "format=duration"
+                    "-of" "default=noprint_wrappers=1:nokey=1" path]))))
+
+;; ---------------------------------------------------------------------------
+;; report bookkeeping
+
+(def ^:private checks (atom []))
+
+(defn- check! [label pass? detail]
+  (swap! checks conj {:label label :pass pass? :detail detail})
+  (println (str (if pass? "  [PASS] " "  [FAIL] ") label " -- " detail)))
+
+;; ---------------------------------------------------------------------------
+
+(defn- byte-hex [n] (let [s (.toString n 16)] (if (= 1 (count s)) (str "0" s) s)))
+(defn- rgb-hex [[r g b]] (str "#" (byte-hex r) (byte-hex g) (byte-hex b)))
+
+(defn -main []
+  (let [workdir (fs/mkdtempSync (path/join (os/tmpdir) "douga-real-ffmpeg-legacy-proof-"))
+        res-w 320 res-h 240
+        fps 24
+        ;; three scenes, each a distinct solid color. Scene 0 has TWO real
+        ;; voice takes (exercises concat-audio-cmd, ordered by lineIndex).
+        ;; Scene 1 has ONE voice take. Scene 2 has ZERO lines -- a real
+        ;; "silent" scene, exercising silent-audio-cmd (the caller-side
+        ;; helper for exactly this case; build-render-plan itself never
+        ;; synthesizes silence).
+        frame-defs [{:scene-index 0 :color "red"  :rgb [255 0 0]}
+                    {:scene-index 1 :color "lime" :rgb [0 255 0]}
+                    {:scene-index 2 :color "blue" :rgb [0 0 255]}]
+        voice-defs [{:scene-index 0 :line-index 0 :freq 440 :dur-s 1.0 :speaker "left"  :text "scene0 first"}
+                    {:scene-index 0 :line-index 1 :freq 660 :dur-s 1.2 :speaker "right" :text "scene0 second"}
+                    {:scene-index 1 :line-index 0 :freq 554 :dur-s 1.6 :speaker "left"  :text "scene1 only"}
+                    ;; scene 2: intentionally no voice-defs entry.
+                    ]
+        silent-scene-2-seconds 1.8]
+    (println (str "workdir: " workdir))
+    (try
+      ;; -- 1. generate real source media (no external assets) ---------------
+      (doseq [{:keys [scene-index color]} frame-defs]
+        (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+                "-i" (str "color=c=" color ":size=" res-w "x" res-h)
+                "-frames:v" "1" (path/join workdir (str "frame-" scene-index ".png"))]))
+      (doseq [{:keys [scene-index line-index freq dur-s]} voice-defs]
+        (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+                "-i" (str "sine=frequency=" freq ":duration=" dur-s)
+                "-ar" "24000" "-ac" "1"
+                (path/join workdir (str "voice-" scene-index "-" line-index ".wav"))]))
+      (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+              "-i" "sine=frequency=220:duration=1.0"
+              "-ar" "24000" "-ac" "1" (path/join workdir "bgm.wav")])
+
+      ;; -- 2. build a REAL scene/lines/assets timeline, in the exact lenient
+      ;;    shape test/douga/ffmpeg_test.cljk's `timeline` fixture uses -----
+      (let [frame-path (fn [si] (path/join workdir (str "frame-" si ".png")))
+            voice-path (fn [si li] (path/join workdir (str "voice-" si "-" li ".wav")))
+            bgm-path (path/join workdir "bgm.wav")
+            timeline
+            {:resolution (str res-w "x" res-h)
+             :fps fps
+             :scenes (mapv (fn [{:keys [scene-index]}] {:index scene-index}) frame-defs)
+             :assets (into (mapv (fn [{:keys [scene-index]}]
+                                    {:kind "scene" :blobKey (frame-path scene-index)
+                                     :meta {:sceneIndex scene-index}})
+                                  frame-defs)
+                           [{:kind "bgm" :blobKey bgm-path}])
+             :lines (mapv (fn [{:keys [scene-index line-index speaker text]}]
+                            {:sceneIndex scene-index :lineIndex line-index
+                             :voiceBlobKey (voice-path scene-index line-index)
+                             :speaker speaker :text text})
+                          voice-defs)}]
+
+        (println "\n=== hand-built legacy scene/lines/assets timeline ===")
+        (println (pr-str timeline))
+
+        ;; -- 3. drive the REAL, UNMODIFIED douga.ffmpeg/build-render-plan --
+        (let [plan (ffmpeg/build-render-plan timeline)]
+          (println "\n=== douga.ffmpeg/build-render-plan output ===")
+          (println (pr-str plan))
+          (check! "build-render-plan produced 3 segments" (= 3 (count (:segments plan))) (str (count (:segments plan))))
+          (check! "build-render-plan segments in scene order [0 1 2]"
+                  (= [0 1 2] (mapv :scene-index (:segments plan)))
+                  (pr-str (mapv :scene-index (:segments plan))))
+          (check! "build-render-plan width matches timeline resolution" (= res-w (:width plan)) (str (:width plan)))
+          (check! "build-render-plan height matches timeline resolution" (= res-h (:height plan)) (str (:height plan)))
+          (check! "build-render-plan fps matches timeline fps" (= fps (:fps plan)) (str (:fps plan)))
+          (check! "build-render-plan bgm-blob-key matches bgm asset" (= bgm-path (:bgm-blob-key plan)) (str (:bgm-blob-key plan)))
+          (check! "scene 0 has 2 voice-blob-keys ordered by lineIndex"
+                  (= [(voice-path 0 0) (voice-path 0 1)] (:voice-blob-keys (first (:segments plan))))
+                  (pr-str (:voice-blob-keys (first (:segments plan)))))
+          (check! "scene 0 texts/speakers ordered to match"
+                  (and (= ["scene0 first" "scene0 second"] (:texts (first (:segments plan))))
+                       (= ["left" "right"] (:speakers (first (:segments plan)))))
+                  (pr-str (select-keys (first (:segments plan)) [:texts :speakers])))
+          (check! "scene 1 has 1 voice-blob-key"
+                  (= [(voice-path 1 0)] (:voice-blob-keys (second (:segments plan))))
+                  (pr-str (:voice-blob-keys (second (:segments plan)))))
+          (check! "scene 2 (no lines) has 0 voice-blob-keys -- caller must supply silence"
+                  (= [] (:voice-blob-keys (nth (:segments plan) 2)))
+                  (pr-str (:voice-blob-keys (nth (:segments plan) 2))))
+          (check! "no segment carries any duration field (legacy plan has none -- duration is 100% emergent from -shortest at render time)"
+                  (every? #(not (contains? % :duration-frames)) (:segments plan))
+                  (pr-str (mapv keys (:segments plan))))
+
+          ;; -- 4. execute the REAL douga.ffmpeg command vectors --------------
+          ;; per-segment audio: concat-audio-cmd for any non-empty
+          ;; voice-blob-keys (n=1 or n=2), silent-audio-cmd for the empty case.
+          (let [seg-results
+                (mapv
+                 (fn [seg]
+                   (let [si (:scene-index seg)
+                         voice-keys (:voice-blob-keys seg)
+                         audio-path (path/join workdir (str "seg-" si "-audio.wav"))
+                         measured-input-audio-dur
+                         (if (seq voice-keys)
+                           (do
+                             (let [cmd (ffmpeg/concat-audio-cmd voice-keys audio-path)]
+                               (println (str "\n=== douga.ffmpeg/concat-audio-cmd for scene " si " ==="))
+                               (println (pr-str cmd))
+                               (exec! cmd))
+                             (check! (str "scene-" si " concatenated audio produced")
+                                     (and (fs/existsSync audio-path) (> (.-size (fs/statSync audio-path)) 0))
+                                     audio-path)
+                             (ffprobe-duration! audio-path))
+                           (do
+                             (let [cmd (ffmpeg/silent-audio-cmd audio-path {:seconds silent-scene-2-seconds :sample-rate 24000})]
+                               (println (str "\n=== douga.ffmpeg/silent-audio-cmd for scene " si " (no lines) ==="))
+                               (println (pr-str cmd))
+                               (exec! cmd))
+                             (check! (str "scene-" si " silent audio produced")
+                                     (and (fs/existsSync audio-path) (> (.-size (fs/statSync audio-path)) 0))
+                                     audio-path)
+                             (ffprobe-duration! audio-path)))
+                         out-path (path/join workdir (str "seg-" si ".mp4"))
+                         cmd (ffmpeg/scene-segment-cmd (:frame-blob-key seg) audio-path out-path
+                                                        {:width (:width plan) :height (:height plan) :fps (:fps plan)})]
+                     (println (str "\n=== douga.ffmpeg/scene-segment-cmd for scene " si " ==="))
+                     (println (pr-str cmd))
+                     (exec! cmd)
+                     (check! (str "scene-" si " segment file produced")
+                             (and (fs/existsSync out-path) (> (.-size (fs/statSync out-path)) 0))
+                             out-path)
+                     (let [measured-out-dur (ffprobe-duration! out-path)]
+                       ;; THE key legacy-path proof: -shortest means the
+                       ;; rendered segment's real duration tracks the real
+                       ;; input audio's real duration -- not a value
+                       ;; build-render-plan supplied (it supplied none).
+                       (check! (str "scene-" si " rendered video duration (" measured-out-dur
+                                    "s) tracks its real input audio duration (" measured-input-audio-dur
+                                    "s) via -shortest, within 1 frame (" (/ 1.0 fps) "s)")
+                               (< (Math/abs (- measured-out-dur measured-input-audio-dur)) (/ 1.0 fps))
+                               (str "delta=" (Math/abs (- measured-out-dur measured-input-audio-dur)) "s"))
+                       {:scene-index si :out-path out-path
+                        :audio-dur measured-input-audio-dur :video-dur measured-out-dur})))
+                 (:segments plan))
+                seg-paths (mapv :out-path seg-results)
+                list-path (path/join workdir "concat-list.txt")
+                _ (fs/writeFileSync list-path (ffmpeg/concat-list-text seg-paths))
+                concat-path (path/join workdir "concat.mp4")
+                concat-cmd (ffmpeg/concat-segments-cmd list-path concat-path)
+                _ (println "\n=== douga.ffmpeg/concat-segments-cmd ===")
+                _ (println (pr-str concat-cmd))
+                _ (exec! concat-cmd)
+                _ (check! "concat output produced"
+                          (and (fs/existsSync concat-path) (> (.-size (fs/statSync concat-path)) 0))
+                          concat-path)
+                final-path (path/join workdir "final.mp4")
+                bgm-cmd (ffmpeg/bgm-mix-cmd concat-path (:bgm-blob-key plan) final-path)
+                _ (println "\n=== douga.ffmpeg/bgm-mix-cmd ===")
+                _ (println (pr-str bgm-cmd))
+                _ (exec! bgm-cmd)
+                _ (check! "final bgm-mixed output produced"
+                          (and (fs/existsSync final-path) (> (.-size (fs/statSync final-path)) 0))
+                          final-path)
+
+                ;; -- 5. verify with REAL ffprobe -------------------------------
+                probe-json (js/JSON.parse
+                            (capture-text! ["ffprobe" "-v" "error" "-print_format" "json"
+                                            "-show_entries" "format=duration:stream=width,height,codec_type"
+                                            final-path]))
+                _ (println "\n=== ffprobe output (real, on final.mp4) ===")
+                _ (println (js/JSON.stringify probe-json nil 2))
+                v-stream (first (filter #(= "video" (.-codec_type %)) (.-streams probe-json)))
+                probed-w (.-width v-stream)
+                probed-h (.-height v-stream)
+                probed-dur (js/parseFloat (.-duration (.-format probe-json)))
+                ;; expected total duration is the SUM of each segment's own
+                ;; MEASURED real video duration -- not a value ever computed
+                ;; or stored anywhere by douga.ffmpeg itself (build-render-plan
+                ;; has no total-duration concept; it emerges purely from
+                ;; concatenating whatever -shortest actually produced).
+                expected-dur (reduce + (map :video-dur seg-results))]
+            (check! "ffprobe width == timeline resolution width" (= res-w probed-w) (str probed-w))
+            (check! "ffprobe height == timeline resolution height" (= res-h probed-h) (str probed-h))
+            (check! (str "ffprobe final duration ~= sum of measured per-segment durations (" expected-dur "s, concat+bgm-mix rounding tolerance 0.3s)")
+                    (< (Math/abs (- probed-dur expected-dur)) 0.3)
+                    (str probed-dur "s"))
+
+            ;; -- 6. verify REAL sampled pixel colors at specific timestamps --
+            ;; boundaries are the MEASURED (not assumed) per-segment durations.
+            (println "\n=== pixel-sample proof (crop=2:2, see real_ffmpeg_proof.cljs for the ffmpeg-8.1.1 1x1-crop rounding note) ===")
+            (let [cx (- (quot res-w 2) 1) cy (- (quot res-h 2) 1)
+                  cum-starts (reductions + 0 (map :video-dur seg-results))
+                  scene-window (fn [i] [(nth cum-starts i) (nth cum-starts (inc i))])
+                  margin 0.15
+                  sample-points
+                  (mapcat (fn [i {:keys [rgb]}]
+                            (let [[s e] (scene-window i)
+                                  dur (- e s)
+                                  ;; 3 samples inside the window, margin away
+                                  ;; from both cut boundaries.
+                                  frac->t (fn [f] (+ s (* f (- dur (* 2 margin))) margin))]
+                              (map (fn [f] {:t (frac->t f) :scene-index i :expected-rgb rgb})
+                                   [0.15 0.5 0.85])))
+                          (range)
+                          frame-defs)]
+              (doseq [{:keys [t scene-index expected-rgb]} sample-points]
+                (let [raw (capture-bytes! ["ffmpeg" "-hide_banner" "-loglevel" "error" "-i" final-path
+                                           "-ss" (str t) "-vf" (str "crop=2:2:" cx ":" cy ":exact=1")
+                                           "-frames:v" "1" "-f" "rawvideo" "-pix_fmt" "rgb24" "-"])
+                      actual-rgb [(aget raw 0) (aget raw 1) (aget raw 2)]
+                      diff (reduce max (map (fn [a b] (Math/abs (- a b))) actual-rgb expected-rgb))]
+                  (check! (str "t=" (.toFixed t 3) "s -> scene " scene-index
+                               " expected " (rgb-hex expected-rgb) " actual " (rgb-hex actual-rgb))
+                          (<= diff 40)
+                          (str "max channel diff " diff))))))))
+
+      (let [all @checks
+            pass? (every? :pass all)]
+        (println (str "\n=== SUMMARY: " (count (filter :pass all)) "/" (count all) " checks passed ==="))
+        (println (str "workdir (artifacts kept for inspection): " workdir))
+        (println (if pass? "\nRESULT: PASS" "\nRESULT: FAIL"))
+        (js/process.exit (if pass? 0 1)))
+
+      (catch :default e
+        (println "\nERROR:" (.-message e))
+        (println (str "workdir (kept for inspection): " workdir))
+        (println "\nRESULT: FAIL (exception)")
+        (js/process.exit 1)))))
+
+(-main)

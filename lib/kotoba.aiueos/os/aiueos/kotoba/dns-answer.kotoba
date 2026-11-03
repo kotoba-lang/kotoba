@@ -1,0 +1,64 @@
+;; net_dns_answer_ok_named of kernel/pci.c in Kotoba (JUN-552): the constant-offset admission of a DNS A answer to the
+;; query net_build_dns_query_named sent.
+;;
+;; answer(frame, n, src, dst, port, question, qlen): 2^32 + A when frame[0..n) is an Ethernet / IPv4 (IHL 5) / UDP frame
+;; from src to dst, from port to the client port 49154, whose IPv4 header checksum is right and whose UDP checksum is
+;; zero or right, carrying a DNS response (QR, RCODE 0) to transaction 0xa1e0 with one question equal to
+;; question[0..qlen) and at least one answer, whose first answer is either the RFC 1035 pointer 0xc00c then type A,
+;; class IN, RDLENGTH 4, or the question copied uncompressed then RDLENGTH 4 at +4, A the address there (big-endian on
+;; the wire): the C wrote it to *out_a at that point and admitted the answer only if it was non-zero. Else 0, where the C
+;; returned before writing. 5 <= qlen <= 255 and n >= 70 + qlen as the C required; n above 16384 (16 KiB windows, amu
+;; ADR 0386; pci.c's frames are at most 2048 bytes), a null pointer or a non-canonical value is refused (0).
+;; The checksums are the ones kotoba_aiueos_ipv4_checksum answers (RFC 1071, a trailing odd byte the high half, refused
+;; past 2048 bytes); the UDP one is summed over the pseudo header in place instead of in net_dhcp_scratch.
+(ns aiueos.dns-answer (:export [kotoba_aiueos_dns_answer]))
+(defn- canonical? [x :i64] :bool (= (u64-shift-right x 32) 0))
+(defn- b [f :i64 n :i64 i :i64] :i64 (kernel-load-u8-16k f n i))
+(defn- be16 [f :i64 n :i64 i :i64] :i64 (+ (* 256 (b f n i)) (b f n (+ i 1))))
+(defn- be32 [f :i64 n :i64 i :i64] :i64 (+ (* 65536 (be16 f n i)) (be16 f n (+ i 2))))
+;; the RFC 1071 words of w[off..wn), a trailing odd byte the high half, added to acc
+(defn- sum16 [w :i64 wn :i64 off :i64 acc :i64] :i64
+  (if (>= off wn) acc
+    (let [hi (b w wn off) lo (if (>= (+ off 1) wn) 0 (b w wn (+ off 1)))]
+      (sum16 w wn (+ off 2) (+ acc (+ (* 256 hi) lo))))))
+(defn- fold [t :i64] :i64 (if (< t 65536) t (fold (+ (bit-and t 65535) (quot t 65536)))))
+;; w[0..qn) = q[0..qn), w's window wn (= qn); each base is followed by its own length (amu ADR 0373's rooting)
+(defn- same? [w :i64 wn :i64 q :i64 qn :i64 i :i64] :bool
+  (if (>= i qn) true
+    (let [x (b w wn i) y (b q qn i)] (if (not= x y) false (same? w wn q qn (+ i 1))))))
+(defn- ip-ok? [f :i64 n :i64] :bool
+  (let [h (kernel-subregion f n 14 20)] (= (fold (sum16 h 20 0 0)) 65535)))
+(defn- udp-ok? [f :i64 n :i64 ul :i64] :bool
+  (if (> (+ 12 ul) 2048) false
+    (let [u (kernel-subregion f n 34 ul) src (be32 f n 26) dst (be32 f n 30)
+          pseudo (+ (+ (quot src 65536) (bit-and src 65535)) (+ (+ (quot dst 65536) (bit-and dst 65535)) (+ 17 ul)))]
+      (= (fold (sum16 u ul 0 pseudo)) 65535))))
+(def REACHED 4294967296)
+;; the answer section at a (after the question): the two layouts
+(defn- answer [f :i64 n :i64 q :i64 qn :i64] :i64
+  (let [a (+ 54 qn)]
+    (if (and (= (b f n a) 192) (= (b f n (+ a 1)) 12))
+      (if (or (< n (+ a 16)) (not= (be16 f n (+ a 2)) 1) (not= (be16 f n (+ a 4)) 1) (not= (be16 f n (+ a 10)) 4)) 0
+        (+ REACHED (be32 f n (+ a 12))))
+      (if (< n (+ (+ a qn) 10)) 0
+        (let [w (kernel-subregion f n a qn)]
+          (if (or (not (same? w qn q qn 0)) (not= (be16 f n (+ (+ a qn) 4)) 4)) 0
+            (+ REACHED (be32 f n (+ (+ a qn) 6)))))))))
+(defn- dns-ok? [f :i64 n :i64 q :i64 qn :i64] :bool
+  (let [flags (be16 f n 44) w (kernel-subregion f n 54 qn)]
+    (and (= (be16 f n 42) 41440) (not= (bit-and flags 32768) 0) (= (bit-and flags 15) 0)
+         (= (be16 f n 46) 1) (not= (be16 f n 48) 0) (same? w qn q qn 0))))
+(defn- udp-head-ok? [f :i64 n :i64 port :i64 qn :i64] :bool
+  (let [total (be16 f n 16) ul (be16 f n 38)]
+    (and (= (be16 f n 34) port) (= (be16 f n 36) 49154)
+         (>= ul (+ 20 qn)) (= (+ 20 ul) total)
+         (or (= (be16 f n 40) 0) (udp-ok? f n ul)))))
+(defn kotoba_aiueos_dns_answer [frame :i64 n :i64 src :i64 dst :i64 port :i64 question :i64 qlen :i64] :i64
+  (if (or (= frame 0) (= question 0) (not (canonical? n)) (> n 16384) (not (canonical? src)) (not (canonical? dst))
+          (not (canonical? port)) (not (canonical? qlen)) (< qlen 5) (> qlen 255) (< n (+ 70 qlen))) 0
+    (let [total (be16 frame n 16)]
+      (if (or (not= (be16 frame n 12) 2048) (not= (b frame n 14) 69) (not= (b frame n 23) 17)
+              (< total 58) (> (+ 14 total) n) (not (ip-ok? frame n))
+              (not= (be32 frame n 26) src) (not= (be32 frame n 30) dst)
+              (not (udp-head-ok? frame n port qlen)) (not (dns-ok? frame n question qlen))) 0
+        (answer frame n question qlen)))))

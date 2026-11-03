@@ -1,0 +1,142 @@
+(ns vdesign.dc-bus-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [vdesign.dc-bus :as dc]))
+
+(defn- close? [a b] (< (Math/abs (- a b)) 1e-6))
+
+(defn- throws? [f]
+  (try (f) false
+       (catch #?(:clj Exception :cljs js/Error) _ true)))
+
+(deftest dispatch-identity-per-interval
+  (testing "fc = min(demand, rating); battery covers exactly the fc shortfall"
+    (let [r (dc/power-split {:demand-profile-kw [10.0 30.0 5.0 0.0]
+                             :dt-s 1.0 :fc-max-kw 20.0
+                             :buffer-capacity-kwh 1.5})]
+      (is (every? #(close? (min (:demand-kw %) 20.0) (- (:fc-kw %) (:fc-charge-kw %)))
+                  (:intervals r)))
+      (is (every? #(close? (max 0.0 (- (:demand-kw %) (:fc-kw %)))
+                           (:batt-discharge-kw %))
+                  (:intervals r)))
+      ;; residual fc capability above demand is what charges the battery
+      ;; (possibly curtailed by headroom): charge <= fc-max - fc
+      ;; charge comes from real fc output above demand: charge <= rating − base
+      (is (every? #(<= (:fc-charge-kw %)
+                       (+ (- 20.0 (- (:fc-kw %) (:fc-charge-kw %))) 1e-9))
+                  (:intervals r)))
+      (is (:feasible? r)))))
+
+(deftest energy-conservation-integral
+  (testing "demand energy = fc out + battery discharge − charge + deficit"
+    (let [profile [5.0 30.0 25.0 2.0 0.0 30.0]
+          r (dc/power-split {:demand-profile-kw profile :dt-s 1.0
+                             :fc-max-kw 20.0 :buffer-capacity-kwh 1.5})
+          {:keys [demand-kwh fc-out-kwh batt-discharge-kwh batt-charge-kwh
+                  fc-curtail-kwh deficit-kwh]} (:energy r)]
+      (is (close? 0.0255555555 demand-kwh)) ; 92 kW·s
+      ;; identity: demand = (fc out − fc→battery charge) + discharge + deficit
+      (is (close? demand-kwh
+                  (+ fc-out-kwh (- batt-charge-kwh) batt-discharge-kwh deficit-kwh)))
+      ;; the two 30 kW intervals draw 10 kW × 1 s = 0.00556 kWh total from
+      ;; a full 1.5 kWh buffer — feasible
+      (is (close? 0.0069444444 batt-discharge-kwh)) ; (10+10+5) kW·s
+      (is (:feasible? r)))))
+
+(deftest energy-infeasible-case
+  (testing "a long heavy interval exhausts the buffer: the remainder is an explicit deficit"
+    ;; 80 kW deficit for 600 s = 13.33 kWh, but the buffer holds 1.5 kWh;
+    ;; deliverable power over one interval is 1.5 kWh/600 s = 9 kW.
+    (let [r (dc/power-split {:demand-profile-kw [100.0] :dt-s 600.0
+                             :fc-max-kw 20.0 :buffer-capacity-kwh 1.5
+                             :initial-soc-kwh 1.5})]
+      (is (close? 9.0 (:batt-discharge-kw (first (:intervals r)))))
+      (is (close? 71.0 (:deficit-kw (first (:intervals r)))))
+      (is (close? 0.0 (:end-kwh (:soc r))))
+      (is (not (:feasible? r))))))
+
+(deftest battery-energy-bounded-by-capacity
+  (testing "SoC never leaves [0, capacity]"
+    (let [r (dc/power-split {:demand-profile-kw [40.0 0.0 0.0 0.0 0.0 0.0 0.0]
+                             :dt-s 60.0 :fc-max-kw 20.0
+                             :buffer-capacity-kwh 1.5})]
+      (is (every? #(and (>= (:soc-end-kwh %) -1e-9)
+                        (<= (:soc-end-kwh %) (+ 1.5 1e-9)))
+                  (:intervals r)))
+      ;; after the 40 kW interval: 1.5 − (20 kW·60 s = 0.333 kWh) = 1.1667;
+      ;; idle intervals recharge at up to 20 kW·60 s = 0.333 kWh each.
+      (is (close? 1.1666666667 (:min-kwh (:soc r))))
+      (is (close? 1.5 (:end-kwh (:soc r)))))))
+
+(deftest load-leveling-recharges-buffer
+  (testing "below-rating demand recharges the battery; fc output capped at rating"
+    (let [r (dc/power-split {:demand-profile-kw [2.0 2.0 2.0]
+                             :dt-s 600.0 :fc-max-kw 10.0
+                             :buffer-capacity-kwh 1.5
+                             :initial-soc-kwh 0.0})]
+      ;; fc runs above demand: 2 kW serving + up to 8 kW charging
+      (is (close? 10.0 (:fc-kw (nth (:intervals r) 0))))
+      (is (close? 3.0 (:fc-kw (nth (:intervals r) 1))))
+      ;; interval 0: 8 kW × 600 s = 1.333 kWh; interval 1: headroom-limited
+      ;; 0.167 kWh over 600 s = 1.0 kW; interval 2: full, curtailed to 0.
+      (is (close? 8.0 (:fc-charge-kw (nth (:intervals r) 0))))
+      (is (close? 8.0 (:fc-curtail-kw (nth (:intervals r) 2))))
+      (is (close? 1.0 (:fc-charge-kw (nth (:intervals r) 1))))
+      (is (close? 0.0 (:fc-charge-kw (nth (:intervals r) 2))))
+      (is (close? 1.5 (:soc-end-kwh (nth (:intervals r) 1))))
+      (is (close? 1.5 (:soc-end-kwh (nth (:intervals r) 2)))))))
+
+(deftest initial-soc-respected
+  (testing "explicit initial SoC is honored, not reset to full"
+    ;; 10 kW × 1 s = 0.00278 kWh drawn from 0.5 kWh initial SoC.
+    (let [r (dc/power-split {:demand-profile-kw [30.0] :dt-s 1.0
+                             :fc-max-kw 20.0 :buffer-capacity-kwh 1.5
+                             :initial-soc-kwh 0.5})]
+      (is (:feasible? r))
+      (is (close? 0.4972222222 (-> r :intervals first :soc-end-kwh))))))
+
+(deftest deficit-refusal-is-explicit
+  (testing "unservable demand appears as per-interval deficit, not silent drop"
+    (let [r (dc/power-split {:demand-profile-kw [100.0] :dt-s 1.0
+                             :fc-max-kw 20.0 :buffer-capacity-kwh 1.5
+                             :initial-soc-kwh 0.0})]
+      (is (close? 80.0 (:deficit-kw (first (:intervals r)))))
+      (is (not (:feasible? r))))))
+
+(deftest non-physical-input-refusals
+  (testing "negative demand, zero dt, zero fc-max, empty profile all refuse"
+    (is (throws? #(dc/power-split {:demand-profile-kw [-1.0]
+                                            :dt-s 1.0 :fc-max-kw 10.0
+                                            :buffer-capacity-kwh 1.5})))
+    (is (throws? #(dc/power-split {:demand-profile-kw [1.0]
+                                            :dt-s 0.0 :fc-max-kw 10.0
+                                            :buffer-capacity-kwh 1.5})))
+    (is (throws? #(dc/power-split {:demand-profile-kw [1.0]
+                                            :dt-s 1.0 :fc-max-kw 0.0
+                                            :buffer-capacity-kwh 1.5})))
+    (is (throws? #(dc/power-split {:demand-profile-kw []
+                                            :dt-s 1.0 :fc-max-kw 10.0
+                                            :buffer-capacity-kwh 1.5})))
+    (is (throws? #(dc/power-split {:demand-profile-kw [1.0]
+                                            :dt-s 1.0 :fc-max-kw 10.0
+                                            :buffer-capacity-kwh 1.5
+                                            :initial-soc-kwh 9.9})))))
+
+(deftest fcev-composition-guard
+  (testing "BEV results are refused at the boundary"
+    (is (throws? #(dc/power-split-for-fcev {:kind :bev :p-peak-kW 80.0}
+                                          {:demand-profile-kw [1.0] :dt-s 1.0}))))
+  (testing "FCEV result composes; fc-max comes from :p-peak-kW, buffer from tech table"
+    (let [r (dc/power-split-for-fcev {:kind :fcev :p-peak-kW 60.0}
+                                     {:demand-profile-kw [50.0 70.0 10.0]
+                                      :dt-s 1.0})]
+      (is (close? 60.0 (get-in r [:provenance :fc-max-kw])))
+      (is (close? 1.5 (get-in r [:provenance :buffer-capacity-kwh])))
+      (is (= "vdesign.powertrain/tech :fcev :buffer-kWh"
+             (get-in r [:source :buffer-capacity-source]))))))
+
+(deftest unmeasured-declared
+  (testing "efficiency/dod/dcdc are explicitly unmeasured in every result"
+    (let [r (dc/power-split {:demand-profile-kw [1.0] :dt-s 1.0
+                             :fc-max-kw 10.0 :buffer-capacity-kwh 1.5})]
+      (is (= {:battery-round-trip-eff true :battery-dod true :dcdc-losses true}
+             (:unmeasured r))))))

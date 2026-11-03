@@ -1,0 +1,210 @@
+(ns kotoba.web.math
+  "Pure matrix/vector math ported from `kami-web/src/math_bindings.rs`
+  (kotoba-lang/kami-engine, ADR-2607010930 clj-wgsl migration Phase 4).
+
+  Faithful `.cljc` port of the `glam`-backed WASM exports (`perspective`,
+  `invert_mat4`, `view_projection`) plus the bilinear heightmap sampler
+  (`sample_terrain_height`). All matrices are 16-element vectors in
+  **column-major** order — `m[col*4 + row]` — matching `glam::Mat4`'s
+  `to_cols_array` / `from_cols_array` layout, so values round-trip byte
+  for byte with the Rust side if ever cross-checked.
+
+  Left unported (adapter-only, stays in Rust — see kami-web AGENTS.md /
+  ARCHITECTURE.md): the `wasm_bindgen` boundary itself, the thread-local
+  `HeightmapCache` (WASM-memory caching of `cache_heightmap`/
+  `sample_terrain_height` state — pure session-cache plumbing, no math),
+  and everything that constructs a `kami_terrain::Heightmap` (procedural
+  noise generation lives in the `kami-terrain` Rust crate, not ported
+  here — only the *consumption* of an already-generated heightmap via
+  bilinear sampling is pure enough to port).")
+
+;; ---------------------------------------------------------------------
+;; cross-platform trig/sqrt shim (Math/* differs between clj and cljs)
+;; ---------------------------------------------------------------------
+
+(defn- tan* [x] #?(:clj (Math/tan (double x)) :cljs (.tan js/Math x)))
+(defn- sqrt* [x] #?(:clj (Math/sqrt (double x)) :cljs (.sqrt js/Math x)))
+
+;; ---------------------------------------------------------------------
+;; vec3 helpers
+;; ---------------------------------------------------------------------
+
+(defn v-sub [[ax ay az] [bx by bz]] [(- ax bx) (- ay by) (- az bz)])
+(defn v-add [[ax ay az] [bx by bz]] [(+ ax bx) (+ ay by) (+ az bz)])
+(defn v-scale [[x y z] s] [(* x s) (* y s) (* z s)])
+(defn v-dot [[ax ay az] [bx by bz]] (+ (* ax bx) (* ay by) (* az bz)))
+
+(defn v-cross [[ax ay az] [bx by bz]]
+  [(- (* ay bz) (* az by))
+   (- (* az bx) (* ax bz))
+   (- (* ax by) (* ay bx))])
+
+(defn v-length [v] (sqrt* (v-dot v v)))
+
+(defn v-normalize [v]
+  (let [l (v-length v)]
+    (if (zero? l) v (v-scale v (/ 1.0 l)))))
+
+;; ---------------------------------------------------------------------
+;; mat4 — 16-element column-major vector, m[col*4+row]
+;; ---------------------------------------------------------------------
+
+(def mat4-identity
+  [1.0 0.0 0.0 0.0
+   0.0 1.0 0.0 0.0
+   0.0 0.0 1.0 0.0
+   0.0 0.0 0.0 1.0])
+
+(defn- m-get [m col row] (nth m (+ (* col 4) row)))
+
+(defn mat4-mul
+  "a * b (column-major 4x4), matching glam/Rust `Mat4` `Mul` — `(a*b)*v = a*(b*v)`."
+  [a b]
+  (vec (for [c (range 4) r (range 4)]
+         (reduce + (map (fn [k] (* (m-get a k r) (m-get b c k))) (range 4))))))
+
+(defn mat4-vec-mul
+  "m * v where v is a 4-vector `[x y z w]`."
+  [m v]
+  (vec (for [r (range 4)]
+         (reduce + (map (fn [c] (* (m-get m c r) (nth v c))) (range 4))))))
+
+(defn mat4-translation [[x y z]]
+  [1.0 0.0 0.0 0.0
+   0.0 1.0 0.0 0.0
+   0.0 0.0 1.0 0.0
+   x   y   z   1.0])
+
+(defn mat4-scale [[x y z]]
+  [x   0.0 0.0 0.0
+   0.0 y   0.0 0.0
+   0.0 0.0 z   0.0
+   0.0 0.0 0.0 1.0])
+
+(defn mat4-rotation-y
+  "Right-handed rotation about +Y by `theta` radians (matches `glam::Mat4::from_rotation_y`)."
+  [theta]
+  (let [c #?(:clj (Math/cos (double theta)) :cljs (.cos js/Math theta))
+        s #?(:clj (Math/sin (double theta)) :cljs (.sin js/Math theta))]
+    [c   0.0 (- s) 0.0
+     0.0 1.0 0.0   0.0
+     s   0.0 c     0.0
+     0.0 0.0 0.0   1.0]))
+
+(defn mat4-perspective-rh
+  "Right-handed, zero-to-one depth perspective projection — matches
+  `glam::Mat4::perspective_rh` (the convention `kami-render`/wgpu use)."
+  [fov-y aspect near far]
+  (let [f (/ 1.0 (tan* (/ fov-y 2.0)))]
+    [(/ f aspect) 0.0 0.0            0.0
+     0.0          f   0.0            0.0
+     0.0          0.0 (/ far (- near far))          -1.0
+     0.0          0.0 (/ (* near far) (- near far)) 0.0]))
+
+(defn mat4-look-at-rh
+  "Right-handed view matrix — matches `glam::Mat4::look_at_rh`."
+  [eye target up]
+  (let [z (v-normalize (v-sub eye target))
+        x (v-normalize (v-cross up z))
+        y (v-cross z x)]
+    [(nth x 0) (nth y 0) (nth z 0) 0.0
+     (nth x 1) (nth y 1) (nth z 1) 0.0
+     (nth x 2) (nth y 2) (nth z 2) 0.0
+     (- (v-dot x eye)) (- (v-dot y eye)) (- (v-dot z eye)) 1.0]))
+
+(defn mat4-invert
+  "General 4x4 matrix inverse (2x2-minor Laplace expansion, the classic
+  MESA/Intel `Inverse4x4` technique). Matches `glam::Mat4::inverse`.
+  Returns a zero matrix's worth of `NaN`/`Infinity` columns if singular
+  (division by a zero determinant), same as the IEEE-754 float behaviour
+  the Rust side gets from `glam`."
+  [m]
+  (let [g (fn [c r] (nth m (+ (* c 4) r)))
+        a00 (g 0 0) a01 (g 1 0) a02 (g 2 0) a03 (g 3 0)
+        a10 (g 0 1) a11 (g 1 1) a12 (g 2 1) a13 (g 3 1)
+        a20 (g 0 2) a21 (g 1 2) a22 (g 2 2) a23 (g 3 2)
+        a30 (g 0 3) a31 (g 1 3) a32 (g 2 3) a33 (g 3 3)
+        s0 (- (* a00 a11) (* a10 a01))
+        s1 (- (* a00 a12) (* a10 a02))
+        s2 (- (* a00 a13) (* a10 a03))
+        s3 (- (* a01 a12) (* a11 a02))
+        s4 (- (* a01 a13) (* a11 a03))
+        s5 (- (* a02 a13) (* a12 a03))
+        c5 (- (* a22 a33) (* a32 a23))
+        c4 (- (* a21 a33) (* a31 a23))
+        c3 (- (* a21 a32) (* a31 a22))
+        c2 (- (* a20 a33) (* a30 a23))
+        c1 (- (* a20 a32) (* a30 a22))
+        c0 (- (* a20 a31) (* a30 a21))
+        det (+ (- (* s0 c5) (* s1 c4)) (* s2 c3) (* s3 c2) (- (* s4 c1)) (* s5 c0))
+        invdet (/ 1.0 det)
+        b00 (* invdet (+ (- (* a11 c5) (* a12 c4)) (* a13 c3)))
+        b01 (* invdet (+ (- (* a01 c5)) (* a02 c4) (- (* a03 c3))))
+        b02 (* invdet (+ (- (* a31 s5) (* a32 s4)) (* a33 s3)))
+        b03 (* invdet (+ (- (* a21 s5)) (* a22 s4) (- (* a23 s3))))
+        b10 (* invdet (+ (- (* a10 c5)) (* a12 c2) (- (* a13 c1))))
+        b11 (* invdet (+ (- (* a00 c5) (* a02 c2)) (* a03 c1)))
+        b12 (* invdet (+ (- (* a30 s5)) (* a32 s2) (- (* a33 s1))))
+        b13 (* invdet (+ (- (* a20 s5) (* a22 s2)) (* a23 s1)))
+        b20 (* invdet (+ (- (* a10 c4) (* a11 c2)) (* a13 c0)))
+        b21 (* invdet (+ (- (* a00 c4)) (* a01 c2) (- (* a03 c0))))
+        b22 (* invdet (+ (- (* a30 s4) (* a31 s2)) (* a33 s0)))
+        b23 (* invdet (+ (- (* a20 s4)) (* a21 s2) (- (* a23 s0))))
+        b30 (* invdet (+ (- (* a10 c3)) (* a11 c1) (- (* a12 c0))))
+        b31 (* invdet (+ (- (* a00 c3) (* a01 c1)) (* a02 c0)))
+        b32 (* invdet (+ (- (* a30 s3)) (* a31 s1) (- (* a32 s0))))
+        b33 (* invdet (+ (- (* a20 s3) (* a21 s1)) (* a22 s0)))]
+    [b00 b10 b20 b30
+     b01 b11 b21 b31
+     b02 b12 b22 b32
+     b03 b13 b23 b33]))
+
+;; ---------------------------------------------------------------------
+;; Wasm-export-shaped API (mirrors math_bindings.rs 1:1 by name+arity)
+;; ---------------------------------------------------------------------
+
+(defn perspective
+  "`perspective(fov_y, aspect, near, far) -> Vec<f32>` port."
+  [fov-y aspect near far]
+  (mat4-perspective-rh fov-y aspect near far))
+
+(defn invert-mat4
+  "`invert_mat4(m) -> Vec<f32>` port."
+  [m]
+  (mat4-invert m))
+
+(defn view-projection
+  "`view_projection(eye_x..eye_z, target_x..target_z, fov_y, aspect, near, far) -> Vec<f32>`
+  port — `perspective * look_at` composed in one call."
+  [eye-x eye-y eye-z target-x target-y target-z fov-y aspect near far]
+  (mat4-mul (mat4-perspective-rh fov-y aspect near far)
+            (mat4-look-at-rh [eye-x eye-y eye-z] [target-x target-y target-z] [0.0 1.0 0.0])))
+
+;; ---------------------------------------------------------------------
+;; sample_terrain_height (bilinear interpolation over a cached heightmap)
+;; ---------------------------------------------------------------------
+
+(defn sample-terrain-height
+  "Bilinear-sample `heights` (a flat row-major `width*depth` vector of floats,
+  as produced by `kami-terrain::Heightmap::generate`) at world `(x, z)`.
+  Direct port of `math_bindings.rs::sample_terrain_height`'s interpolation —
+  the caller is responsible for the heightmap itself (procedural generation
+  stays in the Rust `kami-terrain` crate, not ported here). Returns `0.0`
+  for an empty heightmap or a point outside `[origin, origin+dim-1)`."
+  [heights width depth origin-x origin-z x z]
+  (if (empty? heights)
+    0.0
+    (let [fx (- x origin-x)
+          fz (- z origin-z)]
+      (if (or (< fx 0.0) (< fz 0.0)
+              (>= fx (double (dec width))) (>= fz (double (dec depth))))
+        0.0
+        (let [x0 (long fx) z0 (long fz)
+              x1 (inc x0) z1 (inc z0)
+              tx (- fx x0) tz (- fz z0)
+              idx (fn [cx cz] (nth heights (+ (* cz width) cx)))
+              h00 (idx x0 z0) h10 (idx x1 z0)
+              h01 (idx x0 z1) h11 (idx x1 z1)
+              ix0 (+ (* h00 (- 1.0 tx)) (* h10 tx))
+              ix1 (+ (* h01 (- 1.0 tx)) (* h11 tx))]
+          (+ (* ix0 (- 1.0 tz)) (* ix1 tz)))))))

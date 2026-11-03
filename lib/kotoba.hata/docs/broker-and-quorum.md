@@ -78,8 +78,8 @@ The trusted checkpoint writer remains responsible for legal business-state
 transitions: voters authenticate its data and register ordering, not a complete
 replay of C0 business logic. A certificate collected before it reaches any
 committed replica is not an automatically discoverable latest head. A caller
-must retain its ACK/certificate or obtain a fresh quorum read before relying on
-a head; this API alone does not implement a linearizable read protocol.
+must retain its ACK/certificate or obtain a fresh quorum read (below) before
+relying on a head; `replica/current` alone is not a read protocol.
 
 This is a safety-focused, bounded, fixed-roster register, not a complete BFT
 consensus service. Split votes can halt it. Do not erase outstanding votes,
@@ -91,6 +91,86 @@ own voted value and a different certified value at a position; interrupted
 pre-ACK writes may leave additional orphan blocks. A host-provisioned disk
 quota is required; the sequence bound alone is not a disk quota. Disk-full is
 refusal, never a reset. Automatic orphan collection remains unimplemented.
+
+## Fresh read (AWAI-103)
+
+A reader chooses a nonce and asks replicas to attest. `replica/attest`, under
+the replica lock, signs with that replica's voter key the reader's nonce, its
+current snapshot and, when it holds one, its pending vote (re-issued for the
+one descriptor it already voted; a replica never votes twice at a seq):
+
+```text
+Attestation = [1 index nonce4 state-len vote-len] snapshot vote(0|65) signature64
+```
+
+`read/latest` needs three valid attestations from distinct replicas. A
+certificate has three voters; any three responders share at least two of them
+and at most one replica is faulty, so an honest responder holds a certified
+entry either committed or as its pending vote. The latest certified head is
+therefore the highest committed sequence K seen, or K+1 when a responder at K
+holds a pending vote. The result is one of:
+
+| status | meaning | the reader may |
+|---|---|---|
+| 1 | committed head K with its certificate | rely on K |
+| 2 | three pending votes for K+1 assemble a certificate that was never distributed | distribute it (`commit`), then rely on K+1 |
+| 3 | one or two pending votes for K+1 | collect the missing vote or wait; never act on K or K+1 |
+| 4 | nothing certified or pending (genesis) | create the first entry |
+| 0 | refused | retry with a new nonce |
+
+Refusal covers fewer than three distinct valid attestations, two different
+certified heads at one sequence (more than one fault), a nonce other than the
+reader's (a replayed signed snapshot), another roster, any changed word, a
+pending vote by another index, for another sequence or on another parent.
+Invalid attestations are dropped, so one faulty replica cannot forge a head but
+can make a read wait. `replica/block` returns a retained value only when it
+matches the descriptor's length and value hash; any replica that holds it can
+supply a missing value.
+
+The writer stays trusted: one writer signature per descriptor. An equivocating
+writer is bounded only by one vote per replica and sequence, and can split votes
+so that a read stays at status 3. View and roster changes are AWAI-104.
+
+## Writer restore (AWAI-103)
+
+A new writer starts from an empty C0 base. `broker/restore` takes the head a
+fresh read returned, verifies its certificate on the full request (value
+included) and that its epoch is the policy's, and passes the value to
+`store/restore`. That store checks that the value parses as C0 state bound to
+this policy's epoch, domain and operation, with each stable request id at most
+once, writes a durable `restored` marker and only then publishes the state.
+
+A restored store is inactive: `submit` and `complete` return
+`rejected:inactive`; `recover` (the epoch bump) is allowed. The writer recovers
+to a new epoch, certifies a fence entry and installs it at the sink.
+`broker/activate` then reads a durable copy of the sink's sealed state and calls
+`store/activate` only when that state shows the new epoch at or past the fence
+entry. The previous writer is refused by the sink's epoch fence.
+
+Legality of the transitions before the restored head rests on the trusted
+writer's signatures; the restore checks shape and binding, not replayed
+business history. No privileged rollback resistance is claimed without an
+external witness or anchor.
+
+## Audit history (AWAI-106)
+
+A replica's snapshot holds only its head, so it cannot by itself show the past
+proposals and certificates. `replica/commit` therefore first writes a sealed
+record of the position, `quorum-log-<seq>` = descriptor and certificate signed
+with the replica key, and only then moves its head: a crash in between leaves a
+record past the head, never a head without its record. `replica/history`
+returns the records 1..K of its committed position as a batch; a missing or
+unsealed record ends the batch early.
+
+`audit/history` accepts a batch only when every entry is certified on this
+roster, entry k has sequence k and its parent is entry k-1 (zero for the
+first). It returns `[K entry-id]`, `[0 0 0 0 0]` for the empty history, and
+`[0]` for a gap, a fork, a forged certificate or trailing bytes; partial history
+is never success. `audit/extends?` accepts a later history only when it holds an
+earlier accepted head at its sequence, so a shorter or diverging history
+(rollback) is refused. This proves agreement with the roster, not that no newer
+history exists: freshness needs `read/latest`, and resistance to a privileged
+rollback of every replica needs an external witness or anchor (not claimed).
 
 ## Broker fence, consume and reconcile
 
@@ -159,6 +239,164 @@ mint another request ID. `abandon` is a recovery outcome, not an application
 success receipt. The C0 token inside a dispatch command identifies its original
 local reservation and is not substituted for the quorum parent CAS.
 
+## Broker envelope over an authenticated session (AWAI-102)
+
+Broker exchanges are moving from files copied between private directories onto
+authenticated sessions: Noise XXhfs with ML-KEM-768 and Ed25519 + ML-DSA-65 identities, over
+the native TCP wires (`lib/kotoba.noise`, ADR-0001). Each exchange travels in one
+`hata.wire` envelope (`src/hata/wire.kotoba`), and one envelope is one `noise.frame`.
+
+- **Layout:** version (1, = 1), kind (1), request id (32), body length (4, big-endian), then
+  the body; at most 65535 bytes. Kinds 1-8 are the vote, commit, attest and execute
+  requests and their responses; a response kind is its request kind plus one.
+- **Request id:** `SHA-256("hata.wire.v1/request\n" || handshake hash || sequence (8) ||
+  body)`. A request replayed into another session, or at another position in the same
+  session, has another id. The session owner accepts only the next sequence number.
+- **Opening:** `open` gives the body only for an envelope of exactly the expected version,
+  kind and id and an exact length; anything else is `[-1]`. A response is accepted only
+  under its request's id.
+
+`test/wire_native.kotoba` returns 127, and runs in the history section of
+`scripts/check-broker-native.py`. Its unbound-reply control, an opener that skips the id
+comparison, returns 61. Measured on Apple Silicon (Amu Mac root of main `91faa123`), the
+other mutants give: length check dropped, an out-of-bounds read that traps; sequence
+left out of the id, 55; handshake hash left out of the id, 119.
+
+`open-request` lets the receiving side check a request it could not predict: it returns
+the body only if the envelope's id equals `request-id(hh, seq, body)` for that very body.
+The gate returns 255 with it; skipping that comparison gives 127.
+
+**Votes between processes.** `test/session_native.kotoba` (driver) and
+`scripts/check-session-native.py` (Linux arm64) carry the quorum's votes between separate
+processes. Each replica serves its vote as the session responder: it requires the
+coordinator's identity, opens the request at sequence 0, votes with `hata.replica/vote`
+and replies under the same id. The coordinator dials, requires the replica's identity and
+stores only the bound reply. The broker driver's `certificate` step then assembles the
+quorum certificate from those votes.
+
+**Commit and attest between processes.** After the certificate, the coordinator opens a
+second session to each replica and sends two requests in order: the commit at sequence 0
+(body: 4-byte big-endian request length, the request, the certificate), answered with
+`hata.replica/commit`'s result, then the attest at sequence 1 (body: the reader's nonce),
+answered with the attestation. The coordinator stores each bound attestation, and the
+broker driver's `fresh` step decides the fresh committed head from them.
+
+Measured 2026-10-30 in the podman machine (Linux arm64) with Amu's committed
+`aarch64-linux-static-root.elf` at `65359a09` (image `8ebb44c5`, also at `91faa123`, image
+`7814504c`). The compiler of the workflow's general Amu pin, `6a77cd91` (image `d5ef9cee`),
+builds a broker driver that traps (SIGILL) in `prepare`, so the CI step checks out
+`65359a09` for these sessions only:
+
+| exchange | result |
+|---|---|
+| replicas 0, 1, 2 vote over their own sessions | vote 1 each; the certificate assembles |
+| coordinator expects another replica's identity | the handshake is refused (replica -21, coordinator -31) |
+| request id made for sequence 1 | the replica refuses it (-23); no vote is written (coordinator -33) |
+| replicas 0, 1, 2 commit (sequence 0) and attest (sequence 1) over a second session | commit 2 and an attestation each; `fresh` decides the committed head (1) |
+| the commit replayed where the attest belongs (sequence 1) | the replica refuses it (-44); no attestation is written (coordinator -55) |
+
+**Unauthenticated peers.** `serve-guarded` is the vote listener for a port anyone can
+reach. Each handshake read has a 10 s deadline. A connection whose handshake fails is
+closed and costs one unit of the listener's connection budget. The listener gives up
+(-62) when the budget is spent, and the first authenticated coordinator gets the vote.
+Message 0 is read before any Noise state exists. Only a frame of exactly its XXhfs length
+(e 32 + e1 1184, empty payload: 1216 bytes) goes on to the handshake.
+
+That pre-check is needed because the static runtime reclaims no vectors within a process,
+and each handshake state costs X25519 work. Without it, three failed connections and a
+wrong-identity handshake exhausted the vector table (`KEXE_TRAP {:kind :arena :reason
+:vector-table-exhausted}`): the listener trapped and gave no vote. A `KEXE_VECTORS` /
+`KEXE_VECTOR_ITEMS` grant did not move that trap point on this image. With the pre-check,
+the same run measured (podman, Linux arm64, amu `65359a09`):
+
+| peer | result |
+|---|---|
+| connects and stays silent | closed at the deadline (10.0 s) |
+| sends a frame that is not message 0 | closed at once |
+| declares a frame and never completes it | closed at the deadline (10.0 s) |
+| completes message 0 but expects another replica's identity | refused (-31) |
+| then the authenticated coordinator | served; replica 3's answer 12 (it already committed this request) is bound to the request id |
+| three failures against a budget of 3 | the listener stops (-62) using 238 fuel; the coordinator's dial is refused, and no vote is written |
+
+A peer that sends a well-formed message 0 still costs the responder a full first message
+(KEM encapsulation and an ML-DSA-65 signature) before XX reveals who the initiator is.
+The connection budget is what bounds that cost.
+
+**Retry after a lost reply.** For the claim, replica 2 votes durably on its first
+connection and then closes it without replying, as if the reply were lost. The coordinator
+sees no reply and opens a fresh session: a new handshake hash, sequence 0 again. It asks
+again, at most three times. `replica/vote` returns the same durable vote for the same
+descriptor, so a retry can never produce a second, different vote. The harness requires
+the dropped vote, the delivered vote and the coordinator's stored vote to be byte-identical,
+and the certificate is assembled from that vote (podman, Linux arm64: the second attempt
+answered 1).
+
+**Backoff between retries.** Between attempts the retrying coordinator waits 100 ms ×
+2^(attempt−1) plus 0–99 ms of jitter, slept on the monotonic clock through wire 7 (`sleep <ms>`,
+JUN-360). The jitter is the clock reading's microsecond digits. It only has to keep two
+coordinators from retrying in lockstep, so it needs no secret randomness. The entropy wire (23)
+would be the natural source, but a call to it crashes the checker of Amu `65359a09` with SIGILL,
+even when `:entropy/draw` is declared. The coordinator records the planned and the measured
+wait. Without the clock grant the wire refuses (`KEXE_CAP {:wire 7 :refused :not-granted}`), so
+a retry never runs without its wait. Measured 2026-10-30 (podman, Linux arm64): the vote retry
+planned 169 ms and slept 172 ms; the execute retry planned 116 ms and slept 121 ms. A coordinator
+without the grant is refused at its first backoff, and its replica gives up waiting (-94).
+
+**Per-peer budgets, one request in flight, and memory per connection.** `serve-roster` accepts
+any coordinator on its roster (roles 9 and 8 in the driver) and learns from the handshake which one
+it is talking to.
+- **Budget:** each authenticated peer is served at most once in the listener's lifetime. A second
+  session from the same peer is closed before its request is read (-71), while another peer is
+  still served.
+- **One request in flight:** after reading a request, the listener waits up to 2 s for a second
+  frame. If one arrives, the peer is pipelining, and the session is closed without an answer (-72).
+- **Memory:** each connection's work runs inside an `arena-scope`, and only one encoded result
+  (peer and outcome) leaves it. The runtime reclaims a connection's vectors when it ends. Before
+  this, a third full handshake in one process exhausted the vector table
+  (`vector-table-exhausted`); with it, one process completes three full handshakes.
+
+Measured 2026-10-30 (podman, Linux arm64):
+
+| sessions | outcomes |
+|---|---|
+| coordinator 9, coordinator 9 again, coordinator 8 | `[1, -71, 1]`: served, over budget, served |
+| coordinator 8 pipelining, then coordinator 8 | `[-72, 1]`: refused unanswered, then served |
+
+Limits:
+- The wait costs every served request 2 s. The TCP wires have no readiness poll, and a large second
+  frame takes over 300 ms to arrive, because each 16 KiB chunk is one hex-encoded wire call. A
+  300 ms window missed it.
+- The budget is per listener process. No store is shared across processes or hosts.
+
+**Execute over a session.** The effect itself also travels over a session. The sink
+installs the certified fence. The coordinator then reserves a claim, and the claim's votes
+and commits are carried over sessions like the fence's. Finally the coordinator sends the
+claim to the sink as one execute request (kind 7). Its body holds the entry, certificate
+and command, each with a 4-byte length prefix, followed by the effect body.
+
+The sink takes all four only from the session; it has no files for them. It runs
+`hata.broker/execute` on exactly the bytes it received. That call re-verifies, right
+before dispatch:
+- the quorum certificate;
+- the C0 signatures and current policy;
+- the reservation;
+- the body commitment, through `payload-matches?` on the received body.
+
+Measured 2026-10-30 (podman, Linux arm64, amu `65359a09`):
+
+| execute request | sink's answer |
+|---|---|
+| a body other than the committed one (`hellp`) | 0; no object exists afterwards |
+| the committed body (`hello`), reply lost after the effect | the effect ran (1, the dropped reply); the coordinator's retry in a fresh session is answered 2 (already executed); the object exists once |
+| the same request again | 2; no second effect, and the object reads back |
+
+The keys in the driver are fixed public test values; a deployment takes ephemerals and
+KEM randomness from the host's entropy provider and identities from the roster. The CI
+arm64 lane runs it.
+
+Not yet: a readiness poll for backpressure without the 2 s wait, budgets shared across
+listener processes, and separate hosts.
+
 ## Verification and scope
 
 Run the exact source-locked gate on Linux x86_64 with the declared experimental
@@ -171,12 +409,35 @@ python3 lib/kotoba.hata/scripts/check-broker-native.py \
   --runner /absolute/path/candidate-runner.elf --output /new/private/evidence
 ```
 
+On Apple Silicon (JUN-593) the same gate runs with the Mac root compiler and a
+Mac packager whose `fs2-cli-stdio-general` runtime answers these wire-35 text
+requests (kotoba-lang/amu#1687):
+
+```sh
+python3 lib/kotoba.hata/scripts/check-broker-native.py \
+  --compiler /absolute/path/amu-full-root.macho --compiler-sha256 <sha256> \
+  --packager /absolute/path/kotoba-packager-root.macho --packager-sha256 <sha256> \
+  --output /new/private/evidence
+```
+
+There FD 3 is the output directory and each scope directory reaches the guest
+as `/<relative path>`; main's result is the exit status, compared modulo 256
+(Linux reads the full i64 `:result`). Measured 2026-10-29 on an M1 Max:
+`PASS_NATIVE_BROKER_QUORUM`, the same 97 guest calls in the same order as the
+Linux x86_64 CI evidence (run 40854047278), and all 96 results equal modulo
+256, including the non-durable-vote mutant (-17, exit 239). The fresh-read verdicts
+(`read_native`) are miscompiled on the Mac by the current Mac compiler
+(JUN-595: a multi-module compile reads a wrong vector element; the same code as
+one module is correct); until it is fixed they are qualified on Linux x86_64
+only.
+
 The Python observer stages explicit closed source files, hashes artifacts,
 launches Native processes and transports opaque bytes. Proposal construction,
 signing, certificate assembly, origin/authority checks, persistence decisions
 and semantic test verdicts execute in the Kotoba guest. PATH has no hosted
 language executable. The expected failure from a deliberately non-durable-vote
-mutation must be detected by the same Native no-equivocation verdict.
+mutation must be detected by the same Native no-equivocation verdict. A reader
+that ignores pending votes must be detected by the fresh-read verdict 3003.
 
 The fixture uses four separate private directories and fresh Native processes
 on one physical Linux host. It does not qualify independent-host crash domains,

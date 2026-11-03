@@ -1,0 +1,267 @@
+;; aiueos.session.live -- the session-process legs as a pure Kotoba guest
+;; (oracle namespace: aiueos.session.live, src/aiueos/session/live.cljk, blob
+;; 0a8279d6; the .cljk stays untouched as the oracle -- this is an addition).
+;;
+;; The oracle's legs run through aiueos.cloud-live and aiueos.provider.cloud
+;; from the session HTTP process. Those calls (live/outcome-of, live/with-clock,
+;; live/read-policy, provider/read-block!, provider/resolve-model!,
+;; provider/infer!) are HOST mechanism and stay host-side: this guest is
+;; standalone (no :require) and receives already-resolved values -- verdict,
+;; policy and model as :document, the leg outcome as a :keyword.
+;;
+;; ex-info -> :error mapping (no guest path throws; every failure is an :error
+;; status document with :ok 0 plus :why/:fault):
+;;   cloud_live.cljk:140/148 CertificateException (not-a-TLS-server, pin
+;;     refusal) -> host flattens into the verdict :aiueos.provider.cloud/error
+;;     fault field -> surfaced as :fault with :ok 0 (the host's outcome-of
+;;     decides "refused" vs "unmeasured"; :fault leads the doc when present)
+;;   provider/cloud.cljk:295/310/329 request faults (:body-unencodable,
+;;     :method-unsupported, json errors) -> carried in the verdict error field
+;;     -> surfaced as :fault; never thrown across the guest boundary
+;;   live.cljk:55-71 (nil? model) alias-did-not-resolve branch -> this guest's
+;;     own :error status doc: :ok 0, :outcome "unmeasured", :why (verbatim
+;;     oracle string), :alias, :via "session-process"
+;;   any absent verdict/policy field -> option-value-of default ("" / 0);
+;;     absence is never success and never a crash
+;;
+;; Bounds baked into this port (measured on the amu route):
+;;   max-parameters 5 (this guest: 2/4/4), :container-items 32 and the
+;;   document-map entry limit 32 (outputs are 10/14/17 entries), no regex
+;;   literals (positional scanning only), no throw/ex-info, count is never
+;;   applied to strings (string-length), mod spelled (- x (* n (quot x n)))
+;;   (unused here), i64 shifts literal-only [0,63] (unused here), if branches
+;;   same-typed, no forward refs (every helper precedes its first use),
+;;   document accessors return [:option ...] (double-wrap via option-value-of),
+;;   flags travel as i64 0/1.
+;;
+;; Conversion notes (the 7 rules; rules 3 and 4 are vacuous against live.cljk:
+;; it has no regex literal and no top-level defs):
+;;   - read-cid's 0-/1-arity collapses to one arity (guest defns are
+;;     single-arity): the host always passes the cid, "" for absent; the
+;;     (not-empty cid) default chain becomes
+;;     (if (> (string-length cid) 0) cid default-cid)
+;;   - `name` is NOT admitted on this amu ("name is not a builtin"), so the
+;;     outcome keyword spells its name through an if-chain (live/outcome-of
+;;     vocabulary: :admitted :refused :unmeasured; anything else falls to
+;;     "unmeasured") and verdict keyword fields arrive pre-named as strings
+;;   - (when (string? completion) ...) becomes the typed field read; the
+;;     oracle's nil snippet is this guest's "" and the 240-char truncation
+;;     stays positional (string-substring 0 240 + the oracle's "…"); note
+;;     string-length counts UTF-8 BYTES, so a truncated completion is 243
+;;     bytes (240 + the 3-byte ellipsis)
+;;   - oracle nil string/i64 fields surface as ""/0 document fields
+;;   - some->/or/merge/assoc become option gates, nested ifs and a
+;;     document-assoc chain (no vec/for/mapcat/cond->).
+;;
+;; main guards the entryless-library rejection on the kotoba -M route.
+;; test-* defns are exported; assertions are and-chains of equalities.
+
+(ns aiueos.session.live
+  (:export [read-cid infer main test-public-outcome test-read-cid test-infer]))
+
+;; --- field access (every accessor returns [:option ...]; double-wrap) --------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- field-str [d :document k :keyword] :string
+  (option-value-of [:option :string]
+    (document-string-value (dg d k))
+    ""))
+
+(defn- field-i64 [d :document k :keyword] :i64
+  (option-value-of [:option :i64]
+    (document-i64-value (dg d k))
+    0))
+
+(defn- outcome-name [o :keyword] :string
+  (if (= o :admitted)
+    "admitted"
+    (if (= o :refused)
+      "refused"
+      "unmeasured")))
+
+(defn- status-of [verdict :document] :string
+  (let [s (field-str verdict :aiueos.provider.cloud/status)]
+    (if (> (string-length s) 0)
+      s
+      (field-str verdict :aiueos.cloud/status))))
+
+(defn- snippet [completion :string] :string
+  (if (> (string-length completion) 240)
+    (string-concat (string-substring completion 0 240) "…")
+    completion))
+
+(defn- a-pow [acc :string k :i64] :string
+  (if (> k 0)
+    (a-pow (string-concat acc acc) (- k 1))
+    acc))
+
+;; --- public-outcome (oracle defn-, not exported) -----------------------------
+;; 10 output entries; :ok travels as i64 0/1, the :via literal is verbatim.
+
+(defn- public-outcome [verdict :document outcome :keyword] :document
+  (document-map
+   :ok (document-i64 (if (= outcome :admitted) 1 0))
+   :outcome (document-string (outcome-name outcome))
+   :status (document-string (status-of verdict))
+   :reason (document-string (field-str verdict :aiueos.cloud/reason))
+   :fault (document-string (field-str verdict :aiueos.provider.cloud/error))
+   :host (document-string (field-str verdict :aiueos.provider.cloud/peer-host))
+   :peer_spki (document-string (field-str verdict :aiueos.provider.cloud/peer-spki))
+   :byte_count (document-i64 (field-i64 verdict :aiueos.provider.cloud/byte-count))
+   :digest (document-string (field-str verdict :aiueos.cloud/digest))
+   :via (document-string "session-process")))
+
+;; --- read-cid ---------------------------------------------------------------
+;; GET a CID from kotobase.net through the session process. The host does the
+;; block read; the guest owns cid-default + URL assembly. 14 output entries.
+
+(defn read-cid [cid :string policy :document verdict :document outcome :keyword] :document
+  (let [default-cid (field-str policy :aiueos.cloud-live/read-cid)
+        chosen (if (> (string-length cid) 0) cid default-cid)
+        origin (field-str policy :aiueos.cloud/storage-origin)
+        pub (public-outcome verdict outcome)
+        p1 (document-assoc pub :leg (document-string "storage-read"))
+        p2 (document-assoc p1 :cid (document-string chosen))
+        p3 (document-assoc p2 :origin (document-string origin))]
+    (document-assoc p3 :url
+                    (document-string (string-concat origin (string-concat "/ipfs/" chosen))))))
+
+;; --- infer ------------------------------------------------------------------
+;; Resolve murakumo-main and POST a completion through the session process.
+;; The host resolves the alias and does the request; the guest owns the
+;; alias-unresolved decision + the completion snippet. Absent model -- a
+;; :null kind or a zero-entry document -- is the oracle's (nil? model)
+;; branch -> the guest's :error status doc (6 entries); the happy path is
+;; 17 entries.
+;;
+;; Rule-mapping refinement recorded during amu check/test verification
+;; (2026-11-01, this amu, probes p1-p6 in the verification log): the landed
+;; "document-count = 0" absence idiom alone is NOT nil-safe -- document-count
+;; requires a container and traps document-container-required on the null a
+;; host sends for (nil? model), on every target. document-kind IS admitted
+;; and answers :null/:map, so model-absent? reads the kind first and only
+;; counts real maps. No rule mapping was dropped or weakened; the oracle's
+;; (nil? model) branch is now reachable exactly as the oracle spells it.
+
+(defn- model-absent? [m :document] :bool
+  (if (= :map (document-kind m))
+    (= 0 (document-count m))
+    true))
+
+(defn infer [policy :document model :document verdict :document outcome :keyword] :document
+  (if (model-absent? model)
+    (document-map
+     :ok (document-i64 0)
+     :outcome (document-string "unmeasured")
+     :leg (document-string "inference")
+     :why (document-string "the alias did not resolve, so there was no admitted endpoint to ask")
+     :alias (document-string (field-str policy :aiueos.cloud/model-alias))
+     :via (document-string "session-process"))
+    (let [pub (public-outcome verdict outcome)
+          a1 (document-assoc pub :leg (document-string "inference"))
+          a2 (document-assoc a1 :alias (document-string (field-str policy :aiueos.cloud/model-alias)))
+          a3 (document-assoc a2 :endpoint (document-string (field-str model :endpoint)))
+          a4 (document-assoc a3 :response_shape (document-string (field-str verdict :aiueos.cloud/response-shape)))
+          a5 (document-assoc a4 :completion_chars (document-i64 (field-i64 verdict :aiueos.cloud/completion-chars)))
+          a6 (document-assoc a5 :stop_reason (document-string (field-str verdict :aiueos.cloud/stop-reason)))
+          a7 (document-assoc a6 :completion
+                             (document-string (snippet (field-str verdict :aiueos.cloud/completion))))]
+      a7)))
+
+(defn main [] :i64 0)
+
+;; --- tests (exported; and-chains of equalities) ------------------------------
+
+(defn test-public-outcome [] :bool
+  (let [v (document-map
+           :aiueos.provider.cloud/status (document-string "accepted")
+           :aiueos.provider.cloud/peer-host (document-string "api.murakumo.cloud")
+           :aiueos.provider.cloud/peer-spki (document-string "spki-1")
+           :aiueos.provider.cloud/byte-count (document-i64 42)
+           :aiueos.cloud/digest (document-string "sha256-1"))
+        pub (public-outcome v :admitted)
+        v2 (document-map :aiueos.provider.cloud/error (document-string "pin-mismatch"))
+        pub2 (public-outcome v2 :refused)
+        v3 (document-map :aiueos.cloud/status (document-string "ping-ok"))
+        pub3 (public-outcome v3 :unmeasured)]
+    (and (= 1 (field-i64 pub :ok))
+         (string=? "admitted" (field-str pub :outcome))
+         (string=? "accepted" (field-str pub :status))
+         (string=? "api.murakumo.cloud" (field-str pub :host))
+         (string=? "spki-1" (field-str pub :peer_spki))
+         (= 42 (field-i64 pub :byte_count))
+         (string=? "sha256-1" (field-str pub :digest))
+         (string=? "session-process" (field-str pub :via))
+         (= 0 (field-i64 pub2 :ok))
+         (string=? "refused" (field-str pub2 :outcome))
+         (string=? "pin-mismatch" (field-str pub2 :fault))
+         (string=? "ping-ok" (field-str pub3 :status))
+         (= 0 (field-i64 pub3 :ok)))))
+
+(defn test-read-cid [] :bool
+  (let [policy (document-map
+                :aiueos.cloud-live/read-cid (document-string "QmDefault")
+                :aiueos.cloud/storage-origin (document-string "https://kotobase.net"))
+        v (document-map :aiueos.provider.cloud/status (document-string "accepted"))
+        r1 (read-cid "" policy v :admitted)
+        r2 (read-cid "QmX" policy v :admitted)]
+    (and (string=? "QmDefault" (field-str r1 :cid))
+         (string=? "https://kotobase.net/ipfs/QmDefault" (field-str r1 :url))
+         (string=? "storage-read" (field-str r1 :leg))
+         (string=? "https://kotobase.net" (field-str r1 :origin))
+         (string=? "accepted" (field-str r1 :status))
+         (string=? "QmX" (field-str r2 :cid))
+         (string=? "https://kotobase.net/ipfs/QmX" (field-str r2 :url)))))
+
+(defn test-infer [] :bool
+  (let [policy (document-map :aiueos.cloud/model-alias (document-string "murakumo-main"))
+        v0 (document-map :aiueos.provider.cloud/status (document-string "accepted"))
+        absent (infer policy (document-null) v0 :unmeasured)
+        absent2 (infer policy (document-map) v0 :unmeasured)
+        model (document-map :endpoint (document-string "https://infer.murakumo.cloud"))
+        p256 (a-pow "a" 8)
+        p128 (a-pow "a" 7)
+        p64 (a-pow "a" 6)
+        p32 (a-pow "a" 5)
+        p16 (a-pow "a" 4)
+        p8 (a-pow "a" 3)
+        p4 (a-pow "a" 2)
+        c100 (string-concat (string-concat p64 p32) p4)
+        c240 (string-concat (string-concat p128 p64) (string-concat p32 p16))
+        c300 (string-concat (string-concat p256 p32) (string-concat p8 p4))
+        v300 (document-map
+              :aiueos.cloud/completion (document-string c300)
+              :aiueos.cloud/completion-chars (document-i64 300)
+              :aiueos.cloud/stop-reason (document-string "stop")
+              :aiueos.cloud/response-shape (document-string "text"))
+        v100 (document-map :aiueos.cloud/completion (document-string c100))
+        r300 (infer policy model v300 :admitted)
+        r100 (infer policy model v100 :admitted)]
+    (and (= 0 (field-i64 absent :ok))
+         (string=? "unmeasured" (field-str absent :outcome))
+         (string=? "inference" (field-str absent :leg))
+         (string=? "the alias did not resolve, so there was no admitted endpoint to ask"
+                   (field-str absent :why))
+         (string=? "murakumo-main" (field-str absent :alias))
+         (string=? "session-process" (field-str absent :via))
+         (= 0 (field-i64 absent2 :ok))
+         (string=? "unmeasured" (field-str absent2 :outcome))
+         (string=? "inference" (field-str absent2 :leg))
+         (string=? "the alias did not resolve, so there was no admitted endpoint to ask"
+                   (field-str absent2 :why))
+         (string=? "murakumo-main" (field-str absent2 :alias))
+         (string=? "session-process" (field-str absent2 :via))
+         (= 243 (string-length (field-str r300 :completion)))
+         (string=? c240 (string-substring (field-str r300 :completion) 0 240))
+         (string=? "…" (string-substring (field-str r300 :completion) 240 243))
+         (string=? c100 (field-str r100 :completion))
+         (= 100 (string-length (field-str r100 :completion)))
+         (string=? "inference" (field-str r300 :leg))
+         (string=? "https://infer.murakumo.cloud" (field-str r300 :endpoint))
+         (string=? "text" (field-str r300 :response_shape))
+         (= 300 (field-i64 r300 :completion_chars))
+         (string=? "stop" (field-str r300 :stop_reason))
+         (string=? "admitted" (field-str r300 :outcome))
+         (= 1 (field-i64 r300 :ok)))))

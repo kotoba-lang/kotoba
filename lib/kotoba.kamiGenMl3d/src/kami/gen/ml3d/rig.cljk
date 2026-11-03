@@ -1,0 +1,365 @@
+(ns kami.gen.ml3d.rig
+  "First-pass heuristic auto-rig: a downloaded mesh (arbitrary glTF/GLB, e.g.
+  TRELLIS/Hunyuan3D-2 output -- or, in this dev environment, only ever this
+  repo's own synthetic fixture, `kami.gen.ml3d.fixture`) -> a synthesized VRM
+  humanoid skeleton (via `kotoba-lang/skeleton`'s Bone/Skeleton/pose-eval) ->
+  nearest-bone vertex skin weights -> a real VRM GLB export (via
+  `kotoba-lang/vrm`'s vrm-types/gltf-types/glb/export).
+
+  ADR-2607051120 is explicit that auto-rigging an arbitrary generated mesh to
+  a valid VRM humanoid is genuinely unsolved elsewhere in this org -- this is
+  new, nontrivial code, not glue between two libraries that already do this.
+  It is also explicit that this heuristic has **not been validated against
+  real TRELLIS/Hunyuan3D-2 output**, because no live backend exists in this
+  dev environment to generate one (see README). What IS tested here: this
+  module correctly synthesizes a *plausible* humanoid skeleton from *some*
+  mesh's bounding box, attaches real (if crude) nearest-bone skin weights,
+  and the result round-trips through `vrm.parse/parse-vrm` and
+  `vrm.humanoid/to-kami-skeleton` -- i.e. the VRM/glTF plumbing is genuinely
+  correct, even though the *rigging quality* on a real photoreal-mesh TRELLIS
+  output is unverified.
+
+  Design note on `vrm.compose` (not used here): `vrm.compose/compose` merges
+  multiple ALREADY-humanoid-rigged VRM parts that share one scene (e.g. swap
+  hair while keeping the body's skeleton -- see `kami-gen-procedural`'s use of
+  it, ADR-2607051100). Its skin-rebuild phase only *rebuilds* a skin that
+  already exists on the `:skeleton-base` source; it has no path for
+  synthesizing a brand new skin/skeleton for a raw, skinless input mesh with
+  no existing `:humanoid` mapping, which is exactly this module's job. So
+  this module assembles the `VrmDocument` directly (`vrm.vrm-types` +
+  `vrm.gltf-types`) and calls `vrm.export/export-glb` on it -- the same GLB
+  writer `compose`'s own output goes through, just without driving it through
+  `compose`'s part-merge machinery, which doesn't fit this shape of problem."
+  (:require [kotoba.io :as kio] [skeleton :as sk]
+            [kotoba.lang.text :as str]
+            [skeleton.math :as skm]
+            [vrm.vrm-types :as vt]
+            [vrm.gltf-types :as gt]
+            [vrm.glb :as glb]
+            [vrm.json :as json]
+            [vrm.convert :as convert]
+            [vrm.parse :as parse]
+            [vrm.export :as export])
+  (:import [java.nio ByteBuffer ByteOrder]))
+
+;; ── byte helpers (mirrors kami.gen.ml3d.fixture's; both need to WRITE raw
+;;    little-endian glTF binary data, `vrm.convert` only READS it) ──────────
+
+(defn- bytes->byte-ints [^bytes bs] (vec (map #(bit-and (int %) 0xFF) bs)))
+
+(defn- le [n fill]
+  (let [bb (doto (ByteBuffer/allocate n) (.order ByteOrder/LITTLE_ENDIAN))]
+    (fill bb)
+    (bytes->byte-ints (.array bb))))
+
+(defn- f32le [x] (le 4 (fn [^ByteBuffer bb] (.putFloat bb (float x)))))
+(defn- u16le [x] (le 2 (fn [^ByteBuffer bb] (.putShort bb (short x)))))
+(defn- pad4 [n] (mod (- 4 (mod n 4)) 4))
+
+;; ── read an arbitrary (non-VRM) GLB ─────────────────────────────────────
+;; `vrm.parse/parse-vrm` requires a VRMC_vrm/VRM extension -- a raw TRELLIS/
+;; Hunyuan3D-2-shaped mesh (or our fixture) won't have one, it's not a VRM
+;; yet. So we parse the GLB container + glTF JSON ourselves (`vrm.glb` +
+;; `vrm.json`, the same layer `vrm.parse` itself is built on) into the plain
+;; `{:gltf :bin}` shape `vrm.convert/read-accessor-f32` needs (it only reads
+;; those two keys, so a non-VRM doc works with it as-is).
+
+(defn read-glb-doc
+  [path]
+  (let [raw (bytes->byte-ints (kio/read-all-bytes path))
+        chunks (glb/parse-glb raw)
+        gltf (gt/gltf-document (json/parse (glb/byte-seq->string (:json chunks))))
+        bin (vec (or (:bin chunks) []))]
+    {:gltf gltf :bin bin}))
+
+(defn mesh-node-index
+  [gltf]
+  (or (some (fn [[i n]] (when (:mesh n) i)) (map-indexed vector (:nodes gltf)))
+      (throw (ex-info "kami.gen.ml3d.rig: no mesh-bearing node in input glTF" {}))))
+
+(defn bounding-box
+  "`{:min [x y z] :max [x y z]}` of the first mesh-bearing node's primitive-0
+  POSITION accessor."
+  [{:keys [gltf] :as doc}]
+  (let [ni (mesh-node-index gltf)
+        mesh-idx (get-in gltf [:nodes ni :mesh])
+        pos-acc-idx (get-in gltf [:meshes mesh-idx :primitives 0 :attributes :POSITION])
+        _ (when-not pos-acc-idx
+            (throw (ex-info "kami.gen.ml3d.rig: mesh primitive has no POSITION attribute" {})))
+        flat (convert/read-accessor-f32 doc pos-acc-idx)
+        n (long (/ (count flat) 3))
+        xs (for [i (range n)] (nth flat (* i 3)))
+        ys (for [i (range n)] (nth flat (+ (* i 3) 1)))
+        zs (for [i (range n)] (nth flat (+ (* i 3) 2)))]
+    {:min [(apply min xs) (apply min ys) (apply min zs)]
+     :max [(apply max xs) (apply max ys) (apply max zs)]}))
+
+;; ── heuristic humanoid bone plan ─────────────────────────────────────────
+;; [wire-name parent-wire-name height-frac x-frac z-frac]. `height-frac` in
+;; [0,1] of the bbox Y-extent (0 = bottom/feet, 1 = top/head-crown).
+;; `x-frac`/`z-frac` are fractions of the bbox half-width/half-depth from its
+;; center (+x = one side, -x = the other -- "left"/"right" is a naming
+;; convention call here, not verified against the mesh's actual facing
+;; direction, since a raw generated mesh carries no such metadata). These are
+;; rough humanoid defaults (Vitruvian-ish proportions), not derived from the
+;; mesh's actual silhouette beyond its overall bounding box -- a genuine
+;; first-pass heuristic, not a solved auto-rig (ADR-2607051120, README).
+(def bone-plan
+  [["hips"          nil              0.50  0.00 0.0]
+   ["spine"         "hips"           0.60  0.00 0.0]
+   ["chest"         "spine"          0.70  0.00 0.0]
+   ["neck"          "chest"          0.85  0.00 0.0]
+   ["head"          "neck"           0.92  0.00 0.0]
+   ["leftShoulder"  "chest"          0.80  0.15 0.0]
+   ["leftUpperArm"  "leftShoulder"   0.80  0.50 0.0]
+   ["leftLowerArm"  "leftUpperArm"   0.55  0.50 0.0]
+   ["leftHand"      "leftLowerArm"   0.30  0.50 0.0]
+   ["rightShoulder" "chest"          0.80 -0.15 0.0]
+   ["rightUpperArm" "rightShoulder"  0.80 -0.50 0.0]
+   ["rightLowerArm" "rightUpperArm"  0.55 -0.50 0.0]
+   ["rightHand"     "rightLowerArm"  0.30 -0.50 0.0]
+   ["leftUpperLeg"  "hips"           0.50  0.15 0.0]
+   ["leftLowerLeg"  "leftUpperLeg"   0.28  0.15 0.0]
+   ["leftFoot"      "leftLowerLeg"   0.05  0.15 0.0]
+   ["rightUpperLeg" "hips"           0.50 -0.15 0.0]
+   ["rightLowerLeg" "rightUpperLeg"  0.28 -0.15 0.0]
+   ["rightFoot"     "rightLowerLeg"  0.05 -0.15 0.0]])
+
+;; ADR-0048 §2 -- a second, deliberately-different bone plan used ONLY as a
+;; mock stand-in for "what a different auto-rigger (UniRig) might produce",
+;; NOT derived from any real UniRig output (no live backend exists in this
+;; dev environment -- see kami.gen.ml3d's namespace docstring). Adds the
+;; optional `upperChest` bone (VRM 1.0 spec, `vrm.vrm-types/human-bone-table`)
+;; between chest/neck, giving `kami.gen.ml3d/generate-from-image-with-rig-
+;; choice`'s ensemble comparison a genuinely different bone count/set to
+;; report on when run against this module's own default `bone-plan`, instead
+;; of two calls into the same code producing byte-identical output.
+(def unirig-mock-bone-plan
+  (vec (concat (take 3 bone-plan) ; hips spine chest
+               [["upperChest" "chest" 0.78 0.00 0.0]]
+               [(assoc (nth bone-plan 3) 1 "upperChest")] ; neck, reparented
+               (drop 4 bone-plan))))
+
+(defn- world-position [bbox [_ _ hfrac xfrac zfrac]]
+  (let [[minx miny minz] (:min bbox) [maxx maxy maxz] (:max bbox)
+        cx (/ (+ minx maxx) 2.0) cz (/ (+ minz maxz) 2.0)
+        halfw (max 1e-6 (/ (- maxx minx) 2.0))
+        halfd (max 1e-6 (/ (- maxz minz) 2.0))
+        height (max 1e-6 (- maxy miny))]
+    [(+ cx (* xfrac halfw)) (+ miny (* hfrac height)) (+ cz (* zfrac halfd))]))
+
+(defn build-skeleton
+  "bbox (+ optional bone `plan`, default `bone-plan`) -> `{:sk <skeleton.cljc
+  Skeleton> :names [wire-name ...] :name->index {...}}`. Bones carry identity
+  rotation/unit scale throughout -- this heuristic only ever places joints,
+  it never orients them -- which lets the inverse-bind-matrix step below skip
+  a general Mat4 inverse (see `inverse-bind-of`).
+
+  `plan` is parameterized (ADR-0048 §2) so callers can synthesize an
+  alternate-but-equally-plausible skeleton from the same bbox heuristic --
+  used by `kami.gen.ml3d`'s UniRig mock to produce a structurally different
+  rig (different bone count/set) than this module's own default plan,
+  without a second hand-rolled VRM assembler."
+  ([bbox] (build-skeleton bbox bone-plan))
+  ([bbox plan]
+   (let [names (mapv first plan)
+         name->index (into {} (map-indexed (fn [i n] [n i]) names))
+         worlds (mapv #(world-position bbox %) plan)
+         bones (mapv (fn [i [_name parent _h _x _z]]
+                        (let [w (nth worlds i)
+                              local (if parent (skm/vec3- w (nth worlds (name->index parent))) w)]
+                          (sk/bone {:name (nth names i)
+                                    :parent (when parent (name->index parent))
+                                    :local-position local
+                                    :local-rotation skm/quat-identity
+                                    :local-scale skm/vec3-one})))
+                      (range (count plan)) plan)]
+     {:sk (sk/skeleton bones) :names names :name->index name->index})))
+
+(defn bone-world-positions
+  "World translations of every bone in `sk`'s rest pose -- via
+  `skeleton/evaluate` itself (an animation clip with no tracks IS the rest
+  pose), not hand-rolled parent-chaining, so this genuinely exercises
+  `kotoba-lang/skeleton`'s own pose evaluator rather than just its Bone
+  struct constructor."
+  [sk]
+  (let [rest-clip (sk/animation-clip {:name "rest" :duration 0.0 :tracks [] :looping false})
+        world (sk/evaluate sk rest-clip 0.0)]
+    (mapv skm/mat4-translation world)))
+
+(defn- inverse-bind-of
+  "Every synthesized bone has identity rotation / unit scale (`build-
+  skeleton`), so its rest-pose world matrix is a pure translation and its
+  inverse is just the negated translation -- correct here, NOT a general Mat4
+  inverse (this heuristic never needs one, since it never rotates a bone)."
+  [[tx ty tz]]
+  (assoc skm/mat4-identity 12 (- tx) 13 (- ty) 14 (- tz)))
+
+;; ── nearest-bone vertex skin weights (real, if crude, first-pass skinning)──
+
+(defn- nearest-two [bone-world-pos vpos]
+  (let [dists (map-indexed (fn [i wp] [i (skm/vec3-length (skm/vec3- wp vpos))]) bone-world-pos)
+        [[i1 d1] [i2 d2]] (take 2 (sort-by second dists))
+        w1 (/ 1.0 (max 1e-6 d1))
+        w2 (/ 1.0 (max 1e-6 d2))
+        total (+ w1 w2)]
+    {:joints [i1 i2 0 0] :weights [(/ w1 total) (/ w2 total) 0.0 0.0]}))
+
+(defn skin-weights
+  "Per vertex, a 2-bone weighted blend toward its 2 nearest bone rest-pose
+  joints (point distance, not bone segments/capsules -- the crude part of
+  'first-pass')."
+  [bone-world-pos vertices]
+  (mapv #(nearest-two bone-world-pos %) vertices))
+
+;; ── assemble the VRM GLB ─────────────────────────────────────────────────
+
+(defn- bones->gltf-nodes
+  [sk]
+  (let [bones (:bones sk)
+        n (count bones)
+        children (reduce (fn [acc [i b]]
+                            (if-let [p (:parent b)] (update acc p (fnil conj []) i) acc))
+                          {} (map-indexed vector bones))]
+    (mapv (fn [i b]
+            {:name (:name b) :translation (:local-position b)
+             :rotation (:local-rotation b) :scale (:local-scale b)
+             :children (vec (get children i []))})
+          (range n) bones)))
+
+(defn- append-block
+  "Append `bytes` to `bin`, 4-byte-pad afterwards (glTF bufferView alignment
+  convention). Returns `{:bin :byte-offset :byte-length}` -- offset/length of
+  the block itself, i.e. before the trailing pad."
+  [bin bytes]
+  (let [start (count bin)
+        bin' (into bin bytes)
+        pad (pad4 (count bin'))]
+    {:bin (into bin' (repeat pad 0)) :byte-offset start :byte-length (count bytes)}))
+
+(defn auto-rig-glb
+  "`mesh-path` (a plain, non-VRM GLB) -> VRM GLB bytes (byte-int vector),
+  auto-rigged to a heuristic VRM humanoid skeleton. See namespace docstring
+  for what is and isn't validated here.
+
+  Optional 2-arity form takes a `plan` (same shape as `bone-plan`) -- ADR-0048
+  §2, used by `kami.gen.ml3d`'s UniRig mock to synthesize a structurally
+  different rig from the same mesh, so the ensemble comparison path has two
+  genuinely different skeletons to report on, not two calls into the same
+  code producing byte-identical output."
+  ([mesh-path] (auto-rig-glb mesh-path bone-plan))
+  ([mesh-path plan]
+  (let [{:keys [gltf bin] :as doc} (read-glb-doc mesh-path)
+        ni (mesh-node-index gltf)
+        mesh-idx (get-in gltf [:nodes ni :mesh])
+        pos-acc-idx (get-in gltf [:meshes mesh-idx :primitives 0 :attributes :POSITION])
+        flat (convert/read-accessor-f32 doc pos-acc-idx)
+        vcount (long (/ (count flat) 3))
+        vertices (mapv (fn [i] [(nth flat (* i 3)) (nth flat (+ (* i 3) 1)) (nth flat (+ (* i 3) 2))])
+                       (range vcount))
+        bbox (bounding-box doc)
+        {:keys [sk names name->index]} (build-skeleton bbox plan)
+        num-bones (count names)
+        world-pos (bone-world-positions sk)
+        base-node-count (count (:nodes gltf))
+        base-acc-count (count (:accessors gltf))
+        base-bv-count (count (:bufferViews gltf))
+        bone-nodes (bones->gltf-nodes sk)
+        hips-final-idx (+ base-node-count (name->index "hips"))
+
+        ibm-bytes (vec (mapcat (fn [wp] (mapcat f32le (inverse-bind-of wp))) world-pos))
+        weights (skin-weights world-pos vertices)
+        joints-bytes (vec (mapcat (fn [w] (mapcat u16le (:joints w))) weights))
+        weights-bytes (vec (mapcat (fn [w] (mapcat f32le (:weights w))) weights))
+
+        {bin1 :bin ibm-off :byte-offset ibm-len :byte-length} (append-block bin ibm-bytes)
+        {bin2 :bin joints-off :byte-offset joints-len :byte-length} (append-block bin1 joints-bytes)
+        {bin3 :bin weights-off :byte-offset weights-len :byte-length} (append-block bin2 weights-bytes)
+
+        ibm-acc-idx base-acc-count
+        joints-acc-idx (inc base-acc-count)
+        weights-acc-idx (+ base-acc-count 2)
+        ibm-acc {:bufferView base-bv-count :componentType gt/component-type-float :count num-bones :type "MAT4"}
+        joints-acc {:bufferView (inc base-bv-count) :componentType gt/component-type-unsigned-short
+                    :count vcount :type "VEC4"}
+        weights-acc {:bufferView (+ base-bv-count 2) :componentType gt/component-type-float
+                     :count vcount :type "VEC4"}
+        ibm-bv {:buffer 0 :byteOffset ibm-off :byteLength ibm-len}
+        joints-bv {:buffer 0 :byteOffset joints-off :byteLength joints-len :target gt/buffer-target-array-buffer}
+        weights-bv {:buffer 0 :byteOffset weights-off :byteLength weights-len :target gt/buffer-target-array-buffer}
+
+        updated-meshes (update-in (:meshes gltf) [mesh-idx :primitives 0 :attributes]
+                                   assoc :JOINTS_0 joints-acc-idx :WEIGHTS_0 weights-acc-idx)
+        updated-nodes (into (update (:nodes gltf) ni assoc :skin 0) bone-nodes)
+        skin {:joints (vec (range base-node-count (+ base-node-count num-bones)))
+              :inverseBindMatrices ibm-acc-idx
+              :skeleton hips-final-idx}
+
+        final-gltf
+        (gt/gltf-document
+         {:asset (gt/asset {:generator "kami-gen-ml3d auto-rig (heuristic first pass, see README)"})
+          :scene 0
+          :scenes [{:nodes (vec (distinct (conj (get-in gltf [:scenes 0 :nodes] [ni]) hips-final-idx)))}]
+          :nodes updated-nodes
+          :meshes updated-meshes
+          :accessors (into (:accessors gltf) [ibm-acc joints-acc weights-acc])
+          :bufferViews (into (:bufferViews gltf) [ibm-bv joints-bv weights-bv])
+          :buffers [{:byteLength (count bin3)}]
+          :materials (:materials gltf)
+          :textures (:textures gltf)
+          :images (:images gltf)
+          :samplers (:samplers gltf)
+          :skins [skin]
+          :animations []})
+
+        human-bones (vec (keep (fn [[i nm]]
+                                  (when-let [bone-kw (vt/str->human-bone-name nm)]
+                                    (vt/vrm-human-bone bone-kw (+ base-node-count i))))
+                                (map-indexed vector names)))
+
+        vrm-doc (vt/vrm-document
+                 {:gltf final-gltf
+                  :bin bin3
+                  :version :v1-0
+                  :meta (vt/vrm-meta
+                         {:name "kami-gen-ml3d auto-rig (heuristic — NOT verified against real TRELLIS/Hunyuan3D-2 output, see README)"
+                          :authors ["kotoba-lang/kami-gen-ml3d"]})
+                  :humanoid (vt/vrm-humanoid human-bones)})]
+    (export/export-glb vrm-doc))))
+
+(defn write-vrm-file!
+  "Write VRM GLB `bytes` (byte-int vector) to a fresh temp `.vrm` file,
+  returning its path."
+  [bytes]
+  (let [path (kio/temp-file "kami-gen-ml3d-" ".vrm")]
+    (kio/write-bytes path (byte-array (map unchecked-byte bytes)))
+    (str path)))
+
+(defn- cli-opts [args]
+  (loop [xs args out {}]
+    (if (empty? xs)
+      out
+      (let [[flag value & more] xs]
+        (when-not (and (str/starts-with? (str flag) "--") value)
+          (throw (ex-info "usage: --input mesh.glb --output avatar.vrm [--image ref] [--asset-dir dir]" {})))
+        (recur more (assoc out (keyword (subs flag 2)) value))))))
+
+(defn convert-file!
+  "Convert one raw humanoid-shaped GLB with the documented bbox heuristic,
+   then parse the emitted bytes again so a malformed/non-VRM output never
+   crosses the process boundary. Returns the output path."
+  [input output]
+  (when (or (str/blank? input) (str/blank? output))
+    (throw (ex-info "--input and --output are required" {})))
+  (let [bytes (auto-rig-glb input)
+        parsed (parse/parse-vrm bytes)]
+    (when (< (count (get-in parsed [:humanoid :human-bones])) 15)
+      (throw (ex-info "generated VRM lacks required humanoid mapping" {})))
+    (kio/write-bytes output
+                 (byte-array (map unchecked-byte bytes))
+                 [:create :truncate-existing :write])
+    output))
+
+(defn -main [& args]
+  (let [{:keys [input output]} (cli-opts args)]
+    (println (convert-file! input output))))

@@ -84,6 +84,7 @@ extern int64_t kotoba_aiueos_device_worker_canonical(
     uint8_t *ctx, uint64_t ctx_len, uint8_t *out, uint64_t out_cap);
 
 int aiueos_cpu_random_bytes(uint8_t *out, uint32_t bytes);
+void aiueos_device_worker_identity_refresh(void);
 uint32_t aiueos_device_result_http_request(
     const struct aiueos_device_result *result, uint8_t *out, uint32_t capacity,
     char *did_out, uint32_t did_capacity);

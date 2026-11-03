@@ -1,0 +1,225 @@
+(ns kami.gen.ml3d-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [cloud-murakumo.worker :as worker]
+            [kami.gen.ml3d :as ml3d]
+            [kami.gen.ml3d.rig :as rig]
+            [kami.gen.ml3d.fixture :as fixture]
+            [vrm :as vrm]
+            [vrm.glb :as glb]))
+
+(deftest postprocessor-converts-raw-glb-to-parseable-vrm
+  (let [input (fixture/write-glb-file!)
+        output (str (kio/temp-file "kami-postprocess-" ".vrm"))]
+    (is (= output (rig/convert-file! input output)))
+    (let [bytes (vec (map #(bit-and (int %) 255) (kio/read-all-bytes output)))
+          document (vrm/parse-vrm bytes)]
+      (is (= :v1-0 (:version document)))
+      (is (>= (count (get-in document [:humanoid :human-bones])) 15)))))
+
+(deftest model3d-fn-matches-cloud-murakumo-spec
+  (testing "the real :model3d function from cloud-murakumo's murakumo.edn, not a copy"
+    (let [f (ml3d/model3d-fn)]
+      (is (= :model3d (:fn/id f)))
+      (is (= :gen (:fn/kind f)))
+      (is (= :trellis (:fn/engine f)))
+      (is (= :3d (:fn/modality f)))
+      (is (= :a100-80 (:gpu/class f)))
+      (is (= #{"trellis" "hunyuan3d-2.1"} (set (keys (get-in f [:gen :models])))))
+      (is (= "trellis" (get-in f [:gen :default])))
+      (is (= [:gltf :glb] (get-in f [:gen :out]))))))
+
+(deftest build-job-normalizes-per-cloud-murakumo-gen
+  (let [job (ml3d/build-job {:model "trellis" :prompt nil :refs ["/tmp/ref.png"] :params {}}
+                            {:account "test/demo"})]
+    (is (= :3d (:gen.job/modality job)))
+    (is (= :trellis (:gen.job/engine job)))
+    (is (= :model3d (:gen.job/fn job)))
+    (is (= "trellis" (:gen.job/model job)))
+    (is (= :queued (:gen.job/status job)))
+    (is (= ["/tmp/ref.png"] (get-in job [:gen.job/input :refs])))))
+
+(deftest build-job-rejects-unknown-model
+  (testing "unsupported model throws -- no silent fallback (cloud-murakumo.gen/resolve-model contract)"
+    (is (thrown? kerror/ExceptionInfo
+                 (ml3d/build-job {:model "dall-e" :refs ["/tmp/ref.png"]} {:account "test"})))))
+
+(deftest mock-execute-returns-fixture-glb
+  (let [{:keys [outputs gpu-seconds]} (ml3d/mock-execute {:via :proc :backend {:runtime "TRELLIS"}})]
+    (is (= 1 (count outputs)))
+    (is (io/exists? (io/file (first outputs))))
+    (is (pos? gpu-seconds))
+    ;; structurally valid GLB (parses without throwing)
+    (let [raw (vec (map #(bit-and (int %) 0xFF) (.readAllBytes (io/input-stream (first outputs)))))]
+      (is (map? (glb/parse-glb raw))))))
+
+(deftest real-execute-fails-closed-without-backend
+  (testing "matches cloud-murakumo's own default-execute fail-closed contract, through this wrapper"
+    (with-redefs [worker/getenv (fn [_] nil)]
+      (is (thrown-with-msg? kerror/ExceptionInfo
+                            #"no live cloud-murakumo backend configured"
+                            (ml3d/real-execute {:via :proc :backend {:runtime "TRELLIS"}}))))))
+
+(defn- approx= [a b] (every? true? (map (fn [x y] (< (Math/abs (- (double x) (double y))) 1e-4)) a b)))
+
+(deftest rig-bounding-box-matches-fixture
+  (testing "float32 round-trip through the GLB binary chunk -- approx-equal, not exact"
+    (let [doc (rig/read-glb-doc (fixture/write-glb-file!))
+          bbox (rig/bounding-box doc)]
+      (is (approx= fixture/box-min (:min bbox)))
+      (is (approx= fixture/box-max (:max bbox))))))
+
+(deftest rig-build-skeleton-shape
+  (let [bbox {:min [-0.3 0.0 -0.2] :max [0.3 1.8 0.2]}
+        {:keys [sk names name->index]} (rig/build-skeleton bbox)]
+    (is (= 19 (count names)))
+    (is (= 0 (name->index "hips")))
+    (is (nil? (:parent (first (:bones sk)))))
+    (is (every? some? (map :parent (rest (:bones sk)))))))
+
+(deftest auto-rig-glb-round-trips-through-vrm-parse
+  (testing "the exported VRM GLB is a real, valid VRM 1.0 file per kotoba-lang/vrm's own parser"
+    (let [mesh-path (fixture/write-glb-file!)
+          vrm-bytes (rig/auto-rig-glb mesh-path)
+          doc (vrm/parse-vrm vrm-bytes)]
+      (is (= :v1-0 (:version doc)))
+      (is (= 19 (count (:human-bones (:humanoid doc)))))
+      (testing "vrm.humanoid/to-kami-skeleton re-reads the same skin/skeleton we wrote"
+        (let [sk (vrm/to-kami-skeleton doc)]
+          (is (= 19 (count (:bones sk))))
+          (is (= "hips" (:name (first (:bones sk)))))))
+      (testing "mesh primitive carries real skin weight attributes"
+        (let [prim (get-in doc [:gltf :meshes 0 :primitives 0])]
+          (is (contains? (:attributes prim) :JOINTS_0))
+          (is (contains? (:attributes prim) :WEIGHTS_0)))))))
+
+(deftest generate-from-image-end-to-end-against-mock-executor
+  (testing "full pipeline: job -> run -> mesh -> auto-rig -> asset, all against the mock executor"
+    (let [result (ml3d/generate-from-image
+                  {:image-path "/tmp/reference-photo.png" :model "trellis"}
+                  {:execute ml3d/mock-execute})]
+      (testing ":gen.job shape (cloud-murakumo.gen/job normalization)"
+        (is (= :trellis (get-in result [:gen.job :gen.job/engine])))
+        (is (= "trellis" (get-in result [:gen.job :gen.job/model]))))
+      (testing ":run shape (:murakumo.run ledger entry, cloud-murakumo.worker/run-job)"
+        (is (= :done (:murakumo.run/state (:run result))))
+        (is (= 7 (:murakumo.run/gpu-seconds (:run result))))
+        (is (= :3d (:murakumo.run/modality (:run result)))))
+      (testing ":mesh-path is a real downloaded (fixture) file"
+        (is (io/exists? (io/file (:mesh-path result)))))
+      (testing ":vrm is a real, parseable VRM document"
+        (is (io/exists? (io/file (get-in result [:vrm :path]))))
+        (is (= 19 (count (:human-bones (:humanoid (get-in result [:vrm :document])))))))
+      (testing ":asset matches the network-isekai Asset Hub :asset/* schema"
+        (let [asset (:asset result)]
+          (is (= :model3d (:asset/kind asset)))
+          (is (= :vrm (:asset/format asset)))
+          (is (re-find #"^bafy-sha256-" (get-in asset [:asset/payload :cid :hash])))
+          (is (pos? (get-in asset [:asset/payload :bytes])))
+          (is (= (get-in result [:vrm :path]) (get-in asset [:asset/payload :uri])))
+          (is (contains? (set (:asset/deps asset)) "gftdcojp/cloud-murakumo")))))))
+
+(deftest generate-from-image-requires-execute
+  (is (thrown-with-msg? kerror/ExceptionInfo #"requires :execute"
+                        (ml3d/generate-from-image {:image-path "/tmp/x.png"} {}))))
+
+;; ── ADR-0048 §2 -- UniRig (:autorig) ensemble/fallback ─────────────────────
+
+(deftest autorig-fn-matches-cloud-murakumo-spec
+  (testing "the real :autorig function from cloud-murakumo's murakumo.edn, not a copy"
+    (let [f (ml3d/autorig-fn)]
+      (is (= :autorig (:fn/id f)))
+      (is (= :gen (:fn/kind f)))
+      (is (= :unirig (:fn/engine f)))
+      (is (= :rig (:fn/modality f)))
+      (is (= :l4 (:gpu/class f)))
+      (is (= #{"unirig"} (set (keys (get-in f [:gen :models])))))
+      (is (= [:vrm] (get-in f [:gen :out]))))))
+
+(deftest build-autorig-job-normalizes-per-cloud-murakumo-gen
+  (let [job (ml3d/build-autorig-job {:mesh-path "/tmp/mesh.glb" :model "unirig" :params {}}
+                                    {:account "test/demo"})]
+    (is (= :rig (:gen.job/modality job)))
+    (is (= :unirig (:gen.job/engine job)))
+    (is (= :autorig (:gen.job/fn job)))
+    (is (= "unirig" (:gen.job/model job)))
+    (is (= :queued (:gen.job/status job)))
+    (is (= ["/tmp/mesh.glb"] (get-in job [:gen.job/input :refs])))))
+
+(deftest mock-execute-autorig-returns-a-fixture-vrm
+  (let [{:keys [outputs gpu-seconds]} (ml3d/mock-execute-autorig {:via :proc :backend {:runtime "UniRig"}})]
+    (is (= 1 (count outputs)))
+    (is (io/exists? (io/file (first outputs))))
+    (is (pos? gpu-seconds))
+    (testing "it's a real, valid VRM 1.0 file, structurally different from the heuristic's own default rig"
+      (let [raw (vec (map #(bit-and (int %) 0xFF) (.readAllBytes (io/input-stream (first outputs)))))
+            doc (vrm/parse-vrm raw)]
+        (is (= :v1-0 (:version doc)))
+        (is (= 20 (count (:human-bones (:humanoid doc)))))
+        (is (contains? (set (map :bone (:human-bones (:humanoid doc)))) :upper-chest))))))
+
+(deftest real-execute-autorig-fails-closed-without-backend
+  (testing "matches cloud-murakumo's own default-execute fail-closed contract, through this wrapper"
+    (with-redefs [worker/getenv (fn [_] nil)]
+      (is (thrown-with-msg? kerror/ExceptionInfo
+                            #"no live cloud-murakumo backend configured"
+                            (ml3d/real-execute-autorig {:via :proc :backend {:runtime "UniRig"}}))))))
+
+(deftest auto-rig-via-unirig-end-to-end-against-mock-executor
+  (testing "full :autorig pipeline: job -> run -> vrm, against the mock executor"
+    (let [mesh-path (fixture/write-glb-file!)
+          result (ml3d/auto-rig-via-unirig {:mesh-path mesh-path :model "unirig"}
+                                           {:execute ml3d/mock-execute-autorig})]
+      (is (= :unirig (get-in result [:gen.job :gen.job/engine])))
+      (is (= "unirig" (get-in result [:gen.job :gen.job/model])))
+      (is (= :done (:murakumo.run/state (:run result))))
+      (is (io/exists? (io/file (get-in result [:vrm :path]))))
+      (is (= 20 (count (:human-bones (:humanoid (get-in result [:vrm :document])))))))))
+
+(deftest generate-from-image-with-rig-choice-defaults-to-heuristic-only
+  (testing ":rig-strategy omitted -- byte-for-byte the same rig stage generate-from-image runs"
+    (let [result (ml3d/generate-from-image-with-rig-choice
+                  {:image-path "/tmp/reference-photo.png" :model "trellis"}
+                  {:execute ml3d/mock-execute})]
+      (is (contains? result :heuristic))
+      (is (not (contains? result :unirig)))
+      (is (not (contains? result :comparison)))
+      (is (= (:vrm result) (:heuristic result)))
+      (is (= 19 (count (:human-bones (:humanoid (:document (:vrm result))))))))))
+
+(deftest generate-from-image-with-rig-choice-unirig-only
+  (let [result (ml3d/generate-from-image-with-rig-choice
+                {:image-path "/tmp/reference-photo.png" :model "trellis" :rig-strategy :unirig}
+                {:execute ml3d/mock-execute :rig-execute ml3d/mock-execute-autorig})]
+    (is (not (contains? result :heuristic)))
+    (is (contains? result :unirig))
+    (is (= (:vrm result) (:unirig result)))
+    (is (= 20 (count (:human-bones (:humanoid (:document (:vrm result)))))))))
+
+(deftest generate-from-image-with-rig-choice-requires-rig-execute-for-unirig
+  (is (thrown-with-msg? kerror/ExceptionInfo #"requires :rig-execute"
+                        (ml3d/generate-from-image-with-rig-choice
+                         {:image-path "/tmp/x.png" :rig-strategy :unirig}
+                         {:execute ml3d/mock-execute}))))
+
+(deftest generate-from-image-with-rig-choice-both-runs-both-and-compares
+  (testing "ADR-0048 §2 ensemble: :both runs the heuristic AND UniRig, reports a simple comparison, picks neither silently"
+    (let [result (ml3d/generate-from-image-with-rig-choice
+                  {:image-path "/tmp/reference-photo.png" :model "trellis" :rig-strategy :both}
+                  {:execute ml3d/mock-execute :rig-execute ml3d/mock-execute-autorig})]
+      (testing "both riggers actually ran"
+        (is (contains? result :heuristic))
+        (is (contains? result :unirig))
+        (is (io/exists? (io/file (get-in result [:heuristic :path]))))
+        (is (io/exists? (io/file (get-in result [:unirig :path]))))
+        (is (= 19 (count (:human-bones (:humanoid (:document (:heuristic result)))))))
+        (is (= 20 (count (:human-bones (:humanoid (:document (:unirig result))))))))
+      (testing "primary :vrm defaults to the heuristic's result, not silently swapped for UniRig's"
+        (is (= (:vrm result) (:heuristic result))))
+      (testing "comparison report is simple, not a scoring system"
+        (let [cmp (:comparison result)]
+          (is (= 19 (get-in cmp [:heuristic :bone-count])))
+          (is (= 20 (get-in cmp [:unirig :bone-count])))
+          (is (= 1 (:bone-count-diff cmp)))
+          (is (false? (:agree-on-bone-count? cmp)))
+          (is (true? (:both-plausible-humanoid? cmp))))))))

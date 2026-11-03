@@ -61,3 +61,35 @@ def verify_text(seed97_text):
 
 def verify_amu(amu_source):
     return verify_text((Path(amu_source) / "seed/97-aiueos-desktop-regions.kotoba").read_text())
+
+
+def _seed_value(text, pattern, what):
+    m = re.search(pattern, text, re.M)
+    if not m:
+        raise RegionMismatch(f"the compiler no longer defines {what}")
+    return m
+
+
+def verify_layout_text(seed95_text, seed85_text, table):
+    """native/layout-table.json must carry the compiler's page-table roots and text caps (one row per RW rung)."""
+    pml4 = int(_seed_value(seed95_text, r"^\(def UV-PML4 (0x[0-9a-fA-F]+)\)", "UV-PML4").group(1), 16)
+    v5 = int(_seed_value(seed95_text, r"^\(def UV-V5-PML4 (0x[0-9a-fA-F]+)\)", "UV-V5-PML4").group(1), 16)
+    cap = _seed_value(seed85_text, r"\(defn- kp-text-cap \[\] :i64 \(if \(or \(kp-v2\?\) \(kp-v3\?\)\) (\d+) (\d+)\)\)", "kp-text-cap")
+    want = {"0x200000": (pml4, int(cap.group(2))), "0x400000": (v5, int(cap.group(1)))}
+    rungs = table.get("rungs", {})
+    if set(rungs) != set(want):
+        raise RegionMismatch(f"the layout table has rungs {sorted(rungs)}, the compiler's are {sorted(want)}")
+    for rung, (root, text_cap) in want.items():
+        row = rungs[rung]
+        if int(row["pageTableRootOffset"], 16) != root or row["compilerTextCapBytes"] != text_cap:
+            raise RegionMismatch(f"layout table rung {rung}: {row['pageTableRootOffset']}/{row['compilerTextCapBytes']} "
+                                 f"differs from the compiler's {hex(root)}/{text_cap}")
+    return want
+
+
+def verify_layout(amu_source, table_path):
+    import json
+    amu = Path(amu_source)
+    return verify_layout_text((amu / "seed/95-aiueos-user-context.kotoba").read_text(),
+                              (amu / "seed/85-aiueos-project.kotoba").read_text(),
+                              json.loads(Path(table_path).read_text()))

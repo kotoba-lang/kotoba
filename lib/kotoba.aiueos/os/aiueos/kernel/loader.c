@@ -65,8 +65,9 @@ extern const uint8_t aiueos_plc_elf_start[],aiueos_plc_elf_end[];
 extern const uint8_t aiueos_plc_elf_sha256[32],aiueos_plc_receipt_sha256[32];
 extern const uint8_t aiueos_plc_signature[64],aiueos_plc_public_key[64];
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-  const uint8_t *,const uint8_t *,const uint8_t *,uint8_t *,uint64_t);
+  const uint8_t *,uint64_t,const uint8_t *,uint64_t,const uint8_t *,uint64_t,uint8_t *,uint64_t);
 static uint8_t plc_signature_workspace[2048];
+static uint64_t plc_data_offset;
 volatile uint64_t aiueos_plc_loader_stage;
 int aiueos_load_embedded_plc_process(unsigned process,uint64_t *entry,uint64_t **result) {
   uint8_t actual[32],workspace[512],nonzero=0;
@@ -80,10 +81,10 @@ int aiueos_load_embedded_plc_process(unsigned process,uint64_t *entry,uint64_t *
   uint8_t invalid_signature[64];
   for (unsigned i=0;i<64;i++) invalid_signature[i]=aiueos_plc_signature[i];
   invalid_signature[0]^=1;
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,actual,
-      aiueos_plc_public_key,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_plc_signature,actual,
-      aiueos_plc_public_key,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,64,actual,32,
+      aiueos_plc_public_key,64,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_plc_signature,64,actual,32,
+      aiueos_plc_public_key,64,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
   aiueos_plc_loader_stage=4;
   for (unsigned i=0;i<32;i++) nonzero|=aiueos_plc_receipt_sha256[i];
   if (!nonzero) return 0;
@@ -97,18 +98,24 @@ int aiueos_load_embedded_plc_process(unsigned process,uint64_t *entry,uint64_t *
   uint64_t data_va=load_u32(aiueos_plc_elf_start+136)|
     (load_u32(aiueos_plc_elf_start+140)<<32);
   if (!data_va) return 0;
+  /* KOTOBA-175: the data bytes come from the data phdr's p_offset, which plc-user-elf-valid pins at 8192 (and the
+     image at <= 12288 bytes); ELF_DATA_OFFSET is the 64 KiB catalog layout (JUN-145), outside a PLC image. */
+  uint64_t data_offset=load_u32(aiueos_plc_elf_start+128)|
+    (load_u32(aiueos_plc_elf_start+132)<<32);
+  if (data_offset+88>size) return 0;
+  plc_data_offset=data_offset;
   if (!aiueos_address_space_map_user_image(process,
       aiueos_plc_elf_start+ELF_TEXT_OFFSET,text_size,
-      aiueos_plc_elf_start+ELF_DATA_OFFSET,88,data_va)) return 0;
+      aiueos_plc_elf_start+data_offset,88,data_va)) return 0;
   aiueos_plc_loader_stage=7;
   *entry=ELF_TEXT_VA;
   *result=aiueos_address_space_user_data_backing(process);
   return *result!=0;
 }
 int aiueos_reset_embedded_plc_context(uint64_t *result,uint64_t runtime_handle) {
-  if (!result || !runtime_handle) return 0;
+  if (!result || !runtime_handle || !plc_data_offset) return 0;
   for (unsigned i=0;i<88;i++)
-    ((uint8_t *)result)[i]=aiueos_plc_elf_start[ELF_DATA_OFFSET+i];
+    ((uint8_t *)result)[i]=aiueos_plc_elf_start[plc_data_offset+i];
   result[10]=runtime_handle;
   return 1;
 }
@@ -118,7 +125,7 @@ extern const uint8_t aiueos_zero_cap_elf_start[],aiueos_zero_cap_elf_end[];
 extern const uint8_t aiueos_zero_cap_elf_sha256[32];
 extern const uint8_t aiueos_zero_cap_signature[64],aiueos_zero_cap_public_key[64];
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-  const uint8_t *,const uint8_t *,const uint8_t *,uint8_t *,uint64_t);
+  const uint8_t *,uint64_t,const uint8_t *,uint64_t,const uint8_t *,uint64_t,uint8_t *,uint64_t);
 static uint8_t zero_cap_signature_workspace[2048];
 volatile uint64_t aiueos_zero_cap_loader_stage;
 int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint64_t **result) {
@@ -132,11 +139,11 @@ int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint6
   for (unsigned i=0;i<64;i++) invalid_signature[i]=aiueos_zero_cap_signature[i];
   invalid_signature[0]^=1;
   aiueos_zero_cap_loader_stage=3;
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,actual,
-      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,64,actual,32,
+      aiueos_zero_cap_public_key,64,zero_cap_signature_workspace,
       sizeof(zero_cap_signature_workspace))) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_zero_cap_signature,actual,
-      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_zero_cap_signature,64,actual,32,
+      aiueos_zero_cap_public_key,64,zero_cap_signature_workspace,
       sizeof(zero_cap_signature_workspace))) return 0;
   aiueos_zero_cap_loader_stage=4;
   if (!load_kotoba_process(process,aiueos_zero_cap_elf_start,size,entry,result)) return 0;

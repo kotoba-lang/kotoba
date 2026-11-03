@@ -279,7 +279,7 @@ def main(argv=None):
     receipt = {
         "format": "aiueos-plc-native-receipt/v1",
         "profile": "aiueos-plc-v1",
-        "target": "x86_64-aiueos-user-v1",
+        "target": "x86_64-aiueos-user-plc-v1",
         "source_language": "iec-61131-3-structured-text-subset-v1",
         "runtime_linux": False,
         "runtime_jvm": False,

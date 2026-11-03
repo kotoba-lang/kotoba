@@ -4,7 +4,10 @@ Date: 2026-10-28
 
 ## Status
 
-Proposed (design only, nothing in this ADR is implemented). It extends ADR-0275 (the web3-first positioning and the W1-W8 scorecard) and
+Proposed; **partly implemented (2026-10-29, checked against the code; gates in `check-native-consent-qemu.py` and `check-native-keystore-qemu.py`, QEMU TCG with synthetic input).**
+Implemented: the trust strip rows (Identity, Key, Approved, Network, Telemetry; no Wallet row), visible Create key / Unlock / Lock / Forget buttons (Forget only while a stored key is locked) with F8/F6/F10 as accelerators, lock and forget,
+the attempt counter with a growing delay, the passphrase strength hint, and the key buttons with two windows open. The first-run offer is the Create key button, which is always shown while no key exists (it is not a one-time offer).
+**Not implemented:** operation-derived consent text and the pre-launch declaration (decisions 7 and 8; JUN-519), `ipfs://` (decision 9; JUN-520). The merged slices are listed on JUN-517. It extends ADR-0275 (the web3-first positioning and the W1-W8 scorecard) and
 ADR-0277 (key custody). It creates no kernel, ABI, signer or trust root. Every row is `:spec` until its gate prints green.
 
 ## Why

@@ -33,6 +33,7 @@ struct aiueos_plc_runtime {
 
 static struct aiueos_plc_runtime plc;
 static uint8_t plc_initialized;
+static uint64_t plc_scan_count,plc_release_expected,plc_release_observed;
 extern volatile uint64_t aiueos_apic_timer_ticks;
 
 static void plc_safe(enum aiueos_plc_fault fault) {
@@ -48,8 +49,14 @@ static void plc_reset(void) {
   plc.next_release=AIUEOS_PLC_CYCLE_TICKS;
 }
 
+/* What a release or a capability call may do is kotoba/plc-step.kotoba (JUN-554); this file keeps the runtime struct and
+   performs the step the object names. */
+extern int64_t kotoba_aiueos_plc_release_step(uint64_t, uint64_t, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_plc_call_step(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t kotoba_aiueos_tick_wait(uint64_t ticks, uint64_t ticks_length, uint64_t target, uint64_t rounds);
+
 static int plc_release(uint64_t now) {
-  if (plc.fault_latched || plc.active || now!=plc.next_release) {
+  if (kotoba_aiueos_plc_release_step(plc.fault_latched, plc.active, now, plc.next_release) != 1) {
     plc_safe(AIUEOS_PLC_FAULT_RELEASE); return 0;
   }
   for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++) {
@@ -65,37 +72,20 @@ static int plc_release(uint64_t now) {
 }
 
 static uint64_t plc_call(uint64_t capability,uint64_t argument,uint64_t now) {
-  if (!plc.active) { plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0; }
-  if (capability==AIUEOS_PLC_INPUT_CAP) {
-    unsigned index=(unsigned)argument;
-    if (index>=AIUEOS_PLC_IO_COUNT) { plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0; }
-    return (uint64_t)(int64_t)plc.input_image[index];
+  uint64_t state=(plc.active?1U:0U)|(plc.watchdog?2U:0U)|((uint64_t)(plc.staged&3U)<<2);
+  int64_t r=kotoba_aiueos_plc_call_step(capability,argument,now,state,plc.deadline,plc.budget_end);
+  unsigned index=(unsigned)((uint64_t)r>>16)&0xffU;
+  switch ((int)(r&0xff)) {
+    case 1: return (uint64_t)(int64_t)plc.input_image[index];
+    case 2: plc.shadow_output[index]=(int32_t)argument; plc.staged|=1U<<index; return 1;
+    case 3: plc.watchdog=1; return 1;
+    case 4:
+      for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++)
+        plc.physical_output[i]=plc.shadow_output[i];
+      plc.active=0; return 1;
+    default:
+      plc_safe((enum aiueos_plc_fault)(((uint64_t)r>>8)&0xffU)); return 0;
   }
-  if (capability==AIUEOS_PLC_STAGE_CAP) {
-    unsigned index=(unsigned)(argument>>32);
-    if (index>=AIUEOS_PLC_IO_COUNT || (plc.staged&(1U<<index))) {
-      plc_safe(AIUEOS_PLC_FAULT_STAGE); return 0;
-    }
-    plc.shadow_output[index]=(int32_t)argument;
-    plc.staged|=1U<<index;
-    return 1;
-  }
-  if (capability==AIUEOS_PLC_WATCHDOG_CAP) {
-    if (argument!=1 || plc.watchdog) { plc_safe(AIUEOS_PLC_FAULT_WATCHDOG); return 0; }
-    plc.watchdog=1; return 1;
-  }
-  if (capability==AIUEOS_PLC_COMMIT_CAP) {
-    if (argument!=AIUEOS_PLC_IO_COUNT || plc.staged!=3U) {
-      plc_safe(AIUEOS_PLC_FAULT_STAGE); return 0;
-    }
-    if (!plc.watchdog) { plc_safe(AIUEOS_PLC_FAULT_WATCHDOG); return 0; }
-    if (now>plc.deadline) { plc_safe(AIUEOS_PLC_FAULT_DEADLINE); return 0; }
-    if (now>plc.budget_end) { plc_safe(AIUEOS_PLC_FAULT_BUDGET); return 0; }
-    for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++)
-      plc.physical_output[i]=plc.shadow_output[i];
-    plc.active=0; return 1;
-  }
-  plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0;
 }
 
 static int plc_failure_vectors(void) {
@@ -134,11 +124,32 @@ int aiueos_plc_rt_begin_scan(int32_t enable,int32_t sensor) {
     plc_initialized=1;
   }
   if (plc.active || plc.fault_latched) return 0;
-  while (aiueos_apic_timer_ticks<plc.next_release) __asm__ volatile("sti; hlt; cli");
-  uint64_t release=plc.next_release;
-  if (aiueos_apic_timer_ticks!=release) return 0;
+  /* kotoba/tick-wait.o: look, then sti; hlt; cli, until the tick counter
+     reaches the release; it answers 2 when its rounds run out, 0 on refusal
+     (plc_release below then refuses the scan). */
+  for (uint64_t got=2; got==2;)
+    got=kotoba_aiueos_tick_wait((uint64_t)(uintptr_t)&aiueos_apic_timer_ticks,8,plc.next_release,65536);
+#ifdef AIUEOS_PLC_RT_FORCE_MISS_SCAN
+  /* Negative control (JUN-736): stay in the kernel past this scan's release
+     tick, so the release the provider sees is one tick late -- the same
+     observation a host stall under an unpinned QEMU clock produced. */
+  if (plc_scan_count==(uint64_t)(AIUEOS_PLC_RT_FORCE_MISS_SCAN)) {
+    __asm__ volatile("sti");
+    while (aiueos_apic_timer_ticks<=plc.next_release) __asm__ volatile("pause");
+    __asm__ volatile("cli");
+  }
+#endif
+  plc_scan_count++;
+  /* JUN-736: the release is the tick the kernel observes now, not the tick it
+     waited for. A late release (the counter already past next_release, e.g.
+     two timer interrupts inside one sti; hlt; cli window) is refused by
+     plc-step's release_step, which latches FAULT_RELEASE and drives the safe
+     outputs -- the contract for every other refused scan. This used to return
+     0 before plc_release, so a missed release left no fault and no safe state. */
+  plc_release_expected=plc.next_release;
+  plc_release_observed=aiueos_apic_timer_ticks;
   plc.physical_input[0]=enable; plc.physical_input[1]=sensor;
-  if (!plc_release(release)) return 0;
+  if (!plc_release(plc_release_observed)) return 0;
   /* Mutating the physical source after release proves the input image is
    * immutable during this scan. */
   plc.physical_input[0]=!enable; plc.physical_input[1]=sensor+1000;
@@ -155,3 +166,9 @@ int aiueos_plc_rt_result_ready(int32_t output0,int32_t output1) {
 }
 
 int aiueos_plc_rt_failed(void) { return plc.fault_latched; }
+
+/* JUN-736: what a failed run reports -- the latched fault, and for the last
+   scan the release tick it waited for and the tick it observed. */
+uint64_t aiueos_plc_rt_fault(void) { return plc.fault_latched ? plc.fault : 0; }
+uint64_t aiueos_plc_rt_release_expected(void) { return plc_release_expected; }
+uint64_t aiueos_plc_rt_release_observed(void) { return plc_release_observed; }
