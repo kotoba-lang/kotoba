@@ -245,3 +245,28 @@ The consumer still needs the experimental compiler candidate described above,
 and the file bridge and numeric context are test orchestration, not an
 integrated production supervisor. No signed or remote receipt, deployment,
 whole-VM parity, or Linux ARM64 result is claimed.
+
+## Experimental native expression reference
+
+`test/kototama/experimental_i64_reference.kotoba` is a test-only iterative
+interpreter over a manually supplied vector tree. It covers constants, binary
+wrapping addition, and signed quotient, with a bounded frame stack and a
+per-node charge. It returns success, exhaustion, zero-divisor or signed
+quotient-overflow as data. It is deliberately not a canonical CBOR decoder,
+program admission, general evaluator, public API, host, or a replacement for
+any complete VM component. Its malformed-tree response is not an admission
+contract. Loop/recur, calls, most operators and all effects remain absent.
+
+Its separately source-locked fixture returned 42 as native code on macOS
+ARM64 (Amu CLI SHA-256 `616a41c017e92dd475e7472d791629a65d0811552b305b93d8c8c4b87bf3b1b0`)
+and Linux x86-64 (compiler SHA-256
+`f6c887b23c8b8447dc397821cc82a972c3502a269ae51893075bf888a32aea9a`;
+native KX64 runner SHA-256
+`27349b7edfea5833f41263cdbf6195e5f26848bfb491e406c2d826987194d3b2`).
+A separate macOS build with addition's charge removed returned 0 instead of
+42. The fixture includes 12 manually constructed two-fault/budget cases whose
+status, value and spent projections agree with the corresponding real Amu
+receipt/v2 observations on Linux x86-64. This is a manual correspondence
+between two representations; it does not prove that a common canonical
+program was decoded or interpreted by the test model. The source and gate
+are retained to support that future work; they are not wired to CI.
