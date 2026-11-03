@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Compare baseline and compact runtime on bounded Bunsho snapshots.
 
-Usage: script AMU BASELINE_BUILD COMPACT_BUILD LAB_DIR NEW_OUTPUT CHROME
+Usage: script AMU BASELINE_BUILD COMPACT_BUILD LAB_DIR NEW_OUTPUT CHROME [expect-full]
 The lab is not a production compiler or an OS/QEMU runtime.
 """
 import hashlib,importlib.util,json,sys
 from pathlib import Path
-if len(sys.argv)!=7:raise SystemExit(__doc__)
+if len(sys.argv) not in (7,8):raise SystemExit(__doc__)
+full=len(sys.argv)==8 and sys.argv[7]=='expect-full'
+if len(sys.argv)==8 and not full:raise SystemExit(__doc__)
 amu,normal,small,lab,out=map(lambda x:Path(x).resolve(),sys.argv[1:6]);chrome=sys.argv[6];out.mkdir(parents=True,exist_ok=False)
 sha=lambda b:hashlib.sha256(b).hexdigest()
 r0=json.loads((normal/'build-receipt.json').read_text());r1=json.loads((small/'build-receipt.json').read_text());experiment=json.loads((lab/'build.json').read_text())
@@ -16,7 +18,7 @@ for build,receipt in ((normal,r0),(small,r1)):
 if r0['sourceSha256']!=r1['sourceSha256'] or r1['compilerSha256']!=experiment['instrumentedCompilerSha256']:raise ValueError('source/compiler mismatch')
 pool=experiment['limits']['KXRT-POOL']
 if pool not in (1048576,4194304):raise ValueError('unexpected pool')
-refusal_from=8 if pool==1048576 else 32
+refusal_from=33 if full else (8 if pool==1048576 else 32)
 spec=importlib.util.spec_from_file_location('harness',amu/'scripts/seed/check-js-browser.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
 def frame(x):return str(len(x.encode('utf-8')))+':'+x
 runs=[]
@@ -25,7 +27,7 @@ for n in (2,4,8,16,24,32):
  assert len(data.encode())<35000
  for name,path in [('normal',normal),('compact',small)]:runs.append((name+'-'+str(n),path/'program.wasm',{'allow':[37,38],'args':['view',data],'fuel':100000000}))
 version,results=h.run_js(chrome,out,runs,timeout=600)
-report={'status':'PASS_COMPACT_BOUNDARY_CHARACTERIZATION','compilerSha256':r1['compilerSha256'],'sourceSha256':r1['sourceSha256'],'browser':version,'cases':{},'scope':'Synthetic Bunsho snapshot; bounded runtime is experimental and not OS/QEMU or production'}
+report={'status':'PASS_COMPACT_BOUNDARY_CHARACTERIZATION','expectFull':full,'compilerSha256':r1['compilerSha256'],'sourceSha256':r1['sourceSha256'],'browser':version,'cases':{},'scope':'Synthetic Bunsho snapshot; bounded runtime is experimental and not OS/QEMU or production'}
 for n in (2,4,8,16,24,32):
  row={}
  for name in ('normal','compact'):
