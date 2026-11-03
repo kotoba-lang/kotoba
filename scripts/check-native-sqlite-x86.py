@@ -137,8 +137,15 @@ def main(amu, out):
     payload_path = out / "sqlite-notepad.payload"
     payload_path.write_bytes(payload)
 
+    # The compiler's FS35 admission root is the temporary output directory;
+    # stage the already digest-verified runner source under that root before
+    # invoking the selfhosted compiler.
+    staged_runner_source = out / "x86_64-kx64-runner.kotoba"
+    staged_runner_source.write_bytes(runner_source.read_bytes())
+    if sha(staged_runner_source.read_bytes()) != AMU_RUNNER_SHA256:
+        raise RuntimeError("staged Amu KX64 runner-source digest mismatch")
     runner = out / "x86_64-kx64-runner.elf"
-    run("compile-kx64-runner", [compiler, "compile", runner_source, "--target", "x86_64-linux",
+    run("compile-kx64-runner", [compiler, "compile", staged_runner_source, "--target", "x86_64-linux",
         "--output", runner, "--format", "kx64-runner"], out, env, calls)
     runner.chmod(0o700)
 
