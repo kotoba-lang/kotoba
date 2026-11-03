@@ -17,6 +17,8 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
+import native_media_retention
 
 
 HERE = Path(__file__).resolve().parent
@@ -26,6 +28,16 @@ EFI_MAX_BYTES = 16351 * 512 - 1123840  # file start .. backup GPT entries
 def pin(path):
     raw = path.read_bytes()
     return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def remove_reproduced_copy(original, copy):
+    """Remove a verified duplicate while preserving the original image."""
+    if original.is_symlink() or copy.is_symlink():
+        return False
+    if pin(original) != pin(copy):
+        return False
+    copy.unlink()
+    return True
 
 
 def verify_macho(path, expected):
@@ -57,6 +69,10 @@ def main(args):
     verify_macho(compiler, args.compiler_sha256)
     verify_macho(packager, args.packager_sha256)
     original_efi = pin(efi)
+    retention_helper = HERE / "native_media_retention.py"
+    if retention_helper.is_symlink() or not retention_helper.is_file():
+        raise ValueError("retention helper must be a regular file")
+    retention_pin = pin(retention_helper)
     if original_efi["sha256"] != args.efi_sha256 or not (512 <= original_efi["bytes"] <= EFI_MAX_BYTES):
         raise ValueError("EFI digest or size mismatch")
     output = args.output.resolve()
@@ -67,6 +83,7 @@ def main(args):
         "linuxJVMNodeOrCCompiler": False, "nativeFormatEmission": False,
         "qemuBootQualified": False, "physicalHardwareQualified": False, "calls": [],
         "efiCapacityBytes": EFI_MAX_BYTES,
+        "retentionHelper": retention_pin,
     }
 
     def save():
@@ -246,6 +263,7 @@ def main(args):
                     or pin(output / "media.kotoba") != state["sourceUnity"]
                     or any(pin(path) != {k: v for k, v in identity.items() if k != "name"}
                            for path, identity in zip(parts, identities))
+                    or pin(retention_helper) != retention_pin
                     or pin(output / disk) != pin(output / reproduced)
                     or pin(output / iso) != pin(output / iso_reproduced)):
                 raise ValueError("source, executable or media drift")
@@ -255,7 +273,30 @@ def main(args):
                          iso=pin(output / iso), independentISO=iso_independent,
                          refusalCases=18 if args.verify_efi_capacity else 16, nativeFormatEmission=True,
                          qualification="Mac native GPT/FAT16 and El Torito ISO format verification; QEMU, release and physical gates separate")
+            controls = []
+            for name, source, operation, offset in native_media_retention.specifications(len(raw)):
+                try:
+                    record = native_media_retention.make_record(output, name, source, operation, offset)
+                    if record is not None:
+                        controls.append(record)
+                except (OSError, ValueError, IndexError) as error:
+                    print(f"negative control retained: {name}: {error}", file=sys.stderr)
+            state["reconstructableControls"] = controls
             save()
+            for record in controls:
+                try:
+                    if not native_media_retention.discard_control(output, record):
+                        print(f"negative control retained: {record['name']}", file=sys.stderr)
+                except (OSError, ValueError, IndexError) as error:
+                    print(f"negative control retained: {record['name']}: {error}", file=sys.stderr)
+            # Only successful builds may discard reproduction copies. Keep the
+            # original images, digests, logs and all failed build artifacts.
+            for original, copy in ((disk, reproduced), (iso, iso_reproduced)):
+                try:
+                    if not remove_reproduced_copy(output / original, output / copy):
+                        print(f"reproduction copy retained: {copy}", file=sys.stderr)
+                except OSError as error:
+                    print(f"reproduction copy retained: {copy}: {error}", file=sys.stderr)
             print(state["state"], state["image"]["sha256"])
         finally:
             os.close(scope)

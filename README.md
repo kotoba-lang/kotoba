@@ -4,6 +4,20 @@
 
 # Kotoba
 
+**A modern Lisp machine, built for safety and machine speed.**
+
+Lisp's power begins with programs as data: simple forms to read, compose and
+reason about. Kotoba carries that spirit into a Lisp machine in development,
+for people and AI agents. Amu is its native compiler; Kototama and AIUEOS own
+the execution contract and OS direction. Integrated live system modification
+and a complete machine remain separate work.
+
+In one Apple M4 measurement, translated Kotoba ports ran in **0.80× the time
+of C** across 19 Embench workloads. The exploratory compiler snapshot included
+audited algorithm substitutions; this is one sample per workload, not a
+released-toolchain result or a universal speed ranking. [See the measurements
+and audit](https://kotoba-lang.org/blog/embench-c-parity-20261015/).
+
 > **A language AI agents can use, not abuse.**
 
 AI writes freely. Kotoba draws the boundary.
