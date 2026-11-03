@@ -327,3 +327,18 @@ of complete coverage. The bridge supports only binary arithmetic and `if`;
 method reachability, unused invalid code, effects, limits and the complete
 canonical DAG-CBOR/program profile still need independently qualified native
 admission and CI. No production execution or host integration is claimed.
+
+The test-only bridge now checks the entire *supported experiment subset*
+before evaluating: exact program and method field counts, the declared i64
+profile, bounded unique exports that name existing methods, empty parameters
+and effects, and supported bodies in every method and both branches. The
+fixed native fixture refuses unknown fields, invalid declarations, an invalid
+unused method and an invalid unselected branch, while accepting a valid unused
+method. The source-locked macOS gate returned 42; replacing the method scan
+with `true` made its negative control return 0. The 98 actual-receipt native
+comparison still returned 42. These checks deliberately refuse features such
+as method parameters and calls even when another profile supports them. They
+are neither full pure-i64 nor general VM admission, do not establish safe
+resource limits for untrusted inputs, and do not resolve the pending normative
+`exports` question. The accepted test shape follows the existing Amu route
+only for this experiment.
