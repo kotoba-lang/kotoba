@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded pure-i64 receipt validator and a mutant on native macOS ARM64."""
+"""Run a bounded pure-i64 fixture and mutant on native macOS ARM64."""
 import argparse
 import hashlib
 import json
@@ -25,6 +25,7 @@ def main():
     p.add_argument('--compiler', type=Path, required=True)
     p.add_argument('--compiler-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--fixture', choices=('receipt', 'reference'), default='receipt')
     a = p.parse_args()
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('requires native macOS arm64')
@@ -33,11 +34,23 @@ def main():
         raise ValueError('compiler digest mismatch')
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(compiler)], check=True, capture_output=True, timeout=30)
     ledger = json.loads(LEDGER.read_text())['added']
-    for path, name in ((SOURCE, 'src/kototama/pure_i64_receipt.kotoba'),
-                       (GATE, 'test/kototama/pure_i64_receipt_gate.kotoba')):
+    if a.fixture == 'reference':
+        source_key = 'test/kototama/experimental_i64_reference.kotoba'
+        gate_key = 'test/kototama/experimental_i64_reference_gate.kotoba'
+        module, gate_module = 'reference', 'gate'
+        original = '(if (= value 0) 3 2)'
+        replacement = '(if (= value 0) 2 3)'
+    else:
+        source_key = 'src/kototama/pure_i64_receipt.kotoba'
+        gate_key = 'test/kototama/pure_i64_receipt_gate.kotoba'
+        module, gate_module = 'kototama.pure-i64-receipt', 'kototama.pure-i64-receipt-gate'
+        original = '(= magic 14164133038085195)'
+        replacement = '(= magic magic)'
+    src, fixture = LIB / source_key, LIB / gate_key
+    for path, name in ((src, source_key), (fixture, gate_key)):
         if digest(path) != ledger[name]['sha256']:
             raise ValueError('source digest mismatch: ' + name)
-    inputs = {str(path): digest(path) for path in (compiler, SOURCE, GATE, LEDGER, Path(__file__).resolve())}
+    inputs = {str(path): digest(path) for path in (compiler, src, fixture, LEDGER, Path(__file__).resolve())}
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
@@ -45,20 +58,19 @@ def main():
     def observe(name, mutant, expected):
         work = output / name
         work.mkdir()
-        source, gate = work / SOURCE.name, work / GATE.name
-        text = SOURCE.read_text()
+        source, gate = work / 'source.kotoba', work / 'gate.kotoba'
+        text = src.read_text()
         if mutant:
-            original = '(= magic 14164133038085195)'
             if text.count(original) != 1:
                 raise ValueError('negative-control anchor drift')
-            text = text.replace(original, '(= magic magic)')
+            text = text.replace(original, replacement)
         source.write_text(text)
-        shutil.copyfile(GATE, gate)
+        shutil.copyfile(fixture, gate)
         lock = work / 'project.ksl'
+        modules = sorted(((module, source), (gate_module, gate)))
         lock.write_text('KSL2\nentry ' + str(gate) + '\n' +
-                        'module kototama.pure-i64-receipt ' + str(source) + '\n' +
-                        'module kototama.pure-i64-receipt-gate ' + str(gate) + '\n' +
-                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in (source, gate)))
+                        ''.join('module ' + m + ' ' + str(f) + '\n' for m, f in modules) +
+                        ''.join('file ' + digest(f) + ' ' + str(f) + '\n' for f in sorted((source, gate))))
         binary = work / 'gate'
         commands = [[str(compiler), 'check', str(gate), '--source-lock', str(lock)],
                     [str(compiler), 'compile', str(gate), '--source-lock', str(lock), '-o', str(binary)],
@@ -76,7 +88,7 @@ def main():
     negative = observe('mutant', True, 0)
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
-    receipt = {'status': 'PASS_BOUNDED_PURE_I64_RECEIPT_MACOS', 'inputs': inputs,
+    receipt = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_MACOS', 'inputs': inputs,
                'positive': positive, 'negative': negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'])
