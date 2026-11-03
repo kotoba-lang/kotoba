@@ -40,14 +40,15 @@
   ;; bytes, 690/691 the ESP's last LBA, 692/693 staging cursor (cluster,
   ;; byte in it), 695/696 BOOTX64.EFI entry offset, 697/698 UPDATE.BIN entry
   ;; offset, 699 staging first cluster.
-  (:require [aiueos.native.nvme :as nvme]
+  (:require [aiueos.native.storage-state :as storage]
+            [aiueos.native.nvme :as nvme]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [run open-window prepare stage-write sync swap hash-chain]))
+  (:export [run open-window prepare stage-write sync swap hash-chain state-file create-state]))
 
 (defn word [region i]
-  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+  (storage/word region i))
 (defn put-word [region i value]
-  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+  (storage/put-word region i value))
 (defn word64 [ctx i] (+ (word ctx i) (* (word ctx (+ i 1)) 4294967296)))
 (defn put-word64 [ctx i value]
   (do (put-word ctx i (bit-and value 4294967295))
@@ -95,7 +96,8 @@
     (if (= n 1) (case i 0 73 1 84 2 79 3 78 4 65 5 77 6 73 32)
       (if (= n 2) (case i 0 66 1 79 2 79 3 84 32)
         (if (= n 3) (case i 0 66 1 79 2 79 3 84 4 88 5 54 6 52 8 69 9 70 10 73 32)
-          (case i 0 85 1 80 2 68 3 65 4 84 5 69 8 66 9 73 10 78 32))))))
+          (if (= n 4) (case i 0 85 1 80 2 68 3 65 4 84 5 69 8 66 9 73 10 78 32)
+            (case i 0 83 1 84 2 65 3 84 4 69 8 66 9 73 10 78 32)))))))
 (defn name-match [ctx at n i]
   (if (>= i 11) 1
     (if (= (u8 ctx (+ at i)) (name-byte n i)) (name-match ctx at n (+ i 1)) 0)))
@@ -425,3 +427,113 @@
     (do (set-entry ctx own new-first size)
         (set-entry ctx staged old-first old-size)
         (if (flushed ctx) 1 0))))
+
+;; AWAI-120: a separate STATE.BIN, never BOOTX64.EFI or UPDATE.BIN. The
+;; bounded v1 transport requires a contiguous 4KiB-aligned 20KiB file.
+;; Boot only opens an existing file. create-state is called only by F5 in
+;; the explicit input/state profile, never by boot or an inference operation.
+(defn crc-bit [v n]
+  (if (= n 0) v
+    (crc-bit (bit-xor (u64-shift-right v 1) (if (= (bit-and v 1) 1) 3988292384 0)) (- n 1))))
+(defn crc-span [ctx at size zero-start i crc]
+  (if (>= i size) (bit-xor crc 4294967295)
+    (let [v (if (and (>= i zero-start) (< i (+ zero-start 4))) 0 (u8 ctx (+ at i)))]
+      (crc-span ctx at size zero-start (+ i 1) (crc-bit (bit-xor crc v) 8)))))
+(defn state-geometry [ctx]
+  (let [block (i64-shift-left 1 (word ctx 609))
+        hsize (u32 ctx (+ block 12)) expected (u32 ctx (+ block 16))
+        table (* (u64 ctx (+ block 72)) block) count (u32 ctx (+ block 80))
+        size (u32 ctx (+ block 84)) entries-crc (u32 ctx (+ block 88))
+        disk (* (+ (word ctx 607) (* (word ctx 608) 4294967296)) block)
+        end (* (+ (word64 ctx 690) 1) block)]
+    (and (>= hsize 92) (<= hsize block) (>= count 1) (<= count 128) (= size 128)
+         (>= table (* block 2)) (< table disk) (<= (+ table (* count size)) disk)
+         (> end (word64 ctx 660)) (<= end disk)
+         (>= (word ctx 665) block) (= (bit-and (word ctx 665) (- (word ctx 665) 1)) 0)
+         (<= (+ (word64 ctx 671) (* (- (word ctx 664) 2) (word ctx 665))) end)
+         (= (crc-span ctx block hsize 16 0 4294967295) expected)
+         (= (crc-span ctx table (* count size) -8 0 4294967295) entries-crc)
+         (= (word ctx 652) 0))))
+(defn fats-equal [ctx c k]
+  (if (>= k (word ctx 688)) 1
+    (if (= (u32 ctx (fat-at ctx c k)) (u32 ctx (fat-at ctx c 0)))
+      (fats-equal ctx c (+ k 1)) 0)))
+(defn state-chain [ctx c remaining]
+  (if (or (<= remaining 0) (not (valid-cluster? ctx c)) (>= c (word ctx 664))) 0
+    (if (not (= (fats-equal ctx c 0) 1)) 0
+    (let [next (next-cluster ctx c)]
+      (if (<= remaining (word ctx 665)) (if (last-cluster? ctx next) 1 0)
+        (if (= next (+ c 1)) (state-chain ctx next (- remaining (word ctx 665))) 0))))))
+(defn disjoint-chain [ctx c first last guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) 0
+    (if (and (>= c first) (<= c last)) 0
+      (let [next (next-cluster ctx c)]
+        (if (last-cluster? ctx next) 1 (disjoint-chain ctx next first last (- guard 1)))))))
+(defn state-file [ctx]
+  (if (or (not (= (word ctx 676) 15)) (not (= (word ctx 662) 32)) (not (= (word ctx 677) 1))
+          (not (state-geometry ctx))) 0
+    (let [dir (dir-lookup ctx (root-lookup ctx 0) 1)
+          found (if (< dir 0) -2 (dir-lookup ctx dir 5))
+          first (bit-and found 4294967295)
+          last (+ first (- (quot (+ 20480 (- (word ctx 665) 1)) (word ctx 665)) 1))
+          staged (if (< dir 0) -2 (dir-lookup ctx dir 4))]
+      (if (or (< found 0) (not (= (u64-shift-right found 32) 20480))
+              (not (= (bit-and (u8 ctx (+ (locate ctx (bit-and dir 4294967295) 0 5 65536) 11)) 31) 0))
+              (not (= (bit-and (cluster-offset ctx first) 4095) 0))
+              (not (= (state-chain ctx first 20480) 1))
+              (not (= (disjoint-chain ctx (word ctx 674) first last 1048576) 1))
+              (and (>= staged 0) (not (= (disjoint-chain ctx (bit-and staged 4294967295) first last 1048576) 1)))
+              (> (+ (cluster-offset ctx first) 20480) (* (+ (word64 ctx 690) 1) (i64-shift-left 1 (word ctx 609))))
+              (> (word ctx 652) 0)) 0
+        (cluster-offset ctx first)))))
+(defn free-run [ctx c count need]
+  (if (>= c (word ctx 664)) 0
+    (let [n (if (and (= (fats-equal ctx c 0) 1) (free? ctx c)) (+ count 1) 0)
+          first (- (+ c 1) n)]
+      (if (and (>= n need) (= (bit-and (cluster-offset ctx first) 4095) 0)) first
+        (free-run ctx (+ c 1) (if (>= n need) (- n 1) n) need)))))
+(defn link-state [ctx first i need]
+  (if (>= i need) 1
+    (do (set-fat ctx (+ first i) (if (= (+ i 1) need) 268435455 (+ first (+ i 1))) 0)
+        (link-state ctx first (+ i 1) need))))
+(defn zero-data [i]
+  (if (>= i 4096) 1
+    (do (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 16384 4096) 4096 i 0)
+        (zero-data (+ i 4)))))
+(defn initialize-state [ctx start page]
+  (if (>= page 5) (if (= (nvme/flush ctx) 0) 1 0)
+    (do (zero-data 0)
+        (if (= page 0)
+          (do (data-store 0 65) (data-store 1 87) (data-store 2 65) (data-store 3 73)
+              (data-store 4 68) (data-store 5 82) (data-store 6 70) (data-store 7 84)
+              (data-store 8 1) (data-store 12 128)) 0)
+        (if (= (nvme/write-span ctx (+ start (* page 4096)) (data-address) 4096) 0)
+          (initialize-state ctx start (+ page 1)) 0))))
+(defn state-entry [ctx at i first]
+  (if (< i 32)
+    (do (poke8 ctx (+ at i) (if (< i 11) (name-byte 5 i) (if (= i 11) 32 0)))
+        (state-entry ctx at (+ i 1) first))
+    (set-entry ctx at first 20480)))
+(defn create-state [ctx]
+  (if (or (not (= (word ctx 676) 15)) (not (= (word ctx 662) 32)) (not (= (word ctx 677) 1))
+          (not (state-geometry ctx))) 0
+    (let [dir (dir-lookup ctx (root-lookup ctx 0) 1)
+          existing (if (< dir 0) -2 (dir-lookup ctx dir 5))
+          own (if (< dir 0) -2 (locate ctx (bit-and dir 4294967295) 0 3 65536))
+          block (i64-shift-left 1 (word ctx 609))
+          start (- own (bit-and own (- block 1)))
+          slot (if (< own 0) -1 (free-slot ctx start (+ start block)))
+          need (quot (+ 20480 (- (word ctx 665) 1)) (word ctx 665))]
+      ;; An existing malformed state file is never reformatted or replaced.
+      (if (>= existing 0) (state-file ctx)
+        (if (or (< slot 0) (> (word ctx 652) 0)) 0
+          (let [first (free-run ctx 2 0 need)]
+            (if (< first 2) 0
+              (do (open-window ctx) (link-state ctx first 0 need)
+                  (if (not (flushed ctx)) 0
+                    (let [offset (cluster-offset ctx first)]
+                      (do (put-word64 ctx 650 0)
+                          (nvme/open-window ctx offset (+ offset 20480))
+                          (if (not (= (initialize-state ctx offset 0) 1)) 0
+                            (do (open-window ctx) (state-entry ctx slot 0 first)
+                                (if (flushed ctx) offset 0))))))))))))))
