@@ -424,3 +424,17 @@ comparison and therefore misses a later division fault. Existing receipt and
 reference fixtures still pass. Bindings, calls, general loops, complete
 admission, independent artifact admission and full VM qualification remain
 open; the reference and AOT still share a compiler backend on each ISA.
+
+The experimental CBOR/reference path now supports lexical `var` and sequential
+`let` bindings, including same-name shadowing and restoration of outer scope.
+It resolves names to bounded lexical slots while staging the model and rejects
+an initializer that references an unbound name. Eight observations from the
+existing `let-sequential` and `let-shadow` AOT corpus raised the fresh and
+snapshot comparison set to 157. Both native Linux x86-64 and physical ARM64
+passed fresh AOT/reference comparison; the macOS ARM64 snapshot and fixed
+fixture passed. An earliest-binding shadow mutant was rejected. A separate
+x86-64 AOT run of a nested-shadow program (CBOR SHA-256
+`5bd6894c82891eab387a9089a298b09921ed7a07071f246024166bb5c80e5d8b`)
+returned value 7 with spent 7, matching the model's fixed case. The model has
+no calls or loops; its slot strategy is not yet validated for either, and all
+prior admission, backend-independence and host limitations remain.

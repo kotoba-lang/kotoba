@@ -70,7 +70,10 @@ def main():
         if mutant:
             old, new = (("(valid-methods methods 0)", "true") if name == 'mutant-methods'
                         else ("(>= count 4095)", "(>= count 4096)") if name == 'mutant-limit'
-                        else (original, replacement))
+                        else ("(if (string=? (typed-list-nth [:list :string] env i) name) i",
+                              "(if (string=? (typed-list-nth [:list :string] env i) name) "
+                              "(if (> i 0) (let [prior (lookup env name (- i 1))] (if (< prior 0) i prior)) i)")
+                        if name == 'mutant-shadow' else (original, replacement))
             if text.count(old) != 1:
                 raise ValueError('negative-control anchor drift')
             text = text.replace(old, new)
@@ -122,10 +125,11 @@ def main():
     limit_negative = observe('mutant-limit', True, 0) if a.fixture == 'cbor-reference' else None
     synthetic_negative = observe('mutant-synthetic', False, 0) if a.fixture == 'cbor-reference' else None
     eager_negative = observe('mutant-compare-eager', False, 0) if a.fixture == 'cbor-reference' else None
+    shadow_negative = observe('mutant-shadow', True, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     report = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_LINUX_X86_64', 'inputs': inputs,
-              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'fullVmQualified': False}
+              'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     print(report['status'])
 
