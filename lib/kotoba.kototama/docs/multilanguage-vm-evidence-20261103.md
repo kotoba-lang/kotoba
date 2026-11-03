@@ -134,3 +134,18 @@ the native runner hash was
 `27349b7edfea5833f41263cdbf6195e5f26848bfb491e406c2d826987194d3b2`.
 This tests a source-locked component on one ISA, not a host integration,
 independent compiler rebuild, cross-architecture parity or full VM contract.
+
+The same two source files were also tested on macOS ARM64 with the public
+Amu host CLI SHA-256
+`616a41c017e92dd475e7472d791629a65d0811552b305b93d8c8c4b87bf3b1b0`,
+using a KSL2 source lock with both module names and byte hashes. `check`
+returned `ok`; `compile` produced a native executable, which printed `42`
+and exited zero. Weakening only the magic check in a separately locked
+negative-control build made its executable print `0`. The positive executable
+SHA-256 was `da8cf8ee7bc5576e3bed553d1a82d17563da8b51b1105381f9c4630048deb6b8`;
+the modified source SHA-256 was
+`f19aa486174a00d3b38c3502f0148b2051db6ffcac30fed830aaf95bae478ffe`.
+The test gate returns its decision as an i64; the native CLI process exits
+zero for both outputs, so a runner must check the returned value rather than
+equating a zero process exit with a passing gate. These are observations on
+two OS/ISA combinations, not Linux ARM64 or a full host integration.
