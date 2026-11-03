@@ -570,3 +570,24 @@ complete treatment must cover aliases, control flow, loops, function escape and
 callee summaries, avoid unsound acceptance and unjustified refusal, and compare
 accepted programs across engines. The bulk-copy `into` experiment was not
 adopted while those rules and the observed native difference remain open.
+
+## Local cache-hit artifact binding experiment
+
+The native Amu cache-host candidate now checks a cache hit against a fresh
+compilation by its pinned compiler: it compares the resulting image digest and
+stack bound with the cached binding, then verifies the cached image digest again
+before sealing and execution. In a test-owned cache, the previous host accepted
+a separately constructed ELF whose public image CID had been updated to match;
+it returned a valid-looking receipt with value 99 for a program that should
+return 42. The new host refused that same substitution before execution. Its
+Linux x86-64 host gate passed 62 observations, including ordinary hits,
+full-capacity hits, tampering and staging cleanup. The previous host produced
+a failing negative control for the forged-image case.
+
+This check runs the compiler on **every hit** and therefore does not establish
+any cache speedup. It assumes the compiler pin and local user/process boundary
+are trustworthy; it is neither signed provenance nor isolation from a hostile
+process with the same UID. The separate source revision, independent admission,
+remote identity, external authorization and public release gates remain open.
+The extended deadline controls and exact-head CI were still running when this
+observation was recorded; see Amu PR #1802 for their current status.
