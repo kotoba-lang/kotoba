@@ -270,3 +270,17 @@ receipt/v2 observations on Linux x86-64. This is a manual correspondence
 between two representations; it does not prove that a common canonical
 program was decoded or interpreted by the test model. The source and gate
 are retained to support that future work; they are not wired to CI.
+
+The follow-up `scripts/stage-i64-reference-comparison.py` reads actual v2
+corpus inputs and receipts, verifies each input against the report hash, and
+stages a native reference gate for the subset expressible by this experiment.
+On Linux x86-64 it selected 68 actual observations from the 287-case corpus;
+the native gate returned 42 when comparing status, value and spent to those
+receipts. A separate model with addition's charge removed returned 0; an input
+with a changed byte and the original report digest was refused before staging.
+The adapter decodes CBOR and constructs the model tree in Python, so this is
+not an independently implemented native canonical decoder or admission, and
+the subset filtering and representation mapping remain part of the test's
+trusted scaffolding. It does not cover programs with other operators, loops,
+methods, state or effects. The generated reference gate was compiled with the
+Linux source-lock route and is not yet a continuous CI gate.
