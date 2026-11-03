@@ -1,0 +1,195 @@
+;; Native verification for one fleet-pin/v1 successor. This is a library
+;; primitive, not a receiver, checkpoint authority, keyring, or transport.
+;; The caller must obtain the checkpoint and allowed DID from trusted state.
+;; Only ASCII hex hashes/signatures and nil valid-until are admitted here.
+(ns kagami.fleet-native
+  (:require [ed25519.selfhost :as ed] [sha2.core :as sha])
+  (:schemas {:fleet/native-head
+             [:record :fleet/native-head
+              [[:name :string] [:value :string] [:sequence :i64]
+               [:parent :string] [:signature :string] [:signer :string]
+               [:valid-until-nil :bool]]]})
+  (:export [verify-successor verify-edn-successor verify-edn-chain verify-edn-chain-into verify-edn-plan-into]))
+
+;; Byte offsets below are valid only for ASCII. Check raw UTF-8 bytes first;
+;; code-point-at on a continuation byte can trap on the native target.
+(defn fn-ascii? [s :string] :bool
+  (let [v (vector-i64-from-bytes (string-to-utf8 s))]
+    (loop [i 0]
+      (if (= i (vector-count v)) true
+        (if (> (vector-at v i) 127) false (recur (+ i 1)))))))
+
+(defn fn-hex? [s :string expected :i64] :bool
+  (if (or (not (= (string-byte-length s) expected)) (not (fn-ascii? s))) false
+    (loop [i 0]
+      (if (= i expected) true
+        (let [c (string-code-point-at s i)]
+          (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+            (recur (+ i 1)) false))))))
+
+;; Base58btc decoding into a fixed 34-byte big-endian buffer, rejecting
+;; invalid characters, carry overflow and non-ed25519 multicodec prefixes.
+(defn fn-b58-digit [c :i64] :i64
+  (let [alphabet "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"]
+    (if (or (< c 33) (> c 126)) -1
+      (loop [i 0]
+        (cond (= i 58) -1 (= (string-code-point-at alphabet i) c) i :else (recur (+ i 1)))))))
+(defn fn-b58-step [v :vector-i64 digit :i64] :bool
+  (loop [i 33 carry digit]
+    (if (< i 0) (= carry 0)
+      (let [x (+ (* (vector-at v i) 58) carry)
+            ignored (vector-assoc! v i (rem x 256))]
+        (recur (- i 1) (quot x 256))))))
+(defn fn-key [did :string] :vector-i64
+  (if (or (not (= (string-byte-length did) 56)) (not (fn-ascii? did))
+          (not (string=? (string-substring did 0 9) "did:key:z"))) (vector-alloc 0)
+    (let [v (vector-alloc 34)
+          ok (loop [i 9]
+               (if (= i 56) true
+                 (let [digit (fn-b58-digit (string-code-point-at did i))]
+                   (if (or (< digit 0) (not (fn-b58-step v digit))) false (recur (+ i 1))))))]
+      (if (and ok (= (vector-at v 0) 237) (= (vector-at v 1) 1))
+        (loop [i 0 out (vector-alloc 32)]
+          (if (= i 32) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ i 2))))))
+        (vector-alloc 0)))))
+
+(defn fn-payload [h [:ref :fleet/native-head]] :string
+  (string-concat "[\"fleet-pin/v1\" \"fleet-db\" \""
+    (string-concat (get h :value)
+      (string-concat "\" " (string-concat (string-from-i64 (get h :sequence))
+        (string-concat " \"" (string-concat (get h :parent) "\" nil]")))))))
+
+;; Returns the hash needed to verify the next successor, or none. The input
+;; checkpoint is explicitly trusted out of band; no chain gap is bridged.
+(defn verify-successor [h [:ref :fleet/native-head] anchor-seq :i64 anchor-hash :string allowed-did :string] [:option :string]
+  (let [seq (get h :sequence) sig (get h :signature) did (get h :signer)]
+    (if (or (< anchor-seq 0) (= anchor-seq 9223372036854775807) (not (= seq (+ anchor-seq 1)))
+            (not (string=? (get h :name) "fleet-db")) (not (get h :valid-until-nil))
+            (not (fn-hex? (get h :value) 64)) (not (fn-hex? anchor-hash 64))
+            (not (string=? (get h :parent) anchor-hash))
+            (not (fn-hex? sig 128)) (not (string=? did allowed-did)))
+      (option-none-of [:option :string])
+      (let [pk (fn-key did) payload (fn-payload h)]
+        (if (and (= (vector-count pk) 32) (ed/prime-order-key? pk)
+                 (ed/verify? pk (vector-i64-from-bytes (string-to-utf8 payload)) (ed/hex-bytes sig)))
+          (option-some-of [:option :string]
+            (sha/sha256-hex (vector-i64-from-bytes (string-to-utf8 (string-concat payload (string-concat "|" sig))))))
+          (option-none-of [:option :string]))))))
+
+;; Deliberately only the exact pr-str layout emitted for fleet-head.edn:
+;; alternate EDN orderings, duplicate keys, escaped strings and extra data are
+;; refused. The parser never assigns trust to the caller-supplied checkpoint.
+(defn fn-at? [s :string at :i64 literal :string] :bool
+  (let [n (string-byte-length literal)]
+    (and (>= at 0) (<= (+ at n) (string-byte-length s))
+         (string=? (string-substring s at (+ at n)) literal))))
+
+;; Returns -1 for invalid decimal, including overflow and leading zeros.
+(defn fn-decimal [s :string start :i64 end :i64] :i64
+  (if (or (<= end start) (> (- end start) 19)
+          (and (> (- end start) 1) (= (string-code-point-at s start) 48))) -1
+    (loop [i start value 0]
+      (if (= i end) value
+        (let [c (string-code-point-at s i) digit (- c 48)]
+          (if (or (< digit 0) (> digit 9) (> value 922337203685477580)
+                  (and (= value 922337203685477580) (> digit 7))) -1
+            (recur (+ i 1) (+ (* value 10) digit))))))))
+
+(defn fn-seq-end [s :string start :i64] :i64
+  (loop [i start]
+    (if (or (>= i (string-byte-length s)) (> (- i start) 19)) -1
+      (if (= (string-code-point-at s i) 44) i (recur (+ i 1))))))
+
+(defn verify-edn-successor [raw :string anchor-seq :i64 anchor-hash :string allowed-did :string] [:option :string]
+  (let [raw-len (string-byte-length raw)]
+    (if (or (> raw-len 513) (not (fn-ascii? raw)))
+      (option-none-of [:option :string])
+      (let [n (if (and (> raw-len 0) (= (string-code-point-at raw (- raw-len 1)) 10)) (- raw-len 1) raw-len)
+        prefix "{:record #:pin{:name \"fleet-db\", :value \""
+        mid "\", :sequence "
+        parent-label ", :parent \""
+        sig-label "\", :valid-until nil}, :signature \""
+        did-label "\", :signer \""
+        value-at (string-byte-length prefix)
+        seq-at (+ (+ value-at 64) (string-byte-length mid))]
+    (if (or (> n 512) (< n seq-at) (not (fn-at? raw 0 prefix))
+            (not (fn-at? raw (+ value-at 64) mid)))
+      (option-none-of [:option :string])
+      (let [seq-end (fn-seq-end raw seq-at)
+            seq (if (< seq-end 0) -1 (fn-decimal raw seq-at seq-end))
+            parent-at (+ seq-end (string-byte-length parent-label))
+            sig-at (+ (+ parent-at 64) (string-byte-length sig-label))
+            did-at (+ (+ sig-at 128) (string-byte-length did-label))
+            end (+ did-at 56)]
+        (if (or (< seq 0) (not (= n (+ end 2)))
+                (not (fn-at? raw seq-end parent-label))
+                (not (fn-at? raw (+ parent-at 64) sig-label))
+                (not (fn-at? raw (+ sig-at 128) did-label))
+                (not (fn-at? raw end "\"}")))
+          (option-none-of [:option :string])
+          (verify-successor
+            (record [:record :fleet/native-head
+                     [[:name :string] [:value :string] [:sequence :i64]
+                      [:parent :string] [:signature :string] [:signer :string]
+                      [:valid-until-nil :bool]]]
+                    "fleet-db" (string-substring raw value-at (+ value-at 64)) seq
+                    (string-substring raw parent-at (+ parent-at 64))
+                    (string-substring raw sig-at (+ sig-at 128))
+                    (string-substring raw did-at (+ did-at 56)) true)
+            anchor-seq anchor-hash allowed-did))))))))
+
+;; Verify a bounded, ordered batch before returning a new checkpoint hash. No
+;; durable state is written here. The caller must atomically persist the result
+;; only after success, and must independently trust the original checkpoint and
+;; signer. A batch has one signer; key rotations require a separate protocol.
+(defn verify-edn-chain [heads :document anchor-seq :i64 anchor-hash :string allowed-did :string] [:option :string]
+  (if (not (vector? heads)) (option-none-of [:option :string])
+    (let [n (document-count heads)]
+      (if (or (< n 1) (> n 16)) (option-none-of [:option :string])
+        (loop [i 0 seq anchor-seq head-hash anchor-hash]
+          (if (= i n) (option-some-of [:option :string] head-hash)
+            (let [item (document-vector-at heads i)
+                  text (if (option-some?-of [:option :document] item)
+                         (document-string-value (option-value-of [:option :document] item (document-null)))
+                         (option-none-of [:option :string]))]
+              (if (not (option-some?-of [:option :string] text)) (option-none-of [:option :string])
+                (let [next (verify-edn-successor (option-value-of [:option :string] text "") seq head-hash allowed-did)]
+                  (if (not (option-some?-of [:option :string] next)) (option-none-of [:option :string])
+                    (recur (+ i 1) (+ seq 1) (option-value-of [:option :string] next ""))))))))))))
+
+;; Caller owns `out` outside this arena. A failed batch leaves it unchanged;
+;; a successful batch writes the 32 raw bytes only after every link verifies.
+;; The caller still owns trusted anchor, signer, and durable commit semantics.
+(defn verify-edn-chain-into [out :vector-i64 heads :document anchor-seq :i64 anchor-hash :string allowed-did :string] :bool
+  (if (not (= (vector-count out) 32)) false
+    (arena-scope
+      (let [r (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]
+        (if (not (option-some?-of [:option :string] r)) false
+          (let [hash-bytes (ed/hex-bytes (option-value-of [:option :string] r ""))]
+            (if (not (= (vector-count hash-bytes) 32)) false
+              (loop [i 0]
+                (if (= i 32) true
+                  (let [ignored (vector-assoc! out i (vector-at hash-bytes i))]
+                    (recur (+ i 1))))))))))))
+
+;; Verified result for a storage adapter: [32 bytes chain hash, 32 bytes value].
+;; The caller owns `out` outside the arena. Do not treat these bytes as a
+;; durable commit: the caller must atomically compare the trusted checkpoint
+;; and update sequence, hash and value together. Trust and rotation stay outside.
+(defn verify-edn-plan-into [out :vector-i64 heads :document anchor-seq :i64 anchor-hash :string allowed-did :string] :bool
+  (if (not (= (vector-count out) 64)) false
+    (arena-scope
+      (let [verified (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]
+        (if (not (option-some?-of [:option :string] verified)) false
+          ;; verify-edn-chain validated every entry and the last exact layout.
+          (let [last-item (option-value-of [:option :document] (document-vector-at heads (- (document-count heads) 1)) (document-null))
+                raw (option-value-of [:option :string] (document-string-value last-item) "")
+                value-at (string-byte-length "{:record #:pin{:name \"fleet-db\", :value \"")
+                hash-bytes (ed/hex-bytes (option-value-of [:option :string] verified ""))
+                value-bytes (ed/hex-bytes (string-substring raw value-at (+ value-at 64)))]
+            (if (or (not (= (vector-count hash-bytes) 32)) (not (= (vector-count value-bytes) 32))) false
+              (loop [i 0]
+                (if (= i 32) true
+                  (let [a (vector-assoc! out i (vector-at hash-bytes i))
+                        b (vector-assoc! out (+ i 32) (vector-at value-bytes i))]
+                    (recur (+ i 1))))))))))))

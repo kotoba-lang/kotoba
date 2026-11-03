@@ -1,0 +1,148 @@
+(ns kagami.fleet-store-native
+  (:export [advance advance-announcement advance-message advance-successor-message])
+  (:capabilities [:fs/app-data])
+  (:require [kagami.fleet-native :as fleet] [hata.store-io :as io] [hata.codec :as codec]))
+
+;; File is only a cache of an independently trusted checkpoint. Callers must
+;; provision it from trusted state and must never derive their trust from it.
+;; All writers must use the same stable lock inode. The caller owns out.
+(defn fs-path [base :string name :string] :string
+  (string-concat base (string-concat "/" name)))
+(defn fs-hex? [s :string] :bool
+  (if (not (= (string-byte-length s) 64)) false
+    (let [b (vector-i64-from-bytes (string-to-utf8 s))]
+      (loop [i 0]
+        (if (= i 64) true
+          (let [c (vector-at b i)]
+            (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+              (recur (+ i 1)) false)))))))
+(defn fs-hex-bytes [v :vector-i64 offset :i64] :string
+  (let [digits "0123456789abcdef" out (vector-alloc 64)]
+    (loop [i 0]
+      (if (= i 32) (string-from-utf8 (bytes-from-vector-i64 out))
+        (let [b (vector-at v (+ offset i))
+              a (vector-assoc! out (* i 2) (string-code-point-at digits (quot b 16)))
+              z (vector-assoc! out (+ (* i 2) 1) (string-code-point-at digits (rem b 16)))]
+          (recur (+ i 1)))))))
+(defn fs-snapshot [seq :i64 hash :string value :string signer :string] :string
+  (string-concat "fleet-checkpoint/v1\n" (string-concat (string-from-i64 seq)
+    (string-concat "\n" (string-concat hash (string-concat "\n" (string-concat value
+      (string-concat "\n" (string-concat signer "\n")))))))))
+(defn fs-persist [base :string text :string] :bool
+  (let [temp (fs-path base "fleet.state.pending") final (fs-path base "fleet.state")]
+    (and (io/write temp text) (io/sync temp) (io/rename temp final) (io/sync base))))
+
+;; A checkpoint is ASCII. Validate bytes before converting to UTF-8 so a
+;; damaged file produces uncertainty instead of a string conversion trap.
+;; KFR1 atomically opens and reads one scoped regular file, returning status
+;; zero on I/O failure. Allocation and capability failures still fail closed.
+(defn fs-read-checkpoint [path :string] [:option :string]
+  (let [nul (string-from-utf8 (bytes-from-vector-i64 (vector-alloc 1)))
+        raw (typed-cap-call :fs/app-data :bytes :bytes (string-to-utf8 (str nul "KFR1" nul path)))
+        n (bytes-count raw)
+        ascii (loop [i 1]
+                (if (>= i n) true
+                  (if (> (bytes-at raw i) 127) false (recur (+ i 1)))))]
+    (if (and (> n 0) (= (bytes-at raw 0) 1) ascii)
+      (option-some-of [:option :string] (string-from-utf8 (bytes-slice raw 1 n)))
+      (option-none-of [:option :string]))))
+
+;; Return committed/already-committed/stale/busy/invalid/uncertain. Uncertain includes every I/O
+;; or unlock failure, including a rename that might already have reached disk.
+;; Committed requires all sync calls and unlock to succeed. Out changes only
+;; on committed or already-committed; it is not a trusted signer store.
+(defn advance [out :vector-i64 base :string seq :i64 hash :string value :string signer :string heads :document] :string
+  (if (or (not (= (vector-count out) 64)) (not (codec/safe-base? base))
+          (< seq 0) (not (fs-hex? hash)) (not (fs-hex? value))) "invalid"
+    (let [result (arena-scope
+      (let [plan (vector-alloc 64)]
+        (if (not (fleet/verify-edn-plan-into plan heads seq hash signer)) 1
+          (if (not (io/lock (fs-path base "fleet.lock"))) 2
+            (let [old (fs-snapshot seq hash value signer)
+                  file (fs-path base "fleet.state")
+                  checkpoint (fs-read-checkpoint file)
+                  observed (option-value-of [:option :string] checkpoint "")
+                  next (fs-snapshot (+ seq (document-count heads))
+                         (fs-hex-bytes plan 0) (fs-hex-bytes plan 32) signer)
+                  status (cond (not (option-some?-of [:option :string] checkpoint)) 4
+                               (string=? old observed) (if (fs-persist base next) 0 4)
+                               (string=? next observed)
+                                 (if (and (io/sync (fs-path base "fleet.state")) (io/sync base)) 5 4)
+                               :else 3)
+                  unlocked (io/unlock (fs-path base "fleet.lock"))]
+              (if (not unlocked) 4
+                (if (and (not (= status 0)) (not (= status 5))) status
+                  (loop [i 0]
+                    (if (= i 64) status
+                      (let [ignored (vector-assoc! out i (vector-at plan i))]
+                        (recur (+ i 1))))))))))))]
+      (cond (= result 0) "committed" (= result 1) "invalid" (= result 2) "busy"
+            (= result 3) "stale" (= result 5) "already-committed" :else "uncertain"))))
+
+;; Bind head-announce metadata to the verified final record before storage.
+;; The caller must decode the transport envelope and supply a trusted anchor;
+;; this function does not fetch missing links or trust the announcing peer.
+(defn advance-announcement [out :vector-i64 base :string seq :i64 hash :string value :string signer :string heads :document
+                           message-type :string graph :string head-seq :i64 head-value :string announced-head :string] :string
+  (if (or (not (string=? message-type "head-announce")) (not (string=? graph "fleet-db"))) "invalid"
+    (let [valid (arena-scope
+                  (let [plan (vector-alloc 64)]
+                    (if (fleet/verify-edn-plan-into plan heads seq hash signer)
+                      (let [item (document-vector-at heads (- (document-count heads) 1))
+                            text (if (option-some?-of [:option :document] item)
+                                   (document-string-value (option-value-of [:option :document] item (document-null)))
+                                   (option-none-of [:option :string]))
+                            last-head (option-value-of [:option :string] text "")]
+                        (and (option-some?-of [:option :string] text)
+                             (string=? announced-head last-head)
+                             (= head-seq (+ seq (document-count heads)))
+                             (string=? head-value (fs-hex-bytes plan 32))))
+                      false)))]
+      (if valid (advance out base seq hash value signer heads) "invalid"))))
+
+;; Convert the decoded map to the exact validated fleet-head serialization.
+;; Missing, extra, or wrong-typed fields fail the comparison with a valid head.
+(defn fm-get [d :document k :keyword] :document
+  (if (map? d) (option-value-of [:option :document] (document-get d k) (document-null)) (document-null)))
+(defn fm-text [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (fm-get d k)) ""))
+(defn fm-record [head :document] :string
+  (let [r (fm-get head :record) n (option-value-of [:option :i64] (document-i64-value (fm-get r :pin/sequence)) -1)
+        until (if (map? r) (document-get r :pin/valid-until) (option-none-of [:option :document]))]
+    (if (or (not (map? head)) (not (= (document-count head) 3)) (not (map? r)) (not (= (document-count r) 5))
+            (< n 0) (not (option-some?-of [:option :document] until))
+            (not (= (string-byte-length (fm-text r :pin/name)) 8))
+            (not (= (string-byte-length (fm-text r :pin/value)) 64))
+            (not (= (string-byte-length (fm-text r :pin/parent)) 64))
+            (not (= (string-byte-length (fm-text head :signature)) 128))
+            (not (= (string-byte-length (fm-text head :signer)) 56))
+            (not (nil? (option-value-of [:option :document] until (document-null))))) ""
+      (string-concat "{:record #:pin{:name \"" (string-concat (fm-text r :pin/name)
+        (string-concat "\", :value \"" (string-concat (fm-text r :pin/value)
+          (string-concat "\", :sequence " (string-concat (string-from-i64 n)
+            (string-concat ", :parent \"" (string-concat (fm-text r :pin/parent)
+              (string-concat "\", :valid-until nil}, :signature \"" (string-concat (fm-text head :signature)
+                (string-concat "\", :signer \"" (string-concat (fm-text head :signer) "\"}")))))))))))))))
+
+;; Existing kagami.p2p/head->announce map shape; the host still owns framing.
+(defn advance-message [out :vector-i64 base :string seq :i64 hash :string value :string signer :string heads :document message :document] :string
+  (let [result (arena-scope
+    (let [mtype (fm-get message :type) graph (fm-text message :graph) cid (fm-text message :head-cid)
+          number (option-value-of [:option :i64] (document-i64-value (fm-get message :seq)) -1)
+          announced (fm-record (fm-get message :fleet-head))]
+      (if (document-equal? mtype (document-keyword :head-announce))
+        (let [status (advance-announcement out base seq hash value signer heads "head-announce" graph number cid announced)]
+          (cond (string=? status "committed") 0 (string=? status "invalid") 1
+                (string=? status "busy") 2 (string=? status "stale") 3
+                (string=? status "already-committed") 5 :else 4))
+        1)))]
+    (cond (= result 0) "committed" (= result 1) "invalid" (= result 2) "busy"
+          (= result 3) "stale" (= result 5) "already-committed" :else "uncertain")))
+
+;; A single incoming announce supplies its own untrusted candidate record.
+;; Only a direct successor of the independently trusted anchor can pass the
+;; existing chain verifier. Missing intermediate records need another path.
+(defn advance-successor-message [out :vector-i64 base :string seq :i64 hash :string value :string signer :string message :document] :string
+  (let [announced (fm-record (fm-get message :fleet-head))]
+    (if (string=? announced "") "invalid"
+      (advance-message out base seq hash value signer (document-vector (document-string announced)) message))))
