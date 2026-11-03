@@ -1,0 +1,327 @@
+;; kotoba.verifier.native-signing -- canonical wire adapter from the
+;; existing base64 X.509 SPKI envelope to the selfhost raw-key Ed25519 API.
+(ns kotoba.verifier.native-signing
+  {:kotoba/export [signer-id valid-verification-key? valid-verification-key-document?
+                   valid-signing-key-document? verification-key trusted-signer-id
+                   valid-trust-policy? sign-value sign-key-value verify-value
+                   verify-signature-envelope]}
+  (:require [kotoba.bytes.base64 :as base64]
+            [kotoba.artifact.core :as artifact]
+            [multiformats.sha256 :as sha256]
+            [ed25519.selfhost :as ed25519]))
+
+(defn- spki-prefix-byte [index :i64] :i64
+  (if (= index 0) 48
+      (if (= index 1) 42
+          (if (= index 2) 48
+              (if (= index 3) 5
+                  (if (= index 4) 6
+                      (if (= index 5) 3
+                          (if (= index 6) 43
+                              (if (= index 7) 101
+                                  (if (= index 8) 112
+                                      (if (= index 9) 3
+                                          (if (= index 10) 33 0))))))))))))
+
+(defn- strict-base64 [text :string expected-length :i64] [:option :vector-i64]
+  (let [decoded (base64/base64-decode text)]
+    (if (not (option-some?-of [:option :vector-i64] decoded))
+      (option-none-of [:option :vector-i64])
+      (let [bytes (option-value-of [:option :vector-i64] decoded (vector-i64))]
+        (if (and (= (vector-count bytes) expected-length)
+                 (= (base64/base64-encode bytes) text))
+          (option-some-of [:option :vector-i64] bytes)
+          (option-none-of [:option :vector-i64]))))))
+
+(defn- decode-spki [encoded :string] [:option :vector-i64]
+  (let [der (strict-base64 encoded 44)]
+    (if (not (option-some?-of [:option :vector-i64] der))
+      (option-none-of [:option :vector-i64])
+      (let [bytes (option-value-of [:option :vector-i64] der (vector-i64))
+            valid-prefix?
+            (loop [index 0]
+              (if (= index 12) true
+                (and (= (vector-at bytes index) (spki-prefix-byte index))
+                     (recur (+ index 1)))))]
+        (if (not valid-prefix?)
+          (option-none-of [:option :vector-i64])
+          (loop [index 12 raw (vector-i64)]
+            (if (= index 44)
+              (option-some-of [:option :vector-i64] raw)
+              (recur (+ index 1) (vector-conj raw (vector-at bytes index))))))))))
+
+(defn- pkcs8-prefix-byte [index :i64] :i64
+  (cond (= index 0) 48 (= index 1) 46 (= index 2) 2 (= index 3) 1
+        (= index 4) 0 (= index 5) 48 (= index 6) 5 (= index 7) 6
+        (= index 8) 3 (= index 9) 43 (= index 10) 101 (= index 11) 112
+        (= index 12) 4 (= index 13) 34 (= index 14) 4 (= index 15) 32
+        :else 0))
+
+(defn- decode-pkcs8-seed [encoded :string] [:option :vector-i64]
+  (let [der (strict-base64 encoded 48)]
+    (if (not (option-some?-of [:option :vector-i64] der))
+      (option-none-of [:option :vector-i64])
+      (let [bytes (option-value-of [:option :vector-i64] der (vector-i64))
+            valid-prefix?
+            (loop [index 0]
+              (if (= index 16) true
+                (and (= (vector-at bytes index) (pkcs8-prefix-byte index))
+                     (recur (+ index 1)))))]
+        (if (not valid-prefix?)
+          (option-none-of [:option :vector-i64])
+          (loop [index 16 seed (vector-i64)]
+            (if (= index 48)
+              (option-some-of [:option :vector-i64] seed)
+              (recur (+ index 1) (vector-conj seed (vector-at bytes index))))))))))
+
+(defn- bytes-to-vector [bytes :bytes] :vector-i64
+  (loop [index 0 out (vector-i64)]
+    (if (>= index (bytes-count bytes)) out
+      (recur (+ index 1) (vector-conj out (bytes-at bytes index))))))
+
+(defn signer-id [public-key :string] :string
+  ;; The field set and order are fixed. This is the exact canonical map text
+  ;; used by artifact/sha256 for the host value
+  ;; {:algorithm :ed25519, :public-key public-key}; the base64 alphabet needs
+  ;; no string escaping. Hashing this text directly avoids constructing a
+  ;; general document map in the bootstrap verifier path.
+  (sha256/digest-hex
+    (vector-i64-from-bytes
+      (string-to-utf8
+        (string-concat "{:algorithm :ed25519, :public-key \""
+          (string-concat public-key "\"}"))))))
+
+(defn valid-verification-key? [public-key :string] :bool
+  (option-some?-of [:option :vector-i64] (decode-spki public-key)))
+
+(defn- field [value :document key :keyword] :document
+  (option-value-of [:option :document] (document-get value key) (document-null)))
+
+(defn- field-key? [key :document fields :document i :i64] :bool
+  (if (= i (document-count fields)) false
+    (if (document-equal? key
+          (option-value-of [:option :document] (document-vector-at fields i) (document-null)))
+      true
+      (recur key fields (+ i 1)))))
+
+(defn- map-has-fields? [value :document fields :document] :bool
+  (and (= (document-kind value) :map)
+       (= (document-count value) (document-count fields))
+       (loop [i 0]
+         (if (= i (document-count value)) true
+           (let [entry (option-value-of [:option :document] (document-map-entry-at value i) (document-vector))
+                 key (option-value-of [:option :document] (document-vector-at entry 0) (document-null))]
+             (and (field-key? key fields 0) (recur (+ i 1))))))))
+
+(defn- map-keys-within? [value :document allowed :document] :bool
+  (and (= (document-kind value) :map)
+       (loop [i 0]
+         (if (= i (document-count value)) true
+           (let [entry (option-value-of [:option :document] (document-map-entry-at value i) (document-vector))
+                 key (option-value-of [:option :document] (document-vector-at entry 0) (document-null))]
+             (and (field-key? key allowed 0) (recur (+ i 1))))))))
+
+(defn- sha256-hex? [value :string] :bool
+  (and (= (string-length value) 64)
+       (loop [i 0]
+         (if (= i 64) true
+           (let [c (string-code-point-at value i)]
+             (and (or (and (>= c 48) (<= c 57))
+                      (and (>= c 97) (<= c 102)))
+                  (recur (+ i 1))))))))
+
+(defn- valid-digest-set? [value :document] :bool
+  (and (= (document-kind value) :set)
+       (loop [i 0]
+         (if (= i (document-count value)) true
+           (let [item (option-value-of [:option :document] (document-set-at value i) (document-null))
+                 text (option-value-of [:option :string] (document-string-value item) "")]
+             (and (= (document-kind item) :string)
+                  (sha256-hex? text)
+                  (recur (+ i 1))))))))
+
+(defn valid-verification-key-document? [key :document] :bool
+  (let [fields (document-vector
+                 (document-keyword :format)
+                 (document-keyword :algorithm)
+                 (document-keyword :signer)
+                 (document-keyword :public-key))
+        public-key (option-value-of [:option :string]
+                      (document-string-value (field key :public-key)) "")
+        signer (option-value-of [:option :string]
+                  (document-string-value (field key :signer)) "")]
+    (and (map-has-fields? key fields)
+         (document-equal? (field key :format) (document-keyword :kotoba.verification-key/v1))
+         (document-equal? (field key :algorithm) (document-keyword :ed25519))
+         (= signer (signer-id public-key))
+         (valid-verification-key? public-key))))
+
+(defn valid-signing-key-document? [key :document] :bool
+  (let [fields (document-vector
+                 (document-keyword :format)
+                 (document-keyword :algorithm)
+                 (document-keyword :signer)
+                 (document-keyword :public-key)
+                 (document-keyword :private-key))
+        public-key (option-value-of [:option :string]
+                      (document-string-value (field key :public-key)) "")
+        private-key (option-value-of [:option :string]
+                       (document-string-value (field key :private-key)) "")
+        signer (option-value-of [:option :string]
+                  (document-string-value (field key :signer)) "")
+        raw-public (decode-spki public-key)
+        seed (decode-pkcs8-seed private-key)]
+    (and (map-has-fields? key fields)
+         (document-equal? (field key :format) (document-keyword :kotoba.signing-key/v1))
+         (document-equal? (field key :algorithm) (document-keyword :ed25519))
+         (= signer (signer-id public-key))
+         (option-some?-of [:option :vector-i64] raw-public)
+         (option-some?-of [:option :vector-i64] seed)
+         (ed25519/bytes=?
+           (option-value-of [:option :vector-i64] raw-public (vector-i64))
+           (ed25519/public-from-seed
+             (option-value-of [:option :vector-i64] seed (vector-i64)))))))
+
+(defn verification-key [key :document] [:option :document]
+  (if (not (valid-signing-key-document? key))
+    (option-none-of [:option :document])
+    (option-some-of [:option :document]
+      (document-map
+        :format (document-keyword :kotoba.verification-key/v1)
+        :algorithm (document-keyword :ed25519)
+        :signer (field key :signer)
+        :public-key (field key :public-key)))))
+
+(defn trusted-signer-id [key :document] [:option :string]
+  (if (valid-verification-key-document? key)
+    (option-some-of [:option :string]
+      (option-value-of [:option :string] (document-string-value (field key :signer)) ""))
+    (if (valid-signing-key-document? key)
+      (option-some-of [:option :string]
+        (option-value-of [:option :string] (document-string-value (field key :signer)) ""))
+      (option-none-of [:option :string]))))
+
+(defn valid-trust-policy? [policy :document] :bool
+  (let [allowed (document-vector
+                  (document-keyword :format)
+                  (document-keyword :trusted-signers)
+                  (document-keyword :revoked-signers)
+                  (document-keyword :revoked-artifacts)
+                  (document-keyword :trusted-runtime-sha256)
+                  (document-keyword :revoked-runtime-sha256))]
+    (and (map-keys-within? policy allowed)
+         (document-contains policy (document-keyword :format))
+         (document-contains policy (document-keyword :trusted-signers))
+         (document-contains policy (document-keyword :revoked-signers))
+         (document-contains policy (document-keyword :revoked-artifacts))
+         (document-equal? (field policy :format) (document-keyword :kotoba.trust/v1))
+         (valid-digest-set? (field policy :trusted-signers))
+         (valid-digest-set? (field policy :revoked-signers))
+         (valid-digest-set? (field policy :revoked-artifacts))
+         (or (not (document-contains policy (document-keyword :trusted-runtime-sha256)))
+             (valid-digest-set? (field policy :trusted-runtime-sha256)))
+         (or (not (document-contains policy (document-keyword :revoked-runtime-sha256)))
+             (valid-digest-set? (field policy :revoked-runtime-sha256))))))
+
+(defn sign-value [private-key :string value :document] [:option :string]
+  (let [seed (decode-pkcs8-seed private-key)]
+    (if (not (option-some?-of [:option :vector-i64] seed))
+      (option-none-of [:option :string])
+      (option-some-of [:option :string]
+        (base64/base64-encode
+          (ed25519/sign
+            (option-value-of [:option :vector-i64] seed (vector-i64))
+            (bytes-to-vector (artifact/canonical-bytes value))))))))
+
+(defn sign-key-value [key :document value :document] [:option :string]
+  (if (not (valid-signing-key-document? key))
+    (option-none-of [:option :string])
+    (sign-value
+      (option-value-of [:option :string] (document-string-value (field key :private-key)) "")
+      value)))
+
+(defn verify-value [public-key :string value :document signature :string] :bool
+  (let [raw-key (decode-spki public-key)
+        raw-signature (strict-base64 signature 64)]
+    (and (option-some?-of [:option :vector-i64] raw-key)
+         (option-some?-of [:option :vector-i64] raw-signature)
+         (ed25519/verify?
+           (option-value-of [:option :vector-i64] raw-key (vector-i64))
+           (bytes-to-vector (artifact/canonical-bytes value))
+           (option-value-of [:option :vector-i64] raw-signature (vector-i64))))))
+
+(defn- envelope-refusal [phase :document reason :document] :document
+  (document-map :signature-valid? (document-bool false)
+                :phase phase :reason reason))
+
+;; This verifies the signed-envelope schema, Ed25519 statement, trust policy,
+;; validity interval and artifact seal. It deliberately does not claim the
+;; full KExe semantic checks performed by kotoba.verifier/verify-artifact!.
+(defn verify-signature-envelope [envelope :document trust :document now :i64] :document
+  (if (not (document-equal? (field envelope :format) (document-keyword :kotoba.signed-kexe/v1)))
+    (envelope-refusal (document-keyword :signature) (document-keyword :unknown-signed-envelope-format))
+    (let [envelope-fields (document-vector
+                            (document-keyword :format)
+                            (document-keyword :artifact)
+                            (document-keyword :statement)
+                            (document-keyword :signature))]
+      (if (not (map-has-fields? envelope envelope-fields))
+        (envelope-refusal (document-keyword :signature) (document-keyword :signed-envelope-schema-mismatch))
+        (if (not (valid-trust-policy? trust))
+          (envelope-refusal (document-keyword :trust) (document-keyword :malformed-trust-policy))
+          (let [artifact-value (field envelope :artifact)
+                statement (field envelope :statement)
+                signature-value (field envelope :signature)
+                statement-fields (document-vector
+                                   (document-keyword :format)
+                                   (document-keyword :artifact-sha256)
+                                   (document-keyword :signer)
+                                   (document-keyword :public-key)
+                                   (document-keyword :not-before)
+                                   (document-keyword :expires))]
+            (if (not (map-has-fields? statement statement-fields))
+              (envelope-refusal (document-keyword :signature) (document-keyword :signature-statement-mismatch))
+              (let [signature (option-value-of [:option :string]
+                                 (document-string-value signature-value) "")
+                    signer (option-value-of [:option :string]
+                              (document-string-value (field statement :signer)) "")
+                    public-key (option-value-of [:option :string]
+                                  (document-string-value (field statement :public-key)) "")
+                    artifact-sha256 (option-value-of [:option :string]
+                                      (document-string-value (field statement :artifact-sha256)) "")
+                    not-before (document-i64-value (field statement :not-before))
+                    expires (document-i64-value (field statement :expires))]
+                (if (not (and (document-equal? (field statement :format) (document-keyword :kotoba.signature-statement/v1))
+                              (option-some?-of [:option :i64] not-before)
+                              (option-some?-of [:option :i64] expires)
+                              (< (option-value-of [:option :i64] not-before 0)
+                                 (option-value-of [:option :i64] expires 0))
+                              (sha256-hex? artifact-sha256)
+                              (= signer (signer-id public-key))
+                              (= artifact-sha256
+                                 (option-value-of [:option :string]
+                                   (document-string-value (field artifact-value :sha256)) ""))
+                              (valid-verification-key? public-key)
+                              (= (document-kind signature-value) :string)))
+                  (envelope-refusal (document-keyword :signature) (document-keyword :signature-statement-mismatch))
+                  (if (not (verify-value public-key statement signature))
+                    (envelope-refusal (document-keyword :signature) (document-keyword :ed25519-signature-verification-failed))
+                    (if (not (document-set-contains? (field trust :trusted-signers) (document-string signer)))
+                      (envelope-refusal (document-keyword :trust) (document-keyword :signer-not-trusted))
+                      (if (document-set-contains? (field trust :revoked-signers) (document-string signer))
+                        (envelope-refusal (document-keyword :trust) (document-keyword :signer-revoked))
+                        (if (document-set-contains? (field trust :revoked-artifacts) (document-string artifact-sha256))
+                          (envelope-refusal (document-keyword :trust) (document-keyword :artifact-revoked))
+                          (if (< now (option-value-of [:option :i64] not-before 0))
+                            (envelope-refusal (document-keyword :trust) (document-keyword :signature-not-yet-valid))
+                            (if (>= now (option-value-of [:option :i64] expires 0))
+                              (envelope-refusal (document-keyword :trust) (document-keyword :signature-expired))
+                              (if (not (artifact/valid-seal? artifact-value))
+                                (envelope-refusal (document-keyword :artifact) (document-keyword :artifact-integrity-mismatch))
+                                (document-map
+                                  :signature-valid? (document-bool true)
+                                  :signer (document-string signer)
+                                  :artifact artifact-value
+                                  :validity (document-map
+                                    :not-before (document-i64 (option-value-of [:option :i64] not-before 0))
+                                    :expires (document-i64 (option-value-of [:option :i64] expires 0))))))))))))))))))))
