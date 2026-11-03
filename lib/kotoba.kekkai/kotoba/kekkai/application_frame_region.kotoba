@@ -1,0 +1,197 @@
+;; JUN-757: native existing application/1 JSON chunk codec, not reassembly.
+;; decode/encode(work,actual>=8192,input,actual-used,output,actual-capacity).
+;; Caller-owned work8192 and full input/output allocations must be disjoint;
+;; inputs immutable, calls serialized. Shape refusal preserves all bytes;
+;; processed completion/refusal clears all8192 private bytes. Refused output
+;; is unchanged. decode returns1/-1 and commits exactly2048 record bytes;
+;; encode returns JSON byte count/-1 and commits only its encoded prefix.
+;; Input JSON0..65536, depth64; five required names (escaped names match),
+;; unknown fields syntactically checked/ignored, duplicate required names
+;; rejected. version1; plain decimal indices0..<count, count1..2048;
+;; messageId1..160 UTF16 units, strict UTF8 scalars (no lone surrogates);
+;; canonical RFC4648 payload<=700 decoded bytes (JSON escapes allowed).
+;; Stricter than legacy JS's duplicate/numeric/base64/surrogate coercions;
+;; keeps canonical encoder wire, limits and all byte payloads. Not a full
+;; acceptance claim for the legacy parser's permissive input language.
+;; Record2048: magic0x3146504b@0, UTF8 ID length4, UTF16 units8, partIndex12,
+;; partCount16, payload length20; ID64..703 (640), payload704..1403 (700).
+;; Remaining record bytes zero on decode. No authentication/peer association,
+;; entropy, app/port/effect/consent grant.1MiB message/128 assemblies/4MiB
+;; buffered/2048 parts, out-of-order/replay and peer/epoch keyed reassembly
+;; remain separate full-product requirements; they are not reduced here.
+(ns kekkai.application-frame-region
+  (:require [kotoba.json.region :as j])
+  (:export [decode encode valid-record]))
+(defn- r [work at] (kernel-load-u32 (kernel-subregion work 8192 at 4) 4 0))
+(defn- w [work at value] (kernel-store-u32 (kernel-subregion work 8192 at 4) 4 0 value))
+(defn- p [work at value] (kernel-store-u8 (kernel-subregion work 8192 at 1) 1 0 value))
+(defn- wb [work at] (kernel-load-u8 (kernel-subregion work 8192 at 1) 1 0))
+(defn- b [input count at] (if (and (>= at 0) (< at count)) (kernel-load-u8-64k input count at) -1))
+(defn- clear [work at]
+  (if (>= at 8192) 1 (do (kernel-store-u64 (kernel-subregion work 8192 at 8) 8 0 0) (clear work (+ at 8)))))
+(defn- disjoint [a al b bl] :bool (or (= al 0) (= bl 0) (<= (+ a al) b) (<= (+ b bl) a)))
+(defn- shape [work work-bytes input count output capacity] :bool
+  (and (>= work-bytes 8192) (>= count 0) (<= count 65536) (>= capacity 0) (<= capacity 65536)
+       (disjoint work 8192 input count) (disjoint work 8192 output capacity) (disjoint input count output capacity)))
+(defn- key-byte [kind i]
+  (case kind 1 (case i 0 118 1 101 2 114 3 115 4 105 5 111 110)
+    2 (case i 0 109 1 101 2 115 3 115 4 97 5 103 6 101 7 73 100)
+    3 (case i 0 112 1 97 2 114 3 116 4 73 5 110 6 100 7 101 120)
+    4 (case i 0 112 1 97 2 114 3 116 4 67 5 111 6 117 7 110 116)
+    5 (case i 0 112 1 97 2 121 3 108 4 111 5 97 100) -1))
+(defn- key-same [input count at end kind index] :bool
+  (if (>= at end) (= index (if (or (= kind 1) (= kind 5)) 7 9))
+    (if (>= index (if (or (= kind 1) (= kind 5)) 7 9)) false
+      (let [step (j/next-character input count at end)]
+        (and (>= step 0) (= (mod step 2097152) (key-byte kind index))
+             (key-same input count (quot step 2097152) end kind (+ index 1)))))))
+(defn- key-kind [input count at end kind]
+  (if (> kind 5) 0 (if (key-same input count at end kind 0) kind (key-kind input count at end (+ kind 1)))))
+(defn- members [work input count at mask]
+  (if (not= (b input count at) 34) -1
+    (let [key-end (j/string-end input count (+ at 1))]
+      (if (< key-end 0) -1
+        (let [kind (key-kind input count (+ at 1) key-end 1) colon (j/skip-space input count (+ key-end 1))]
+          (if (or (not= (b input count colon) 58) (and (> kind 0) (not= (bit-and mask (i64-shift-left 1 (- kind 1))) 0))) -1
+            (let [start (j/skip-space input count (+ colon 1))]
+              (let [end (j/value-end input count start 1)]
+                (if (< end 0) -1
+                  (do (if (> kind 0) (do (w work (+ 4096 (* kind 8)) start) (w work (+ 4100 (* kind 8)) end)) 0)
+                      (let [next (j/skip-space input count end) bits (bit-or mask (if (> kind 0) (i64-shift-left 1 (- kind 1)) 0))]
+                        (if (= (b input count next) 125)
+                          (if (and (= bits 31) (= (j/skip-space input count (+ next 1)) count)) 1 -1)
+                          (if (= (b input count next) 44) (members work input count (j/skip-space input count (+ next 1)) bits) -1)))))))))))))
+(defn- parse [work input count]
+  (let [start (j/skip-space input count 0)]
+    (if (= (b input count start) 123) (members work input count (j/skip-space input count (+ start 1)) 0) -1)))
+(defn- natural [work input count kind maximum]
+  (j/natural-value input count (r work (+ 4096 (* kind 8))) (r work (+ 4100 (* kind 8))) maximum))
+(defn- utf8-save [work value at]
+  (if (< value 128) (do (p work (+ 64 at) value) (+ at 1))
+    (if (< value 2048) (do (p work (+ 64 at) (+ 192 (quot value 64))) (p work (+ 65 at) (+ 128 (mod value 64))) (+ at 2))
+      (if (< value 65536) (do (p work (+ 64 at) (+ 224 (quot value 4096))) (p work (+ 65 at) (+ 128 (mod (quot value 64) 64)))
+                            (p work (+ 66 at) (+ 128 (mod value 64))) (+ at 3))
+        (do (p work (+ 64 at) (+ 240 (quot value 262144))) (p work (+ 65 at) (+ 128 (mod (quot value 4096) 64)))
+            (p work (+ 66 at) (+ 128 (mod (quot value 64) 64))) (p work (+ 67 at) (+ 128 (mod value 64))) (+ at 4))))))
+(defn- id-copy [work input count at end pos]
+  (if (>= at end) pos
+    (let [step (j/next-character input count at end)]
+      (if (or (< step 0) (> (+ pos 4) 644)) -1
+        (id-copy work input count (quot step 2097152) end (utf8-save work (mod step 2097152) pos))))))
+(defn- id-read [work input count start end]
+  (if (and (= (b input count start) 34) (= (b input count (- end 1)) 34))
+    (let [units (j/utf16-length input count (+ start 1) (- end 1) false)]
+      (if (and (>= units 1) (<= units 160))
+        (let [size (id-copy work input count (+ start 1) (- end 1) 0)]
+          (if (and (> size 0) (<= size 640)) (do (w work 4 size) (w work 8 units) 1) -1)) -1)) -1))
+(defn- sextet [v]
+  (if (and (>= v 65) (<= v 90)) (- v 65)
+    (if (and (>= v 97) (<= v 122)) (+ 26 (- v 97))
+      (if (and (>= v 48) (<= v 57)) (+ 52 (- v 48)) (if (= v 43) 62 (if (= v 47) 63 -1))))))
+(defn- quartet [work input count at end index]
+  (if (>= index 4) at
+    (let [step (j/next-character input count at end)]
+      (if (or (< step 0) (> (mod step 2097152) 127)) -1
+        (do (w work (+ 4160 (* index 4)) (mod step 2097152))
+            (quartet work input count (quot step 2097152) end (+ index 1)))))))
+(defn- group [work pos last :bool]
+  (let [a (sextet (r work 4160)) b (sextet (r work 4164)) c (sextet (r work 4168)) d (sextet (r work 4172))]
+    (if (or (< a 0) (< b 0)) -1
+      (if (= (r work 4168) 61)
+        (if (and last (= (r work 4172) 61) (= (mod b 16) 0) (< pos 700))
+          (do (p work (+ 704 pos) (+ (* a 4) (quot b 16))) (+ pos 1)) -1)
+        (if (< c 0) -1
+          (if (= (r work 4172) 61)
+            (if (and last (= (mod c 4) 0) (<= (+ pos 2) 700))
+              (do (p work (+ 704 pos) (+ (* a 4) (quot b 16))) (p work (+ 705 pos) (+ (* (mod b 16) 16) (quot c 4))) (+ pos 2)) -1)
+            (if (and (>= d 0) (<= (+ pos 3) 700))
+              (do (p work (+ 704 pos) (+ (* a 4) (quot b 16))) (p work (+ 705 pos) (+ (* (mod b 16) 16) (quot c 4)))
+                  (p work (+ 706 pos) (+ (* (mod c 4) 64) d)) (+ pos 3)) -1)))))))
+(defn- base64-read [work input count at end pos]
+  (if (>= at end) pos
+    (let [next (quartet work input count at end 0)]
+      (if (< next 0) -1
+        (let [size (group work pos (= next end))]
+          (if (< size 0) -1 (base64-read work input count next end size)))))))
+(defn- payload-read [work input count start end]
+  (if (and (= (b input count start) 34) (= (b input count (- end 1)) 34))
+    (base64-read work input count (+ start 1) (- end 1) 0) -1))
+(defn- admitted [work input count]
+  (if (and (= (parse work input count) 1) (= (natural work input count 1 1) 1)
+           (= (id-read work input count (r work 4112) (r work 4116)) 1))
+    (let [index (natural work input count 3 2047) total (natural work input count 4 2048)
+          size (payload-read work input count (r work 4136) (r work 4140))]
+      (if (and (>= index 0) (> total 0) (< index total) (>= size 0))
+        (do (w work 0 0x3146504b) (w work 12 index) (w work 16 total) (w work 20 size) 1) -1)) -1))
+(defn- commit [work output capacity used at]
+  (if (>= at used) used
+    (do (kernel-store-u8 (kernel-subregion output capacity at 1) 1 0 (wb work at)) (commit work output capacity used (+ at 1)))))
+(defn- decode-run [work input count output capacity]
+  (do (clear work 0)
+      (let [ok (admitted work input count)]
+        (do (if (= ok 1) (commit work output capacity 2048 0) 0) (clear work 0) ok))))
+(defn decode [work work-bytes input count output capacity]
+  (if (and (shape work work-bytes input count output capacity) (>= capacity 2048))
+    (decode-run (kernel-subregion work work-bytes 0 8192) input count output capacity) -1))
+
+(defn- fixed-size [kind] (case kind 1 26 2 14 3 13 4 12 5 2 0))
+(defn- fixed-byte [kind i]
+  (case kind 1 (case i 0 123 1 34 2 118 3 101 4 114 5 115 6 105 7 111 8 110 9 34 10 58 11 49 12 44 13 34 14 109 15 101 16 115 17 115 18 97 19 103 20 101 21 73 22 100 23 34 24 58 25 34 -1)
+    2 (case i 0 34 1 44 2 34 3 112 4 97 5 114 6 116 7 73 8 110 9 100 10 101 11 120 12 34 13 58 -1)
+    3 (case i 0 44 1 34 2 112 3 97 4 114 5 116 6 67 7 111 8 117 9 110 10 116 11 34 12 58 -1)
+    4 (case i 0 44 1 34 2 112 3 97 4 121 5 108 6 111 7 97 8 100 9 34 10 58 11 34 -1)
+    5 (case i 0 34 1 125 -1) -1))
+(defn- fixed [work at kind index]
+  (if (>= index (fixed-size kind)) at
+    (do (p work at (fixed-byte kind index)) (fixed work (+ at 1) kind (+ index 1)))))
+(defn- decimal [work at number]
+  (if (< number 10) (do (p work at (+ 48 number)) (+ at 1))
+    (let [next (decimal work at (quot number 10))]
+      (do (p work next (+ 48 (mod number 10))) (+ next 1)))))
+(defn- record-word [input at] (kernel-load-u32 (kernel-subregion input 2048 at 4) 4 0))
+(defn- hex-byte [v] (if (< v 10) (+ 48 v) (+ 87 v)))
+(defn- escape-id [work input at size index]
+  (if (>= index size) at
+    (let [v (b input 2048 (+ 64 index))]
+      (if (or (= v 34) (= v 92))
+        (do (p work at 92) (p work (+ at 1) v) (escape-id work input (+ at 2) size (+ index 1)))
+        (if (or (= v 8) (= v 9) (= v 10) (= v 12) (= v 13))
+          (do (p work at 92) (p work (+ at 1) (case v 8 98 9 116 10 110 12 102 114))
+              (escape-id work input (+ at 2) size (+ index 1)))
+          (if (< v 32)
+            (do (p work at 92) (p work (+ at 1) 117) (p work (+ at 2) 48) (p work (+ at 3) 48)
+                (p work (+ at 4) (hex-byte (quot v 16))) (p work (+ at 5) (hex-byte (mod v 16)))
+                (escape-id work input (+ at 6) size (+ index 1)))
+            (do (p work at v) (escape-id work input (+ at 1) size (+ index 1)))))))))
+(defn- alphabet [v]
+  (if (< v 26) (+ 65 v) (if (< v 52) (+ 71 v) (if (< v 62) (- v 4) (if (= v 62) 43 47)))))
+(defn- base64-write [work input at size index]
+  (if (>= index size) at
+    (let [a (b input 2048 (+ 704 index))
+          c (if (< (+ index 1) size) (b input 2048 (+ 705 index)) 0)
+          d (if (< (+ index 2) size) (b input 2048 (+ 706 index)) 0)]
+      (do (p work at (alphabet (quot a 4))) (p work (+ at 1) (alphabet (+ (* (mod a 4) 16) (quot c 16))))
+          (p work (+ at 2) (if (< (+ index 1) size) (alphabet (+ (* (mod c 16) 4) (quot d 64))) 61))
+          (p work (+ at 3) (if (< (+ index 2) size) (alphabet (mod d 64)) 61))
+          (base64-write work input (+ at 4) size (+ index 3))))))
+(defn- record-valid [input] :bool
+  (and (= (record-word input 0) 0x3146504b) (>= (record-word input 4) 1) (<= (record-word input 4) 640)
+       (>= (record-word input 8) 1) (<= (record-word input 8) 160)
+       (= (j/utf16-length input 2048 64 (+ 64 (record-word input 4)) true) (record-word input 8))
+       (> (record-word input 16) 0) (<= (record-word input 16) 2048) (< (record-word input 12) (record-word input 16))
+       (<= (record-word input 20) 700)))
+(defn valid-record [input count] :bool
+  (and (= count 2048) (record-valid (kernel-subregion input count 0 2048))))
+(defn- encoded [work input]
+  (let [id (escape-id work input (fixed work 0 1 0) (record-word input 4) 0)]
+    (let [index (decimal work (fixed work id 2 0) (record-word input 12))]
+      (let [total (decimal work (fixed work index 3 0) (record-word input 16))]
+        (fixed work (base64-write work input (fixed work total 4 0) (record-word input 20) 0) 5 0)))))
+(defn- encode-run [work input output capacity]
+  (do (clear work 0)
+      (let [size (if (record-valid input) (encoded work input) -1)]
+        (let [result (if (and (>= size 0) (<= size capacity)) (commit work output capacity size 0) -1)]
+          (do (clear work 0) result)))))
+(defn encode [work work-bytes input count output capacity]
+  (if (and (shape work work-bytes input count output capacity) (= count 2048))
+    (encode-run (kernel-subregion work work-bytes 0 8192) (kernel-subregion input count 0 2048) output capacity) -1))

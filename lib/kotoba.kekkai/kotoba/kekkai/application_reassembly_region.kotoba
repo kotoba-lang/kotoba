@@ -1,0 +1,250 @@
+;; JUN-757: serialized, exclusively owned8MiB application/1 reassembly data.
+;; initialize before use; never deserialize an untrusted owner image. The
+;; managed caller supplies the authenticated peer/key/current roster binding;
+;; a record, binding or completed message does not grant app/service consent.
+;; 1MiB/message,2048 parts,128 pending assemblies,4MiB pending payload.
+;; Out-of-order, replace-duplicate, zero-length parts and exact quotas retained.
+;; accept(owner,actual>=8MiB,binding,actual64,record,actual2048,now)=-1/0/1.
+;; Refusals preserve all owner/input bytes, including malformed completed JSON.
+;; Complete JSON is validated before removing the assembly. Result bytes stay
+;; pinned until release/revoke/epoch/reset; accept refuses while result pinned.
+;; No implicit TTL: expire is an explicit caller lifecycle decision.
+;; Owner: global4096;128 headers1024 from4096;262144 entries10 from135168;
+;; payload4MiB from2756608; completed1MiB from6950912; tail389120 unused.
+;; Entry: offset32, present/length16 (0x8000|0..700), next32 at6. A linked
+;; arrival list packs the payload without fixed-block fragmentation. Removing
+;; one part/assembly compacts once and updates every surviving offset/link.
+;; Binding64: magic0x3142504b/version1, epoch64@8, peer index32@16 (1..64),
+;; reserved32@20, nonzero key32@24, reserved64@56. Equal index/key/epoch plus
+;; exact UTF8 message ID identifies an assembly; epoch advance wipes all8MiB.
+(ns kekkai.application-reassembly-region
+  (:require [kekkai.application-frame-region :as f]
+            [kotoba.json.document-region :as j])
+  (:export [initialize advance-epoch accept release revoke expire
+            pending-count buffered-bytes completed-size completed-copy
+            pin-completed-channel completed-message-start completed-channel-start completed-storage-start]))
+(defn- b [o at] :i64 (kernel-load-u8 (kernel-subregion o 8388608 at 1) 1 0))
+(defn- p [o at v] :i64 (kernel-store-u8 (kernel-subregion o 8388608 at 1) 1 0 v))
+(defn- r [o at] :i64 (kernel-load-u32 (kernel-subregion o 8388608 at 4) 4 0))
+(defn- w [o at v] :i64 (kernel-store-u32 (kernel-subregion o 8388608 at 4) 4 0 v))
+(defn- r64 [o at] :i64 (kernel-load-u64 (kernel-subregion o 8388608 at 8) 8 0))
+(defn- w64 [o at v] :i64 (kernel-store-u64 (kernel-subregion o 8388608 at 8) 8 0 v))
+(defn- zero [o at end] :i64
+  (loop [i at]
+    (if (>= i end) 1
+      (if (<= (+ i 8) end)
+        (let [z (w64 o i 0)] (recur (+ i 8)))
+        (let [z (p o i 0)] (recur (+ i 1)))))))
+(defn- move [o to from size] :i64
+  (loop [i 0]
+    (if (>= i size) 1
+      (if (<= (+ i 8) size)
+        (let [v (r64 o (+ from i)) z (w64 o (+ to i) v)] (recur (+ i 8)))
+        (let [v (b o (+ from i)) z (p o (+ to i) v)] (recur (+ i 1)))))))
+(defn- copy-in [o to input count from size] :i64
+  (loop [i 0]
+    (if (>= i size) 1
+      (let [v (kernel-load-u8 (kernel-subregion input count (+ from i) 1) 1 0)
+            z (p o (+ to i) v)] (recur (+ i 1))))))
+(defn- separate [a n c m] :bool (or (<= (+ a n) c) (<= (+ c m) a)))
+(defn- header [s] :i64 (+ 4096 (* s 1024)))
+(defn- entry [i] :i64 (+ 135168 (* i 10)))
+(defn- part-length [o i] :i64 (+ (b o (+ (entry i) 4)) (* 256 (b o (+ (entry i) 5)))))
+(defn- present [o i] :bool (>= (part-length o i) 32768))
+(defn- part-size [o i] :i64 (if (present o i) (- (part-length o i) 32768) 0))
+(defn- set-length [o i n] :i64
+  (do (p o (+ (entry i) 4) (mod n 256)) (p o (+ (entry i) 5) (quot n 256))))
+(defn- initialized [o] :bool
+  (and (= (r o 0) 0x3152414b) (= (r o 4) 1) (<= (r o 8) 128)
+       (<= (r o 12) 4194304) (<= (r o 16) 1048576) (<= (r o 20) 1)
+       (<= (r o 24) 262144) (<= (r o 28) 262144)
+       (> (r64 o 32) 0) (<= (r64 o 32) 9007199254740991)
+       (>= (r64 o 40) 0) (<= (r64 o 40) 9007199254740991)))
+(defn- reset [o epoch] :i64
+  (do (zero o 0 8388608) (w o 0 0x3152414b) (w o 4 1)
+      (w o 24 262144) (w o 28 262144) (w64 o 32 epoch) 1))
+(defn initialize [owner length epoch] :i64
+  (if (and (>= length 8388608) (> epoch 0) (<= epoch 9007199254740991))
+    (reset (kernel-subregion owner length 0 8388608) epoch) -1))
+(defn- advance-run [o epoch] :i64
+  (if (and (initialized o) (> epoch (r64 o 32)) (<= epoch 9007199254740991)) (reset o epoch) -1))
+(defn advance-epoch [owner length epoch] :i64
+  (if (>= length 8388608) (advance-run (kernel-subregion owner length 0 8388608) epoch) -1))
+(defn- br [binding at] :i64 (kernel-load-u32 (kernel-subregion binding 64 at 4) 4 0))
+(defn- br64 [binding at] :i64 (kernel-load-u64 (kernel-subregion binding 64 at 8) 8 0))
+(defn- bb [binding at] :i64 (kernel-load-u8 (kernel-subregion binding 64 at 1) 1 0))
+(defn- key-any [binding i any] :i64
+  (if (>= i 32) any (key-any binding (+ i 1) (bit-or any (bb binding (+ 24 i))))))
+(defn- binding-valid [o binding] :bool
+  (and (= (br binding 0) 0x3142504b) (= (br binding 4) 1)
+       (= (br64 binding 8) (r64 o 32))
+       (>= (br binding 16) 1) (<= (br binding 16) 64)
+       (= (br binding 20) 0) (= (br64 binding 56) 0) (> (key-any binding 0 0) 0)))
+(defn- same-key [o h binding i] :bool
+  (if (>= i 32) true (and (= (r64 o (+ h 16 i)) (br64 binding (+ 24 i))) (same-key o h binding (+ i 8)))))
+(defn- bound [o h binding] :bool
+  (and (= (r o h) 1) (= (r o (+ h 4)) (br binding 16))
+       (= (r64 o (+ h 8)) (br64 binding 8)) (same-key o h binding 0)))
+(defn- fr [frame at] :i64 (kernel-load-u32 (kernel-subregion frame 2048 at 4) 4 0))
+(defn- same-id [o h frame i] :bool
+  (if (>= i (fr frame 4)) true
+    (and (= (b o (+ h 128 i)) (kernel-load-u8 (kernel-subregion frame 2048 (+ 64 i) 1) 1 0))
+         (same-id o h frame (+ i 1)))))
+(defn- find-slot [o binding frame s free] :i64
+  (if (>= s 128) free
+    (if (and (= (r o (header s)) 1) (= (r o (+ (header s) 48)) (fr frame 4))
+             (same-id o (header s) frame 0) (bound o (header s) binding)) s
+      (find-slot o binding frame (+ s 1) (if (and (< free 0) (= (r o (header s)) 0)) s free)))))
+(defn- save-header [o h binding frame now] :i64
+  (do (zero o h (+ h 1024)) (w o h 1) (w o (+ h 4) (br binding 16))
+      (w64 o (+ h 8) (br64 binding 8)) (copy-in o (+ h 16) binding 64 24 32)
+      (w o (+ h 48) (fr frame 4)) (w o (+ h 52) (fr frame 8))
+      (w o (+ h 56) (fr frame 16)) (w64 o (+ h 72) now)
+      (copy-in o (+ h 128) frame 2048 64 (fr frame 4)) 1))
+;; drop-part=-1 removes a whole assembly, otherwise only one absolute entry.
+;; The caller has already admitted every quota and possible refusal.
+(defn- compact [o slot drop-part] :i64
+  (let [old (r o 12)]
+    (loop [i (r o 24) previous 262144 first 262144 used 0]
+      (if (= i 262144)
+        (do (if (< previous 262144) (w o (+ (entry previous) 6) 262144) 0)
+            (w o 24 first) (w o 28 previous) (w o 12 used)
+            (zero o (+ 2756608 used) (+ 2756608 old)) 1)
+        (let [next (r o (+ (entry i) 6)) size (part-size o i)]
+          (if (if (< drop-part 0) (= (quot i 2048) slot) (= i drop-part))
+            (let [z (zero o (entry i) (+ (entry i) 10))] (recur next previous first used))
+            (let [z (move o (+ 2756608 used) (+ 2756608 (r o (entry i))) size)
+                  a (w o (entry i) used)
+                  c (if (< previous 262144) (w o (+ (entry previous) 6) i) 0)]
+              (recur next i (if (= first 262144) i first) (+ used size)))))))))
+(defn- remove-slot [o s] :i64
+  (do (compact o s -1) (zero o (header s) (+ (header s) 1024)) (w o 8 (- (r o 8) 1)) 1))
+(defn- append-part [o s binding frame now] :i64
+  (let [h (header s) id (+ (* s 2048) (fr frame 12))
+        prior (present o id) total (+ (- (r o (+ h 64)) (part-size o id)) (fr frame 20))
+        count (+ (r o (+ h 60)) (if prior 0 1))]
+    (do (if prior (compact o s id) 0)
+        (if (= (r o h) 0) (do (save-header o h binding frame now) (w o 8 (+ (r o 8) 1))) 0)
+        (copy-in o (+ 2756608 (r o 12)) frame 2048 704 (fr frame 20))
+        (w o (entry id) (r o 12)) (set-length o id (+ 32768 (fr frame 20))) (w o (+ (entry id) 6) 262144)
+        (if (< (r o 28) 262144) (w o (+ (entry (r o 28)) 6) id) (w o 24 id))
+        (w o 28 id) (w o 12 (+ (r o 12) (fr frame 20)))
+        (w o (+ h 60) count) (w o (+ h 64) total) (w64 o (+ h 72) now) (w64 o 40 now) 0)))
+(defn- stage [o s frame] :i64
+  (loop [i 0 used 0]
+    (if (>= i (fr frame 16)) used
+      (if (= i (fr frame 12))
+        (let [n (fr frame 20) z (copy-in o (+ 6950912 used) frame 2048 704 n)] (recur (+ i 1) (+ used n)))
+        (let [id (+ (* s 2048) i) n (part-size o id)
+              z (move o (+ 6950912 used) (+ 2756608 (r o (entry id))) n)]
+          (recur (+ i 1) (+ used n)))))))
+(defn- valid-staged [region count] :bool (j/valid-document region 1048576 count))
+(defn- complete [o s binding frame now] :i64
+  (let [size (stage o s frame)]
+    (if (valid-staged (kernel-subregion o 8388608 6950912 1048576) size)
+      (do (zero o 1152 1248) (save-header o 128 binding frame now)
+          (if (= (r o (header s)) 1) (remove-slot o s) 0)
+          (w o 16 size) (w o 20 1) (w64 o 40 now) 1)
+      (do (zero o 6950912 7999488) -1))))
+(defn- accept-slot [o binding frame now s] :i64
+  (if (< s 0) -1
+    (let [h (header s) exists (= (r o h) 1) id (+ (* s 2048) (fr frame 12))
+          prior (present o id) old (part-size o id) size (fr frame 20)
+          total (+ (- (r o (+ h 64)) old) size)]
+      (if (or (and exists (not= (r o (+ h 56)) (fr frame 16)))
+              (and (not exists) (>= (r o 8) 128))
+              (> total 1048576) (> (+ (- (r o 12) old) size) 4194304)) -1
+        (if (= (+ (r o (+ h 60)) (if prior 0 1)) (fr frame 16))
+          (complete o s binding frame now) (append-part o s binding frame now))))))
+(defn- accept-run [o binding frame now] :i64
+  (if (and (initialized o) (= (r o 20) 0) (binding-valid o binding)
+           (>= now (r64 o 40)) (<= now 9007199254740991) (f/valid-record frame 2048))
+    (accept-slot o binding frame now (find-slot o binding frame 0 -1)) -1))
+(defn accept [owner length binding binding-bytes frame frame-bytes now] :i64
+  (if (and (>= length 8388608) (= binding-bytes 64) (= frame-bytes 2048)
+           (separate owner 8388608 binding 64) (separate owner 8388608 frame 2048)
+           (separate binding 64 frame 2048))
+    (accept-run (kernel-subregion owner length 0 8388608)
+      (kernel-subregion binding binding-bytes 0 64) (kernel-subregion frame frame-bytes 0 2048) now) -1))
+(defn- release-run [o] :i64
+  (do (zero o 6950912 7999488) (zero o 128 1248) (w o 16 0) (w o 20 0) 1))
+(defn release [owner length] :i64
+  (if (>= length 8388608)
+    (let [o (kernel-subregion owner length 0 8388608)] (if (initialized o) (release-run o) -1)) -1))
+(defn- revoke-run [o binding] :i64
+  (if (and (initialized o) (binding-valid o binding))
+    (loop [s 0 count 0]
+      (if (>= s 128)
+        (+ count (if (and (= (r o 20) 1) (bound o 128 binding)) (do (release-run o) 1) 0))
+        (if (bound o (header s) binding)
+          (let [z (remove-slot o s)] (recur (+ s 1) (+ count 1))) (recur (+ s 1) count)))) -1))
+(defn revoke [owner length binding binding-bytes] :i64
+  (if (and (>= length 8388608) (= binding-bytes 64) (separate owner 8388608 binding 64))
+    (revoke-run (kernel-subregion owner length 0 8388608) (kernel-subregion binding binding-bytes 0 64)) -1))
+(defn- expire-run [o now idle] :i64
+  (if (and (initialized o) (>= now (r64 o 40)) (<= now 9007199254740991) (> idle 0) (<= idle 9007199254740991))
+    (loop [s 0 count 0]
+      (if (>= s 128)
+        (do (w64 o 40 now) (+ count
+          (if (and (= (r o 20) 1) (>= (- now (r64 o 200)) idle)) (do (release-run o) 1) 0)))
+        (if (and (= (r o (header s)) 1) (>= (- now (r64 o (+ (header s) 72))) idle))
+          (let [z (remove-slot o s)] (recur (+ s 1) (+ count 1))) (recur (+ s 1) count)))) -1))
+(defn expire [owner length now idle] :i64
+  (if (>= length 8388608) (expire-run (kernel-subregion owner length 0 8388608) now idle) -1))
+(defn- statistic [owner length at] :i64
+  (if (>= length 8388608)
+    (let [o (kernel-subregion owner length 0 8388608)] (if (initialized o) (r o at) -1)) -1))
+(defn pending-count [owner length] :i64 (statistic owner length 8))
+(defn buffered-bytes [owner length] :i64 (statistic owner length 12))
+(defn completed-size [owner length] :i64 (statistic owner length 16))
+(defn- completed-run [o offset output capacity] :i64
+  (if (and (initialized o) (= (r o 20) 1) (>= offset 0) (<= offset (r o 16)))
+    (let [n (if (< (- (r o 16) offset) capacity) (- (r o 16) offset) capacity)]
+      (loop [i 0]
+        (if (>= i n) n
+          (let [v (b o (+ 6950912 offset i))
+                z (kernel-store-u8-64k output capacity i v)] (recur (+ i 1)))))) -1))
+(defn completed-copy [owner length offset output capacity] :i64
+  (if (and (>= length 8388608) (>= capacity 0) (<= capacity 65536)
+           (or (= capacity 0) (separate owner 8388608 output capacity)))
+    (completed-run (kernel-subregion owner length 0 8388608) offset output capacity) -1))
+
+;; Optional managed-ingress completion association. Legacy accept64 remains
+;; unpinned; this API confers data provenance only, never app/socket/consent.
+;; Managed bridge calls once after authentic completion with its actual96B
+;; session binding. Retagging a pinned completion to another channel refuses.
+;; Header1152..1247 holds the public binding; release/reset/revoke erase it.
+;; View getters return bounded RELATIVE offsets, not fabricated region roots.
+;; Caller holds exclusive pool/session/pending/IO ownership through consumption.
+(defn- channel-empty [o at] :bool
+  (if (>= at 1248) true (and (= (r64 o at) 0) (channel-empty o (+ at 8)))))
+(defn- channel-same [o binding i] :bool
+  (if (>= i 96) true
+    (and (= (r64 o (+ 1152 i)) (kernel-load-u64 (kernel-subregion binding 96 i 8) 8 0))
+         (channel-same o binding (+ i 8)))))
+(defn- pin-run [o binding] :i64
+  (if (and (initialized o) (= (r o 20) 1) (> (r o 16) 0)
+           (binding-valid o (kernel-subregion binding 96 0 64))
+           (bound o 128 (kernel-subregion binding 96 0 64))
+           (or (channel-empty o 1152) (channel-same o binding 0)))
+    (do (copy-in o 1152 binding 96 0 96) 1) -1))
+(defn pin-completed-channel [owner length binding binding-bytes] :i64
+  (if (and (>= length 8388608) (= binding-bytes 96) (separate owner 8388608 binding 96))
+    (pin-run (kernel-subregion owner length 0 8388608) (kernel-subregion binding binding-bytes 0 96)) -1))
+(defn- channel-pinned [o] :bool
+  (and (initialized o) (= (r o 20) 1) (> (r o 16) 0)
+       (binding-valid o (kernel-subregion o 8388608 1152 64))
+       (bound o 128 (kernel-subregion o 8388608 1152 64))))
+(defn completed-message-start [owner length] :i64
+  (if (>= length 8388608)
+    (if (channel-pinned (kernel-subregion owner length 0 8388608)) 6950912 -1) -1))
+(defn completed-channel-start [owner length] :i64
+  (if (>= length 8388608)
+    (if (channel-pinned (kernel-subregion owner length 0 8388608)) 1152 -1) -1))
+
+;; Discard-only storage locator also admits unpinned legacy completions. It
+;; certifies no channel; the response controller checks pending hold first.
+(defn completed-storage-start [owner length] :i64
+  (if (>= length 8388608)
+    (let [o (kernel-subregion owner length 0 8388608)]
+      (if (and (initialized o) (= (r o 20) 1) (> (r o 16) 0)) 6950912 -1)) -1))

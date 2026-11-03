@@ -65,9 +65,13 @@ Owned page 9 is reserved for host state, never named by a DMA descriptor:
 | 3584..3995 | profile 6 NVMe/ESP controller state (words 600..702) |
 
 USB rings and contexts own pages 0..2; scratchpads own pages 3 and 14.
-NVMe DMA owns 4..8 and RTL8168 DMA owns 10..13. Profile 6 refuses signed
-remote update/install commands (5/6), since their staging page 14 belongs to
-xHCI in this profile. Other profiles retain the existing update path. Browser-context 2048..3071 is crypto scratch. Effects 12800..15943 is
+NVMe DMA owns 4..8 and RTL8168 DMA owns 10..13. The remote-management
+successor admits signed update/install commands5/6 only after the active
+non-radio xHCI reports HCHalted. It borrows scratchpad14, snapshots context
+3072..3711 in stopped USB memory0..639, restores those bytes and reinitializes
+the same controller before returning. A pending modal, missing/failed host,
+active radio or failed halt refuses the borrow. Earlier input candidates
+refuse commands5/6 entirely. Browser-context2048..3071 is crypto scratch. Effects12800..15943 is
 retained draw-list cache, not free scratch. The tests must exercise signing,
 redraw and a subsequent save to catch aliases between these owners.
 

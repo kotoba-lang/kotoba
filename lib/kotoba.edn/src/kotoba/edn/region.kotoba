@@ -1,0 +1,221 @@
+;; JUN-757: caller-owned EDN indexing profile for native OS protocol consumers.
+;; Not the document/string facade or a complete EDN reader. No heap or IO.
+;; Supported: keyword-key maps, vectors/lists, keywords, strings with UTF8 and
+;; EDN escapes, decimal i64, nil/true/false, ASCII separators and comments.
+;; Tags/discards/sets/symbols/floats/ratios/namespace maps fail closed. Integers
+;; forbid leading zeros. Raw string controls refuse; escaped controls are valid.
+;; Work98304, input0..65536, at most4096 nodes/depth64. Inputs immutable/disjoint.
+;; parse returns1/0. Shape refusal preserves work; processed failure clears it.
+;; Success indexes source spans; caller must retain source bytes and serialize.
+;; State is caller-owned data, never an authority or an approval capability.
+;; Header: magic0, phase4, node count8, input length12. Nodes at1024,16 bytes:
+;; kind/start/length/after-subtree. Kinds1map2vector3keyword4string5i64
+;; 6nil7true8false9list. String spans exclude quotes, keywords exclude colon.
+(ns kotoba.edn.region
+  (:export [parse node-count node-kind node-start node-length node-after
+            next-character string-equal string-pair-equal escaped-equal integer-value
+            skip-space atom-end sequence-has]))
+(defn- b [input count at]
+  (if (and (>= count 0) (<= count 65536) (>= at 0) (< at count)) (kernel-load-u8-64k input count at) -1))
+(defn- r [work at] (kernel-load-u32 (kernel-subregion work 98304 at 4) 4 0))
+(defn- p [work at value] (kernel-store-u32 (kernel-subregion work 98304 at 4) 4 0 value))
+(defn- clear [work i]
+  (if (>= i 98304) 1
+    (do (kernel-store-u64 (kernel-subregion work 98304 i 8) 8 0 0) (clear work (+ i 8)))))
+(defn- white [v] :bool (or (= v 32) (= v 9) (= v 10) (= v 13) (= v 44)))
+(defn- comment-end [input count at]
+  (if (or (>= at count) (= (b input count at) 10) (= (b input count at) 13)) at
+    (comment-end input count (+ at 1))))
+(defn skip-space [input count at]
+  (if (white (b input count at)) (skip-space input count (+ at 1))
+    (if (= (b input count at) 59) (skip-space input count (comment-end input count (+ at 1))) at)))
+(defn- delimiter [v] :bool
+  (or (< v 0) (white v) (= v 59) (= v 123) (= v 125) (= v 91) (= v 93) (= v 40) (= v 41) (= v 34)))
+(defn atom-end [input count at]
+  (if (delimiter (b input count at)) at (atom-end input count (+ at 1))))
+(defn- continuation [v] :bool (and (>= v 128) (<= v 191)))
+;; next byte offset*2^21 + scalar. Negative means malformed; no truncation,
+;; overlong UTF8, surrogate scalars or values beyond U+10FFFF are admitted.
+(defn- literal-step [input count at limit]
+  (let [a (b input count at) c (b input count (+ at 1)) d (b input count (+ at 2)) e (b input count (+ at 3))]
+    (if (or (< at 0) (>= at limit) (> limit count)) -1
+      (if (< a 128) (+ (* (+ at 1) 2097152) a)
+        (if (and (>= a 194) (<= a 223) (< (+ at 1) limit) (continuation c))
+          (+ (* (+ at 2) 2097152) (* (- a 192) 64) (- c 128))
+          (if (and (>= a 224) (<= a 239) (< (+ at 2) limit) (continuation c) (continuation d)
+                   (or (not= a 224) (>= c 160)) (or (not= a 237) (< c 160)))
+            (+ (* (+ at 3) 2097152) (* (- a 224) 4096) (* (- c 128) 64) (- d 128))
+            (if (and (>= a 240) (<= a 244) (< (+ at 3) limit) (continuation c) (continuation d) (continuation e)
+                     (or (not= a 240) (>= c 144)) (or (not= a 244) (< c 144)))
+              (+ (* (+ at 4) 2097152) (* (- a 240) 262144) (* (- c 128) 4096) (* (- d 128) 64) (- e 128)) -1)))))))
+(defn- utf8 [input count at] :bool
+  (if (>= at count) true
+    (if (< (literal-step input count at count) 0) false
+      (utf8 input count (quot (literal-step input count at count) 2097152)))))
+(defn- hex [v]
+  (if (and (>= v 48) (<= v 57)) (- v 48)
+    (if (and (>= v 65) (<= v 70)) (+ 10 (- v 65))
+      (if (and (>= v 97) (<= v 102)) (+ 10 (- v 97)) -1))))
+(defn- four-hex [input count at limit]
+  (if (or (> (+ at 4) limit) (< (hex (b input count at)) 0) (< (hex (b input count (+ at 1))) 0)
+          (< (hex (b input count (+ at 2))) 0) (< (hex (b input count (+ at 3))) 0)) -1
+    (+ (* (hex (b input count at)) 4096) (* (hex (b input count (+ at 1))) 256)
+       (* (hex (b input count (+ at 2))) 16) (hex (b input count (+ at 3))))))
+(defn- unicode-escape [input count at limit first]
+  (if (< first 0) -1
+    (if (and (>= first 55296) (<= first 56319))
+      (if (and (<= (+ at 12) limit) (= (b input count (+ at 6)) 92) (= (b input count (+ at 7)) 117)
+               (>= (four-hex input count (+ at 8) limit) 56320) (<= (four-hex input count (+ at 8) limit) 57343))
+        (+ (* (+ at 12) 2097152) 65536 (* (- first 55296) 1024) (- (four-hex input count (+ at 8) limit) 56320)) -1)
+      (if (and (>= first 56320) (<= first 57343)) -1 (+ (* (+ at 6) 2097152) first)))))
+(defn next-character [input count at limit]
+  (if (or (< at 0) (>= at limit) (> limit count)) -1
+    (if (not= (b input count at) 92) (literal-step input count at limit)
+      (if (>= (+ at 1) limit) -1
+        (if (= (b input count (+ at 1)) 117) (unicode-escape input count at limit (four-hex input count (+ at 2) limit))
+          (let [v (case (b input count (+ at 1)) 34 34 92 92 116 9 114 13 110 10 98 8 102 12 -1)]
+            (if (< v 0) -1 (+ (* (+ at 2) 2097152) v))))))))
+(defn- string-close [input count at]
+  (if (or (>= at count) (< (b input count at) 32)) -1
+    (if (= (b input count at) 34) at
+      (if (< (next-character input count at count) 0) -1
+        (string-close input count (quot (next-character input count at count) 2097152))))))
+(defn- same-string [input count at end other other-bytes pos] :bool
+  (if (>= at end) (= pos other-bytes)
+    (if (or (>= pos other-bytes) (< (next-character input count at end) 0) (< (literal-step other other-bytes pos other-bytes) 0)) false
+      (if (= (mod (next-character input count at end) 2097152) (mod (literal-step other other-bytes pos other-bytes) 2097152))
+        (same-string input count (quot (next-character input count at end) 2097152) end other other-bytes
+          (quot (literal-step other other-bytes pos other-bytes) 2097152)) false))))
+(defn string-equal [input count start length other other-bytes] :bool
+  (if (and (>= start 0) (>= length 0) (<= (+ start length) count) (>= other-bytes 0) (<= count 65536) (<= other-bytes 65536))
+    (same-string input count start (+ start length) other other-bytes 0) false))
+(defn- same-pair [input count a ae c ce] :bool
+  (if (>= a ae) (>= c ce)
+    (if (or (>= c ce) (< (next-character input count a ae) 0) (< (next-character input count c ce) 0)) false
+      (if (= (mod (next-character input count a ae) 2097152) (mod (next-character input count c ce) 2097152))
+        (same-pair input count (quot (next-character input count a ae) 2097152) ae (quot (next-character input count c ce) 2097152) ce) false))))
+(defn string-pair-equal [input count a al c cl] :bool
+  (if (and (>= a 0) (>= al 0) (<= (+ a al) count) (>= c 0) (>= cl 0) (<= (+ c cl) count) (<= count 65536))
+    (same-pair input count a (+ a al) c (+ c cl)) false))
+(defn- escaped-pair [input count at end other other-bytes pos finish] :bool
+  (if (>= at end) (>= pos finish)
+    (if (or (>= pos finish) (< (next-character input count at end) 0) (< (next-character other other-bytes pos finish) 0)) false
+      (if (= (mod (next-character input count at end) 2097152) (mod (next-character other other-bytes pos finish) 2097152))
+        (escaped-pair input count (quot (next-character input count at end) 2097152) end other other-bytes
+          (quot (next-character other other-bytes pos finish) 2097152) finish) false))))
+(defn escaped-equal [input count at length other other-bytes pos size] :bool
+  (if (and (>= count 0) (<= count 65536) (>= other-bytes 0) (<= other-bytes 65536)
+           (>= at 0) (>= length 0) (<= (+ at length) count) (>= pos 0) (>= size 0) (<= (+ pos size) other-bytes))
+    (escaped-pair input count at (+ at length) other other-bytes pos (+ pos size)) false))
+(defn- digits-ok [input count at end negative :bool value] :bool
+  (if (>= at end) true
+    (let [v (- (b input count at) 48)]
+      (if (or (< v 0) (> v 9) (< value -922337203685477580)
+              (and (= value -922337203685477580) (> v (if negative 8 7)))) false
+        (digits-ok input count (+ at 1) end negative (- (* value 10) v))))))
+(defn- number-ok [input count start end] :bool
+  (let [at (if (or (= (b input count start) 45) (= (b input count start) 43)) (+ start 1) start)]
+    (and (< at end) (not (and (= (b input count at) 48) (> (- end at) 1)))
+         (digits-ok input count at end (= (b input count start) 45) 0))))
+(defn- digits-value [input count at end value]
+  (if (>= at end) value (digits-value input count (+ at 1) end (- (* value 10) (- (b input count at) 48)))))
+(defn integer-value [input count start length]
+  (if (and (>= start 0) (> length 0) (<= (+ start length) count) (<= count 65536) (number-ok input count start (+ start length)))
+    (let [value (digits-value input count (if (or (= (b input count start) 45) (= (b input count start) 43)) (+ start 1) start) (+ start length) 0)]
+      (if (= (b input count start) 45) value (- value))) 0))
+(defn- raw-same [input count a c length i] :bool
+  (if (>= i length) true (if (= (b input count (+ a i)) (b input count (+ c i))) (raw-same input count a c length (+ i 1)) false)))
+(defn- keyword-ok [input count at end slash :bool] :bool
+  (if (>= at end) true
+    (let [v (b input count at)]
+      (if (or (< v 33) (= v 58) (= v 92) (= v 35) (= v 39) (= v 96) (= v 126) (= v 94) (= v 64)) false
+        (if (= v 47) (if (or slash (= (+ at 1) end)) false (keyword-ok input count (+ at 1) end true))
+          (keyword-ok input count (+ at 1) end slash))))))
+(defn- field [work node k] (r work (+ 1024 (* node 16) (* k 4))))
+(defn- set-field [work node k v] (p work (+ 1024 (* node 16) (* k 4)) v))
+(defn- new-node [work kind start length]
+  (if (>= (r work 8) 4096) -1
+    (let [node (r work 8)]
+      (do (set-field work node 0 kind) (set-field work node 1 start) (set-field work node 2 length)
+          (set-field work node 3 (+ node 1)) (p work 8 (+ node 1)) node))))
+(defn- duplicate [work input count at key] :bool
+  (if (>= at key) false
+    (if (and (= (field work at 2) (field work key 2))
+             (raw-same input count (field work at 1) (field work key 1) (field work key 2) 0)) true
+      (duplicate work input count (field work (field work at 3) 3) key))))
+(defn- literal-kind [input count at end]
+  (if (and (= (- end at) 3) (= (b input count at) 110) (= (b input count (+ at 1)) 105) (= (b input count (+ at 2)) 108)) 6
+    (if (and (= (- end at) 4) (= (b input count at) 116) (= (b input count (+ at 1)) 114) (= (b input count (+ at 2)) 117) (= (b input count (+ at 3)) 101)) 7
+      (if (and (= (- end at) 5) (= (b input count at) 102) (= (b input count (+ at 1)) 97) (= (b input count (+ at 2)) 108)
+               (= (b input count (+ at 3)) 115) (= (b input count (+ at 4)) 101)) 8
+        (if (number-ok input count at end) 5 0)))))
+(defn- leaf [work input count at]
+  (if (= (b input count at) 34)
+    (let [end (string-close input count (+ at 1))]
+      (if (or (< end 0) (< (new-node work 4 (+ at 1) (- end at 1)) 0)) -1 (+ end 1)))
+    (let [end (atom-end input count at)]
+      (if (= (b input count at) 58)
+        (if (and (> end (+ at 1)) (not= (b input count (+ at 1)) 47) (keyword-ok input count (+ at 1) end false))
+          (if (< (new-node work 3 (+ at 1) (- end at 1)) 0) -1 end) -1)
+        (if (> (literal-kind input count at end) 0)
+          (if (< (new-node work (literal-kind input count at end) at (- end at)) 0) -1 end) -1)))))
+(defn- container [work input count at depth node close members] :i64
+  (if (= (b input count (skip-space input count at)) close)
+    (if (and (= close 125) (= (mod members 2) 1)) -1
+      (do (set-field work node 2 (- (+ (skip-space input count at) 1) (field work node 1)))
+          (set-field work node 3 (r work 8)) (+ (skip-space input count at) 1)))
+    ;; Siblings use a self tail call. A container-step/read-form mutual
+    ;; trampoline retained one native stack frame per item and exhausted the
+    ;; existing stack on the declared4096-node bound. Only nesting recurses
+    ;; across functions, bounded by depth64; no extra stack grant is needed.
+    (let [key (r work 8) next (read-form work input count (skip-space input count at) depth)]
+      (if (< next 0) -1
+        (if (and (= close 125) (= (mod members 2) 0)
+                 (or (not= (field work key 0) 3) (duplicate work input count (+ node 1) key))) -1
+          (container work input count next depth node close (+ members 1)))))))
+(defn- read-form [work input count at depth] :i64
+  (if (or (>= at count) (>= depth 64)) -1
+    (if (or (= (b input count at) 123) (= (b input count at) 91) (= (b input count at) 40))
+      (let [node (new-node work (case (b input count at) 123 1 91 2 9) at 0)]
+        (if (< node 0) -1 (container work input count (+ at 1) (+ depth 1) node (case (b input count at) 123 125 91 93 41) 0)))
+      (leaf work input count at))))
+(defn- process [work input count]
+  (do (clear work 0)
+      (if (and (utf8 input count 0) (= (skip-space input count (read-form work input count (skip-space input count 0) 0)) count)
+               (> (r work 8) 0))
+        (do (p work 0 1162104370) (p work 4 2) (p work 12 count) 1) (do (clear work 0) 0))))
+(defn parse [work length input count]
+  (if (and (>= length 98304) (>= count 0) (<= count 65536)
+           (or (= count 0) (<= (+ work 98304) input) (<= (+ input count) work)))
+    (process (kernel-subregion work length 0 98304) input count) 0))
+(defn- valid [work] :bool (and (= (r work 0) 1162104370) (= (r work 4) 2) (> (r work 8) 0) (<= (r work 8) 4096)))
+(defn node-count [work length]
+  (if (< length 98304) 0 (if (valid (kernel-subregion work length 0 98304)) (r (kernel-subregion work length 0 98304) 8) 0)))
+(defn- node-field [work length node k]
+  (if (< length 98304) -1
+    (if (and (valid (kernel-subregion work length 0 98304)) (>= node 0) (< node (r (kernel-subregion work length 0 98304) 8)))
+      (field (kernel-subregion work length 0 98304) node k) -1)))
+(defn node-kind [work length node] (node-field work length node 0))
+(defn node-start [work length node] (node-field work length node 1))
+(defn node-length [work length node] (node-field work length node 2))
+(defn node-after [work length node] (node-field work length node 3))
+;; Query a previously validated keyword/int vector or list by its raw span.
+;; Kind3 matches the supplied raw keyword bytes (without ':'); kind5 matches
+;; an i64 or the :any port wildcard. This confers no trust on unparsed input.
+(defn- keyword-equal [input count at end other other-bytes i] :bool
+  (if (>= i other-bytes) (= (+ at i) end)
+    (if (= (b input count (+ at i)) (b other other-bytes i)) (keyword-equal input count at end other other-bytes (+ i 1)) false)))
+(defn- sequence-loop [input count at end kind other other-bytes value] :bool
+  (if (>= at end) false
+    (if (or (= (b input count at) 93) (= (b input count at) 41)) false
+      (if (if (= kind 3)
+            (and (= (b input count at) 58) (keyword-equal input count (+ at 1) (atom-end input count at) other other-bytes 0))
+            (or (and (= (b input count at) 58) (= (- (atom-end input count at) at) 4) (= (b input count (+ at 1)) 97)
+                     (= (b input count (+ at 2)) 110) (= (b input count (+ at 3)) 121))
+                (and (number-ok input count at (atom-end input count at)) (= (integer-value input count at (- (atom-end input count at) at)) value)))) true
+        (if (<= (atom-end input count at) at) false
+          (sequence-loop input count (skip-space input count (atom-end input count at)) end kind other other-bytes value))))))
+(defn sequence-has [input count start length kind other other-bytes value] :bool
+  (if (and (>= count 0) (>= other-bytes 0) (<= other-bytes 65536) (>= start 0) (> length 1) (<= (+ start length) count) (<= count 65536) (or (= kind 3) (= kind 5))
+           (or (= (b input count start) 91) (= (b input count start) 40)))
+    (sequence-loop input count (skip-space input count (+ start 1)) (+ start length) kind other other-bytes value) false))

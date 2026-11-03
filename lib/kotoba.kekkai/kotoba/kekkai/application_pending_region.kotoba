@@ -1,0 +1,276 @@
+;; JUN-757:256 active locally originated requests on one actual managed session.
+;; Protected/API-created caller owner262144, immutable full1MiB message input,
+;; serialized and disjoint allocations. Never import an owner from wire bytes.
+;; initialize ONLY before established phase; prevents resetting IDs on a live
+;; channel. request-id-copy emits64 lower hex bytes derived from actual96B
+;; session binding + pinned owner namespace + monotonic sequence. begin validates that issued ID and
+;; full request schema before reserving; send only AFTER begin succeeds.
+;; complete validates response schema and exact issued ID/channel before removal.
+;; Native ID generation is data, NOT entropy/consent/capability. Fresh channel
+;; entropy, custody, trusted clock and caller lifecycle are separate requirements.
+;; now is trusted epoch MILLISECONDS; session poll receives floor(now/1000).
+;; timeout milliseconds explicit at initialize (canonical default30000).
+;; Sync tracks actual generation/key/peer/finalNoise h. Changed channel, roster,
+;; phase loss/stop clears all pending/accepted old data. Deadline>= expires.
+;; Parser refusal adds/removes nothing; trusted sync may advance/reap first.
+;; Shape/header/clock refusal preserves owner. Scratch245760..262143 wipes after
+;; every processed call. Inputs/output tails immutable; refused output unchanged.
+;; begin/complete return positive monotonic handle/-1; complete busy=-2 until
+;; release-result/expiry. No service/socket/endpoint/consent authority is granted.
+;; Header:magic0/version4/count8/phase12/epoch16/lastMs24/timeout32/session40/
+;; nextSequence48/resultReady56; actual96B binding64/pinnedOwner160. Slots512@4096,256 entries.
+;; Slot:live0/port4/handle8/created16/deadline24/binding96@32/issuedID32@128/
+;; UTF16 service/method/path160/164/168; tagged UTF8 hashes32@176/208/240.
+;; Accepted result512@135168: slot data with KPA1/version1@0/4, port/status272/
+;; 276, responseUsed280/responseBase288. Data only; input lifetime stays caller's.
+(ns kekkai.application-pending-region
+  (:require [kekkai.application-message-region :as m]
+            [kekkai.session-region :as s] [kekkai.roster-region :as roster]
+            [kotoba.json.document-region :as j] [noise.blake2s-region :as h])
+  (:export [initialize synchronize request-id-copy begin complete cancel
+            result-copy release-result pending-count stop
+            complete-bound release-bound holds-input request-active]))
+(defn- b [o at] :i64 (kernel-load-u8 (kernel-subregion o 262144 at 1) 1 0))
+(defn- p [o at v] :i64 (kernel-store-u8 (kernel-subregion o 262144 at 1) 1 0 v))
+(defn- r [o at] :i64 (kernel-load-u32 (kernel-subregion o 262144 at 4) 4 0))
+(defn- w [o at v] :i64 (kernel-store-u32 (kernel-subregion o 262144 at 4) 4 0 v))
+(defn- r64 [o at] :i64 (kernel-load-u64 (kernel-subregion o 262144 at 8) 8 0))
+(defn- w64 [o at v] :i64 (kernel-store-u64 (kernel-subregion o 262144 at 8) 8 0 v))
+(defn- zero [o at end] :i64
+  (if (>= at end) 1 (do (w64 o at 0) (zero o (+ at 8) end))))
+(defn- copy [o target source count i] :i64
+  (if (>= i count) 1 (do (p o (+ target i) (b o (+ source i))) (copy o target source count (+ i 1)))))
+(defn- separate [a al c cl] :bool (or (<= (+ a al) c) (<= (+ c cl) a)))
+(defn- shape [o length session session-bytes now] :bool
+  (and (>= length 262144) (>= session-bytes 262144) (>= now 0) (<= now 9007199254740991)
+       (separate o length session session-bytes)))
+(defn- header [o session now] :bool
+  (and (= (r o 0) 0x3150504b) (= (r o 4) 1) (<= (r o 8) 256) (<= (r o 12) 2)
+       (> (r64 o 16) 0) (<= (r64 o 16) 9007199254740991)
+       (>= (r64 o 24) 0) (<= (r64 o 24) now) (> (r64 o 32) 0) (<= (r64 o 32) 9007199254740991)
+       (= (r64 o 40) session) (= (r64 o 160) o) (> (r64 o 48) 0) (<= (r64 o 48) 9007199254740991) (<= (r64 o 56) 1)))
+(defn- slot [index] :i64 (+ 4096 (* index 512)))
+(defn- clear-live [o] :i64
+  (do (zero o 4096 135680) (w o 8 0) (w64 o 56 0)))
+(defn- reap [o now index] :i64
+  (if (>= index 256)
+    (if (and (= (r64 o 56) 1) (>= now (r64 o 135192))) (do (zero o 135168 135680) (w64 o 56 0)) 1)
+    (do (if (and (= (r o (slot index)) 1) (>= now (r64 o (+ (slot index) 24))))
+          (do (zero o (slot index) (+ (slot index) 512)) (w o 8 (- (r o 8) 1))) 0)
+      (reap o now (+ index 1)))))
+(defn- binding-same [o i] :bool
+  (if (>= i 96) true (and (= (r64 o (+ 64 i)) (r64 o (+ 258560 i))) (binding-same o (+ i 8)))))
+(defn- sync-run [o session now] :i64
+  (if (not (header o session now)) -1
+    (let [epoch (roster/generation session 262144)]
+      (if (or (< epoch (r64 o 16)) (> epoch 9007199254740991)) -1
+        (let [phase (s/poll session 262144 (quot now 1000))]
+          (if (< phase 0) -1
+            (if (and (= phase 2) (not= (s/copy-application-binding session 262144 (kernel-subregion o 262144 258560 96) 96 (quot now 1000)) 96)) -1
+              (do (if (or (not= epoch (r64 o 16)) (not= phase (r o 12))
+                          (and (= phase 2) (not (binding-same o 0)))) (clear-live o) 0)
+                (w o 12 phase) (w64 o 16 epoch) (w64 o 24 now)
+                (if (= phase 2) (copy o 64 258560 96 0) (zero o 64 160))
+                (reap o now 0) phase))))))))
+(defn- finish [o result] :i64 (do (zero o 245760 262144) result))
+(defn- initialize-run [o session now timeout] :i64
+  (let [epoch (roster/generation session 262144) phase (s/poll session 262144 (quot now 1000))]
+    (if (and (> epoch 0) (<= epoch 9007199254740991) (>= phase 0) (< phase 2))
+      (do (zero o 0 262144) (w o 0 0x3150504b) (w o 4 1) (w o 12 phase)
+        (w64 o 16 epoch) (w64 o 24 now) (w64 o 32 timeout) (w64 o 40 session) (w64 o 48 1) (w64 o 160 o) 1) -1)))
+(defn initialize [o length session session-bytes now timeout] :i64
+  (if (and (shape o length session session-bytes now) (> timeout 0) (<= timeout 9007199254740991))
+    (initialize-run (kernel-subregion o length 0 262144) (kernel-subregion session session-bytes 0 262144) now timeout) -1))
+(defn synchronize [o length session session-bytes now] :i64
+  (if (shape o length session session-bytes now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now) (finish owner (sync-run owner (kernel-subregion session session-bytes 0 262144) now)) -1)) -1))
+(defn- feed [o value] :i64 (h/update-byte (kernel-subregion o 262144 258048 512) 512 value))
+(defn- hash-start [o] :i64 (h/init (kernel-subregion o 262144 258048 512) 512))
+(defn- hash-finish [o target i] :i64
+  (if (= i 0)
+    (do (h/finish (kernel-subregion o 262144 258048 512) 512) (hash-finish o target 1))
+    (if (> i 32) 1
+      (do (p o (+ target (- i 1)) (h/digest-byte (kernel-subregion o 262144 258048 512) 512 (- i 1)))
+        (hash-finish o target (+ i 1))))))
+(defn- id-tag [o i] :i64
+  (if (>= i 17) 1
+    (do (feed o (case i 0 75 1 101 2 107 3 107 4 97 5 105 6 32 7 112 8 101 9 110 10 100 11 105 12 110 13 103 14 32 15 118 49)) (id-tag o (+ i 1)))))
+(defn- hash-bytes [o at count i] :i64
+  (if (>= i count) 1 (do (feed o (b o (+ at i))) (hash-bytes o at count (+ i 1)))))
+(defn- id-sequence [o value i] :i64
+  (if (>= i 8) 1 (do (feed o (bit-and (u64-shift-right value (* i 8)) 255)) (id-sequence o value (+ i 1)))))
+(defn- issued-id [o] :i64
+  (do (hash-start o) (id-tag o 0) (hash-bytes o 64 96 0) (id-sequence o o 0) (id-sequence o (r64 o 48) 0) (hash-finish o 258688 0)))
+(defn- hex [v] :i64 (if (< v 10) (+ v 48) (+ v 87)))
+(defn- emit-id [o output capacity i] :i64
+  (if (>= i 64) 64
+    (let [v (b o (+ 258688 (quot i 2)))]
+      (do (kernel-store-u8-64k output capacity i (hex (if (= (mod i 2) 0) (quot v 16) (mod v 16))))
+        (emit-id o output capacity (+ i 1))))))
+(defn- output-shape [o length session session-bytes output capacity minimum now] :bool
+  (and (shape o length session session-bytes now) (>= capacity minimum) (<= capacity 65536)
+       (separate o length output capacity) (separate session session-bytes output capacity)))
+(defn- id-copy-run [o session output capacity now] :i64
+  (if (and (= (sync-run o session now) 2) (< (r64 o 48) 9007199254740991))
+    (do (issued-id o) (emit-id o output capacity 0)) -1))
+(defn request-id-copy [o length session session-bytes output capacity now] :i64
+  (if (output-shape o length session session-bytes output capacity 64 now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (id-copy-run owner (kernel-subregion session session-bytes 0 262144) output capacity now)) -1)) -1))
+(defn- record [kind] :i64 (+ 254016 (* (- kind 1) 16)))
+(defn- decode [o input count] :i64
+  (m/decode (kernel-subregion o 262144 245760 8192) 8192 input 1048576 count
+    (kernel-subregion o 262144 253952 4096) 4096))
+(defn- id-same [o input count at end target index] :bool
+  (if (>= at end) (= index 64)
+    (if (>= index 64) false
+      (let [n (j/next-character input 1048576 count at end) v (b o (+ target (quot index 2)))]
+        (and (>= n 0) (= (mod n 2097152) (hex (if (= (mod index 2) 0) (quot v 16) (mod v 16))))
+          (id-same o input count (quot n 2097152) end target (+ index 1)))))))
+(defn- record-id-same [o input count target] :bool
+  (id-same o input count (+ (r o (record 2)) 1) (- (r o (+ (record 2) 4)) 1) target 0))
+(defn- scalar [o v] :i64
+  (if (< v 128) (feed o v)
+    (if (< v 2048) (do (feed o (+ 192 (quot v 64))) (feed o (+ 128 (mod v 64))))
+      (if (< v 65536) (do (feed o (+ 224 (quot v 4096))) (feed o (+ 128 (mod (quot v 64) 64))) (feed o (+ 128 (mod v 64))))
+        (do (feed o (+ 240 (quot v 262144))) (feed o (+ 128 (mod (quot v 4096) 64)))
+          (feed o (+ 128 (mod (quot v 64) 64))) (feed o (+ 128 (mod v 64))))))))
+(defn- hash-text [o input count at end] :i64
+  (if (>= at end) 1
+    (let [n (j/next-character input 1048576 count at end)]
+      (if (< n 0) -1 (do (scalar o (mod n 2097152)) (hash-text o input count (quot n 2097152) end))))))
+(defn- field-hash [o input count kind target] :i64
+  (do (hash-start o) (feed o kind)
+    (hash-text o input count (+ (r o (record kind)) 1) (- (r o (+ (record kind) 4)) 1))
+    (hash-finish o target 0)))
+(defn- free-slot [o index] :i64
+  (if (>= index 256) -1 (if (= (r o (slot index)) 0) index (free-slot o (+ index 1)))))
+(defn- reserve [o input count now index] :i64
+  (let [at (slot index) handle (r64 o 48)]
+    (do (zero o at (+ at 512)) (w o at 1) (w o (+ at 4) (r o 253976))
+      (w64 o (+ at 8) handle) (w64 o (+ at 16) now) (w64 o (+ at 24) (+ now (r64 o 32)))
+      (copy o (+ at 32) 64 96 0) (copy o (+ at 128) 258688 32 0)
+      (w o (+ at 160) (r o (+ (record 3) 8))) (w o (+ at 164) (r o (+ (record 4) 8))) (w o (+ at 168) (r o (+ (record 5) 8)))
+      (field-hash o input count 3 (+ at 176)) (field-hash o input count 4 (+ at 208)) (field-hash o input count 5 (+ at 240))
+      (w o 8 (+ (r o 8) 1)) (w64 o 48 (+ handle 1)) handle)))
+(defn- message-shape [o length session session-bytes input capacity count now] :bool
+  (and (shape o length session session-bytes now) (>= capacity 1048576) (>= count 0) (<= count 1048576)
+       (separate o length input capacity) (separate session session-bytes input capacity)))
+(defn- begin-run [o session input count now] :i64
+  (if (or (not= (sync-run o session now) 2) (>= (r o 8) 256) (>= (r64 o 48) 9007199254740991)
+          (> now (- 9007199254740991 (r64 o 32)))) -1
+    (if (not= (decode o input count) 1) -1
+      (do (issued-id o)
+        (if (not (record-id-same o input count 258688)) -1
+          (let [index (free-slot o 0)] (if (< index 0) -1 (reserve o input count now index))))))))
+(defn begin [o length session session-bytes input capacity count now] :i64
+  (if (message-shape o length session session-bytes input capacity count now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (begin-run owner (kernel-subregion session session-bytes 0 262144) (kernel-subregion input capacity 0 1048576) count now)) -1)) -1))
+(defn- slot-binding [o at i] :bool
+  (if (>= i 96) true (and (= (r64 o (+ at 32 i)) (r64 o (+ 64 i))) (slot-binding o at (+ i 8)))))
+(defn- match-response [o input count index] :i64
+  (if (>= index 256) -1
+    (let [at (slot index)]
+      (if (and (= (r o at) 1) (slot-binding o at 0) (record-id-same o input count (+ at 128))) index
+        (match-response o input count (+ index 1))))))
+(defn- accept-response [o input count index] :i64
+  (let [at (slot index) handle (r64 o (+ (slot index) 8)) port (r o (+ (slot index) 4))]
+    (do (copy o 135168 at 512 0) (w o 135168 0x3141504b) (w o 135172 1)
+      (w o 135440 port) (w o 135444 (r o 253976)) (w o 135448 count) (w64 o 135456 input)
+      (zero o at (+ at 512)) (w o 8 (- (r o 8) 1)) (w64 o 56 1) handle)))
+(defn- complete-run [o session input count now] :i64
+  (if (not= (sync-run o session now) 2) -1
+    (if (= (r64 o 56) 1) -2
+      (if (not= (decode o input count) 2) -1
+        (let [index (match-response o input count 0)] (if (< index 0) -1 (accept-response o input count index)))))))
+(defn complete [o length session session-bytes input capacity count now] :i64
+  (if (message-shape o length session session-bytes input capacity count now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (complete-run owner (kernel-subregion session session-bytes 0 262144) (kernel-subregion input capacity 0 1048576) count now)) -1)) -1))
+(defn- cancel-handle [o handle index] :i64
+  (if (>= index 256) 0
+    (let [at (slot index)]
+      (if (and (= (r o at) 1) (= (r64 o (+ at 8)) handle))
+        (do (zero o at (+ at 512)) (w o 8 (- (r o 8) 1)) 1) (cancel-handle o handle (+ index 1))))))
+(defn cancel [o length session session-bytes handle now] :i64
+  (if (and (shape o length session session-bytes now) (> handle 0) (< handle 9007199254740991))
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (if (>= (sync-run owner (kernel-subregion session session-bytes 0 262144) now) 0) (cancel-handle owner handle 0) -1)) -1)) -1))
+;; 送信待ち中も実セッション・期限を再評価する。返値はデータであり送信許可ではない。
+(defn- active-handle [o handle index] :i64
+  (if (>= index 256) 0
+    (let [at (slot index)]
+      (if (and (= (r o at) 1) (= (r64 o (+ at 8)) handle) (slot-binding o at 0)) 1
+        (active-handle o handle (+ index 1))))))
+(defn request-active [o length session session-bytes handle now] :i64
+  (if (and (shape o length session session-bytes now) (> handle 0) (< handle 9007199254740991))
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (let [phase (sync-run owner (kernel-subregion session session-bytes 0 262144) now)]
+          (if (< phase 0) -1 (if (= phase 2) (active-handle owner handle 0) 0)))) -1)) -1))
+(defn- result-write [o output capacity i] :i64
+  (if (>= i 512) 512
+    (do (kernel-store-u8-64k output capacity i (b o (+ 135168 i))) (result-write o output capacity (+ i 1)))))
+(defn- result-run [o session output capacity now] :i64
+  (if (and (= (sync-run o session now) 2) (= (r64 o 56) 1)) (result-write o output capacity 0) -1))
+(defn result-copy [o length session session-bytes output capacity now] :i64
+  (if (output-shape o length session session-bytes output capacity 512 now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (result-run owner (kernel-subregion session session-bytes 0 262144) output capacity now)) -1)) -1))
+(defn release-result [o length] :i64
+  (if (< length 262144) -1
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (and (= (r owner 0) 0x3150504b) (= (r owner 4) 1) (= (r64 owner 56) 1))
+        (do (zero owner 135168 135680) (w64 owner 56 0) 1) -1))))
+(defn pending-count [o length] :i64
+  (if (< length 262144) -1
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (and (= (r owner 0) 0x3150504b) (= (r owner 4) 1) (<= (r owner 8) 256)) (r owner 8) -1))))
+(defn stop [o length] :i64
+  (if (< length 262144) -1 (do (zero (kernel-subregion o length 0 262144) 0 262144) 1)))
+
+;; Managed-completion profile: input is an actual EXACT1MiB subregion and
+;; binding an actual EXACT96B immutable subregion. These namespace exports
+;; are not new kernel ABI roots; whole-project checking proves both views.
+;; The controller derives them from the protected, pinned reassembly owner.
+;; All four views are disjoint; no network-created record is trusted.
+(defn- incoming-binding [o binding i] :bool
+  (if (>= i 96) true
+    (and (= (r64 o (+ 64 i)) (kernel-load-u64 (kernel-subregion binding 96 i 8) 8 0))
+         (incoming-binding o binding (+ i 8)))))
+(defn- bound-shape [o length session session-bytes input count binding now] :bool
+  (and (message-shape o length session session-bytes input 1048576 count now)
+       (separate o length binding 96) (separate session session-bytes binding 96)
+       (separate input 1048576 binding 96)))
+(defn- bound-complete-run [o session input count binding now] :i64
+  (if (and (= (sync-run o session now) 2) (incoming-binding o binding 0))
+    (complete-run o session input count now) -1))
+(defn complete-bound [o length session session-bytes input count binding now] :i64
+  (if (bound-shape o length session session-bytes input count binding now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (bound-complete-run owner (kernel-subregion session session-bytes 0 262144)
+          (kernel-subregion input 1048576 0 1048576) count (kernel-subregion binding 96 0 96) now)) -1)) -1))
+(defn- release-bound-run [o session input binding now] :i64
+  (if (and (= (sync-run o session now) 2) (incoming-binding o binding 0)
+           (= (r64 o 56) 1) (= (r64 o 135456) input))
+    (do (zero o 135168 135680) (w64 o 56 0) 1) -1))
+(defn release-bound [o length session session-bytes input binding now] :i64
+  (if (bound-shape o length session session-bytes input 0 binding now)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (header owner session now)
+        (finish owner (release-bound-run owner (kernel-subregion session session-bytes 0 262144)
+          (kernel-subregion input 1048576 0 1048576) (kernel-subregion binding 96 0 96) now)) -1)) -1))
+;; Data snapshot only. Controller synchronizes first and keeps exclusive locks.
+(defn holds-input [o length input] :i64
+  (if (>= length 262144)
+    (let [owner (kernel-subregion o length 0 262144)]
+      (if (and (= (r owner 0) 0x3150504b) (= (r owner 4) 1) (= (r64 owner 160) owner) (<= (r64 owner 56) 1))
+        (if (and (= (r64 owner 56) 1) (= (r64 owner 135456) input)) 1 0) -1)) -1))

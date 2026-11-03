@@ -1,0 +1,194 @@
+;; JUN-757: kernel-v5 の独立 TX1MiB と実 pending/session による分割送信。
+;; 1つの保護済み owner24576 を唯一の TX 管理者とし、全呼出し・消費を
+;; host の同じ critical section で直列化する。owner の輸入・複製は禁止。
+;; acquire 成功後だけ本文を TX root へ書き、begin 成功後は変更しない。
+;; 受信8MiB・その末尾・active assembly を借用しない。元の1MiB/2048parts/
+;; 128assemblies/4MiB buffered/pending256 は維持。送信 chunk は700B。
+;;
+;; initialize/step は実 owner/session/pending/IO の4領域・8引数を取る。
+;; IO262144: 既存 frame header0/4、nowMs:u64@8、used:u32@16、
+;; egress:u32@20、op:u32@24。入力4096、出力73728 は既存 frame と同じ。
+;; op:1 acquire,2 ID-copy,3 begin,4 next-packet,5 report,6 cancel,
+;; 7 event-copy,8 release-event,9 stop。出力capacity@4 は0..65538。
+;; report:0 確実に未送信（同一暗号文を保持）、1 確実にqueueへ投入、2 不明。
+;; 不明時は自動再送せず本文/保持暗号文を消し、late response 用pendingを残す。
+;; cancel:0 確実に未送信の残片を取消、2 不明として終了。送信済effectは戻さない。
+;; queue投入は相手の実行・成功の証拠ではない。IO command は同意ではない。
+;;
+;; phase0 idle/1 building/2 active/3 cached-wire/4 terminal。
+;; outcome1 all-queued/2 cancelled/3 unknown/4 channel-changed/
+;; 5 replay-window-lost/6 request-gone/7 counter-exhausting。
+;; cached counter c と actual next N で N-c<=2048 の時だけ再提示する。
+;; shape/header/clock/command refusal は全領域保持。処理した呼出しは実
+;; pending をsync/reapし、private scratchを消去。端末eventは256Bの観測値。
+;; socket/方向service/port/正規化endpoint/各操作fresh同意の判定は別途必要。
+;; このmoduleは通信・app effect・consent・production資格を付与しない。
+(ns kekkai.application-send-region
+  (:require [kekkai.application-pending-region :as pending]
+            [kekkai.session-region :as session] [kekkai.frame-region :as frame]
+            [kekkai.application-frame-region :as codec])
+  (:export [initialize step]))
+(defn- b [o at] :i64 (kernel-load-u8 (kernel-subregion o 24576 at 1) 1 0))
+(defn- p [o at value] :i64 (kernel-store-u8 (kernel-subregion o 24576 at 1) 1 0 value))
+(defn- r [o at] :i64 (kernel-load-u32 (kernel-subregion o 24576 at 4) 4 0))
+(defn- w [o at value] :i64 (kernel-store-u32 (kernel-subregion o 24576 at 4) 4 0 value))
+(defn- ld [o at] :i64 (kernel-load-u64 (kernel-subregion o 24576 at 8) 8 0))
+(defn- put [o at value] :i64 (kernel-store-u64 (kernel-subregion o 24576 at 8) 8 0 value))
+(defn- zero [o at end] :i64
+  (if (>= at end) 1 (do (put o at 0) (zero o (+ at 8) end))))
+(defn- ib [io at] :i64 (kernel-load-u8 (kernel-subregion io 262144 at 1) 1 0))
+(defn- ip [io at value] :i64 (kernel-store-u8 (kernel-subregion io 262144 at 1) 1 0 value))
+(defn- ir [io at] :i64 (kernel-load-u32 (kernel-subregion io 262144 at 4) 4 0))
+(defn- iw [io at value] :i64 (kernel-store-u32 (kernel-subregion io 262144 at 4) 4 0 value))
+(defn- ild [io at] :i64 (kernel-load-u64 (kernel-subregion io 262144 at 8) 8 0))
+(defn- iput [io at value] :i64 (kernel-store-u64 (kernel-subregion io 262144 at 8) 8 0 value))
+(defn- izero [io at end] :i64
+  (if (>= at end) 1 (do (iput io at 0) (izero io (+ at 8) end))))
+(defn- out-copy [o io source target count i] :i64
+  (if (>= i count) count (do (ip io (+ target i) (b o (+ source i))) (out-copy o io source target count (+ i 1)))))
+(defn- in-copy [o io source target count i] :i64
+  (if (>= i count) count (do (p o (+ target i) (ib io (+ source i))) (in-copy o io source target count (+ i 1)))))
+(defn- copy [target at source start count i] :i64
+  (if (>= i count) count
+    (do (p target (+ at i) (b source (+ start i))) (copy target at source start count (+ i 1)))))
+(defn- same [o a c count i] :bool
+  (if (>= i count) true (and (= (ld o (+ a i)) (ld o (+ c i))) (same o a c count (+ i 8)))))
+(defn- separate [a al c cl] :bool (or (<= (+ a al) c) (<= (+ c cl) a)))
+(defn- shape [o ol s sl q ql io il] :bool
+  (and (>= ol 24576) (>= sl 262144) (>= ql 262144) (>= il 262144)
+       (separate o ol s sl) (separate o ol q ql) (separate o ol io il)
+       (separate s sl q ql) (separate s sl io il) (separate q ql io il)
+       (separate o ol (kernel-application-transmit-pool) 1048576)
+       (separate s sl (kernel-application-transmit-pool) 1048576)
+       (separate q ql (kernel-application-transmit-pool) 1048576)
+       (separate io il (kernel-application-transmit-pool) 1048576)))
+(defn- commands [io] :bool
+  (and (>= (ild io 8) 0) (<= (ild io 8) 9007199254740991) (<= (ir io 4) 65538)
+       (>= (ir io 24) 1) (<= (ir io 24) 9)
+       (or (not= (ir io 24) 3) (and (> (ir io 16) 0) (<= (ir io 16) 1048576)))
+       (or (and (not= (ir io 24) 5) (not= (ir io 24) 6)) (<= (ir io 20) 2))
+       (or (not= (ir io 24) 6) (not= (ir io 20) 1))))
+(defn- header [o s q io] :bool
+  (and (= (r o 0) 0x3153544b) (= (r o 4) 1) (<= (r o 8) 4) (<= (r o 12) 7)
+       (<= (r o 16) 1048576) (<= (r o 20) 1498) (<= (r o 24) (r o 20))
+       (<= (r o 28) 2048) (>= (ld o 40) 0) (<= (ld o 40) (ild io 8))
+       (= (ld o 48) s) (= (ld o 56) q) (= (ld o 64) io) (= (ld o 72) o)))
+(defn- tx-zero-page [view i] :i64
+  (if (>= i 65536) 1
+    (do (kernel-store-u64-64k view 65536 i 0) (tx-zero-page view (+ i 8)))))
+(defn- tx-zero [at] :i64
+  (if (>= at 1048576) 1
+    (do (tx-zero-page (kernel-subregion (kernel-application-transmit-pool) 1048576 at 65536) 0)
+        (tx-zero (+ at 65536)))))
+(defn- finish [o result] :i64
+  (do (zero o 4096 20480) (zero o 22528 24576) result))
+(defn- terminal [o outcome] :i64
+  (do (tx-zero 0) (zero o 20480 22528) (w o 28 0) (w o 8 4) (w o 12 outcome) 0))
+(defn- sync-run [o s q now] :i64
+  (let [phase (pending/synchronize q 262144 s 262144 now)]
+    (if (< phase 0) -1
+      (do (put o 40 now)
+        (if (or (= (r o 8) 0) (= (r o 8) 4)) 1
+          (if (or (not= phase 2)
+                  (not= (session/copy-application-binding s 262144 (kernel-subregion o 24576 22528 96) 96 (quot now 1000)) 96)
+                  (not (same o 80 22528 96 0)))
+            (terminal o 4)
+            (if (= (r o 8) 1) 1
+              (let [live (pending/request-active q 262144 s 262144 (ld o 32) now)]
+                (if (< live 0) -1 (if (= live 0) (terminal o 6) 1))))))))))
+(defn- initialize-run [o s q io] :i64
+  (if (not= (r o 0) 0) -1
+    (let [now (ild io 8) phase (pending/synchronize q 262144 s 262144 (ild io 8))]
+      (if (and (>= phase 0) (< phase 2))
+        (do (zero o 0 24576) (tx-zero 0) (w o 0 0x3153544b) (w o 4 1)
+          (put o 40 now) (put o 48 s) (put o 56 q) (put o 64 io) (put o 72 o) 1) -1))))
+(defn initialize [o ol s sl q ql io il] :i64
+  (if (shape o ol s sl q ql io il)
+    (let [i (kernel-subregion io il 0 262144)]
+      (if (and (>= (ild i 8) 0) (<= (ild i 8) 9007199254740991))
+        (initialize-run (kernel-subregion o ol 0 24576) (kernel-subregion s sl 0 262144)
+          (kernel-subregion q ql 0 262144) i) -1)) -1))
+(defn- identifier [o s q now] :i64
+  (if (and (= (pending/request-id-copy q 262144 s 262144 (kernel-subregion o 24576 22656 64) 64 now) 64)
+           (same o 192 22656 64 0)) 1 -1))
+(defn- acquire [o s q io now] :i64
+  (if (and (= (r o 8) 0) (>= (ir io 4) 64) (= (session/poll s 262144 (quot now 1000)) 2)
+           (< (pending/pending-count q 262144) 256)
+           (= (pending/request-id-copy q 262144 s 262144 (kernel-subregion o 24576 192 64) 64 now) 64)
+           (= (session/copy-application-binding s 262144 (kernel-subregion o 24576 80 96) 96 (quot now 1000)) 96))
+    (do (tx-zero 0) (w o 8 1) (out-copy o io 192 73728 64 0)) -1))
+(defn- id-copy [o s q io now] :i64
+  (if (and (= (r o 8) 1) (>= (ir io 4) 64) (= (identifier o s q now) 1)) (out-copy o io 192 73728 64 0) -1))
+(defn- begin [o s q io now] :i64
+  (if (and (= (r o 8) 1) (= (identifier o s q now) 1))
+    (let [count (ir io 16) handle (pending/begin q 262144 s 262144 (kernel-application-transmit-pool) 1048576 (ir io 16) now)]
+      (if (> handle 0)
+        (do (w o 16 count) (w o 20 (quot (+ count 699) 700)) (put o 32 handle) (w o 8 2) handle) -1)) -1))
+(defn- fragment-bytes [o] :i64
+  (let [left (- (r o 16) (* (r o 24) 700))] (if (> left 700) 700 left)))
+(defn- payload-copy [o start count i] :i64
+  (if (>= i count) count
+    (do (p o (+ 12992 i) (kernel-load-u8 (kernel-subregion (kernel-application-transmit-pool) 1048576 (+ start i) 1) 1 0))
+      (payload-copy o start count (+ i 1)))))
+(defn- encode [o] :i64
+  (do (zero o 12288 14336) (w o 12288 0x3146504b) (w o 12292 64) (w o 12296 64)
+    (w o 12300 (r o 24)) (w o 12304 (r o 20)) (w o 12308 (fragment-bytes o))
+    (copy o 12352 o 192 64 0) (payload-copy o (* (r o 24) 700) (fragment-bytes o) 0)
+    (codec/encode (kernel-subregion o 24576 4096 8192) 8192
+      (kernel-subregion o 24576 12288 2048) 2048 (kernel-subregion o 24576 16384 2048) 2048)))
+(defn- cipher [o s io now count] :i64
+  (let [old (ir io 0)]
+    (do (out-copy o io 16384 4096 count 0) (iw io 0 count)
+      (let [wire (frame/send s 262144 io 262144 (quot now 1000) 1)]
+        (do (iw io 0 old)
+          (loop [i 0] (if (>= i count) 1 (let [z (ip io (+ 4096 i) 0)] (recur (+ i 1)))))
+          (if (and (> wire 0) (<= wire 2048))
+            (do (in-copy o io 73728 20480 wire 0) (w o 28 wire) (w o 272 (fragment-bytes o))
+              (put o 176 (kernel-load-u64 (kernel-subregion io 262144 73731 8) 8 0)) (w o 8 3) wire) -1))))))
+(defn- cached [o s io now] :i64
+  (let [next (session/next-send-counter s 262144 (quot now 1000))]
+    (if (< next 0) (do (terminal o 4) -1)
+      (if (or (<= next (ld o 176)) (> (- next (ld o 176)) 2048)) (do (terminal o 5) -1)
+        (if (>= (ir io 4) (r o 28)) (out-copy o io 20480 73728 (r o 28) 0) -1)))))
+(defn- next-packet [o s io now] :i64
+  (if (= (r o 8) 3) (cached o s io now)
+    (if (not= (r o 8) 2) -1
+      (let [next (session/next-send-counter s 262144 (quot now 1000))]
+        (if (< next 0) (do (terminal o 4) -1)
+          (if (>= next 9007199254740989) (do (terminal o 7) -1)
+            (let [count (encode o)]
+              (if (and (> count 0) (>= (ir io 4) (+ count 28))) (cipher o s io now count) -1))))))))
+(defn- report-packet [o io] :i64
+  (if (not= (r o 8) 3) -1
+    (if (= (ir io 20) 0) 0
+      (if (= (ir io 20) 2) (terminal o 3)
+        (do (put o 256 (+ (ld o 256) (r o 272))) (put o 264 (+ (ld o 264) (r o 28)))
+          (w o 24 (+ (r o 24) 1)) (zero o 20480 22528) (w o 28 0) (w o 272 0)
+          (if (= (r o 24) (r o 20)) (terminal o 1) (do (w o 8 2) 1)))))))
+(defn- cancel [o s q io now] :i64
+  (if (or (= (r o 8) 0) (= (r o 8) 4)) -1
+    (if (= (r o 8) 1)
+      (if (= (ir io 20) 0) (terminal o 2) -1)
+      (if (= (ir io 20) 2) (terminal o 3)
+        (if (>= (pending/cancel q 262144 s 262144 (ld o 32) now) 0) (terminal o 2) -1)))))
+(defn- event-copy [o io] :i64
+  (if (and (= (r o 8) 4) (>= (ir io 4) 256))
+    (do (izero io 73728 73984) (iw io 73728 0x3145534b) (iw io 73732 1)
+      (iw io 73736 (r o 12)) (iw io 73740 (r o 16)) (iw io 73744 (r o 20)) (iw io 73748 (r o 24))
+      (iput io 73752 (ld o 32)) (iput io 73760 (ld o 40)) (iput io 73768 (ld o 256)) (iput io 73776 (ld o 264))
+      (out-copy o io 80 73784 96 0) (out-copy o io 192 73880 64 0) 256) -1))
+(defn- release-event [o] :i64
+  (if (not= (r o 8) 4) -1
+    (do (zero o 8 40) (zero o 80 4096) 1)))
+(defn- dispatch [o s q io] :i64
+  (let [now (ild io 8) op (ir io 24)]
+    (if (< (sync-run o s q now) 0) -1
+      (case op 1 (acquire o s q io now) 2 (id-copy o s q io now) 3 (begin o s q io now)
+        4 (next-packet o s io now) 5 (report-packet o io) 6 (cancel o s q io now)
+        7 (event-copy o io) 8 (release-event o)
+        9 (if (or (= (r o 8) 0) (= (r o 8) 4)) (do (tx-zero 0) (zero o 0 24576) 1) -2) -1))))
+(defn step [o ol s sl q ql io il] :i64
+  (if (shape o ol s sl q ql io il)
+    (let [owner (kernel-subregion o ol 0 24576) i (kernel-subregion io il 0 262144)]
+      (if (and (commands i) (header owner s q i))
+        (finish owner (dispatch owner (kernel-subregion s sl 0 262144) (kernel-subregion q ql 0 262144) i)) -1)) -1))

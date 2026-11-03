@@ -56,6 +56,32 @@ class StateBoot(keys.Boot):
         return super().W(i)
 
 
+
+def wait_input_ready(b, seconds=60):
+    """Observe completion, rather than sending a short HID make during paint."""
+    deadline = time.monotonic() + seconds
+    last = None
+    while time.monotonic() < deadline:
+        words = struct.unpack('<26I', b.words(78, 26))
+        last = dict(started=words[0], frames=words[1], effectsActive=words[25])
+        if words[0] == words[1] and words[1] > 0 and words[25] == 0:
+            return
+        time.sleep(.05)
+    raise AssertionError(('native frame did not finish before HID make', last))
+
+
+def observed_key(b, name, scan):
+    wait_input_ready(b)
+    before = b.W(73)
+    b.send('sendkey ' + name, .1)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if b.W(73) == before + 1 and b.W(77) == scan:
+            wait_input_ready(b)
+            return
+        time.sleep(.05)
+    raise AssertionError(('injected HID make not consumed', name, before, b.W(73), b.W(77)))
+
 def main(args):
     for name in ("media", "efi", "kernel", "font", "qemu", "firmware"):
         setattr(args, name, getattr(args, name).resolve(strict=True))
@@ -232,8 +258,10 @@ def main(args):
         invalid.write_bytes(bad_gpt)
         active = boot("gpt-refused", invalid)
         assert active.W(700) == 0
-        active.send("sendkey 2", 1)
-        active.send("sendkey f5", 3)
+        # Keep the rejection assertion, and prove both makes were consumed.
+        # A fixed sleep can expire inside a still-running scene under TCG load.
+        observed_key(active, "2", 3)
+        observed_key(active, "f5", 63)
         assert active.W(80) == 0 and active.W(82) >= 2**31
         active.quit()
         active = None
@@ -274,7 +302,7 @@ def main(args):
     except BaseException:
         if active is not None:
             (out / "failure-state.json").write_text(json.dumps({
-                "context": {str(i): active.W(i) for i in (73, 77, 79, 80, 81, 82, 85, 86, 87, 94, 97, 700, 961, 973)},
+                "context": {str(i): active.W(i) for i in (73, 77, 78, 79, 80, 81, 82, 85, 86, 87, 94, 97, 103, 700, 961, 973)},
                 "focus": active.S(2)}, indent=2) + "\n")
             active.screenshot("failure")
             active.send("info registers", .2)

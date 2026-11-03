@@ -1,0 +1,370 @@
+;; JUN-757: transactional signed-roster policy, caller-owned native OS profile.
+;; Owner262144: current roster0..32767, managed session32768..65535,
+;; candidate/parser65536..163839, candidate roster163840..196607,
+;; authenticated raw payload196608..262143. No heap/IO/authority enrollment.
+;; Config4096: magic0, authority32, self X25519 public64, minimum version96
+;; (u64), self-id length104/tailnet length108, clock floor112(u64), raw UTF8
+;; self-id128..1151/tailnet1152..2175. Config must be independently protected
+;; and approved; magic bytes do not establish its provenance.
+;; Roster32768: header0..511,65 node records96 bytes from512 (self index0),
+;; 128 edge records32 bytes from8192, raw string/metadata arena16384..32767.
+;; Version/clock/generation are8/16/24(u64); valid32, nodes36, edges40,
+;; arena used44, tailnet ref48/52, relays ref56/60, funnels ref64/68,
+;; exact raw payload SHA512 identity96..159. Nodes: public0..31, expiry32,
+;; id ref40/44, authorized48, has-expiry52, overlay ref56/60, endpoints64/68.
+;; Edges: node indices0/4, raw caps ref8/12, raw ports ref16/20.
+;; Capacity refusal is explicit: <=64 peers,128 edges,16KiB arena,4096 EDN
+;; nodes/depth64. These opt-in bounds are not universal protocol limits.
+;; update returns0 refusal/1 new generation/2 exact same-version payload.
+;; Refusal preserves current roster+session; transient196608 bytes clear.
+;; New version clears all managed session bytes. In-boot monotonic clock,
+;; exact same-version identity and configured floor do not supply durable
+;; rollback protection, a trusted clock, app consent or a production session.
+(ns kekkai.roster-region
+  (:require [kekkai.envelope-region :as envelope]
+            [kotoba.edn.region :refer [node-kind node-start node-length node-after
+              next-character string-pair-equal escaped-equal string-equal
+              integer-value parse atom-end skip-space sequence-has]]
+            [aiueos.sha512-stream :as hash])
+  (:export [initialize update version generation advance-clock peer-index
+            peer-key-byte peer-eligible sessionable permitted]))
+(defn- b [owner at] (kernel-load-u8 (kernel-subregion owner 262144 at 1) 1 0))
+(defn- p [owner at v] (kernel-store-u8 (kernel-subregion owner 262144 at 1) 1 0 v))
+(defn- r [owner at] (kernel-load-u32 (kernel-subregion owner 262144 at 4) 4 0))
+(defn- w [owner at v] (kernel-store-u32 (kernel-subregion owner 262144 at 4) 4 0 v))
+(defn- r64 [owner at] (kernel-load-u64 (kernel-subregion owner 262144 at 8) 8 0))
+(defn- w64 [owner at v] (kernel-store-u64 (kernel-subregion owner 262144 at 8) 8 0 v))
+(defn- cb [config at] (kernel-load-u8 (kernel-subregion config 4096 at 1) 1 0))
+(defn- cr [config at] (kernel-load-u32 (kernel-subregion config 4096 at 4) 4 0))
+(defn- cr64 [config at] (kernel-load-u64 (kernel-subregion config 4096 at 8) 8 0))
+(defn- zero [owner at end]
+  (if (>= at end) 1 (do (kernel-store-u64 (kernel-subregion owner 262144 at 8) 8 0 0) (zero owner (+ at 8) end))))
+(defn- copy [owner target source count i]
+  (if (>= i count) 1 (do (p owner (+ target i) (b owner (+ source i))) (copy owner target source count (+ i 1)))))
+(defn- separate [a n c m] :bool (or (= n 0) (= m 0) (<= (+ a n) c) (<= (+ c m) a)))
+(defn- kr [owner at] (r owner (+ 163840 at)))
+(defn- kw [owner at v] (w owner (+ 163840 at) v))
+(defn- k64 [owner at] (r64 owner (+ 163840 at)))
+(defn- kw64 [owner at v] (w64 owner (+ 163840 at) v))
+(defn- nk [owner node] (node-kind (kernel-subregion owner 262144 65536 98304) 98304 node))
+(defn- source-start [owner node] (node-start (kernel-subregion owner 262144 65536 98304) 98304 node))
+(defn- nl [owner node] (node-length (kernel-subregion owner 262144 65536 98304) 98304 node))
+(defn- na [owner node] (node-after (kernel-subregion owner 262144 65536 98304) 98304 node))
+(defn- source-byte [owner count i]
+  (if (and (>= i 0) (< i count)) (kernel-load-u8-64k (kernel-subregion owner 262144 196608 count) count i) -1))
+(defn- prefix-size [key] (if (>= key 50) 0 (if (>= key 40) 7 (if (< key 10) 7 (if (< key 30) 5 6)))))
+(defn- suffix-size [key]
+  (case key 1 7 2 7 3 4 4 5 5 5 6 6 7 7 10 2 11 3 12 10 13 6 14 10 15 9 20 4 21 2 22 12 23 5 30 4 31 6 32 4 33 4 34 3 40 4 41 4 42 4 43 7 44 4 50 4 51 4 52 4 0))
+(defn- prefix-byte [key i]
+  (if (>= key 40) (case i 0 102 1 117 2 110 3 110 4 101 5 108 47)
+    (if (< key 10) (case i 0 110 1 101 2 116 3 109 4 97 5 112 47)
+    (if (< key 20) (case i 0 110 1 111 2 100 3 101 47)
+      (if (< key 30) (case i 0 101 1 100 2 103 3 101 47) (case i 0 114 1 101 2 108 3 97 4 121 47))))))
+(defn- suffix-byte [key i]
+  (case key
+    1 (case i 0 118 1 101 2 114 3 115 4 105 5 111 110)
+    2 (case i 0 116 1 97 2 105 3 108 4 110 5 101 116)
+    3 (case i 0 115 1 101 2 108 102)
+    4 (case i 0 112 1 101 2 101 3 114 115)
+    5 (case i 0 101 1 100 2 103 3 101 115)
+    6 (case i 0 114 1 101 2 108 3 97 4 121 115)
+    7 (case i 0 102 1 117 2 110 3 110 4 101 5 108 115)
+    10 (case i 0 105 100)
+    11 (case i 0 107 1 101 121)
+    12 (case i 0 111 1 118 2 101 3 114 4 108 5 97 6 121 7 45 8 105 112)
+    13 (case i 0 115 1 116 2 97 3 116 4 117 115)
+    14 (case i 0 101 1 120 2 112 3 105 4 114 5 101 6 115 7 45 8 97 116)
+    15 (case i 0 101 1 110 2 100 3 112 4 111 5 105 6 110 7 116 115)
+    20 (case i 0 102 1 114 2 111 109)
+    21 (case i 0 116 111)
+    22 (case i 0 99 1 97 2 112 3 97 4 98 5 105 6 108 7 105 8 116 9 105 10 101 115)
+    23 (case i 0 112 1 111 2 114 3 116 115)
+    30 (case i 0 110 1 97 2 109 101)
+    31 (case i 0 114 1 101 2 103 3 105 4 111 110)
+    32 (case i 0 104 1 111 2 115 116)
+    33 (case i 0 112 1 111 2 114 116)
+    34 (case i 0 107 1 101 121)
+    40 (case i 0 104 1 111 2 115 116)
+    41 (case i 0 101 1 100 2 103 101)
+    42 (case i 0 110 1 111 2 100 101)
+    43 (case i 0 115 1 101 2 114 3 118 4 105 5 99 101)
+    44 (case i 0 112 1 111 2 114 116)
+    50 (case i 0 107 1 105 2 110 100)
+    51 (case i 0 104 1 111 2 115 116)
+    52 (case i 0 112 1 111 2 114 116) 0))
+(defn- name-byte [key i]
+  (if (< i (prefix-size key)) (prefix-byte key i) (suffix-byte key (- i (prefix-size key)))))
+(defn- named-loop [owner count node key i] :bool
+  (if (>= i (nl owner node)) true
+    (if (= (source-byte owner count (+ (source-start owner node) i)) (name-byte key i)) (named-loop owner count node key (+ i 1)) false)))
+(defn- named [owner count node key] :bool
+  (and (= (nk owner node) 3) (= (nl owner node) (+ (prefix-size key) (suffix-size key))) (named-loop owner count node key 0)))
+(defn- find-loop [owner count at end key]
+  (if (or (< at 0) (>= at end)) -1
+    (if (named owner count at key) (na owner at) (find-loop owner count (na owner (na owner at)) end key))))
+(defn- find [owner count map key]
+  (if (= (nk owner map) 1) (find-loop owner count (+ map 1) (na owner map) key) -1))
+(defn- allowed-fields [owner count at end first last] :bool
+  (if (>= at end) true
+    (if (field-allowed owner count at first last) (allowed-fields owner count (na owner (na owner at)) end first last) false)))
+(defn- field-allowed [owner count node first last] :bool
+  (if (> first last) false (if (named owner count node first) true (field-allowed owner count node (+ first 1) last))))
+(defn- sequence-node [owner node] :bool (or (= (nk owner node) 2) (= (nk owner node) 9)))
+(defn- text-safe [owner count at end visible :bool] :bool
+  (if (>= at end) visible
+    (let [step (next-character (kernel-subregion owner 262144 196608 count) count at end)]
+      (if (or (< step 0) (< (mod step 2097152) 32) (= (mod step 2097152) 127)) false
+        (text-safe owner count (quot step 2097152) end (or visible (> (mod step 2097152) 32)))))))
+(defn- text? [owner count node] :bool
+  (and (= (nk owner node) 4) (> (nl owner node) 0) (text-safe owner count (source-start owner node) (+ (source-start owner node) (nl owner node)) false)))
+(defn- save-span [owner count at length]
+  (if (or (< at 0) (< length 0) (> (+ at length) count) (> (+ (kr owner 44) length) 16384)) -1
+    (do (copy owner (+ 163840 16384 (kr owner 44)) (+ 196608 at) length 0)
+        (let [offset (+ 16384 (kr owner 44))] (do (kw owner 44 (+ (kr owner 44) length)) offset)))))
+(defn- save-node [owner count record field node]
+  (if (< node 0) (do (kw owner (+ record field) 0) (kw owner (+ record field 4) 0) 1)
+    (let [offset (save-span owner count (source-start owner node) (nl owner node))]
+      (if (< offset 0) 0 (do (kw owner (+ record field) offset) (kw owner (+ record field 4) (nl owner node)) 1)))))
+(defn- hex [v]
+  (if (and (>= v 48) (<= v 57)) (- v 48) (if (and (>= v 97) (<= v 102)) (+ 10 (- v 97))
+    (if (and (>= v 65) (<= v 70)) (+ 10 (- v 65)) -1))))
+(defn- key-decode [owner count record at end i any] :bool
+  (if (>= i 32) (and (= at end) (> any 0))
+    (let [a (next-character (kernel-subregion owner 262144 196608 count) count at end)]
+      (if (< a 0) false
+        (let [c (next-character (kernel-subregion owner 262144 196608 count) count (quot a 2097152) end)]
+          (if (or (< c 0) (< (hex (mod a 2097152)) 0) (< (hex (mod c 2097152)) 0)) false
+            (do (p owner (+ 163840 record i) (+ (* (hex (mod a 2097152)) 16) (hex (mod c 2097152))))
+                (key-decode owner count record (quot c 2097152) end (+ i 1)
+                  (bit-or any (+ (* (hex (mod a 2097152)) 16) (hex (mod c 2097152))))))))))))
+(defn- status-authorized [owner count node] :bool
+  (and (= (nk owner node) 4) (status-bytes owner count (source-start owner node) (+ (source-start owner node) (nl owner node)) 0)))
+(defn- status-bytes [owner count at end i] :bool
+  (if (>= i 10) (= at end)
+    (let [step (next-character (kernel-subregion owner 262144 196608 count) count at end)]
+      (if (and (>= step 0) (= (mod step 2097152) (case i 0 97 1 117 2 116 3 104 4 111 5 114 6 105 7 122 8 101 100)))
+        (status-bytes owner count (quot step 2097152) end (+ i 1)) false))))
+(defn- integer [owner count node]
+  (integer-value (kernel-subregion owner 262144 196608 count) count (source-start owner node) (nl owner node)))
+(defn- same-key [owner a c i] :bool
+  (if (>= i 32) true (if (= (b owner (+ 163840 a i)) (b owner (+ 163840 c i))) (same-key owner a c (+ i 1)) false)))
+(defn- duplicate-node [owner current other] :bool
+  (if (>= other current) false
+    (if (or (same-key owner (+ 512 (* current 96)) (+ 512 (* other 96)) 0)
+            (string-pair-equal (kernel-subregion owner 262144 163840 32768) 32768
+              (kr owner (+ 512 (* current 96) 40)) (kr owner (+ 512 (* current 96) 44))
+              (kr owner (+ 512 (* other 96) 40)) (kr owner (+ 512 (* other 96) 44)))) true
+      (duplicate-node owner current (+ other 1)))))
+(defn- node-record [owner count node index] :bool
+  (let [record (+ 512 (* index 96)) id (find owner count node 10) key (find owner count node 11)
+        overlay (find owner count node 12) status (find owner count node 13) expiry (find owner count node 14) endpoints (find owner count node 15)]
+    (if (and (= (nk owner node) 1) (allowed-fields owner count (+ node 1) (na owner node) 10 15)
+             (text? owner count id) (text? owner count key) (text? owner count overlay)
+             (or (< status 0) (text? owner count status)) (or (= index 0) (>= status 0))
+             (or (< endpoints 0) (metadata-sequence owner count endpoints 50))
+             (or (< expiry 0) (= (nk owner expiry) 6) (and (= (nk owner expiry) 5) (>= (integer owner count expiry) 0)))
+             (key-decode owner count record (source-start owner key) (+ (source-start owner key) (nl owner key)) 0 0)
+             (= (save-node owner count record 40 id) 1) (= (save-node owner count record 56 overlay) 1)
+             (= (save-node owner count record 64 endpoints) 1) (= (save-node owner count record 72 status) 1))
+      (do (kw owner (+ record 48) (if (or (and (= index 0) (< status 0)) (status-authorized owner count status)) 1 0))
+          (kw owner (+ record 52) (if (= (nk owner expiry) 5) 1 0))
+          (kw64 owner (+ record 32) (if (= (nk owner expiry) 5) (integer owner count expiry) 0))
+          (not (duplicate-node owner index 0))) false)))
+(defn- peer-records [owner count at end index] :bool
+  (if (>= at end) (do (kw owner 36 index) true)
+    (if (or (> index 64) (not (node-record owner count at index))) false
+      (peer-records owner count (na owner at) end (+ index 1)))))
+(defn- node-index [owner count id index]
+  (if (>= index (kr owner 36)) -1
+    (if (escaped-equal (kernel-subregion owner 262144 196608 count) count (source-start owner id) (nl owner id)
+          (kernel-subregion owner 262144 163840 32768) 32768 (kr owner (+ 512 (* index 96) 40)) (kr owner (+ 512 (* index 96) 44))) index
+      (node-index owner count id (+ index 1)))))
+(defn- port? [owner count node] :bool
+  (and (= (nk owner node) 5) (>= (integer owner count node) 1) (<= (integer owner count node) 65535)))
+(defn- metadata-map [owner count node kind] :bool
+  (if (= kind 50)
+    (and (= (nk owner node) 1) (allowed-fields owner count (+ node 1) (na owner node) 50 52)
+         (= (nk owner (find owner count node 50)) 3) (text? owner count (find owner count node 51)) (port? owner count (find owner count node 52)))
+    (if (= kind 30)
+      (and (= (nk owner node) 1) (allowed-fields owner count (+ node 1) (na owner node) 30 34)
+           (text? owner count (find owner count node 30)) (text? owner count (find owner count node 31))
+           (text? owner count (find owner count node 32)) (port? owner count (find owner count node 33)) (text? owner count (find owner count node 34)))
+      (and (= (nk owner node) 1) (allowed-fields owner count (+ node 1) (na owner node) 40 44)
+           (text? owner count (find owner count node 40)) (text? owner count (find owner count node 41))
+           (text? owner count (find owner count node 42)) (text? owner count (find owner count node 43)) (port? owner count (find owner count node 44))))))
+(defn- metadata-records [owner count at end kind] :bool
+  (if (>= at end) true
+    (if (metadata-map owner count at kind) (metadata-records owner count (na owner at) end kind) false)))
+(defn- metadata-sequence [owner count node kind] :bool
+  (and (sequence-node owner node) (metadata-records owner count (+ node 1) (na owner node) kind)))
+(defn- any-port [owner count node] :bool
+  (and (= (nk owner node) 3) (= (nl owner node) 3)
+       (= (source-byte owner count (source-start owner node)) 97) (= (source-byte owner count (+ (source-start owner node) 1)) 110)
+       (= (source-byte owner count (+ (source-start owner node) 2)) 121)))
+(defn- leaves-valid [owner count at end ports :bool] :bool
+  (if (>= at end) true
+    (if (if ports (or (port? owner count at) (any-port owner count at)) (= (nk owner at) 3))
+      (leaves-valid owner count (na owner at) end ports) false)))
+(defn- edge-record [owner count node index] :bool
+  (let [from (find owner count node 20) to (find owner count node 21) caps (find owner count node 22) ports (find owner count node 23)
+        record (+ 8192 (* index 32))]
+    (if (and (= (nk owner node) 1) (allowed-fields owner count (+ node 1) (na owner node) 20 23)
+             (text? owner count from) (text? owner count to) (sequence-node owner caps) (sequence-node owner ports)
+             (leaves-valid owner count (+ caps 1) (na owner caps) false) (leaves-valid owner count (+ ports 1) (na owner ports) true)
+             (>= (node-index owner count from 0) 0) (>= (node-index owner count to 0) 0)
+             (= (save-node owner count record 8 caps) 1) (= (save-node owner count record 16 ports) 1))
+      (do (kw owner record (node-index owner count from 0)) (kw owner (+ record 4) (node-index owner count to 0)) true) false)))
+(defn- edges [owner count at end index] :bool
+  (if (>= at end) (do (kw owner 40 index) true)
+    (if (or (>= index 128) (not (edge-record owner count at index))) false (edges owner count (na owner at) end (+ index 1)))))
+(defn- same-self-key [owner config i] :bool
+  (if (>= i 32) true (if (= (b owner (+ 163840 512 i)) (cb config (+ 64 i))) (same-self-key owner config (+ i 1)) false)))
+(defn- config-binding [owner count config tailnet id-length tail-length] :bool
+  (and (same-self-key owner config 0)
+       (string-equal (kernel-subregion owner 262144 163840 32768) 32768 (kr owner (+ 512 40)) (kr owner (+ 512 44))
+         (kernel-subregion config 4096 128 id-length) id-length)
+       (string-equal (kernel-subregion owner 262144 196608 count) count (source-start owner tailnet) (nl owner tailnet)
+         (kernel-subregion config 4096 1152 tail-length) tail-length)))
+(defn- build [owner count config now] :bool
+  (let [ver (find owner count 0 1) tailnet (find owner count 0 2) self (find owner count 0 3) peers (find owner count 0 4)
+        grants (find owner count 0 5) relays (find owner count 0 6) funnels (find owner count 0 7)]
+    (if (and (= (nk owner 0) 1) (allowed-fields owner count 1 (na owner 0) 1 7)
+             (= (nk owner ver) 5) (>= (integer owner count ver) 0) (>= (integer owner count ver) (cr64 config 96))
+             (text? owner count tailnet) (node-record owner count self 0) (config-binding owner count config tailnet (cr config 104) (cr config 108))
+             (sequence-node owner peers) (peer-records owner count (+ peers 1) (na owner peers) 1)
+             (sequence-node owner grants) (edges owner count (+ grants 1) (na owner grants) 0)
+             (metadata-sequence owner count relays 30)
+             (or (< funnels 0) (metadata-sequence owner count funnels 40))
+             (= (save-node owner count 0 48 tailnet) 1) (= (save-node owner count 0 56 relays) 1)
+             (= (save-node owner count 0 64 funnels) 1))
+      (do (kw owner 0 0x31524e4b) (kw64 owner 8 (integer owner count ver)) (kw64 owner 16 now) (kw owner 32 1) true) false)))
+(defn- hash-input [owner count i]
+  (if (>= i count) 1
+    (do (hash/stream-byte (kernel-subregion owner 262144 65536 4608) 4608 (source-byte owner count i)) (hash-input owner count (+ i 1)))))
+(defn- hash-save [owner i]
+  (if (>= i 64) 1
+    (do (p owner (+ 163840 96 i) (hash/stream-digest-byte (kernel-subregion owner 262144 65536 4608) 4608 i)) (hash-save owner (+ i 1)))))
+(defn- authority-save [owner config i]
+  (if (>= i 32) 1 (do (p owner (+ 163840 160 i) (cb config (+ 32 i))) (authority-save owner config (+ i 1)))))
+(defn- parse-build [owner config now count] :bool
+  (if (< count 0) false
+    (do (hash/stream-init (kernel-subregion owner 262144 65536 4608) 4608) (hash-input owner count 0)
+        (hash/stream-finish (kernel-subregion owner 262144 65536 4608) 4608) (hash-save owner 0) (authority-save owner config 0)
+        (and (= (parse (kernel-subregion owner 262144 65536 98304) 98304
+                  (kernel-subregion owner 262144 196608 count) count) 1) (build owner count config now)))))
+(defn- same-digest [owner i] :bool
+  (if (>= i 64) true (if (= (b owner (+ 96 i)) (b owner (+ 163840 96 i))) (same-digest owner (+ i 1)) false)))
+(defn- same-authority [owner i] :bool
+  (if (>= i 32) true (if (= (b owner (+ 160 i)) (b owner (+ 163840 160 i))) (same-authority owner (+ i 1)) false)))
+(defn- current [owner] :bool
+  (and (= (r owner 0) 0x31524e4b) (= (r owner 32) 1) (> (r owner 36) 0) (<= (r owner 36) 65)
+       (<= (r owner 40) 128) (<= (r owner 44) 16384) (>= (r64 owner 8) 0) (> (r64 owner 24) 0) (>= (r64 owner 16) 0)))
+(defn- decide [owner now]
+  (if (and (= (r owner 32) 1) (< (k64 owner 8) (r64 owner 8))) 0
+    (if (and (= (r owner 32) 1) (= (k64 owner 8) (r64 owner 8)))
+      (if (and (same-digest owner 0) (same-authority owner 0)) (do (w64 owner 16 now) (reap owner now) 2) 0)
+      (if (>= (r64 owner 24) 9223372036854775807) 0
+        (do (kw64 owner 24 (+ (r64 owner 24) 1)) (copy owner 0 163840 32768 0) (zero owner 32768 65536) 1)))))
+(defn- apply-envelope [owner input count config now]
+  (do (zero owner 65536 262144)
+      (let [ok (parse-build owner config now
+                  (envelope/verify (kernel-subregion owner 262144 65536 98304) 98304 input count
+                    (kernel-subregion config 4096 32 32) 32 (kernel-subregion owner 262144 196608 65536) 65536))]
+        (let [result (if ok (decide owner now) 0)] (do (zero owner 65536 262144) result)))))
+(defn- config-valid [config] :bool
+  (and (= (cr config 0) 0x4746434b) (> (cr config 104) 0) (<= (cr config 104) 1024)
+       (> (cr config 108) 0) (<= (cr config 108) 1024) (>= (cr64 config 96) 0) (>= (cr64 config 112) 0)))
+(defn initialize [owner length]
+  (if (< length 262144) 0
+    (do (zero (kernel-subregion owner length 0 262144) 0 262144) (w (kernel-subregion owner length 0 262144) 0 0x31524e4b) 1)))
+(defn update [owner length input count config config-bytes now]
+  (if (and (>= length 262144) (>= count 0) (<= count 98304) (= config-bytes 4096) (>= now 0)
+           (separate owner 262144 input count) (separate owner 262144 config 4096)
+           (= (r (kernel-subregion owner length 0 262144) 0) 0x31524e4b)
+           (config-valid (kernel-subregion config config-bytes 0 4096))
+           (>= now (r64 (kernel-subregion owner length 0 262144) 16)) (>= now (cr64 (kernel-subregion config config-bytes 0 4096) 112)))
+    (apply-envelope (kernel-subregion owner length 0 262144) input count (kernel-subregion config config-bytes 0 4096) now) 0))
+(defn version [owner length]
+  (if (< length 262144) -1 (if (current (kernel-subregion owner length 0 262144)) (r64 (kernel-subregion owner length 0 262144) 8) -1)))
+(defn generation [owner length]
+  (if (< length 262144) 0 (if (current (kernel-subregion owner length 0 262144)) (r64 (kernel-subregion owner length 0 262144) 24) 0)))
+(defn- key-equals [owner peer expected i] :bool
+  (if (>= i 32) true (if (= (b owner (+ 512 (* peer 96) i)) (kernel-load-u8 expected 32 i)) (key-equals owner peer expected (+ i 1)) false)))
+(defn- locate [owner expected index]
+  (if (>= index (r owner 36)) -1 (if (key-equals owner index expected 0) index (locate owner expected (+ index 1)))))
+(defn peer-index [owner length expected expected-bytes]
+  (if (or (< length 262144) (not= expected-bytes 32)) -1
+    (if (current (kernel-subregion owner length 0 262144))
+      (locate (kernel-subregion owner length 0 262144) (kernel-subregion expected expected-bytes 0 32) 1) -1)))
+(defn peer-key-byte [owner length peer i]
+  (if (or (< length 262144) (< peer 0) (< i 0) (>= i 32)) -1
+    (if (and (current (kernel-subregion owner length 0 262144)) (< peer (r (kernel-subregion owner length 0 262144) 36)))
+      (b (kernel-subregion owner length 0 262144) (+ 512 (* peer 96) i)) -1)))
+(defn- authorized [owner peer now] :bool
+  (and (> peer 0) (< peer (r owner 36)) (= (r owner (+ 512 (* peer 96) 48)) 1)
+       (or (= (r owner (+ 512 (* peer 96) 52)) 0) (> (r64 owner (+ 512 (* peer 96) 32)) now))))
+(defn- overlay-byte [i] (case i 0 111 1 118 2 101 3 114 4 108 5 97 121))
+(defn- overlay-token [owner at end i] :bool
+  (if (>= i 7) (= (+ at i) end)
+    (if (= (b owner (+ at i)) (overlay-byte i)) (overlay-token owner at end (+ i 1)) false)))
+(defn- overlay-list [owner at end] :bool
+  (if (>= at end) false
+    (if (and (= (b owner at) 58) (overlay-token owner (+ at 1)
+               (atom-end (kernel-subregion owner 262144 0 32768) 32768 at) 0)) true
+      (if (<= (atom-end (kernel-subregion owner 262144 0 32768) 32768 at) at) false
+        (overlay-list owner (skip-space (kernel-subregion owner 262144 0 32768) 32768
+                              (atom-end (kernel-subregion owner 262144 0 32768) 32768 at)) end)))))
+(defn- session-edge [owner peer index] :bool
+  (if (>= index (r owner 40)) false
+    (let [record (+ 8192 (* index 32))]
+      (if (and (or (and (= (r owner record) 0) (= (r owner (+ record 4)) peer))
+                   (and (= (r owner record) peer) (= (r owner (+ record 4)) 0)))
+               (overlay-list owner (skip-space (kernel-subregion owner 262144 0 32768) 32768 (+ (r owner (+ record 8)) 1))
+                 (+ (r owner (+ record 8)) (r owner (+ record 12))))) true (session-edge owner peer (+ index 1))))))
+(defn- eligible [owner peer now] :bool
+  (and (= (r owner (+ 512 48)) 1)
+       (or (= (r owner (+ 512 52)) 0) (> (r64 owner (+ 512 32)) now))
+       (authorized owner peer now) (session-edge owner peer 0)))
+(defn- reap [owner now]
+  (if (and (> (r owner (+ 32768 24)) 0)
+           (or (not= (r64 owner (+ 32768 8)) (r64 owner 24)) (not (eligible owner (r owner (+ 32768 16)) now))))
+    (zero owner 32768 65536) 1))
+(defn advance-clock [owner length now]
+  (if (< length 262144) 0
+    (if (and (current (kernel-subregion owner length 0 262144)) (>= now (r64 (kernel-subregion owner length 0 262144) 16)))
+      (do (w64 (kernel-subregion owner length 0 262144) 16 now) (reap (kernel-subregion owner length 0 262144) now) 1) 0)))
+(defn sessionable [owner length expected expected-bytes now]
+  (if (or (not= expected-bytes 32) (< length 262144) (not (separate owner 262144 expected 32))) 0
+    (if (and (= (advance-clock owner length now) 1)
+             (eligible (kernel-subregion owner length 0 262144) (peer-index owner length expected expected-bytes) now)) 1 0)))
+;; Index query for an already bound, protected managed session. Callers must
+;; separately compare its pinned key with peer-key-byte; indices are not
+;; identities or grants. This keeps policy in this owner without passing an
+;; alias of session bytes to the immutable external-key sessionable API.
+(defn peer-eligible [owner length peer now]
+  (if (< length 262144) 0
+    (if (and (= (advance-clock owner length now) 1)
+             (eligible (kernel-subregion owner length 0 262144) peer now)) 1 0)))
+;; Request32: direction0(out)/1(in), port4, now8(u64), epoch16(u64).
+;; Capability bytes are the operation's keyword name without colon. Caller
+;; must bind direction/port/capability to the real operation and fresh consent;
+;; a request record is not itself that proof or an app authorization ticket.
+(defn- grant-loop [owner peer cap cap-bytes direction port index] :bool
+  (if (>= index (r owner 40)) false
+    (let [record (+ 8192 (* index 32))]
+      (if (and (= (r owner record) (if (= direction 0) 0 peer)) (= (r owner (+ record 4)) (if (= direction 0) peer 0))
+               (sequence-has (kernel-subregion owner 262144 0 32768) 32768 (r owner (+ record 8)) (r owner (+ record 12)) 3 cap cap-bytes 0)
+               (sequence-has (kernel-subregion owner 262144 0 32768) 32768 (r owner (+ record 16)) (r owner (+ record 20)) 5 cap cap-bytes port)) true
+        (grant-loop owner peer cap cap-bytes direction port (+ index 1))))))
+(defn- permit [owner expected cap cap-bytes request]
+  (let [direction (kernel-load-u32 request 32 0) port (kernel-load-u32 request 32 4)
+        now (kernel-load-u64 request 32 8) epoch (kernel-load-u64 request 32 16)]
+    (if (and (<= direction 1) (>= port 1) (<= port 65535) (= epoch (r64 owner 24))
+             (= (advance-clock owner 262144 now) 1) (eligible owner (locate owner expected 1) now)
+             (grant-loop owner (locate owner expected 1) cap cap-bytes direction port 0)) 1 0)))
+(defn permitted [owner length expected expected-bytes cap cap-bytes request request-bytes]
+  (if (and (>= length 262144) (= expected-bytes 32) (> cap-bytes 0) (<= cap-bytes 256) (= request-bytes 32)
+           (separate owner 262144 expected 32) (separate owner 262144 cap cap-bytes) (separate owner 262144 request 32)
+           (current (kernel-subregion owner length 0 262144)))
+    (permit (kernel-subregion owner length 0 262144) (kernel-subregion expected expected-bytes 0 32)
+      cap cap-bytes (kernel-subregion request request-bytes 0 32)) 0))

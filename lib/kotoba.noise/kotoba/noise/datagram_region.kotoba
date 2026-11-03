@@ -1,0 +1,123 @@
+;; JUN-757: caller-owned Kekkai datagram wire, without heap or IO.
+;; counter:u64le || ChaChaPoly ciphertext, header is8-byte associated data.
+;; A completed IK handshake must match the caller's expected static key.
+;; That expected key/clock/entropy/roster/revocation/consent are caller duties;
+;; this module verifies neither a signed roster nor authenticated persistence.
+;; Caller owns17408 bytes; calls are serialized and inputs stay immutable.
+;; Header0..63, TX64, RX96,2048 u64 replay markers128..16511,
+;; transient AEAD16512..17023, authenticated peer17024, transcript17056.
+;; Transient bytes are zero after construction and every message operation.
+;; Only states produced by this API, not serialized/untrusted bytes, are valid.
+;; set-length selects plaintext length for seal, full wire length for open.
+;; seal/open receive actual input/output capacities, bounded by65536 bytes.
+;; Physical state/input/output must be disjoint. Return-1 refuses;0 is a
+;; successful authenticated empty plaintext. All refusals preserve state and
+;; output for API-created states; shape refusals do not touch scratch.
+;; Reordered packets use a2048-entry circular window; only authenticated
+;; packets advance it.180-second expiry,120-second rekey advice and existing
+;; counter thresholds are retained. Rekey advice does not grant a new session.
+;; wipe erases all17408 bytes. No constant-time/app/network qualification.
+(ns noise.datagram-region
+  (:require [noise.ik-region :as n] [chacha20.aead-region :as c])
+  (:export [state-size from-handshake set-length advice seal open wipe]))
+(defn state-size [] :i64 17408)
+(defn- b [st i] (kernel-load-u8-64k st 17408 i))
+(defn- p [st i v] (kernel-store-u8-64k st 17408 i v))
+(defn- ld [st i] (kernel-load-u64 (kernel-subregion st 17408 i 8) 8 0))
+(defn- put [st i v] (kernel-store-u64 (kernel-subregion st 17408 i 8) 8 0 v))
+(defn- fill [st i end]
+  (if (>= i end) 1 (do (p st i 0) (fill st (+ i 1) end))))
+(defn- clear-work [st] (fill st 16512 17024))
+(defn- separate [a count b size]
+  (or (= count 0) (= size 0) (<= (+ a count) b) (<= (+ b size) a)))
+(defn- shape [st input input-bytes output capacity]
+  (and (>= input-bytes 0) (<= input-bytes 65536) (>= capacity 0) (<= capacity 65536)
+       (separate st 17408 input input-bytes) (separate st 17408 output capacity)
+       (separate input input-bytes output capacity)))
+(defn- valid [st]
+  (and (= (ld st 0) 1313096753) (= (ld st 56) 1)
+       (>= (ld st 8) 0) (<= (ld st 8) 9007199254740990)
+       (>= (ld st 16) -1) (< (ld st 16) 9007199254740990)
+       (>= (ld st 24) 0) (>= (ld st 32) (ld st 24))
+       (>= (ld st 40) 0) (<= (ld st 40) 9007199254740990)
+       (>= (ld st 48) 0) (<= (ld st 48) 65535)))
+(defn- state-advice [st now]
+  (if (not (valid st)) 2
+    (if (or (< now (ld st 32)) (>= (- now (ld st 24)) 180)
+            (>= (ld st 8) 9007199254740990) (>= (ld st 40) 9007199254740990)) 2
+      (if (or (>= (- now (ld st 24)) 120) (>= (ld st 8) 281474976710656)) 1 0))))
+(defn advice [st length now]
+  (if (< length 17408) 2 (state-advice (kernel-subregion st length 0 17408) now)))
+(defn- peer-diff [hs expected i diff]
+  (if (>= i 32) diff
+    (peer-diff hs expected (+ i 1)
+      (bit-or diff (bit-xor (n/get-byte hs 8192 1 i) (kernel-load-u8 expected 32 i))))))
+(defn- copy-field [st hs kind at i]
+  (if (>= i 32) 1
+    (do (p st (+ at i) (n/get-byte hs 8192 kind i)) (copy-field st hs kind at (+ i 1)))))
+(defn- admit [st hs expected now]
+    (if (and (= (n/status hs 8192) 3) (= (peer-diff hs expected 0 0) 0))
+      (do (fill st 0 17408) (copy-field st hs 2 64 0) (copy-field st hs 3 96 0)
+          (copy-field st hs 1 17024 0) (copy-field st hs 0 17056 0)
+          (put st 0 1313096753) (put st 16 -1) (put st 24 now) (put st 32 now) (put st 56 1) 1) 0))
+(defn from-handshake [st length hs hs-length expected expected-length now]
+  (if (or (< length 17408) (< hs-length 8192) (not (= expected-length 32)) (< now 0)
+          (not (separate st 17408 hs 8192)) (not (separate st 17408 expected 32))) 0
+    (admit (kernel-subregion st length 0 17408) (kernel-subregion hs hs-length 0 8192)
+      (kernel-subregion expected expected-length 0 32) now)))
+(defn set-length [st length count]
+  (if (or (< length 17408) (< count 0) (> count 65535)) 0
+    (if (valid (kernel-subregion st length 0 17408))
+      (do (put (kernel-subregion st length 0 17408) 48 count) 1) 0)))
+(defn- key [st direction i]
+  (if (>= i 32) 1
+    (do (p st (+ 16512 i) (b st (+ 64 (* direction 32) i))) (key st direction (+ i 1)))))
+(defn- nonce [st counter i]
+  (if (>= i 12) 1
+    (do (p st (+ 16544 i) (if (< i 4) 0 (bit-and (u64-shift-right counter (* (- i 4) 8)) 255)))
+        (nonce st counter (+ i 1)))))
+(defn- associated [st counter i]
+  (if (>= i 8) 1
+    (do (c/aad-byte (kernel-subregion st 17408 16512 512) 512 (bit-and (u64-shift-right counter (* i 8)) 255))
+        (associated st counter (+ i 1)))))
+(defn- cipher [st direction count counter]
+  (do (key st direction 0) (nonce st counter 0)
+      (c/init (kernel-subregion st 17408 16512 512) 512 12) (associated st counter 0)
+      (c/set-length (kernel-subregion st 17408 16512 512) 512 count)))
+(defn- emit-header [st output capacity i]
+  (if (>= i 8) 1
+    (do (kernel-store-u8-64k output capacity i (bit-and (u64-shift-right (ld st 8) (* i 8)) 255))
+        (emit-header st output capacity (+ i 1)))))
+(defn- sealed [st output capacity now]
+  (do (emit-header st output capacity 0) (put st 8 (+ (ld st 8) 1)) (put st 32 now)
+      (clear-work st) (+ (ld st 48) 24)))
+(defn seal [st input input-bytes output capacity now]
+  (if (and (shape st input input-bytes output capacity) (not (= (state-advice st now) 2))
+           (<= (ld st 48) 65511) (<= (ld st 48) input-bytes) (<= (+ (ld st 48) 24) capacity))
+    (do (cipher st 0 (ld st 48) (ld st 8))
+        (c/set-offsets (kernel-subregion st 17408 16512 512) 512 0 8)
+        (if (= (c/seal (kernel-subregion st 17408 16512 512) input input-bytes output capacity) (+ (ld st 48) 16))
+          (sealed st output capacity now) (do (clear-work st) -1))) -1))
+(defn- counter [input capacity]
+  (kernel-load-u64 (kernel-subregion input capacity 0 8) 8 0))
+(defn- replay-ok [st number]
+  (and (< number 9007199254740990)
+       (not (= (ld st (+ 128 (* (mod number 2048) 8))) (+ number 1)))
+       (not (and (<= number (ld st 16)) (<= number (- (ld st 16) 2048))))))
+(defn- received [st input input-bytes now]
+  (do (put st (+ 128 (* (mod (counter input input-bytes) 2048) 8)) (+ (counter input input-bytes) 1))
+      (if (> (counter input input-bytes) (ld st 16)) (put st 16 (counter input input-bytes)) 0)
+      (put st 40 (+ (ld st 40) 1)) (put st 32 now) (clear-work st) (- (ld st 48) 24)))
+(defn- open-work [st input input-bytes output capacity now]
+  (do (cipher st 1 (- (ld st 48) 8) (counter input input-bytes))
+      (c/set-offsets (kernel-subregion st 17408 16512 512) 512 8 0)
+      (if (= (c/open (kernel-subregion st 17408 16512 512) input input-bytes output capacity) (- (ld st 48) 24))
+        (received st input input-bytes now) (do (clear-work st) -1))))
+(defn open [st input input-bytes output capacity now]
+  (if (and (shape st input input-bytes output capacity) (not (= (state-advice st now) 2))
+           (>= (ld st 48) 24) (<= (ld st 48) input-bytes) (<= (- (ld st 48) 24) capacity))
+    (if (and (= (kernel-load-u8-64k input input-bytes 7) 0) (<= (kernel-load-u8-64k input input-bytes 6) 31)
+             (replay-ok st (counter input input-bytes)))
+      (open-work st input input-bytes output capacity now) -1) -1))
+(defn wipe [st length]
+  (if (< length 17408) 0 (fill (kernel-subregion st length 0 17408) 0 17408)))

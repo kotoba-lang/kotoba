@@ -1,0 +1,7 @@
+# Native diagnostic-media EFI capacity — JUN-757
+
+The8MiB GPT/FAT16 image has14158 data clusters. EFI/BOOT uses two clusters, so BOOTX64.EFI can use14156 ×512 =7,247,872 bytes before the backup GPT entries at LBA16351. The old6MiB admission threshold rejected the6,582,272-byte dual-font/user-slot diagnostic EFI even though it fits. Native admission and the Mac observer now use the actual bounded file capacity. Geometry, the2MiB compiler code limit, memory grants and runtime ABI are unchanged.
+
+`receipt.json` records the native tool/source pins, eighteen refusals and independent readbacks. A public EFI padded to the exact capacity was emitted and verified by Kotoba and independently parsed. One byte beyond was refused for build and verify, without creating a new output or modifying the valid disk. Existing malformed GPT/FAT/directory/EFI and ISO controls still fail. The prior6,057,984-byte hash fixture produces byte-identical GPT and ISO artifacts before/after this change. Repeated native builds reproduce the original candidate artifacts.
+
+Reproduce with `os/aiueos/scripts/build-native-media-macos.py` and its required pinned Amu source/compiler/packager/EFI arguments, adding `--verify-efi-capacity`. Python stages/hashes and independently parses; the native Kotoba tool emits and verifies GPT/FAT/ISO. Boundary padding is format-test data. These checks do not establish QEMU boot, physical installation or production release readiness.

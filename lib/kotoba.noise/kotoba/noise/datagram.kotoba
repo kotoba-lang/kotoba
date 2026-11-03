@@ -1,0 +1,82 @@
+;; Kekkai's existing noise.session wire: counter:u64le || ChaChaPoly ciphertext.
+;; Header is AEAD associated data. A 2048-entry circular replay window accepts
+;; reordered packets, but only authentic packets advance it. No IO or authority.
+;; The owner must verify the signed netmap, obtain operation consent, and close
+;; sessions on revocation/version changes. This module cannot grant admission.
+;; State 2118 i64s: send-key32, receive-key32, send-counter64, recv-max65,
+;; born66, last-clock67, received68, layout-version69, replay slots70..2117.
+;; Success: state' || frame/plaintext; refusal: empty. Input state is immutable.
+(ns noise.datagram
+  (:require [noise.native :as n] [chacha20.aead :as a])
+  (:export [from-handshake seal open advice state-size]))
+
+(defn state-size [] :i64 2118)
+(defn- slice [v :vector-i64 off :i64 size :i64] :vector-i64
+  (loop [i 0 out (vector-alloc size)] (if (= i size) out
+    (recur (+ i 1) (vector-assoc! out i (vector-at v (+ off i)))))))
+(defn- cat [v :vector-i64 w :vector-i64] :vector-i64
+  (let [nv (vector-count v)]
+    (loop [i 0 out (vector-alloc (+ nv (vector-count w)))]
+      (if (= i (vector-count out)) out
+        (recur (+ i 1) (vector-assoc! out i
+          (if (< i nv) (vector-at v i) (vector-at w (- i nv)))))))))
+(defn- bytes? [v :vector-i64] :bool
+  (loop [i 0] (if (= i (vector-count v)) true
+    (if (and (>= (vector-at v i) 0) (<= (vector-at v i) 255)) (recur (+ i 1)) false))))
+(defn- same? [v :vector-i64 w :vector-i64] :bool
+  (and (= (vector-count v) (vector-count w))
+    (loop [i 0] (if (= i (vector-count v)) true
+      (if (= (vector-at v i) (vector-at w i)) (recur (+ i 1)) false)))))
+(defn- valid? [st :vector-i64] :bool
+  (and (= (vector-count st) 2118) (= (vector-at st 69) 1)
+       (>= (vector-at st 64) 0) (>= (vector-at st 65) -1)
+       (>= (vector-at st 66) 0) (>= (vector-at st 67) (vector-at st 66))
+       (>= (vector-at st 68) 0)))
+(defn advice [st :vector-i64 now :i64] :i64
+  ;; 2: reject/expire, 1: rekey requested, 0: current. A backwards clock refuses.
+  (if (not (valid? st)) 2
+    (cond (or (< now (vector-at st 67)) (>= (- now (vector-at st 66)) 180)
+              (>= (vector-at st 64) 9007199254740990) (>= (vector-at st 68) 9007199254740990)) 2
+          (or (>= (- now (vector-at st 66)) 120) (>= (vector-at st 64) 281474976710656)) 1
+          :else 0)))
+(defn from-handshake [hs :vector-i64 expected :vector-i64 now :i64] :vector-i64
+  ;; Expected key comes from the verified roster, not from the peer's claim.
+  (if (or (not (= (vector-count hs) (n/state-size))) (not (= (vector-count expected) 32))
+          (not (bytes? expected)) (< now 0)) (vector-i64)
+    (if (or (not (= (vector-at hs 294) 4)) (not (= (vector-count (n/handshake-hash hs)) 32))
+            (not (same? (n/remote-static hs) expected))) (vector-i64)
+      (let [init (= (vector-at hs 293) 1) send (if init 296 329) recv (if init 329 296)
+            out (vector-alloc 2118)
+            copied (loop [i 0] (if (= i 32) 0
+              (let [p (vector-assoc! out i (vector-at hs (+ send i)))
+                    q (vector-assoc! out (+ i 32) (vector-at hs (+ recv i)))] (recur (+ i 1)))))
+            max (vector-assoc! out 65 -1) born (vector-assoc! out 66 now)
+            clock (vector-assoc! out 67 now) version (vector-assoc! out 69 1)] out))))
+(defn- header [counter :i64] :vector-i64
+  (loop [i 0 out (vector-alloc 8)] (if (= i 8) out
+    (recur (+ i 1) (vector-assoc! out i (bit-and (u64-shift-right counter (* i 8)) 255))))))
+(defn- nonce [hdr :vector-i64] :vector-i64
+  (cat (vector-i64 0 0 0 0) hdr))
+(defn- associated-data [hdr :vector-i64] :vector-i64 hdr)
+(defn seal [st :vector-i64 data :vector-i64 now :i64] :vector-i64
+  (if (or (= (advice st now) 2) (> (vector-count data) 65511) (not (bytes? data))) (vector-i64)
+    (let [hdr (header (vector-at st 64)) ct (a/seal (slice st 0 32) (nonce hdr) (associated-data hdr) data)
+          next (slice st 0 2118) sent (vector-assoc! next 64 (+ (vector-at st 64) 1))
+          clock (vector-assoc! next 67 now)] (cat next (cat hdr ct)))))
+(defn- counter [hdr :vector-i64] :i64
+  (loop [i 7 acc 0] (if (< i 0) acc (recur (- i 1) (+ (* acc 256) (vector-at hdr i))))))
+(defn open [st :vector-i64 frame :vector-i64 now :i64] :vector-i64
+  (if (or (= (advice st now) 2) (< (vector-count frame) 24) (> (vector-count frame) 65535)
+          (not (bytes? frame))) (vector-i64)
+    (let [hdr (slice frame 0 8)]
+      ;; Reject out-of-range counters before multiplication could overflow i64.
+      (if (or (not (= (vector-at hdr 7) 0)) (> (vector-at hdr 6) 31)) (vector-i64)
+        (let [n (counter hdr) top (vector-at st 65) slot (+ 70 (rem n 2048))]
+          (if (or (>= n 9007199254740990) (= (vector-at st slot) (+ n 1))
+                  (and (<= n top) (<= n (- top 2048)))) (vector-i64)
+            (let [pt (a/open (slice st 32 32) (nonce hdr) (associated-data hdr) (slice frame 8 (- (vector-count frame) 8)))]
+              (if (and (= (vector-count pt) 1) (= (vector-at pt 0) -1)) (vector-i64)
+                (let [next (slice st 0 2118) mark (vector-assoc! next slot (+ n 1))
+                      max (vector-assoc! next 65 (if (> n top) n top))
+                      clock (vector-assoc! next 67 now)
+                      received (vector-assoc! next 68 (+ (vector-at st 68) 1))] (cat next pt))))))))))

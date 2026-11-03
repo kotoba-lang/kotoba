@@ -1,0 +1,93 @@
+;; JUN-757: polled RTL8139C+ adapter for native QEMU network qualification.
+;; Distinct device/profile from6600H RTL8168: BAR1 is256B, C+ command0xE0,
+;; TxPoll0xD9. No fallback to another device or legacy ring mode.
+;; Caller owns512-byte metadata; DMA uses existing owned window10 (16KiB):
+;; TX descriptor0, TX frame4096, RX descriptor8192, RX buffer12288.
+;; One descriptor per ring,1536B RX, Ethernet TX60..1514. No app authority.
+(ns aiueos.native.rtl8139-cplus
+  (:require [capability.dma.map :as dma])
+  (:export [start rx-length rx-byte release tx-byte send]))
+(defn- ld [st i] (kernel-load-u64 st 512 i))
+(defn- put [st i v] (kernel-store-u64 st 512 i v))
+(defn- config-address [device offset]
+  (bit-or 2147483648 (bit-or (* device 2048) (bit-and offset 252))))
+(defn- pci-read [device offset]
+  (do (kernel-out-u32 3320 (config-address device offset)) (kernel-in-u32 3324)))
+(defn- pci-write [device offset value]
+  (do (kernel-out-u32 3320 (config-address device offset)) (kernel-out-u32 3324 value)))
+(defn- find-device [device]
+  (if (>= device 8192) -1
+    (if (= (pci-read device 0) 2168000748) device (find-device (+ device 1)))))
+(defn- clear [st i end]
+  (if (>= i end) 1 (do (kernel-store-u8 st 512 i 0) (clear st (+ i 1) end))))
+(defn- wait-reset [mmio left]
+  (if (= (bit-and (kernel-load-u8 mmio 256 55) 16) 0) 1
+    (if (<= left 0) 0 (do (kernel-pause) (wait-reset mmio (- left 1))))))
+(defn- wait-tx [left]
+  (if (= (bit-and (kernel-load-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096) 4096 0) 2147483648) 0) 1
+    (if (<= left 0) 0 (do (kernel-pause) (wait-tx (- left 1))))))
+(defn- arm-rx []
+  (do (kernel-store-u64-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 4096 8
+          (kernel-subregion (kernel-owned-window 10 16384) 16384 12288 4096))
+      (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 4096 4 0)
+      (dma/release-fence)
+      (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 4096 0 (dma/rx-command 1536))
+      (dma/release-fence) 1))
+(defn- configure [st mmio]
+  (do (kernel-store-u8 mmio 256 55 16)
+      (if (= (wait-reset mmio 1000000) 1)
+        (do (kernel-store-u16 mmio 256 60 0) (kernel-store-u16 mmio 256 62 65535)
+            (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096) 4096 0 1073741824)
+            (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096) 4096 4 0)
+            (kernel-store-u64-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096) 4096 8
+              (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096))
+            (arm-rx)
+            (kernel-store-u32 mmio 256 32 (bit-and (kernel-owned-window 10 16384) 4294967295))
+            (kernel-store-u32 mmio 256 36 (u64-shift-right (kernel-owned-window 10 16384) 32))
+            (kernel-store-u32 mmio 256 228 (bit-and (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 4294967295))
+            (kernel-store-u32 mmio 256 232 (u64-shift-right (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 32))
+            (kernel-store-u16 mmio 256 224 3)
+            ;; Do not enable a legacy8139 ring when C+ was not accepted.
+            (if (= (bit-and (kernel-load-u16 mmio 256 224) 3) 3)
+            (do
+            (kernel-store-u32 mmio 256 64 50333440) (kernel-store-u32 mmio 256 68 10)
+            (kernel-store-u8 mmio 256 55 12) (put st 16 1) 1)
+            (do (kernel-store-u8 mmio 256 55 0) 0))) 0)))
+(defn start [st length]
+  (if (< length 512) 0
+    (do (clear st 0 512)
+        (let [device (find-device 0)]
+          (if (< device 0) 0
+            (let [raw (pci-read device 20) bar (bit-and raw 4294967280)]
+              (if (or (not (= (bit-and raw 7) 0)) (= bar 0)) 0
+                (do (put st 0 device) (put st 8 bar)
+                    (pci-write device 4 (bit-or (bit-and (pci-read device 4) 65535) 6))
+                    (configure st (kernel-pci-mmio (quot device 32) (mod device 32) 0 bar 256))))))))))
+(defn rx-length [st length]
+  (if (or (< length 512) (not (= (ld st 16) 1))) 0
+    (let [flags (kernel-load-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096) 4096 0)]
+      (if (not (= (bit-and flags 2147483648) 0)) 0
+        ;; The same serialising CPUID orders DMA reads after observing OWN.
+        (do (dma/release-fence)
+        (if (and (= (bit-and flags 805306368) 805306368)
+                 (= (bit-and flags 786432) 0) (>= (bit-and flags 8191) 64) (<= (bit-and flags 8191) 1518))
+          (- (bit-and flags 8191) 4) -1))))))
+(defn rx-byte [i]
+  (if (or (< i 0) (>= i 1536)) -1
+    (kernel-load-u8-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 12288 4096) 4096 i)))
+(defn release [st length]
+  (if (or (< length 512) (not (= (ld st 16) 1))) 0
+    (do (arm-rx)
+        (kernel-store-u16 (kernel-pci-mmio (quot (ld st 0) 32) (mod (ld st 0) 32) 0 (ld st 8) 256) 256 62 65535) 1)))
+(defn tx-byte [i value]
+  (if (or (< i 0) (>= i 1514) (< value 0) (> value 255)) 0
+    (do (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096) 4096 i value) 1)))
+(defn- transmit [mmio bytes]
+  (if (= (wait-tx 2000000) 0) -1
+    (do (dma/release-fence)
+        (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096) 4096 0 (dma/tx-command bytes))
+        (dma/release-fence) (kernel-store-u8 mmio 256 217 64)
+        (if (= (wait-tx 2000000) 1) 1 -1))))
+(defn send [st length bytes]
+  (if (or (< length 512) (not (= (ld st 16) 1)) (< bytes 60) (> bytes 1514)) 0
+    (transmit (kernel-pci-mmio (quot (ld st 0) 32) (mod (ld st 0) 32) 0 (ld st 8) 256) bytes)))

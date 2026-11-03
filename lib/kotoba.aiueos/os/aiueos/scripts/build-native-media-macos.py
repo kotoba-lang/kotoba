@@ -22,6 +22,7 @@ import native_media_retention
 
 
 HERE = Path(__file__).resolve().parent
+EFI_MAX_BYTES = 16351 * 512 - 1123840  # file start .. backup GPT entries
 
 
 def pin(path):
@@ -72,7 +73,7 @@ def main(args):
     if retention_helper.is_symlink() or not retention_helper.is_file():
         raise ValueError("retention helper must be a regular file")
     retention_pin = pin(retention_helper)
-    if original_efi["sha256"] != args.efi_sha256 or not (512 <= original_efi["bytes"] <= 6291456):
+    if original_efi["sha256"] != args.efi_sha256 or not (512 <= original_efi["bytes"] <= EFI_MAX_BYTES):
         raise ValueError("EFI digest or size mismatch")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -81,6 +82,7 @@ def main(args):
         "compiler": pin(compiler), "packager": pin(packager), "efi": original_efi,
         "linuxJVMNodeOrCCompiler": False, "nativeFormatEmission": False,
         "qemuBootQualified": False, "physicalHardwareQualified": False, "calls": [],
+        "efiCapacityBytes": EFI_MAX_BYTES,
         "retentionHelper": retention_pin,
     }
 
@@ -171,6 +173,30 @@ def main(args):
             reader = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(reader)
             independent = reader.verify(output / disk, output / "BOOTX64.EFI")
+            if args.verify_efi_capacity:
+                # Padding is public format-test data, never a boot/release image.
+                # Native Kotoba still emits and verifies all GPT/FAT bytes.
+                boundary = output / "capacity.EFI"
+                boundary.write_bytes(efi.read_bytes().ljust(EFI_MAX_BYTES, b"\0"))
+                boundary_pin = pin(boundary)
+                invoke("capacity-build", "build", "capacity.img", source=boundary.name,
+                       digest=boundary_pin["sha256"], size=EFI_MAX_BYTES)
+                invoke("capacity-verify", "verify", "capacity.img", source=boundary.name,
+                       digest=boundary_pin["sha256"], size=EFI_MAX_BYTES)
+                state["capacityReadback"] = reader.verify(output / "capacity.img", boundary)
+                over = output / "over-capacity.EFI"
+                over.write_bytes(boundary.read_bytes() + b"\0")
+                over_pin = pin(over)
+                for operation in ("build", "verify"):
+                    invoke("over-capacity-" + operation, operation,
+                           "over-capacity.img" if operation == "build" else "capacity.img", 1,
+                           source=over.name, digest=over_pin["sha256"], size=EFI_MAX_BYTES + 1)
+                if ((output / "over-capacity.img").exists()
+                        or pin(boundary) != boundary_pin
+                        or pin(over) != over_pin):
+                    raise ValueError("capacity refusal created output or modified input")
+                reader.verify(output / "capacity.img", boundary)
+                state["capacityBoundaryVerified"] = True
             iso = "awai-native.iso"
             iso_reproduced = "awai-native.reproduced.iso"
             if b"PASS_NATIVE_EL_TORITO_ISO_BUILD" not in invoke(
@@ -245,7 +271,7 @@ def main(args):
                          container=pin(output / "media.kseed"), raw=pin(output / "media.raw"),
                          image=pin(output / disk), independentMedia=independent,
                          iso=pin(output / iso), independentISO=iso_independent,
-                         refusalCases=16, nativeFormatEmission=True,
+                         refusalCases=18 if args.verify_efi_capacity else 16, nativeFormatEmission=True,
                          qualification="Mac native GPT/FAT16 and El Torito ISO format verification; QEMU, release and physical gates separate")
             controls = []
             for name, source, operation, offset in native_media_retention.specifications(len(raw)):
@@ -292,4 +318,6 @@ if __name__ == "__main__":
     parser.add_argument("--efi", type=Path, required=True)
     parser.add_argument("--efi-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--verify-efi-capacity", action="store_true",
+                        help="Native exact-capacity and one-byte-over public format fixtures")
     main(parser.parse_args())

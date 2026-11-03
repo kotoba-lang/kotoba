@@ -34,7 +34,8 @@ PQ = importlib.util.module_from_spec(spec); spec.loader.exec_module(PQ)
 spec = importlib.util.spec_from_file_location('check_broker_native', LIB / 'scripts' / 'check-broker-native.py')
 BR = importlib.util.module_from_spec(spec); spec.loader.exec_module(BR)
 
-# every namespace this driver may reach, by file; the closure is computed from :require
+# Explicit source inventory only. Native Amu owns dependency discovery; Python
+# copies bytes and validates the returned paths against this staged inventory.
 CANDIDATES = {
     **{f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba' for n in
        ['codec', 'admission', 'authority', 'quorum', 'seal', 'store_io', 'read', 'replica', 'wire',
@@ -53,23 +54,39 @@ CANDIDATES = {
     'x25519/core.kotoba': LIB.parent / 'org.ietf.x25519/kotoba/x25519/core.kotoba',
     **{f'chacha20/{n}.kotoba': LIB.parent / f'org.ietf.chacha20Poly1305/kotoba/chacha20/{n}.kotoba'
        for n in ['core', 'poly1305', 'aead', 'aead_params']},
-    **{f'noise/{n}.kotoba': LIB.parent / f'kotoba.noise/kotoba/noise/{n}.kotoba' for n in ['native', 'identity', 'frame', 'tcp']},
+    **{f'noise/{n}.kotoba': LIB.parent / f'kotoba.noise/kotoba/noise/{n}.kotoba' for n in ['native', 'blake2s_native', 'identity', 'frame', 'tcp']},
 }
 
-def closure(entry):
-    by_ns = {}
-    for name, path in CANDIDATES.items():
-        m = re.search(rb'\(ns ([a-z0-9.-]+)', path.read_bytes())
-        by_ns[m[1].decode()] = name
-    todo, seen = [entry], set()
-    while todo:
-        name = todo.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        for ns in re.findall(rb'\[([a-z0-9.-]+) :as ', CANDIDATES[name].read_bytes()):
-            todo.append(by_ns[ns.decode()])
-    return {n: CANDIDATES[n].read_bytes() for n in sorted(seen)}
+def session_sources(gate):
+    catalog = gate.out / 'session-source-catalog'
+    catalog.mkdir(mode=0o700)
+    staged = {}
+    for name, path in sorted(CANDIDATES.items()):
+        data = path.read_bytes()
+        target = catalog / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        staged[name] = data
+    entry = catalog / 'hata/session_native_test.kotoba'
+    result = gate.call('session-modules', [gate.compiler, 'modules', entry, '--source-path', catalog])
+    assert result.returncode == 0 and not result.stderr, ('session modules', result.returncode, result.stderr[-500:])
+    selected, namespaces = {}, set()
+    for line in result.stdout.decode().splitlines():
+        namespace, returned = line.split(' ', 1)
+        source = Path(returned)
+        assert source.is_absolute() and '..' not in source.parts, ('module path', returned)
+        name = source.relative_to(catalog).as_posix()
+        assert namespace and namespace not in namespaces and name in staged and name not in selected, ('module record', line)
+        data = source.read_bytes()
+        assert data == staged[name], ('source changed during native discovery', name)
+        namespaces.add(namespace)
+        selected[name] = data
+    assert 'hata/session_native_test.kotoba' in selected, 'native discovery omitted entry'
+    gate.artifacts['sessionDiscovery'] = dict(
+        native=True,
+        catalogSources={name: hashlib.sha256(data).hexdigest() for name, data in staged.items()},
+        selectedSources={name: hashlib.sha256(data).hexdigest() for name, data in sorted(selected.items())})
+    return dict(sorted(selected.items()))
 
 NET = '35,38,43,44,45,46,47'
 # a retrying coordinator also reads the clock and sleeps (wire 7)
@@ -87,7 +104,7 @@ def main():
     a.compiler_sha256 = actual
     gate = PQ.LinuxArm(a)
     broker = gate.build('broker', 'hata/broker_native_test.kotoba', BR.sources(True))
-    session = gate.build('session', 'hata/session_native_test.kotoba', closure('hata/session_native_test.kotoba'))
+    session = gate.build('session', 'hata/session_native_test.kotoba', session_sources(gate))
 
     def env(allow=NET, **grants):
         return gate.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW=allow, KEXE_FUEL='100000000000', **grants)

@@ -1,0 +1,205 @@
+;; JUN-757: 保護済みservice定義と実セッション/方向別private-httpの照合。
+;; これはservice層のデータ照合。URL正規化・socket・fresh同意は未付与。
+;; 出力flags=3（endpoint未資格 + consent未取得）は常に保持する。
+;; overlay portと実upstream URLのportは別物で、後者をACLへ代入しない。
+;; 1 owner32768は1 service/peer/directionの定義。サービス数の大域上限は設けない。
+;; hostは全owner/入力/IO/consumerを同じcritical sectionで専有・直列化する。
+;; 未初期化ownerはzero、owner輸入/複製は禁止。configureはtrusted local host専用。
+;; 定義JSON<=1MiB: version(1..2^53-1),serviceName(nonempty string),peerKey
+;; (64 lower hex scalars),port(1..65535),baseUrl(string),direction(0 out/1 in)。
+;; direction1はbaseUrl非空。baseUrlは全decoded UTF8をhashするがURLとして未資格。
+;; 同versionは同じraw document digestだけ再受理、新versionのみ置換する。
+;; configure/outgoing/incoming: owner/bytes,session/bytes,input/bytes,IO/bytes。
+;; configure/outgoingのinputは実>=1MiB、IO:u64 nowMs@8/u32 used@16、
+;; outgoing/incomingのoutput capacity@4>=512。出力はIO73728の512Bだけ。
+;; incomingは実>=8MiB pinned reassemblyから実1MiB/96B viewを作り、
+;; 実sessionの96B channelと比較する。外部binding/認証booleanを受け取らない。
+;; Request schema/fieldの上限は元の1MiBのまま。responseは照合しない。
+;; shape/header/clock拒否は無変更。処理後private4096..32767を全消去。
+;; matchは実sessionをpollし、trusted clockは拒否時も進行/失効しうる。
+(ns kekkai.application-service-region
+  (:require [kekkai.application-message-region :as message]
+            [kekkai.application-reassembly-region :as assembly]
+            [kekkai.session-region :as session] [kekkai.roster-region :as roster]
+            [kotoba.json.document-region :as json] [noise.blake2s-region :as hash])
+  (:export [configure outgoing incoming stop]))
+(defn- b [o at] :i64 (kernel-load-u8 (kernel-subregion o 32768 at 1) 1 0))
+(defn- p [o at value] :i64 (kernel-store-u8 (kernel-subregion o 32768 at 1) 1 0 value))
+(defn- r [o at] :i64 (kernel-load-u32 (kernel-subregion o 32768 at 4) 4 0))
+(defn- w [o at value] :i64 (kernel-store-u32 (kernel-subregion o 32768 at 4) 4 0 value))
+(defn- ld [o at] :i64 (kernel-load-u64 (kernel-subregion o 32768 at 8) 8 0))
+(defn- put [o at value] :i64 (kernel-store-u64 (kernel-subregion o 32768 at 8) 8 0 value))
+(defn- zero [o at end] :i64
+  (if (>= at end) 1 (do (put o at 0) (zero o (+ at 8) end))))
+(defn- copy [o target source count i] :i64
+  (if (>= i count) count (do (p o (+ target i) (b o (+ source i))) (copy o target source count (+ i 1)))))
+(defn- same [o a c count i] :bool
+  (if (>= i count) true (and (= (ld o (+ a i)) (ld o (+ c i))) (same o a c count (+ i 8)))))
+(defn- ir [io at] :i64 (kernel-load-u32 (kernel-subregion io 262144 at 4) 4 0))
+(defn- ild [io at] :i64 (kernel-load-u64 (kernel-subregion io 262144 at 8) 8 0))
+(defn- ib [input count at] :i64
+  (if (and (>= at 0) (< at count)) (kernel-load-u8 (kernel-subregion input 1048576 at 1) 1 0) -1))
+(defn- separate [a al c cl] :bool (or (<= (+ a al) c) (<= (+ c cl) a)))
+(defn- shape [o ol s sl input capacity io il] :bool
+  (and (>= ol 32768) (>= sl 262144) (>= capacity 1048576) (>= il 262144)
+       (separate o ol s sl) (separate o ol input capacity) (separate o ol io il)
+       (separate s sl input capacity) (separate s sl io il) (separate input capacity io il)))
+(defn- time-ok [io] :bool (and (>= (ild io 8) 0) (<= (ild io 8) 9007199254740991)))
+(defn- header [o s now] :bool
+  (and (= (r o 0) 0x3143534b) (= (r o 4) 1) (= (r o 8) 1) (<= (r o 12) 1)
+       (> (ld o 16) 0) (<= (ld o 16) 9007199254740991) (>= (ld o 24) 0) (<= (ld o 24) now)
+       (= (ld o 32) s) (= (ld o 40) o) (>= (r o 48) 1) (<= (r o 48) 65535)
+       (> (r o 52) 0) (<= (r o 52) 1048576) (<= (r o 56) 1048576) (= (r o 60) 3)))
+(defn- finish [o result] :i64 (do (zero o 4096 32768) result))
+(defn- span [kind] :i64 (+ 16384 (* (- kind 1) 16)))
+(defn- key-size [kind] :i64 (case kind 1 7 2 11 3 7 4 4 5 7 6 9 0))
+(defn- key-byte [kind i] :i64
+  (case kind 1 (case i 0 118 1 101 2 114 3 115 4 105 5 111 110)
+    2 (case i 0 115 1 101 2 114 3 118 4 105 5 99 6 101 7 78 8 97 9 109 101)
+    3 (case i 0 112 1 101 2 101 3 114 4 75 5 101 121)
+    4 (case i 0 112 1 111 2 114 116)
+    5 (case i 0 98 1 97 2 115 3 101 4 85 5 114 108)
+    6 (case i 0 100 1 105 2 114 3 101 4 99 5 116 6 105 7 111 110) -1))
+(defn- key-same [input count at end kind i] :bool
+  (if (>= at end) (= i (key-size kind))
+    (if (>= i (key-size kind)) false
+      (let [n (json/next-character input 1048576 count at end)]
+        (and (>= n 0) (= (mod n 2097152) (key-byte kind i))
+          (key-same input count (quot n 2097152) end kind (+ i 1)))))))
+(defn- key [input count at end kind] :i64
+  (if (> kind 6) 0 (if (key-same input count at end kind 0) kind (key input count at end (+ kind 1)))))
+(defn- members [o input count at mask] :i64
+  (if (not= (ib input count at) 34) -1
+    (let [end (json/string-end input 1048576 count (+ at 1))]
+      (if (< end 0) -1
+        (let [kind (key input count (+ at 1) end 1) colon (json/skip-space input 1048576 count (+ end 1))]
+          (if (or (= kind 0) (not= (ib input count colon) 58) (not= (bit-and mask (i64-shift-left 1 (- kind 1))) 0)) -1
+            (let [start (json/skip-space input 1048576 count (+ colon 1))]
+              (let [finish (json/value-end input 1048576 count start 1)]
+                (if (< finish 0) -1
+                  (do (w o (span kind) start) (w o (+ (span kind) 4) finish)
+                    (let [next (json/skip-space input 1048576 count finish) bits (bit-or mask (i64-shift-left 1 (- kind 1)))]
+                      (if (= (ib input count next) 125)
+                        (if (and (= bits 63) (= (json/skip-space input 1048576 count (+ next 1)) count)) 1 -1)
+                        (if (= (ib input count next) 44) (members o input count (json/skip-space input 1048576 count (+ next 1)) bits) -1)))))))))))))
+(defn- text [o input count kind] :i64
+  (let [start (r o (span kind)) end (r o (+ (span kind) 4))]
+    (if (and (= (ib input count start) 34) (= (ib input count (- end 1)) 34))
+      (json/utf16-length input 1048576 count (+ start 1) (- end 1)) -1)))
+(defn- natural [input at end limit value] :i64
+  (if (>= at end) value
+    (let [digit (- (ib input end at) 48)]
+      (if (or (< digit 0) (> digit 9) (> digit limit) (> value (quot (- limit digit) 10))) -1
+        (natural input (+ at 1) end limit (+ (* value 10) digit))))))
+(defn- number [o input count kind limit] :i64
+  (let [start (r o (span kind)) end (r o (+ (span kind) 4))]
+    (if (or (>= start end) (and (> (- end start) 1) (= (ib input count start) 48))) -1
+      (natural input start end limit 0))))
+(defn- hex [v] :i64
+  (if (and (>= v 48) (<= v 57)) (- v 48) (if (and (>= v 97) (<= v 102)) (- v 87) -1)))
+(defn- peer [o input count at end i high] :i64
+  (if (>= at end) (if (= i 64) 1 -1)
+    (if (>= i 64) -1
+      (let [n (json/next-character input 1048576 count at end)]
+        (let [value (hex (mod n 2097152))]
+          (if (or (< n 0) (< value 0)) -1
+            (do (if (= (mod i 2) 1) (p o (+ 20544 (quot i 2)) (+ (* high 16) value)) 0)
+              (peer o input count (quot n 2097152) end (+ i 1) value))))))))
+(defn- feed [o value] :i64 (hash/update-byte (kernel-subregion o 32768 24832 512) 512 value))
+(defn- scalar [o v] :i64
+  (if (< v 128) (feed o v)
+    (if (< v 2048) (do (feed o (+ 192 (quot v 64))) (feed o (+ 128 (mod v 64))))
+      (if (< v 65536) (do (feed o (+ 224 (quot v 4096))) (feed o (+ 128 (mod (quot v 64) 64))) (feed o (+ 128 (mod v 64))))
+        (do (feed o (+ 240 (quot v 262144))) (feed o (+ 128 (mod (quot v 4096) 64)))
+          (feed o (+ 128 (mod (quot v 64) 64))) (feed o (+ 128 (mod v 64))))))))
+(defn- hash-start [o tag] :i64
+  (do (hash/init (kernel-subregion o 32768 24832 512) 512) (feed o tag)))
+(defn- hash-end [o target i] :i64
+  (if (= i 0) (do (hash/finish (kernel-subregion o 32768 24832 512) 512) (hash-end o target 1))
+    (if (> i 32) 1
+      (do (p o (+ target (- i 1)) (hash/digest-byte (kernel-subregion o 32768 24832 512) 512 (- i 1))) (hash-end o target (+ i 1))))))
+(defn- hash-text [o input count at end] :i64
+  (if (>= at end) 1
+    (let [n (json/next-character input 1048576 count at end)]
+      (if (< n 0) -1 (do (scalar o (mod n 2097152)) (hash-text o input count (quot n 2097152) end))))))
+(defn- field-hash [o input count start end tag target] :i64
+  (do (hash-start o tag) (hash-text o input count (+ start 1) (- end 1)) (hash-end o target 0)))
+(defn- source-hash [o input count i] :i64
+  (if (>= i count) (hash-end o 20640 0) (do (feed o (ib input count i)) (source-hash o input count (+ i 1)))))
+(defn- definition [o input count] :i64
+  (let [start (json/skip-space input 1048576 count 0)]
+    (if (or (not= (ib input count start) 123) (not= (members o input count (json/skip-space input 1048576 count (+ start 1)) 0) 1)) -1
+      (let [version (number o input count 1 9007199254740991) port (number o input count 4 65535)
+            role (number o input count 6 1) name (text o input count 2) base (text o input count 5)]
+        (if (or (<= version 0) (<= port 0) (< role 0) (> role 1) (<= name 0) (< base 0) (and (= role 1) (= base 0))
+                (not= (text o input count 3) 64)) -1
+          (if (not= (peer o input count (+ (r o (span 3)) 1) (- (r o (+ (span 3) 4)) 1) 0 0) 1) -1
+            (do (w o 20492 role) (put o 20496 version) (w o 20528 port) (w o 20532 name) (w o 20536 base) (w o 20540 3)
+              (field-hash o input count (r o (span 2)) (r o (+ (span 2) 4)) 3 20576)
+              (field-hash o input count (r o (span 5)) (r o (+ (span 5) 4)) 66 20608)
+              (hash-start o 67) (source-hash o input count 0) 1)))))))
+(defn- configure-run [o s input io] :i64
+  (do (zero o 4096 32768)
+    (if (or (< (session/poll s 262144 (quot (ild io 8) 1000)) 0) (<= (roster/generation s 262144) 0)
+            (not= (definition o input (ir io 16)) 1)
+            (<= (roster/peer-index s 262144 (kernel-subregion o 32768 20544 32) 32) 0)) -1
+      (if (and (= (r o 0) 0x3143534b)
+               (or (< (ld o 20496) (ld o 16)) (and (= (ld o 20496) (ld o 16)) (not (same o 160 20640 32 0))))) -1
+        (do (w o 20480 0x3143534b) (w o 20484 1) (w o 20488 1) (put o 20504 (ild io 8))
+          (put o 20512 s) (put o 20520 o) (zero o 0 4096) (copy o 0 20480 512 0) 1)))))
+(defn configure [o ol s sl input capacity io il] :i64
+  (if (shape o ol s sl input capacity io il)
+    (let [owner (kernel-subregion o ol 0 32768) i (kernel-subregion io il 0 262144)]
+      (if (and (time-ok i) (> (ir i 16) 0) (<= (ir i 16) 1048576)
+               (or (= (r owner 0) 0) (header owner s (ild i 8))))
+        (finish owner (configure-run owner (kernel-subregion s sl 0 262144) (kernel-subregion input capacity 0 1048576) i)) -1)) -1))
+(defn- permission [o s now role] :i64
+  (do (w o 24672 role) (w o 24676 (r o 48)) (put o 24680 (quot now 1000)) (put o 24688 (roster/generation s 262144))
+    (loop [i 0] (if (>= i 12) 1
+      (let [v (p o (+ 24704 i) (case i 0 112 1 114 2 105 3 118 4 97 5 116 6 101 7 45 8 104 9 116 10 116 112))] (recur (+ i 1)))))
+    (roster/permitted s 262144 (kernel-subregion o 32768 24600 32) 32
+      (kernel-subregion o 32768 24704 12) 12 (kernel-subregion o 32768 24672 32) 32)))
+(defn- emit [o io i] :i64
+  (if (>= i 512) 512
+    (do (kernel-store-u8 (kernel-subregion io 262144 (+ 73728 i) 1) 1 0 (b o (+ 20480 i))) (emit o io (+ i 1)))))
+(defn- match-run [o s input count io role] :i64
+  (let [now (ild io 8) phase (session/poll s 262144 (quot (ild io 8) 1000))]
+    (do (zero o 20480 20992) (if (>= phase 0) (put o 24 now) 0)
+      (if (or (not= phase 2)
+              (not= (session/copy-application-binding s 262144 (kernel-subregion o 32768 24576 96) 96 (quot now 1000)) 96)
+              (not (same o 64 24600 32 0))
+              (not= (message/decode (kernel-subregion o 32768 4096 8192) 8192 input 1048576 count
+                      (kernel-subregion o 32768 12288 4096) 4096) 1)
+              (not= (r o 12312) (r o 48)) (not= (r o 12392) (r o 52))) -1
+        (do (field-hash o input count (r o 12384) (r o 12388) 3 20640)
+          (if (or (not (same o 96 20640 32 0)) (not= (permission o s now role) 1)) -1
+            (do (w o 20480 0x314d534b) (w o 20484 1) (w o 20488 role) (w o 20492 count)
+              (w o 20496 (r o 48)) (w o 20500 (r o 12408)) (w o 20504 (r o 12424)) (w o 20508 (r o 52))
+              (put o 20512 (ld o 16)) (put o 20520 now) (copy o 20544 24576 96 0)
+              (field-hash o input count (r o 12400) (r o 12404) 4 20672)
+              (field-hash o input count (r o 12416) (r o 12420) 5 20704)
+              (copy o 20736 128 32 0) (w o 20768 (r o 56)) (w o 20772 3) (emit o io 0))))))))
+(defn- call-ok [o s io role] :bool
+  (and (time-ok io) (header o s (ild io 8)) (= (r o 12) role) (>= (ir io 4) 512) (<= (ir io 4) 65538)))
+(defn outgoing [o ol s sl input capacity io il] :i64
+  (if (shape o ol s sl input capacity io il)
+    (let [owner (kernel-subregion o ol 0 32768) i (kernel-subregion io il 0 262144)]
+      (if (and (call-ok owner s i 0) (> (ir i 16) 0) (<= (ir i 16) 1048576))
+        (finish owner (match-run owner (kernel-subregion s sl 0 262144) (kernel-subregion input capacity 0 1048576) (ir i 16) i 0)) -1)) -1))
+(defn- incoming-same [o channel i] :bool
+  (if (>= i 96) true
+    (and (= (ld o (+ 24576 i)) (kernel-load-u64 (kernel-subregion channel 96 i 8) 8 0)) (incoming-same o channel (+ i 8)))))
+(defn- incoming-run [o s pool io] :i64
+  (let [start (assembly/completed-message-start pool 8388608) channel (assembly/completed-channel-start pool 8388608)
+        count (assembly/completed-size pool 8388608)]
+    (if (and (>= start 0) (>= channel 0) (> count 0) (<= count 1048576)
+             (= (session/copy-application-binding s 262144 (kernel-subregion o 32768 24576 96) 96 (quot (ild io 8) 1000)) 96)
+             (incoming-same o (kernel-subregion pool 8388608 channel 96) 0))
+      (match-run o s (kernel-subregion pool 8388608 start 1048576) count io 1) -1)))
+(defn incoming [o ol s sl pool length io il] :i64
+  (if (and (>= length 8388608) (shape o ol s sl pool length io il))
+    (let [owner (kernel-subregion o ol 0 32768) i (kernel-subregion io il 0 262144)]
+      (if (call-ok owner s i 1)
+        (finish owner (incoming-run owner (kernel-subregion s sl 0 262144) (kernel-subregion pool length 0 8388608) i)) -1)) -1))
+(defn stop [o length] :i64
+  (if (< length 32768) -1 (do (zero (kernel-subregion o length 0 32768) 0 32768) 1)))

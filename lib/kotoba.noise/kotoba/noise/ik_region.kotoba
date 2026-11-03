@@ -1,0 +1,248 @@
+;; JUN-757: allocation-free OS Noise_IK_25519_ChaChaPoly_BLAKE2s.
+;; Caller owns8192 bytes: active4096 + transient transaction4096. Serialize
+;; calls; buffers must be disjoint, immutable inputs, at most65536 bytes each.
+;; Before initialize write s.priv160, e.priv224, rs288 (32 bytes each).
+;; initialize(st,length,initiator0/1,bind-peer0/1); stream prologue then finish.
+;; A bound peer is snapshotted from rs and checked before accepting its payload.
+;; Fresh entropy, signed-roster authority, socket/clock/consent and erasure are
+;; the caller's responsibility. This module supplies none of those grants.
+;; set-length selects payload length for write, full wire length for read.
+;; prepare-write/read expose the token transcript for payload signatures;
+;; write/read-message also prepare automatically. A prepared read binds the
+;; complete token prefix. Success returns byte length (zero is legal), -1
+;; refuses; failed messages preserve state/output. Shape refusals never touch
+;; scratch. Other refusals clear transient scratch; it must initially be zero.
+;; After success scratch is zero. wipe clears the entire8192-byte allocation.
+;; get-byte kinds:0 current h;1 remote static,2 TX key,3 RX key only when done.
+;; No heap, host crypto or IO. Not a machine-code constant-time qualification.
+(ns noise.ik-region
+  (:require [noise.blake2s-region :as h] [chacha20.aead-region :as c] [aiueos.x25519 :as x])
+  (:export [initialize prologue-byte prologue-finish set-length prepare-write
+            prepare-read write-message read-message status get-byte token-byte wipe]))
+(defn- b [st i] (kernel-load-u8-4k st 4096 i))
+(defn- p [st i v] (kernel-store-u8-4k st 4096 i v))
+(defn- ld [st i] (kernel-load-u32 (kernel-subregion st 4096 i 4) 4 0))
+(defn- put [st i v] (kernel-store-u32 (kernel-subregion st 4096 i 4) 4 0 v))
+(defn- fill [st i end v]
+  (if (>= i end) 1 (do (p st i v) (fill st (+ i 1) end v))))
+(defn- copy [st src dst n]
+  (if (<= n 0) 1 (do (p st dst (b st src)) (copy st (+ src 1) (+ dst 1) (- n 1)))))
+(defn- trial [st i]
+  (if (>= i 4096) 1
+    (do (kernel-store-u8-16k st 8192 (+ 4096 i) (kernel-load-u8-16k st 8192 i)) (trial st (+ i 1)))))
+(defn- work-wipe [st i]
+  (if (>= i 8192) 1
+    (if (= (mod i 4096) 1280)
+      (do (h/wipe (kernel-subregion st 8192 i 512) 512) (work-wipe st (+ i 512)))
+      (do (kernel-store-u8-16k st 8192 i 0) (work-wipe st (+ i 1))))))
+(defn- commit [st i]
+  (if (>= i 4096) 1
+    (do (kernel-store-u8-16k st 8192 i (kernel-load-u8-16k st 8192 (+ 4096 i))) (commit st (+ i 1)))))
+(defn- result [st n]
+  (do (if (>= n 0) (commit st 0) 0) (work-wipe st 4096) n))
+(defn- valid [st]
+  (and (= (ld st 0) 1313426225) (<= (ld st 4) 1) (<= (ld st 32) 1)
+       (>= (ld st 8) 1) (<= (ld st 8) 3) (<= (ld st 12) 2)
+       (<= (ld st 20) 2) (<= (ld st 24) 1) (= (ld st 36) 0) (<= (ld st 28) 1)
+       (if (= (ld st 8) 1) (and (= (ld st 12) 0) (= (ld st 20) 0) (= (ld st 24) 0) (= (ld st 28) 0))
+         (if (= (ld st 8) 3) (and (= (ld st 12) 2) (= (ld st 20) 0) (= (ld st 24) 1)) (< (ld st 12) 2)))
+       (or (= (ld st 20) 0)
+           (and (= (ld st 40) (if (= (ld st 12) 0) 80 32)) (= (ld st 24) 1)
+                (= (ld st 4) (if (= (ld st 20) 1) (if (= (ld st 12) 0) 1 0) (if (= (ld st 12) 0) 0 1)))))))
+(defn- handshake [st] (and (valid st) (= (ld st 8) 2) (< (ld st 12) 2)))
+(defn- my-turn [st] (= (ld st 4) (if (= (ld st 12) 0) 1 0)))
+(defn- prefix [st] (if (= (ld st 12) 0) 80 32))
+(defn- separate [a n b m]
+  (or (= n 0) (= m 0) (<= (+ a n) b) (<= (+ b m) a)))
+(defn- input-shape [st input capacity]
+  (and (>= capacity 0) (<= capacity 65536) (separate st 8192 input capacity)))
+(defn- shape [st input input-bytes output capacity]
+  (and (input-shape st input input-bytes) (input-shape st output capacity)
+       (separate input input-bytes output capacity)))
+(defn- feed [st input capacity i end]
+  (if (>= i end) 1
+    (do (h/update-byte (kernel-subregion st 4096 1280 512) 512 (kernel-load-u8-64k input capacity i))
+        (feed st input capacity (+ i 1) end))))
+(defn- save-hash [st at i]
+  (if (>= i 32) 1
+    (do (p st (+ at i) (h/digest-byte (kernel-subregion st 4096 1280 512) 512 i)) (save-hash st at (+ i 1)))))
+(defn- hash-start [st]
+  (do (h/init (kernel-subregion st 4096 1280 512) 512) (feed st st 4096 64 96)))
+(defn- mix-hash [st input capacity start end]
+  (do (hash-start st) (feed st input capacity start end)
+      (h/finish (kernel-subregion st 4096 1280 512) 512) (save-hash st 64 0)))
+(defn- mac-key [st at i]
+  (if (>= i 32) 1
+    (do (h/hmac-key-byte (kernel-subregion st 4096 1280 512) 512 (b st (+ at i))) (mac-key st at (+ i 1)))))
+(defn- mac-feed [st at end]
+  (if (>= at end) 1
+    (do (h/hmac-update-byte (kernel-subregion st 4096 1280 512) 512 (b st at)) (mac-feed st (+ at 1) end))))
+(defn- mac-start [st key]
+  (do (h/hmac-key-init (kernel-subregion st 4096 1280 512) 512) (mac-key st key 0)
+      (h/hmac-key-finish (kernel-subregion st 4096 1280 512) 512)))
+(defn- mac-end [st at]
+  (do (h/hmac-finish (kernel-subregion st 4096 1280 512) 512) (save-hash st at 0)))
+(defn- hkdf [st n]
+  (do (mac-start st 96) (mac-feed st 448 (+ 448 n)) (mac-end st 2304)
+      (mac-start st 2304) (h/hmac-update-byte (kernel-subregion st 4096 1280 512) 512 1) (mac-end st 2336)
+      (mac-start st 2304) (mac-feed st 2336 2368)
+      (h/hmac-update-byte (kernel-subregion st 4096 1280 512) 512 2) (mac-end st 128)))
+(defn- mix-key [st]
+  (do (hkdf st 32) (copy st 2336 96 32) (put st 24 1) (put st 28 0) (put st 36 0) 1))
+(defn- dh-mix [st private peer]
+  (if (= (x/kotoba_aiueos_x25519 (kernel-subregion st 4096 private 32) 32
+           (kernel-subregion st 4096 peer 32) 32 (kernel-subregion st 4096 448 32) 32
+           (kernel-subregion st 4096 512 646) 646) 1) (mix-key st) 0))
+(defn- public-key [st private target]
+  (x/kotoba_aiueos_x25519 (kernel-subregion st 4096 private 32) 32
+    (kernel-subregion st 4096 2432 32) 32 (kernel-subregion st 4096 target 32) 32
+    (kernel-subregion st 4096 512 646) 646))
+(defn- name-byte [i]
+  (case i 0 78 1 111 2 105 3 115 4 101 5 95 6 73 7 75 8 95 9 50 10 53 11 53 12 49 13 57 14 95
+    15 67 16 104 17 97 18 67 19 104 20 97 21 80 22 111 23 108 24 121 25 95 26 66 27 76 28 65 29 75 30 69 31 50 115))
+(defn- name-feed [st i]
+  (if (>= i 33) 1 (do (h/update-byte (kernel-subregion st 4096 1280 512) 512 (name-byte i)) (name-feed st (+ i 1)))))
+(defn- initialize-active [st role bound]
+  (do (fill st 0 160 0) (fill st 192 224 0) (fill st 256 288 0) (fill st 320 448 0) (fill st 448 4096 0)
+      (if (= bound 1) (copy st 288 416 32) 0)
+      (put st 0 1313426225) (put st 4 role) (put st 8 1) (put st 32 bound)
+      (p st 2432 9) (public-key st 160 192) (public-key st 224 256)
+      (h/init (kernel-subregion st 4096 1280 512) 512) (name-feed st 0)
+      (h/finish (kernel-subregion st 4096 1280 512) 512) (save-hash st 64 0) (copy st 64 96 32) (hash-start st) 1))
+(defn initialize [st length role bound]
+  (if (or (< length 8192) (not (or (= role 0) (= role 1))) (not (or (= bound 0) (= bound 1)))) 0
+    (do (work-wipe st 4096) (initialize-active (kernel-subregion st 8192 0 4096) role bound))))
+(defn prologue-byte [st length value]
+  (if (< length 8192) 0
+    (if (and (valid (kernel-subregion st 8192 0 4096)) (= (ld (kernel-subregion st 8192 0 4096) 8) 1))
+      (h/update-byte (kernel-subregion st 8192 1280 512) 512 value) 0)))
+(defn- prologue-done [st]
+  (if (= (h/finish (kernel-subregion st 4096 1280 512) 512) 1)
+    (do (save-hash st 64 0)
+        (if (= (ld st 4) 1) (mix-hash st st 4096 288 320) (mix-hash st st 4096 192 224))
+        (put st 8 2) 1) 0))
+(defn prologue-finish [st length]
+  (if (< length 8192) 0
+    (if (and (valid (kernel-subregion st 8192 0 4096)) (= (ld (kernel-subregion st 8192 0 4096) 8) 1))
+      (prologue-done (kernel-subregion st 8192 0 4096)) 0)))
+(defn set-length [st length n]
+  (if (or (< length 8192) (< n 0) (> n 65535)) 0
+    (if (handshake (kernel-subregion st 8192 0 4096)) (do (put (kernel-subregion st 8192 0 4096) 16 n) 1) 0)))
+(defn- cipher-key [st i]
+  (if (>= i 32) 1 (do (p st (+ 1792 i) (b st (+ 128 i))) (cipher-key st (+ i 1)))))
+(defn- cipher-nonce [st i]
+  (if (>= i 12) 1
+    (do (p st (+ 1824 i) (if (< i 4) 0
+          (bit-and (u64-shift-right (ld st (if (< i 8) 28 36)) (* (mod i 4) 8)) 255)))
+        (cipher-nonce st (+ i 1)))))
+(defn- cipher-aad [st i]
+  (if (>= i 32) 1
+    (do (c/aad-byte (kernel-subregion st 4096 1792 512) 512 (b st (+ 64 i))) (cipher-aad st (+ i 1)))))
+(defn- cipher [st n]
+  (do (cipher-key st 0) (cipher-nonce st 0) (c/init (kernel-subregion st 4096 1792 512) 512 12)
+      (cipher-aad st 0) (c/set-length (kernel-subregion st 4096 1792 512) 512 n)))
+(defn- next-nonce [st]
+  (if (= (ld st 28) 4294967295) (do (put st 28 0) (put st 36 (+ (ld st 36) 1))) (put st 28 (+ (ld st 28) 1))))
+(defn- static-seal [st]
+  (do (cipher st 32)
+      (if (= (c/seal (kernel-subregion st 4096 1792 512) (kernel-subregion st 4096 192 32) 32
+               (kernel-subregion st 4096 2368 48) 48) 48)
+        (do (next-nonce st) (mix-hash st st 4096 2368 2416) 1) 0)))
+(defn- token-copy [st input capacity i end]
+  (if (>= i end) 1
+    (do (p st (+ 2560 i) (kernel-load-u8-64k input capacity i)) (token-copy st input capacity (+ i 1) end))))
+(defn- receive-e [st input capacity i]
+  (if (>= i 32) (mix-hash st st 4096 320 352)
+    (do (p st (+ 320 i) (kernel-load-u8-64k input capacity i)) (receive-e st input capacity (+ i 1)))))
+(defn- peer-diff [st i diff]
+  (if (>= i 32) diff (peer-diff st (+ i 1) (bit-or diff (bit-xor (b st (+ 288 i)) (b st (+ 416 i)))))))
+(defn- receive-static-copy [st input capacity i]
+  (if (>= i 48) 1
+    (do (p st (+ 2368 i) (kernel-load-u8-64k input capacity (+ 32 i))) (receive-static-copy st input capacity (+ i 1)))))
+(defn- static-open [st input capacity]
+  (do (receive-static-copy st input capacity 0) (cipher st 48)
+      (if (= (c/open (kernel-subregion st 4096 1792 512) (kernel-subregion st 4096 2368 48) 48
+               (kernel-subregion st 4096 288 32) 32) 32)
+        (if (or (= (ld st 32) 0) (= (peer-diff st 0 0) 0))
+          (do (next-nonce st) (mix-hash st st 4096 2368 2416) 1) 0) 0)))
+(defn- write-tokens [st]
+  (do (put st 40 (prefix st)) (mix-hash st st 4096 256 288)
+      (if (= (ld st 12) 0)
+        (if (and (= (dh-mix st 224 288) 1) (= (static-seal st) 1) (= (dh-mix st 160 288) 1))
+          (do (put st 20 1) 1) 0)
+        (if (and (= (dh-mix st 224 320) 1) (= (dh-mix st 224 288) 1)) (do (put st 20 1) 1) 0))))
+(defn- read-tokens [st input capacity]
+  (do (put st 40 (prefix st)) (receive-e st input capacity 0)
+      (if (= (ld st 12) 0)
+        (if (and (= (dh-mix st 160 320) 1) (= (static-open st input capacity) 1) (= (dh-mix st 160 288) 1))
+          (do (token-copy st input capacity 0 (ld st 40)) (put st 20 2) 1) 0)
+        (if (and (= (dh-mix st 224 320) 1) (= (dh-mix st 160 320) 1))
+          (do (token-copy st input capacity 0 (ld st 40)) (put st 20 2) 1) 0))))
+(defn prepare-write [st length]
+  (if (< length 8192) 0
+    (if (and (handshake (kernel-subregion st 8192 0 4096)) (my-turn (kernel-subregion st 8192 0 4096))
+             (= (ld (kernel-subregion st 8192 0 4096) 20) 0))
+      (do (trial st 0)
+          (if (= (write-tokens (kernel-subregion st 8192 4096 4096)) 1) (do (result st 0) 1) (do (result st -1) 0))) 0)))
+(defn prepare-read [st input capacity]
+  (if (and (input-shape st input capacity) (handshake (kernel-subregion st 8192 0 4096))
+           (not (my-turn (kernel-subregion st 8192 0 4096))) (= (ld (kernel-subregion st 8192 0 4096) 20) 0)
+           (>= (ld (kernel-subregion st 8192 0 4096) 16) (prefix (kernel-subregion st 8192 0 4096)))
+           (<= (ld (kernel-subregion st 8192 0 4096) 16) capacity))
+    (do (trial st 0)
+        (if (= (read-tokens (kernel-subregion st 8192 4096 4096) input capacity) 1) (do (result st 0) 1) (do (result st -1) 0))) 0))
+(defn- split [st]
+  (do (hkdf st 0)
+      (if (= (ld st 4) 1) (do (copy st 2336 352 32) (copy st 128 384 32))
+        (do (copy st 128 352 32) (copy st 2336 384 32))) (put st 8 3) 1))
+(defn- finish [st]
+  (do (put st 20 0) (put st 12 (+ (ld st 12) 1)) (if (= (ld st 12) 2) (split st) 1)))
+(defn- emit-tokens [st output capacity i]
+  (if (>= i (ld st 40)) 1
+    (do (kernel-store-u8-64k output capacity i (b st (if (< i 32) (+ 256 i) (+ 2368 (- i 32)))))
+        (emit-tokens st output capacity (+ i 1)))))
+(defn- write-work [st input input-bytes output capacity]
+  (if (and (or (= (ld st 20) 1) (and (= (ld st 20) 0) (= (write-tokens st) 1))) (= (cipher st (ld st 16)) 1))
+    (if (= (do (c/set-offsets (kernel-subregion st 4096 1792 512) 512 0 (ld st 40))
+               (c/seal (kernel-subregion st 4096 1792 512) input input-bytes output capacity)) (+ (ld st 16) 16))
+      (do (next-nonce st) (mix-hash st output capacity (ld st 40) (+ (ld st 40) (ld st 16) 16))
+          (emit-tokens st output capacity 0) (finish st) (+ (ld st 40) (ld st 16) 16)) -1) -1))
+(defn- prefix-diff [st input capacity i diff]
+  (if (>= i (ld st 40)) diff
+    (prefix-diff st input capacity (+ i 1) (bit-or diff (bit-xor (b st (+ 2560 i)) (kernel-load-u8-64k input capacity i))))))
+(defn- read-work [st input input-bytes output capacity]
+  (if (and (or (and (= (ld st 20) 2) (= (prefix-diff st input input-bytes 0 0) 0))
+               (and (= (ld st 20) 0) (= (read-tokens st input input-bytes) 1)))
+           (= (cipher st (- (ld st 16) (ld st 40))) 1))
+    (if (= (do (c/set-offsets (kernel-subregion st 4096 1792 512) 512 (ld st 40) 0)
+               (c/open (kernel-subregion st 4096 1792 512) input input-bytes output capacity))
+           (- (ld st 16) (ld st 40) 16))
+      (do (next-nonce st) (mix-hash st input input-bytes (ld st 40) (ld st 16)) (finish st) (- (ld st 16) (ld st 40) 16)) -1) -1))
+(defn write-message [st input input-bytes output capacity]
+  (if (and (shape st input input-bytes output capacity) (handshake (kernel-subregion st 8192 0 4096))
+           (my-turn (kernel-subregion st 8192 0 4096)) (<= (ld (kernel-subregion st 8192 0 4096) 20) 1)
+           (<= (ld (kernel-subregion st 8192 0 4096) 16) input-bytes)
+           (<= (+ (ld (kernel-subregion st 8192 0 4096) 16) (prefix (kernel-subregion st 8192 0 4096)) 16) 65535)
+           (<= (+ (ld (kernel-subregion st 8192 0 4096) 16) (prefix (kernel-subregion st 8192 0 4096)) 16) capacity))
+    (do (trial st 0) (result st (write-work (kernel-subregion st 8192 4096 4096) input input-bytes output capacity))) -1))
+(defn read-message [st input input-bytes output capacity]
+  (if (and (shape st input input-bytes output capacity) (handshake (kernel-subregion st 8192 0 4096))
+           (not (my-turn (kernel-subregion st 8192 0 4096))) (not (= (ld (kernel-subregion st 8192 0 4096) 20) 1))
+           (<= (ld (kernel-subregion st 8192 0 4096) 16) input-bytes)
+           (>= (ld (kernel-subregion st 8192 0 4096) 16) (+ (prefix (kernel-subregion st 8192 0 4096)) 16))
+           (<= (- (ld (kernel-subregion st 8192 0 4096) 16) (prefix (kernel-subregion st 8192 0 4096)) 16) capacity))
+    (do (trial st 0) (result st (read-work (kernel-subregion st 8192 4096 4096) input input-bytes output capacity))) -1))
+(defn status [st length]
+  (if (< length 8192) 0 (if (valid (kernel-subregion st 8192 0 4096)) (ld (kernel-subregion st 8192 0 4096) 8) 0)))
+(defn get-byte [st length kind i]
+  (if (or (< length 8192) (< i 0) (>= i 32) (< kind 0) (> kind 3)) -1
+    (if (and (valid (kernel-subregion st 8192 0 4096))
+             (or (and (= kind 0) (>= (ld (kernel-subregion st 8192 0 4096) 8) 2)) (= (ld (kernel-subregion st 8192 0 4096) 8) 3)))
+      (b (kernel-subregion st 8192 0 4096) (+ (case kind 0 64 1 288 2 352 384) i)) -1)))
+(defn token-byte [st length i]
+  (if (or (< length 8192) (< i 0)) -1
+    (if (and (handshake (kernel-subregion st 8192 0 4096)) (= (ld (kernel-subregion st 8192 0 4096) 20) 1)
+             (< i (ld (kernel-subregion st 8192 0 4096) 40)))
+      (b (kernel-subregion st 8192 0 4096) (if (< i 32) (+ 256 i) (+ 2368 (- i 32)))) -1)))
+(defn wipe [st length]
+  (if (< length 8192) 0 (work-wipe st 0)))

@@ -1,0 +1,204 @@
+;; JUN-757: one roster-bound managed Noise session per caller-owned262144B.
+;; Composition, not app/socket/consent admission. Current roster and policy
+;; remain in roster-region. No heap, RNG, clock source, persistence or IO.
+;; Session32768..65535: header512B, IK8192 at33280, datagram17408 at41472.
+;; Header: magic0x31534b4b at+0, generation u64+8, peer index u32+16,
+;; role0/1 u32+20, phase0/1/2 u32+24, creation u64+32,last success u64+40,
+;; expected static32B+64. State must be API-created/protected, never imported.
+;; The existing datagram state retains the final public handshake hash32 at
+;; datagram+17056. It identifies this Noise channel, not a timestamp or consent.
+;; Transient: trial IK65536..73727, output81920..147455, trial datagram
+;; 147456..164863. All196608 transient bytes erase after processed operations.
+;; Serialized callers, immutable inputs physically outside owner; outputs must
+;; be disjoint from inputs/owner. Shapes refuse without mutation. A trusted
+;; clock may advance/reap even when a well-shaped operation otherwise refuses.
+;; Poll expires90s handshakes and180s transport; advice preserves120s rekey.
+;; Stop/new roster/revoke/expiry clears all32768B, including private IK keys.
+;; Start requires matching self public plus nonzero/distinct static/ephemeral
+;; private inputs; this cannot prove fresh entropy. Caller retains/erases its
+;; own input secrets. One pending attempt is not the legacy three-retry queue.
+;; Handshake/transport returns exact output bytes>=0 or-1. Failure preserves
+;; cipher/session state and output, apart from clock/reap. Output is private
+;; until checks and possible handshake->datagram conversion all succeed.
+;; Raw transport bytes are not approved app operations: actual inner packet,
+;; direction/capability/port/fresh consent/socket binding remain host duties.
+(ns kekkai.session-region
+  (:require [kekkai.roster-region :as r] [kotoba.edn.region :refer [next-character]]
+            [noise.ik-region :refer [initialize prologue-byte prologue-finish status set-length write-message read-message]]
+            [noise.datagram-region :as d] [aiueos.x25519 :as x])
+  (:export [start poll advice handshake-message transport-message stop copy-application-binding next-send-counter]))
+(defn- b [owner at] (kernel-load-u8 (kernel-subregion owner 262144 at 1) 1 0))
+(defn- p [owner at value] (kernel-store-u8 (kernel-subregion owner 262144 at 1) 1 0 value))
+(defn- rd [owner at] (kernel-load-u32 (kernel-subregion owner 262144 at 4) 4 0))
+(defn- wr [owner at value] (kernel-store-u32 (kernel-subregion owner 262144 at 4) 4 0 value))
+(defn- ld [owner at] (kernel-load-u64 (kernel-subregion owner 262144 at 8) 8 0))
+(defn- put [owner at value] (kernel-store-u64 (kernel-subregion owner 262144 at 8) 8 0 value))
+(defn- clear [owner at end]
+  (if (>= at end) 1
+    (do (kernel-store-u64 (kernel-subregion owner 262144 at 8) 8 0 0) (clear owner (+ at 8) end))))
+(defn- copy [owner target source count i]
+  (if (>= i count) 1 (do (p owner (+ target i) (b owner (+ source i))) (copy owner target source count (+ i 1)))))
+(defn- separate [a count c size] :bool
+  (or (= count 0) (= size 0) (<= (+ a count) c) (<= (+ c size) a)))
+(defn- shape [owner input count output capacity] :bool
+  (and (>= count 0) (<= count 65536) (>= capacity 0) (<= capacity 65536)
+       (separate owner 262144 input count) (separate owner 262144 output capacity)
+       (separate input count output capacity)))
+(defn stop [owner length]
+  (if (< length 262144) 0 (clear (kernel-subregion owner length 0 262144) 32768 65536)))
+(defn- pin-matches [owner peer i] :bool
+  (if (>= i 32) true
+    (if (= (b owner (+ 32832 i)) (r/peer-key-byte owner 262144 peer i)) (pin-matches owner peer (+ i 1)) false)))
+(defn- datagram-pin [owner i] :bool
+  (if (>= i 32) true
+    (if (= (b owner (+ 32832 i)) (b owner (+ 41472 17024 i))) (datagram-pin owner (+ i 1)) false)))
+(defn- active [owner now]
+  (let [phase (rd owner 32792) peer (rd owner 32784)]
+    (if (= phase 0) 0
+      (if (and (= (rd owner 32768) 0x31534b4b) (<= phase 2) (<= (rd owner 32788) 1)
+               (= (ld owner 32776) (r/generation owner 262144)) (pin-matches owner peer 0)
+               (= (r/peer-eligible owner 262144 peer now) 1)
+               (if (= phase 1)
+                 (and (= (status (kernel-subregion owner 262144 33280 8192) 8192) 2)
+                      (>= now (ld owner 32800)) (< (- now (ld owner 32800)) 90))
+                 (and (datagram-pin owner 0) (not= (d/advice (kernel-subregion owner 262144 41472 17408) 17408 now) 2))))
+        phase (do (clear owner 32768 65536) 0)))))
+(defn poll [owner length now]
+  (if (or (< length 262144) (< now 0)) -1
+    (if (= (r/advance-clock owner length now) 1) (active (kernel-subregion owner length 0 262144) now) -1)))
+(defn advice [owner length now]
+  (if (= (poll owner length now) 2) (d/advice (kernel-subregion owner length 41472 17408) 17408 now) 2))
+(defn- seeds [secret i static-nonzero ephemeral-nonzero different] :bool
+  (if (>= i 32) (and (> static-nonzero 0) (> ephemeral-nonzero 0) (> different 0))
+    (seeds secret (+ i 1) (bit-or static-nonzero (kernel-load-u8 secret 64 i))
+      (bit-or ephemeral-nonzero (kernel-load-u8 secret 64 (+ 32 i)))
+      (bit-or different (bit-xor (kernel-load-u8 secret 64 i) (kernel-load-u8 secret 64 (+ 32 i)))))))
+(defn- self-match [owner i] :bool
+  (if (>= i 32) true
+    (if (= (b owner (+ 65568 i)) (r/peer-key-byte owner 262144 0 i)) (self-match owner (+ i 1)) false)))
+(defn- self-private [owner secret] :bool
+  (do (clear owner 65536 262144) (p owner 65536 9)
+      (and (= (x/kotoba_aiueos_x25519 (kernel-subregion secret 64 0 32) 32
+                  (kernel-subregion owner 262144 65536 32) 32 (kernel-subregion owner 262144 65568 32) 32
+                  (kernel-subregion owner 262144 65600 646) 646) 1) (self-match owner 0))))
+(defn- seed-copy [owner peer secret i]
+  (if (>= i 32) 1
+    (do (p owner (+ 33280 160 i) (kernel-load-u8 secret 64 i))
+        (p owner (+ 33280 224 i) (kernel-load-u8 secret 64 (+ 32 i)))
+        (p owner (+ 33280 288 i) (kernel-load-u8 peer 32 i))
+        (p owner (+ 32832 i) (kernel-load-u8 peer 32 i)) (seed-copy owner peer secret (+ i 1)))))
+(defn- feed [owner value]
+  (prologue-byte (kernel-subregion owner 262144 33280 8192) 8192 value))
+(defn- utf8-feed [owner scalar]
+  (if (< scalar 128) (feed owner scalar)
+    (if (< scalar 2048)
+      (do (feed owner (+ 192 (quot scalar 64))) (feed owner (+ 128 (mod scalar 64))))
+      (if (< scalar 65536)
+        (do (feed owner (+ 224 (quot scalar 4096))) (feed owner (+ 128 (mod (quot scalar 64) 64))) (feed owner (+ 128 (mod scalar 64))))
+        (do (feed owner (+ 240 (quot scalar 262144))) (feed owner (+ 128 (mod (quot scalar 4096) 64)))
+            (feed owner (+ 128 (mod (quot scalar 64) 64))) (feed owner (+ 128 (mod scalar 64))))))))
+(defn- tailnet [owner at end]
+  (if (>= at end) 1
+    (let [step (next-character (kernel-subregion owner 262144 0 32768) 32768 at end)]
+      (if (< step 0) 0
+        (do (utf8-feed owner (mod step 2097152)) (tailnet owner (quot step 2097152) end))))))
+(defn- prefix [owner i]
+  (if (>= i 22) 1
+    (do (feed owner (case i 0 107 1 101 2 107 3 107 4 97 5 105 6 45 7 110 8 111 9 100 10 101 11 47 12 49 13 32
+                     14 116 15 97 16 105 17 108 18 110 19 101 20 116 58)) (prefix owner (+ i 1)))))
+(defn- separator [owner i]
+  (if (>= i 8) 1
+    (do (feed owner (case i 0 32 1 110 2 101 3 116 4 109 5 97 6 112 58)) (separator owner (+ i 1)))))
+(defn- decimal [owner value divisor started :bool]
+  (if (= divisor 0) 1
+    (if (or started (> (quot value divisor) 0) (= divisor 1))
+      (do (feed owner (+ 48 (quot value divisor))) (decimal owner (mod value divisor) (quot divisor 10) true))
+      (decimal owner value (quot divisor 10) false))))
+(defn- prologue [owner]
+  (do (prefix owner 0)
+      (if (= (tailnet owner (rd owner 48) (+ (rd owner 48) (rd owner 52))) 1)
+        (do (separator owner 0) (decimal owner (r/version owner 262144) 1000000000000000000 false)
+            (prologue-finish (kernel-subregion owner 262144 33280 8192) 8192)) 0)))
+(defn- begin [owner peer secret now role]
+  (let [ok (self-private owner secret)]
+    (if ok
+      (do (clear owner 32768 65536) (seed-copy owner peer secret 0)
+          (let [ready (and (= (initialize (kernel-subregion owner 262144 33280 8192) 8192 role 1) 1) (= (prologue owner) 1))]
+            (do (clear owner 65536 262144)
+                (if ready
+                  (do (wr owner 32768 0x31534b4b) (put owner 32776 (r/generation owner 262144))
+                      (wr owner 32784 (r/peer-index owner 262144 peer 32)) (wr owner 32788 role) (wr owner 32792 1)
+                      (put owner 32800 now) (put owner 32808 now) 1)
+                  (do (clear owner 32768 65536) 0)))))
+      (do (clear owner 65536 262144) 0))))
+(defn start [owner length peer peer-bytes secret secret-bytes now role]
+  (if (and (>= length 262144) (= peer-bytes 32) (= secret-bytes 64) (>= now 0) (or (= role 0) (= role 1))
+           (separate owner 262144 peer 32) (separate owner 262144 secret 64)
+           (seeds (kernel-subregion secret secret-bytes 0 64) 0 0 0 0)
+           (= (poll owner length now) 0) (= (r/sessionable owner length peer peer-bytes now) 1))
+    (begin (kernel-subregion owner length 0 262144) (kernel-subregion peer peer-bytes 0 32)
+      (kernel-subregion secret secret-bytes 0 64) now role) 0))
+(defn- output-copy [owner output capacity count i]
+  (if (>= i count) 1
+    (do (kernel-store-u8-64k output capacity i (b owner (+ 81920 i))) (output-copy owner output capacity count (+ i 1)))))
+(defn- handshake-commit [owner now]
+  (if (= (status (kernel-subregion owner 262144 65536 8192) 8192) 3)
+    (if (= (d/from-handshake (kernel-subregion owner 262144 147456 17408) 17408
+              (kernel-subregion owner 262144 65536 8192) 8192 (kernel-subregion owner 262144 32832 32) 32 now) 1)
+      (do (copy owner 41472 147456 17408 0) (clear owner 33280 41472) (wr owner 32792 2) 1) 0)
+    (do (copy owner 33280 65536 8192 0) 1)))
+(defn- finish-operation [owner output capacity count now]
+  (do (if (>= count 0) (do (put owner 32808 now) (output-copy owner output capacity count 0)) 0)
+      (clear owner 65536 262144) count))
+(defn- handshake [owner input count output capacity now writing]
+  (do (copy owner 65536 33280 8192 0)
+      (let [result (if (= (set-length (kernel-subregion owner 262144 65536 8192) 8192 count) 1)
+                     (if (= writing 1)
+                       (write-message (kernel-subregion owner 262144 65536 8192) input count (kernel-subregion owner 262144 81920 capacity) capacity)
+                       (read-message (kernel-subregion owner 262144 65536 8192) input count (kernel-subregion owner 262144 81920 capacity) capacity)) -1)]
+        (finish-operation owner output capacity (if (and (>= result 0) (= (handshake-commit owner now) 1)) result -1) now))))
+(defn handshake-message [owner length input count output capacity now writing]
+  (if (and (>= length 262144) (or (= writing 0) (= writing 1))
+           (shape owner input count output capacity) (= (poll owner length now) 1))
+    (handshake (kernel-subregion owner length 0 262144) input count output capacity now writing) -1))
+(defn- transport [owner input count output capacity now sealing]
+  (do (copy owner 147456 41472 17408 0)
+      (let [result (if (= (d/set-length (kernel-subregion owner 262144 147456 17408) 17408 count) 1)
+                     (if (= sealing 1)
+                       (d/seal (kernel-subregion owner 262144 147456 17408) input count (kernel-subregion owner 262144 81920 capacity) capacity now)
+                       (d/open (kernel-subregion owner 262144 147456 17408) input count (kernel-subregion owner 262144 81920 capacity) capacity now)) -1)]
+        (do (if (>= result 0) (copy owner 41472 147456 17408 0) 0) (finish-operation owner output capacity result now)))))
+(defn transport-message [owner length input count output capacity now sealing]
+  (if (and (>= length 262144) (or (= sealing 0) (= sealing 1))
+           (shape owner input count output capacity) (= (poll owner length now) 2))
+    (transport (kernel-subregion owner length 0 262144) input count output capacity now sealing) -1))
+
+;; The output is a96-byte data association: original reassembly binding64
+;; (magic/version, actual generation, peer index and pinned public key), then
+;; the actual final Noise handshake hash32. No secret keys or app authority.
+;; Protected/API-created owner, immutable/disjoint output allocation, serial
+;; caller. Refusal preserves output; poll may advance clock/reap stale session.
+(defn- binding-field [owner i]
+  (if (< i 4) (case i 0 75 1 80 2 66 3 49)
+    (if (< i 8) (if (= i 4) 1 0)
+      (if (< i 16) (bit-and (u64-shift-right (ld owner 32776) (* (- i 8) 8)) 255)
+        (if (< i 20) (bit-and (u64-shift-right (rd owner 32784) (* (- i 16) 8)) 255)
+          (if (< i 24) 0 (if (< i 56) (b owner (+ 32832 (- i 24)))
+            (if (< i 64) 0 (b owner (+ 58528 (- i 64)))))))))))
+(defn- binding-copy [owner output capacity i]
+  (if (>= i 96) 96
+    (do (kernel-store-u8-64k output capacity i (binding-field owner i))
+        (binding-copy owner output capacity (+ i 1)))))
+(defn- application-binding [owner output capacity now]
+  (if (and (= (poll owner 262144 now) 2)
+           (> (ld owner 32776) 0) (<= (ld owner 32776) 9007199254740991))
+    (binding-copy owner output capacity 0) -1))
+(defn copy-application-binding [owner length output capacity now]
+  (if (and (>= length 262144) (>= capacity 96) (<= capacity 65536)
+           (separate owner 262144 output capacity))
+    (application-binding (kernel-subregion owner length 0 262144) output capacity now) -1))
+
+;; 保持済み暗号文の再送窓を判定する観測値。鍵・送信権限を返さない。
+;; 実 owner を poll するため、失効時は既存規則どおりセッションを消去する。
+(defn next-send-counter [owner length now]
+  (if (= (poll owner length now) 2) (ld (kernel-subregion owner length 0 262144) 41480) -1))

@@ -1,0 +1,190 @@
+;; JUN-757: actual managed frame -> chunk codec -> full-capacity reassembly.
+;; One protected/API-created managed owner, one fixed associated pool and IO.
+;; This is the existing single-session profile, not a multi-peer controller.
+;; initialize explicitly before use. Serialize all three actual allocations;
+;; do not import the association cookie or any owner from network bytes.
+;; Peer/index/epoch/key/final handshake h are derived from session-region.
+;; New roster/channel, stop or expiry erases pending/completed old-channel data.
+;; No timestamp identity, app/service/port/socket grant, consent, route or effect.
+;;
+;; IO retains frame-region's layout. This bridge additionally owns record2048
+;; at225280, binding96 at227328, codec8192 at229376, cookie128 at237568 and
+;; result32 at237696. Caller must preserve these private ranges between calls.
+;; Raw NIC scratch221184 and hash scratch214016 are outside bridge ownership.
+;; Processed calls wipe private225280..237567. Application/refused calls wipe
+;; all output73728..139265; typed control/handshake retain only their actual
+;; body prefix for control-copy, wiping the rest. This preserves protocol
+;; ping/pong/CMM/handshake data without granting route or app effects.
+;; Cookie and scalar result remain. Shape/cookie/bridge-clock preflight refuses
+;; without IO/pool changes. Trusted session poll may advance clock/reap.
+;; receive statuses: -2 completed result busy (no frame/counter consumption),
+;; -1 preflight/unauthenticated carrier refusal,0 authenticated malformed or
+;; application refusal,1 pending part,2 completed JSON,3 typed control,4
+;; handshake progress. Result stores status64/raw frame event64/kind32/bytes32.
+;; Input/header bytes are immutable during calls. A completed JSON byte string
+;; is only data: consumers still need full schema/pending context, actual
+;; directed service/port/socket policy and fresh trusted operation consent.
+(ns kekkai.application-receive-region
+  (:require [kekkai.frame-region :as frame] [kekkai.session-region :as session]
+            [kekkai.roster-region :as roster] [kekkai.application-frame-region :as codec]
+            [kekkai.application-reassembly-region :as assembly])
+  (:export [initialize synchronize receive stop event-kind event-bytes control-copy detach-empty]))
+(defn- p [io at value] :i64 (kernel-store-u8 (kernel-subregion io 262144 at 1) 1 0 value))
+(defn- r [io at] :i64 (kernel-load-u32 (kernel-subregion io 262144 at 4) 4 0))
+(defn- w [io at value] :i64 (kernel-store-u32 (kernel-subregion io 262144 at 4) 4 0 value))
+(defn- r64 [io at] :i64 (kernel-load-u64 (kernel-subregion io 262144 at 8) 8 0))
+(defn- w64 [io at value] :i64 (kernel-store-u64 (kernel-subregion io 262144 at 8) 8 0 value))
+(defn- zero [io start end] :i64
+  (loop [i start]
+    (if (>= i end) 1
+      (if (<= (+ i 8) end) (let [z (w64 io i 0)] (recur (+ i 8)))
+        (let [z (p io i 0)] (recur (+ i 1)))))))
+(defn- separate [a count c bytes] :bool
+  (or (= count 0) (= bytes 0) (<= (+ a count) c) (<= (+ c bytes) a)))
+(defn- shape [pool pool-bytes owner owner-bytes io io-bytes now] :bool
+  (and (>= pool-bytes 8388608) (>= owner-bytes 262144) (>= io-bytes 262144)
+       (>= now 0) (<= now 9007199254740991)
+       (separate pool 8388608 owner 262144) (separate pool 8388608 io 262144)
+       (separate owner 262144 io 262144)))
+(defn- clear-private [io] :i64 (do (zero io 73728 139266) (zero io 225280 237568) 1))
+(defn- cookie [pool owner io] :bool
+  (and (= (r io 237568) 0x31475242) (= (r io 237572) 1)
+       (= (r64 io 237576) pool) (= (r64 io 237584) owner)
+       (> (r64 io 237592) 0) (<= (r64 io 237592) 9007199254740991)
+       (<= (r io 237600) 2) (= (r io 237604) 0) (= (r io 237612) 0)
+       (>= (r64 io 237680) 0) (<= (r64 io 237680) 9007199254740991)))
+(defn- clear-peer [io phase] :i64
+  (do (zero io 237600 237680) (w io 237600 phase) 1))
+(defn- initialize-run [pool owner io now] :i64
+  (let [epoch (roster/generation owner 262144)]
+    (if (and (> epoch 0) (<= epoch 9007199254740991) (>= (session/poll owner 262144 now) 0)
+             (= (assembly/initialize pool 8388608 epoch) 1))
+      (do (clear-private io) (zero io 237568 237728)
+          (w io 237568 0x31475242) (w io 237572 1)
+          (w64 io 237576 pool) (w64 io 237584 owner) (w64 io 237592 epoch)
+          (w64 io 237680 now) 1) -1)))
+(defn initialize [pool pool-bytes owner owner-bytes io io-bytes now] :i64
+  (if (shape pool pool-bytes owner owner-bytes io io-bytes now)
+    (initialize-run (kernel-subregion pool pool-bytes 0 8388608)
+      (kernel-subregion owner owner-bytes 0 262144) (kernel-subregion io io-bytes 0 262144) now) -1))
+(defn- binding-same [io i] :bool
+  (if (>= i 64) true
+    (let [source (if (< i 32) (+ 227352 i) (+ 227392 (- i 32)))
+          target (if (< i 32) (+ 237616 i) (+ 237648 (- i 32)))]
+      (and (= (r64 io source) (r64 io target)) (binding-same io (+ i 8))))))
+(defn- binding-save [io i] :i64
+  (if (>= i 64) 1
+    (let [source (if (< i 32) (+ 227352 i) (+ 227392 (- i 32)))
+          target (if (< i 32) (+ 237616 i) (+ 237648 (- i 32)))
+          z (w64 io target (r64 io source))] (binding-save io (+ i 8)))))
+(defn- bind-live [pool owner io epoch] :i64
+  (if (and (= (session/copy-application-binding owner 262144 (kernel-subregion io 262144 227328 96) 96 (r64 io 237680)) 96)
+           (= (r64 io 227336) epoch))
+    (if (and (= (r io 237600) 2)
+             (= (r io 237608) (r io 227344)) (binding-same io 0)) 2
+      (if (= (assembly/initialize pool 8388608 epoch) 1)
+        (do (clear-peer io 2) (w io 237608 (r io 227344)) (binding-save io 0) 2) -1)) -1))
+(defn- sync-phase [pool owner io now epoch phase] :i64
+  (if (= phase 2) (bind-live pool owner io epoch)
+    (if (and (not= phase (r io 237600)) (> (r io 237600) 0))
+      (if (= (assembly/initialize pool 8388608 epoch) 1) (do (clear-peer io phase) phase) -1)
+      (do (clear-peer io phase) phase))))
+(defn- sync-run [pool owner io now] :i64
+  (let [epoch (roster/generation owner 262144) previous (r64 io 237592)]
+    (if (and (>= epoch previous) (<= epoch 9007199254740991))
+      (let [phase (session/poll owner 262144 now)]
+        (if (< phase 0) -1
+          (if (or (= epoch previous) (= (assembly/advance-epoch pool 8388608 epoch) 1))
+            (do (if (> epoch previous) (do (w64 io 237592 epoch) (clear-peer io 0)) 0)
+                (w64 io 237680 now) (sync-phase pool owner io now epoch phase)) -1))) -1)))
+(defn- ready [pool owner io now] :bool
+  (and (cookie pool owner io) (>= now (r64 io 237680))
+       (>= (assembly/pending-count pool 8388608) 0)))
+(defn- finish [io result event] :i64
+  (do (zero io 225280 237568)
+      (zero io (+ 73728 (if (and (or (= result 3) (= result 4)) (>= event 0)) (mod event 65536) 0)) 139266)
+      (zero io 237696 237728)
+      (w64 io 237696 result) (w64 io 237704 event)
+      (w io 237712 (if (>= event 0) (quot event 65536) 0))
+      (w io 237716 (if (>= event 0) (mod event 65536) 0)) result))
+(defn- synchronize-run [pool owner io now] :i64
+  (if (ready pool owner io now) (finish io (sync-run pool owner io now) -1) -1))
+(defn synchronize [pool pool-bytes owner owner-bytes io io-bytes now] :i64
+  (if (shape pool pool-bytes owner owner-bytes io io-bytes now)
+    (synchronize-run (kernel-subregion pool pool-bytes 0 8388608)
+      (kernel-subregion owner owner-bytes 0 262144) (kernel-subregion io io-bytes 0 262144) now) -1))
+(defn- decode-body [io count] :i64
+  (codec/decode (kernel-subregion io 262144 229376 8192) 8192
+    (kernel-subregion io 262144 73728 count) count (kernel-subregion io 262144 225280 2048) 2048))
+(defn- accept-part [pool io now] :i64
+  (let [result (assembly/accept pool 8388608 (kernel-subregion io 262144 227328 64) 64
+                 (kernel-subregion io 262144 225280 2048) 2048 now)]
+    (if (< result 0) 0
+      (if (= result 1)
+        (if (= (assembly/pin-completed-channel pool 8388608 (kernel-subregion io 262144 227328 96) 96) 1) 2 0) 1))))
+(defn- dispatch [pool owner io now event] :i64
+  (if (< event 0) -1
+    (if (= event 0) 0
+      (let [kind (quot event 65536) count (mod event 65536)]
+        (if (= kind 1)
+          (if (and (= (sync-run pool owner io now) 2) (= (decode-body io count) 1))
+            (accept-part pool io now) 0)
+          (if (or (= kind 48) (= kind 49))
+            (if (>= (sync-run pool owner io now) 0) 4 -1) 3))))))
+(defn- receive-run [pool owner io now] :i64
+  (if (ready pool owner io now)
+    (let [phase (sync-run pool owner io now)]
+      (if (< phase 0) (finish io -1 -1)
+        (if (> (assembly/completed-size pool 8388608) 0) (finish io -2 -1)
+          (let [event (frame/receive owner 262144 io 262144 now)]
+            (finish io (dispatch pool owner io now event) event))))) -1))
+(defn receive [pool pool-bytes owner owner-bytes io io-bytes now] :i64
+  (if (and (shape pool pool-bytes owner owner-bytes io io-bytes now)
+           (<= (r (kernel-subregion io io-bytes 0 262144) 0) 65538)
+           (<= (r (kernel-subregion io io-bytes 0 262144) 4) 65538))
+    (receive-run (kernel-subregion pool pool-bytes 0 8388608)
+      (kernel-subregion owner owner-bytes 0 262144) (kernel-subregion io io-bytes 0 262144) now) -1))
+(defn- stop-run [pool owner io now] :i64
+  (if (and (ready pool owner io now) (>= (sync-run pool owner io now) 0))
+    (do (session/stop owner 262144)
+        (let [result (assembly/initialize pool 8388608 (r64 io 237592))]
+          (do (clear-peer io 0) (finish io result -1)))) -1))
+(defn stop [pool pool-bytes owner owner-bytes io io-bytes now] :i64
+  (if (shape pool pool-bytes owner owner-bytes io io-bytes now)
+    (stop-run (kernel-subregion pool pool-bytes 0 8388608)
+      (kernel-subregion owner owner-bytes 0 262144) (kernel-subregion io io-bytes 0 262144) now) -1))
+(defn- event-field [io length at] :i64
+  (if (>= length 262144)
+    (let [view (kernel-subregion io length 0 262144)]
+      (if (and (= (r view 237568) 0x31475242) (= (r view 237572) 1)) (r view at) -1)) -1))
+(defn event-kind [io length] :i64 (event-field io length 237712))
+(defn event-bytes [io length] :i64 (event-field io length 237716))
+(defn- control-run [io offset output capacity] :i64
+  (let [status (r64 io 237696) count (r io 237716)]
+    (if (and (= (r io 237568) 0x31475242) (= (r io 237572) 1)
+             (or (= status 3) (= status 4)) (<= count 65510) (>= offset 0) (<= offset count)
+             (separate (r64 io 237576) 8388608 output capacity)
+             (separate (r64 io 237584) 262144 output capacity))
+      (let [n (if (< (- count offset) capacity) (- count offset) capacity)]
+        (loop [i 0]
+          (if (>= i n) n
+            (let [v (kernel-load-u8 (kernel-subregion io 262144 (+ 73728 offset i) 1) 1 0)
+                  z (kernel-store-u8-64k output capacity i v)] (recur (+ i 1)))))) -1)))
+(defn control-copy [io length offset output capacity] :i64
+  (if (and (>= length 262144) (>= capacity 0) (<= capacity 65536)
+           (or (= capacity 0) (separate io 262144 output capacity)))
+    (control-run (kernel-subregion io length 0 262144) offset output capacity) -1))
+
+;; Relinquish an EMPTY backing pool without stopping the managed transport.
+;; Host holds exclusive pool/session/IO/pending locks and has no accepted input
+;; in this pool. The raw allocation can then transfer to a local1MiB builder;
+;; initialize again before any receive. No quota/capacity is borrowed/shrunk.
+(defn- detach-run [pool owner io now] :i64
+  (if (and (ready pool owner io now) (>= (sync-run pool owner io now) 0)
+           (= (assembly/pending-count pool 8388608) 0) (= (assembly/buffered-bytes pool 8388608) 0)
+           (= (assembly/completed-size pool 8388608) 0))
+    (do (clear-private io) (zero io 237568 237728) 1) -1))
+(defn detach-empty [pool pool-bytes owner owner-bytes io io-bytes now] :i64
+  (if (shape pool pool-bytes owner owner-bytes io io-bytes now)
+    (detach-run (kernel-subregion pool pool-bytes 0 8388608)
+      (kernel-subregion owner owner-bytes 0 262144) (kernel-subregion io io-bytes 0 262144) now) -1))
