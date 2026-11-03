@@ -27,11 +27,12 @@ def index_of(wire, wanted):
   if fields[3]==wanted:return index
   index+=1
  raise ValueError('target not in view: '+wanted)
-report={}
+report={};images={}
 for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
  receipt=json.loads((build/'build-receipt.json').read_text());source=(build/'program.kotoba').read_bytes();wasm=(build/'program.wasm').read_bytes()
  if sha(source)!=receipt['sourceSha256'] or sha(wasm)!=receipt['wasmSha256'] or receipt['compilerSha256']!=args.compiler_sha256:raise ValueError(name+' stale build')
  image=gate.build(name,'program.kotoba',{'program.kotoba':source})
+ images[name]=image
  init=gate.run(name+'-init',image,args=['init']).stdout.decode().removesuffix('\n')
  wire=gate.run(name+'-view',image,args=['view',init]).stdout.decode()
  result=gate.run(name+'-decode',parser,args=[wire,'']).stdout.decode().strip()
@@ -81,6 +82,12 @@ for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
 def frame(x):return str(len(x.encode()))+':'+x
 def node(tag='div',typ='',key='',value='',text='',children='0'):
  return ''.join(map(frame,[tag,'',typ,key,value,text,'',children]))
+# Exercise the actual largest bounded Bunsho view and a late-node action.
+maximum='BS3|1'+''.join(map(frame,['題'*341+'x','edit','32']+sum((['p','x'*1024] for _ in range(32)),[])))
+large=gate.run('bunsho-max-view',images['bunsho'],args=['view',maximum]).stdout.decode()
+if gate.run('bunsho-max-decode',parser,args=[large,'']).stdout!=b'466:div\n':raise ValueError('maximum view rejected')
+last=index_of(large,'b31')
+if gate.run('bunsho-max-action',parser,args=[large,'current',str(last),'input','最後😀']).stdout!='app|input|b31|最後😀\n'.encode():raise ValueError('maximum view action')
 positive='BV2|'+node(children='1')+node('textarea',key='body',value='日本😀\n二行')+'\n'
 if gate.run('unicode-multiline',parser,args=[positive,'']).stdout != b'2:div\n':raise ValueError('unicode')
 if gate.run('unicode-value-index',parser,args=[positive,'inspect']).stdout != '日本😀\n二行\n'.encode():raise ValueError('incorrect indexed field')
