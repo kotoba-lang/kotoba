@@ -342,3 +342,15 @@ are neither full pure-i64 nor general VM admission, do not establish safe
 resource limits for untrusted inputs, and do not resolve the pending normative
 `exports` question. The accepted test shape follows the existing Amu route
 only for this experiment.
+
+The experimental bridge now runs a native structural preflight before the
+generic CBOR codec. It limits input to 65,536 bytes, 4,095 items and nesting
+depth 64, bounds printable ASCII text to 128 bytes, requires definite and
+shortest supported heads, and refuses out-of-range octets and trailing data.
+The macOS ARM64 fixture exercised depth 64/65, 4,095/4,096 items, oversized
+input, non-ASCII text and a non-shortest integer head. A separately compiled
+control that raised the item bound was rejected by the fixture. The 98-case
+actual-receipt native comparison still returned 42. These preflight limits are
+for the experimental subset and do not establish a bound on the generic
+codec's CPU/allocation behavior, safe hostile-input operation, full VM
+admission or cross-platform qualification.
