@@ -59,7 +59,7 @@ def main():
             raise ValueError('source digest mismatch: ' + key)
     snapshot = json.loads(SNAPSHOT.read_text()); report_data = REPORT.read_bytes(); report = json.loads(report_data)
     if (snapshot.get('schema') != 'kototama.experimental-aot-receipts-snapshot.v1'
-            or snapshot.get('caseCount') != 187 or len(snapshot.get('cases', [])) != 187
+            or snapshot.get('caseCount') != 194 or len(snapshot.get('cases', [])) != 194
             or snapshot.get('profile') != 'kototama.pure-i64-receipt/v2'
             or snapshot.get('reportSha256') != sha(report_data)
             or snapshot.get('compilerSha256') != report.get('compilerSHA256')
@@ -106,26 +106,28 @@ def main():
         # The stack bound is a fixed historical fixture, not independent admission.
         stack = struct.unpack('<8q', old)[7]
         observations.append((i, program, guest.stdout, guest.returncode, row['budget'], stack))
-    parts = ['(ns comparison (:export [main]) (:require [bridge :as b] [reference :as r] [kototama.pure-i64-receipt :as receipt]))\n',
-             '(defn- word [d :vector-i64 off :i64] :i64 (loop [i 0 v 0] (if (= i 8) v '
-             '(recur (+ i 1) (bit-or v (i64-shift-left (vector-at d (+ off i)) (* i 8)))))))\n',
-             '(defn- check [program :vector-i64 data :vector-i64 exit :i64 budget :i64 stack :i64] :bool '
-             '(and (receipt/valid? data exit budget stack) '
-             '(let [v (r/evaluate (b/nodes program) budget)] '
-             '(and (= (vector-at v 0) (word data 8)) (= (vector-at v 1) (word data 16)) '
-             '(= (vector-at v 2) (word data 32))))))\n']
-    for start in range(0, len(observations), 8):
-        terms = []
-        for _, program, data, exit_code, budget, stack in observations[start:start + 8]:
-            pv, rv = literal(program), literal(data)
-            terms.append(f'(check {pv} {rv} {exit_code} {budget} {stack})')
-            terms.append(f'(not (check {pv} (vector-assoc! {rv} 0 0) {exit_code} {budget} {stack}))')
-        parts.append(f'(defn- group-{start // 8} [] :bool (and ' + ' '.join(terms) + '))\n')
-    groups = ' '.join(f'(group-{i})' for i in range((len(observations) + 7) // 8))
-    parts.append(f'(defn main [] :i64 (if (and {groups}) 42 0))\n')
-    gate_text = ''.join(parts)
+    def make_gate(observations):
+        parts = ['(ns comparison (:export [main]) (:require [bridge :as b] [reference :as r] [kototama.pure-i64-receipt :as receipt]))\n',
+                 '(defn- word [d :vector-i64 off :i64] :i64 (loop [i 0 v 0] (if (= i 8) v '
+                 '(recur (+ i 1) (bit-or v (i64-shift-left (vector-at d (+ off i)) (* i 8)))))))\n',
+                 '(defn- check [program :vector-i64 data :vector-i64 exit :i64 budget :i64 stack :i64] :bool '
+                 '(and (receipt/valid? data exit budget stack) '
+                 '(let [v (r/evaluate (b/nodes program) budget)] '
+                 '(and (= (vector-at v 0) (word data 8)) (= (vector-at v 1) (word data 16)) '
+                 '(= (vector-at v 2) (word data 32))))))\n']
+        for start in range(0, len(observations), 8):
+            terms = []
+            for _, program, data, exit_code, budget, stack in observations[start:start + 8]:
+                pv, rv = literal(program), literal(data)
+                terms.append(f'(check {pv} {rv} {exit_code} {budget} {stack})')
+                terms.append(f'(not (check {pv} (vector-assoc! {rv} 0 0) {exit_code} {budget} {stack}))')
+            parts.append(f'(defn- group-{start // 8} [] :bool (and ' + ' '.join(terms) + '))\n')
+        groups = ' '.join(f'(group-{i})' for i in range((len(observations) + 7) // 8))
+        parts.append(f'(defn main [] :i64 (if (and {groups}) 42 0))\n')
+        return ''.join(parts)
 
-    def native(name, mutant, expected):
+
+    def native(name, mutant, expected, observations):
         root = out / name / 'src'; root.mkdir(parents=True)
         for relative, source in sources.items():
             dest = root / relative; dest.parent.mkdir(parents=True, exist_ok=True)
@@ -136,7 +138,7 @@ def main():
                     raise ValueError('mutant anchor drift')
                 text = text.replace(needle, '(vector-assoc! base (if (= kind 1) 5 kind))')
             dest.write_text(text)
-        gate = root / 'comparison.kotoba'; gate.write_text(gate_text)
+        gate = root / 'comparison.kotoba'; gate.write_text(make_gate(observations))
         lock = out / (name + '.ksl')
         lock.write_text('KSL1\nentry ' + str(gate) + '\nroot ' + str(root) + '\n' +
                         ''.join('file ' + sha(f.read_bytes()) + ' ' + str(f) + '\n' for f in sorted(root.rglob('*.kotoba'))))
@@ -178,7 +180,9 @@ def main():
             raise RuntimeError(f'{name} verdict mismatch: {result.returncode} {result.stdout[-300:]!r} {result.stderr[-300:]!r}')
         return {'result': expected, 'lockSha256': sha(lock.read_bytes()), 'imageSha256': sha(image.read_bytes())}
 
-    positive, mutant = native('positive', False, 42), native('mutant', True, 0)
+    batches = [observations[i:i + 48] for i in range(0, len(observations), 48)]
+    positive = [native('positive-' + str(i), False, 42, batch) for i, batch in enumerate(batches)]
+    mutant = native('mutant', True, 0, batches[0])
     if any(sha(Path(path).read_bytes()) != digest for path, digest in hashes.items()):
         raise ValueError('input changed during observation')
     evidence = {'status': 'PASS_BOUNDED_LIVE_AOT_REFERENCE_' + target.upper().replace('-', '_'), 'caseCount': len(observations),

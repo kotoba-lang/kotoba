@@ -490,3 +490,17 @@ emitted nodes across all methods, 64 frames and 64 lexical slots, so it refuses
 some otherwise valid profile programs. The two sides still share a compiler
 backend per architecture; neither independent compilation nor full admission,
 artifact authorization, host qualification or general language support follows.
+
+The experimental bridge's aggregate emitted-node ceiling was raised from 63
+to 1023; the reference evaluator retains its 64 control frames and 64 lexical
+slots. Seven retained 32-method tail and non-tail call-chain budget cases now
+bring the comparison to 194. The existing 63-node limit, reintroduced as a
+negative control, is detected by the non-tail chain cases. All 194 cases were
+freshly compiled and compared on Linux x86-64 and physical ARM64; macOS ARM64
+matched the retained snapshot. The native comparison harness executes batches
+of at most 48 observations per process. During an intermediate experiment with
+larger evaluation-frame storage, one combined macOS run terminated with signal
+5, while the new chain cases passed individually; its cause is unproven. The
+frame-storage expansion was removed. Batching is not evidence of a resource
+bound for untrusted programs, and the remaining admission, backend-independence,
+artifact and host limitations continue to apply.

@@ -46,7 +46,7 @@ def main():
             raise ValueError('source digest mismatch: ' + key)
     data = json.loads(SNAPSHOT.read_text()); report_bytes = REPORT.read_bytes(); report = json.loads(report_bytes)
     if (data.get('schema') != 'kototama.experimental-aot-receipts-snapshot.v1'
-            or data.get('caseCount') != 187 or len(data.get('cases', [])) != 187
+            or data.get('caseCount') != 194 or len(data.get('cases', [])) != 194
             or data.get('profile') != 'kototama.pure-i64-receipt/v2'
             or data.get('reportSha256') != hashlib.sha256(report_bytes).hexdigest()
             or data.get('compilerSha256') != report.get('compilerSHA256')
@@ -79,22 +79,28 @@ def main():
     inputs = {str(path): sha(path) for path in tracked}
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
 
-    def observe(name, mutant, expected):
+    def observe(name, mutant, expected, chosen):
+        selected = output / (name + '-selection.json')
+        selected.write_text(json.dumps({'indices': chosen, 'reportSha256': data['reportSha256']}) + '\n')
         work = output / name
         stage = subprocess.run([sys.executable, str(STAGER), '--receipt-dir', str(corpus),
-                                '--selection', str(selection), '--output', str(work)],
+                                '--selection', str(selected), '--output', str(work)],
                                cwd=output, env=env, capture_output=True, timeout=60)
         if stage.returncode or stage.stderr:
             raise RuntimeError(f'{name} staging failed: {stage.stderr[-500:]!r}')
         source, gate, lock = work / 'bridge.kotoba', work / 'comparison.kotoba', work / 'project.ksl'
         if mutant:
-            text = source.read_text(); before = '(vector-assoc! base kind)'
-            if text.count(before) != 1:
+            target = source
+            text = target.read_text()
+            before, after = (('(>= (vector-count out) 4092)', '(>= (vector-count out) 252)') if mutant == 'node-limit'
+                             else ('(vector-assoc! base kind)', '(vector-assoc! base (if (= kind 1) 5 kind))'))
+            count = text.count(before)
+            if (mutant == 'node-limit' and count < 1) or (mutant != 'node-limit' and count != 1):
                 raise ValueError('negative-control anchor drift')
-            source.write_text(text.replace(before, '(vector-assoc! base (if (= kind 1) 5 kind))'))
+            target.write_text(text.replace(before, after))
             lines = lock.read_text().splitlines()
-            lock.write_text('\n'.join(('file ' + sha(source) + ' ' + str(source))
-                                      if line.startswith('file ') and line.endswith(' ' + str(source)) else line
+            lock.write_text('\n'.join(('file ' + sha(target) + ' ' + str(target))
+                                      if line.startswith('file ') and line.endswith(' ' + str(target)) else line
                                       for line in lines) + '\n')
         binary = work / 'comparison'
         for label, command in [('compile', [str(compiler), 'compile', str(gate), '--source-lock', str(lock), '-o', str(binary)]),
@@ -106,12 +112,15 @@ def main():
                 raise RuntimeError(f'{name} {label} failed: {result.returncode} {result.stdout[-200:]!r} {result.stderr[-200:]!r}')
         return {'result': expected, 'lockSha256': sha(lock), 'artifactSha256': sha(binary)}
 
-    positive, negative = observe('positive', False, 42), observe('mutant', True, 0)
+    batches = [indices[i:i + 48] for i in range(0, len(indices), 48)]
+    positive = [observe('positive-' + str(i), False, 42, batch) for i, batch in enumerate(batches)]
+    negative = observe('mutant', True, 0, batches[0])
+    node_negative = observe('mutant-node-limit', 'node-limit', 0, batches[-1])
     if any(sha(Path(path)) != digest for path, digest in inputs.items()):
         raise ValueError('input changed during observation')
     evidence = {'status': 'PASS_BOUNDED_SNAPSHOT_NATIVE_CBOR_REFERENCE_MACOS', 'caseCount': len(indices),
                 'freshAotRun': False, 'fullVmQualified': False, 'inputs': inputs,
-                'positive': positive, 'negative': negative}
+                'positive': positive, 'negative': negative, 'nodeLimitNegative': node_negative}
     (output / 'receipt.json').write_text(json.dumps(evidence, indent=2) + '\n')
     print(evidence['status'], len(indices))
 
