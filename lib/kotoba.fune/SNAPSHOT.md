@@ -1,0 +1,162 @@
+# OCI layer snapshot digest candidate
+
+`fune.snapshot/verify-layer-and-hold` reads a layer descriptor only after the
+manifest bytes match the caller's expected digest and pass the bounded manifest
+profile. It opens the layer using the Linux FS2 V operation, hashes W reads in
+1 MiB windows, and compares SHA-256 to the descriptor. On success the snapshot
+remains open in the same process; the caller must consume that same snapshot,
+then call `close-snapshot`. On digest mismatch the function closes it. It does
+not verify the tar structure, build a rootfs or grant permission to run it.
+It must not be used as a detached admission token or as proof that reopening
+the original path is safe.
+
+The native snapshot provider in [Amu PR #1785](https://github.com/kotoba-lang/amu/pull/1785)
+is a draft dependency. Old runtimes refuse V rather than silently falling back.
+The source path must be granted through `:fs/app-data`. Provider refusals can
+terminate the process. The maximum layer is 256 MiB in a sealed memfd; SHA
+working state stays outside a temporary arena and individual read replies are
+released after each update. The persistent caller-owned vectors are mutable:
+their contents, the byte count and the update order are trusted inputs to the
+streaming SHA API. Finalization consumes the state.
+
+## Local native observations, 2026-11-02
+
+Using an ARM64 compiler rebuilt from Amu PR #1785, the test-only
+`test/fune/snapshot_gate.kotoba` passed these conditions:
+
+* SHA-256 of `abc` and every length 0–130, updated in chunks of 1, 13 and 64,
+  matched the existing non-streaming SHA-256 result.
+* A valid fixture was checked, then its source file was rewritten; reads from
+  the held snapshot retained the original bytes. A same-size corrupted fixture
+  was rejected and the snapshot was closed so another can be opened.
+* An independently exported 8,939,008-byte Alpine ARM64 layer matched its OCI
+  descriptor across multiple windows. This is only digest verification; that
+  image still contains a symlink outside the current tar inspection profile.
+* A separately compiled mutant with digest comparison disabled returned the
+  test failure code 4 on the corrupt fixture. The old pinned runtime refused
+  FS2 V with stage 8 and exit 126.
+
+The fixture runner intentionally rewrites its input in the positive case;
+use a disposable copy. These are local ARM64 checks, not source-locked project
+linkage, native x86 qualification, CI, a release, or Docker compatibility.
+For the test-only runner set `KEXE_COMMAND=1` and leave
+`KEXE_STRUCTURED_REPORT` unset so nonzero guest results become process errors.
+The original `verify-layout` still uses whole-file FS2 reads. The separate
+`verify-layout-snapshots` uses this snapshot function for every layer and
+closes each snapshot after inspection; an `ok` result does not authorize later
+reopening the source paths. Layer application, safe transactional rootfs,
+compression, whiteouts, links and actual container lifecycle remain open.
+
+`fune.snapshot-archive/verify-archive-and-hold` adds tar inspection to that
+same snapshot. It first verifies the descriptor digest, then reads only the
+512-byte headers and zero-filled terminator windows through FS2 W. The shared
+ustar header checker refuses unsupported entry types, whiteouts, absolute or
+dot-component paths, malformed numeric fields and bad checksums. After two
+zero blocks, all remaining bytes must be zero. It admits at most 50,000 entries;
+invalid or unsupported headers share the `fune/tar-header` refusal. On any
+structure refusal the function closes the snapshot; success leaves it open.
+It does not validate conflicts between entries or across layers, apply file
+metadata, create paths, or authorize execution.
+
+While retaining that same verified snapshot, `snapshot-entry` returns the next
+header offset, payload offset, kind, size, mode and ASCII path bytes for a
+caller-supplied aligned entry offset. It rejects invalid headers and out-of-range
+offsets; the caller must traverse from the start using the returned next offset
+and must not close/reopen the snapshot between validation and consumption.
+This low-level cursor does not prove that an arbitrary supplied offset is an
+entry boundary, resolve path conflicts, enforce aggregate rootfs quotas, or
+authorize filesystem writes. The ustar profile now refuses invalid mode fields
+and modes above `0777`, including setuid/setgid/sticky bits.
+
+Native ARM64 checks covered valid regular file, directory, ustar prefix and
+two-entry archives; absolute and traversal paths, whiteout, symlink, device,
+PAX, checksum, numeric field, truncated payload and nonzero tail were refused.
+The successful test rewrote the source after validation and observed unchanged
+bytes from the held snapshot. Separately built mutants that removed traversal
+or terminator validation failed their negative controls. An Alpine ARM64
+layer passed digest checking but was refused for its unsupported symlink.
+These checks use the test-only `snapshot_archive_gate.kotoba`; the positive
+`hold` mode overwrites its input, so use a disposable fixture copy.
+`snapshot_entry_gate.kotoba` additionally checked regular-file, directory,
+prefix and two-entry cursors, invalid offsets, payload bytes after source replacement,
+and descriptor lifetime. Independently staged setuid and malformed mode
+headers were rejected; a mode-check-removal mutant accepted the setuid case.
+
+The test-only `layout_snapshot_runner.kotoba` calls the new whole-layout route.
+With the rebuilt ARM64 root from Amu PR #1785, one- and two-layer layouts
+passed. Altered first or second layers and config, invalid layout marker/index,
+duplicate index entry and unsupported tar were refused; missing and symlinked
+blobs trapped closed. A first-layer-only mutant accepted the changed second
+layer, showing that the negative case detects skipped layers. A binary built
+with the old runtime refused the snapshot operation instead of falling back.
+The original `verify-layout` also accepted the good fixture and refused a
+changed second layer when built with that old runtime. These test runners are
+not production CLIs. For the snapshot route, marker, index, manifest and config
+sizes are read from FS2 metadata before opening a snapshot; V rechecks the size
+and seals the copy, and W reads at most the accepted bound. A changed size
+between metadata and V refuses. The original `verify-layout` still performs
+unbounded provider reads before its checks. The provider's sealed memfd consumes
+up to the declared layer size in kernel-managed memory.
+
+On ARM64, `observe_layout_metadata.py` traced the actual fstat/read boundary.
+It observed no reads of a 512 MiB index before size refusal. In a separate
+disposable layout it grew the marker immediately after metadata fstat; V
+refused the changed size (stage 15, exit 126). A rebuilt control that bypassed
+the bounded snapshot metadata route failed this race observation. Valid marker
+and index inputs padded to exactly 1024 bytes and 1 MiB respectively were
+accepted. This test does not prove all filesystem races or native x86 behavior.
+
+Stage disposable oversized and race inputs with
+`stage_layout_fixtures.py SOURCE NEW_DEST --resource-cases`. On native Linux,
+run `observe_layout_metadata.py --image IMAGE --layout NEW_DEST/race-marker
+--digest DIGEST --output NEW_REPORT --case race` and separately use
+`--layout NEW_DEST/oversize-index --case oversize`. The first invocation
+intentionally enlarges its marker, and each report directory must be new.
+The observer uses ptrace on its own child only; the guest supplies the verdict.
+
+For the snapshot layout runner, compose the existing SHA2, JSON and image
+manifest bodies, then add `image_config.kotoba`, `layer_tar.kotoba`,
+`snapshot.kotoba`, `snapshot_archive.kotoba`, `layout_check.kotoba` and the
+test runner in that order, replacing their namespace aliases with local names
+as in the other seed examples. Stage a fresh layout with
+`stage_layout_fixtures.py`. Run the runner with a scope covering that layout,
+the explicit manifest digest, `KEXE_COMMAND=1`, and structured reporting
+unset. Its output `ok` with exit 0 is a test verdict only. `two-layers-bad`
+must print `fune/blob-digest` and exit 1. For a negative control, replace the
+snapshot loop's `(if (= i n) "ok"` with `(if (>= i 1) "ok"` in a temporary
+composed source: the same corrupt second layer then prints `ok` and exits 0.
+
+To repeat the native fixture, prepare the layer fixtures as described in the
+README and make a disposable copy of `good.tar`. With `G` set to a task-owned
+workspace, place the candidate Amu compiler from PR #1785 at
+`$G/snapshot-compiler.elf`. The local run used compiler SHA-256
+`0da6af45521d7ffc4cfcebee2ea56cb5655e3bc15763069a9d21a9d2f8adafd0`.
+The following composes the namespace bodies for the measured seed compiler;
+this is not source-locked project linking:
+
+```sh
+{
+  printf '(ns fune-snapshot-test (:export [main]))\n'
+  sed '1,/\]))$/d' lib/gov.nist.sha2/kotoba/sha2/core.kotoba
+  sed '1,/\]))$/d' lib/org.ietf.jcs/kotoba/jcs/reader.kotoba
+  sed '1,/\]))$/d;s@json/@@g;s@sha/@@g' lib/kotoba.fune/kotoba/fune/image_manifest.kotoba
+  sed '1,/\]))$/d;s@manifest/@@g;s@sha/@@g' lib/kotoba.fune/kotoba/fune/snapshot.kotoba
+  sed '1d;s@snapshot/@@g;s@sha/@@g' lib/kotoba.fune/test/fune/snapshot_gate.kotoba
+} > "$G/snapshot-candidate.kotoba"
+podman run --rm --pull never --platform linux/arm64 --network none \
+  -e KEXE_CAP_RESOURCES_35=/gate -v "$G:/gate" -w /gate docker.io/library/alpine:3 \
+  sh -c './snapshot-compiler.elf compile /gate/snapshot-candidate.kotoba --target aarch64-linux --output /gate/snapshot-candidate.elf --format static && chmod +x /gate/snapshot-candidate.elf'
+podman run --rm --pull never --platform linux/arm64 --network none \
+  -e KEXE_CAP_RESOURCES_35=/gate -e KEXE_COMMAND=1 -e KEXE_FUEL=100000000000 \
+  -v "$G:/gate" -w /gate docker.io/library/alpine:3 /gate/snapshot-candidate.elf \
+  good /gate/disposable-good.tar /gate/fixtures/good.manifest \
+  sha256:65d85cbf52167eeb2bacc60972d64614b2f1a1fbbe7b4af5ac833c227b67d679
+```
+
+For `bad`, change one byte of a separate same-size fixture and run the same
+command with mode `bad`. For `invalid-manifest`, pass an all-zero expected
+digest. Both must exit zero because the fixture observes the intended refusal.
+For the digest control replace the snapshot comparison `(if (= (str
+"sha256:" actual) digest) "ok"` with `(if true "ok"` in a temporary composed
+source, rebuild, and run `bad`; it must exit 4. Do not use the mutant for any
+other purpose.

@@ -1,0 +1,111 @@
+;; Diagnostic streaming from one sealed, verified OCI layer to the worker's
+;; ASCII-hex transport. This does not establish a trusted supervisor or launch.
+(ns fune.rootfs-stream
+  (:export [rootfs-stream-start rootfs-stream-finalize rootfs-stream-finish rootfs-stream-runnable-finish emit-layer-hex])
+  (:capabilities [:fs/app-data :io/write])
+  (:require [fune.snapshot-archive :as archive] [fune.snapshot :as snapshot]
+            [fune.image-manifest :as manifest] [fune.rootfs-plan :as plan]))
+
+(defn- rs-digit [n :i64] :string
+  (case n 0 "0" 1 "1" 2 "2" 3 "3" 4 "4" 5 "5" 6 "6" 7 "7" 8 "8" "9"))
+(defn- rs-dec [n :i64] :string
+  (if (< n 10) (rs-digit n) (str (rs-dec (quot n 10)) (rs-digit (rem n 10)))))
+(defn- rs-hex-digit [n :i64] :i64 (if (< n 10) (+ 48 n) (+ 87 n)))
+(defn- rs-send-vector [v :vector-i64] :i64
+  (arena-scope
+    (let [n (vector-count v) encoded (vector-alloc (* n 2))
+          out (loop [i 0 a encoded]
+            (if (= i n) a
+              (let [x (vector-at v i) b (vector-assoc! a (* i 2) (rs-hex-digit (quot x 16)))
+                    c (vector-assoc! b (+ (* i 2) 1) (rs-hex-digit (rem x 16)))]
+                (recur (+ i 1) c))))
+          text (string-from-utf8 (bytes-from-vector-i64 out))
+          sent (typed-cap-call :io/write :string :string text)] 0)))
+(defn rootfs-stream-start [] :i64
+  (let [sent (typed-cap-call :io/write :string :string "H")] 0))
+(defn rootfs-stream-finish [commands :i64] :i64
+  (if (or (< commands 0) (> commands 640)) -1
+    (rs-send-vector [67 (quot commands 256) (rem commands 256)])))
+
+;; T seals a runnable diagnostic stream with its bounded process bytes. The
+;; worker checks framing but must not treat those bytes as launch authority.
+(defn rootfs-stream-runnable-finish [commands :i64 spec :vector-i64] :i64
+  (let [n (vector-count spec)]
+    (if (or (< commands 0) (> commands 640) (< n 10) (> n 67500)) -1
+      (let [header (rs-send-vector [84 (quot commands 256) (rem commands 256)
+                                    (rem (quot n 16777216) 256) (rem (quot n 65536) 256)
+                                    (rem (quot n 256) 256) (rem n 256)])]
+        (loop [at 0]
+          (if (= at n) 0
+            (let [left (- n at) take (if (> left 4096) 4096 left)
+                  sent (arena-scope
+                         (let [v (vector-alloc take)
+                               copy (loop [i 0 out v]
+                                      (if (= i take) out (recur (+ i 1) (vector-assoc! out i (vector-at spec (+ at i))))))]
+                           (rs-send-vector copy)))]
+              (recur (+ at take)))))))))
+
+;; Parents are admitted before children, so reverse insertion order applies
+;; child modes before parent modes. The worker must reject further writes after
+;; the first P and the supervisor must discard the tree on any refusal.
+(defn rootfs-stream-finalize [state :vector-i64] :i64
+  (let [count (plan/rootfs-plan-count state)]
+    (if (or (< count 0) (> count 128)) -1
+      (loop [i (- count 1)]
+        (if (< i 0) count
+          (let [entry (plan/rootfs-plan-entry state i) len (- (vector-count entry) 2)]
+            (if (or (<= len 0) (> len 255)) -1
+              (let [mode (vector-at entry 1) frame (vector-alloc (+ 7 len))
+                    a (vector-assoc! frame 0 80) b (vector-assoc! a 1 (quot len 256)) c (vector-assoc! b 2 (rem len 256))
+                    d (vector-assoc! c 3 0) e (vector-assoc! d 4 0)
+                    f (vector-assoc! e 5 (quot mode 256)) g (vector-assoc! f 6 (rem mode 256))
+                    out (loop [j 0 v g]
+                          (if (= j len) v (recur (+ j 1) (vector-assoc! v (+ j 7) (vector-at entry (+ j 2))))))
+                    sent (rs-send-vector out)]
+                (recur (- i 1))))))))))
+
+(defn- rs-header [entry :vector-i64 op :i64] :i64
+  (let [n (- (vector-count entry) 5) size (vector-at entry 3)
+        v (vector-alloc (+ 7 n))
+        a (vector-assoc! v 0 op) b (vector-assoc! a 1 (quot n 256)) c (vector-assoc! b 2 (rem n 256))
+        d (vector-assoc! c 3 (rem (quot size 16777216) 256))
+        e (vector-assoc! d 4 (rem (quot size 65536) 256))
+        f (vector-assoc! e 5 (rem (quot size 256) 256)) g (vector-assoc! f 6 (rem size 256))
+        h (loop [i 0 out g]
+            (if (= i n) out (recur (+ i 1) (vector-assoc! out (+ i 7) (vector-at entry (+ i 5))))))]
+    (rs-send-vector h)))
+(defn- rs-data [path :string off :i64 n :i64] :bool
+  (loop [at 0]
+    (if (= at n) true
+      (let [remaining (- n at) size (if (> remaining 4096) 4096 remaining)
+            ok (arena-scope
+                 (let [frame (str "\u0000FS2\u0000W" path "\u0000" (rs-dec (+ off at)) ":" (rs-dec size))
+                       b (typed-cap-call :fs/app-data :string :bytes frame)]
+                   (if (and (= (bytes-count b) (+ size 5)) (= (bytes-at b 0) 0) (= (bytes-at b 1) 70)
+                            (= (bytes-at b 2) 83) (= (bytes-at b 3) 50) (= (bytes-at b 4) 0))
+                     (let [v (vector-i64-from-bytes (bytes-slice b 5 (+ size 5))) sent (rs-send-vector v)] true)
+                     false)))]
+        (if ok (recur (+ at size)) false)))))
+
+;; One call holds exactly the verified archive while sending its entries.
+;; Caller must provide manifest order, check every result, and destroy the
+;; worker on any failure; prior commands may already have been sent. Neither
+;; this stream nor the planner state is a detached extraction authorization.
+(defn emit-layer-hex [state :vector-i64 path :string m :vector-i64 expected :string index :i64] :string
+  (let [opened (archive/verify-archive-and-hold path m expected index)]
+    (if (not (= opened "ok")) opened
+      (let [size (manifest/layer-size m expected index)
+            result (loop [offset 0]
+              (let [entry (archive/snapshot-entry path offset size)]
+                (if (= (vector-count entry) 1)
+                  (if (archive/snapshot-terminator? path offset size) "ok" "fune/snapshot-cursor")
+                  (let [kind (vector-at entry 2) length (vector-at entry 3)
+                        old (plan/rootfs-plan-existing-kind state entry)
+                        accepted (if (> length 1048576) -1 (plan/rootfs-plan-add state index entry))]
+                    (if (not (= accepted 0)) "fune/rootfs-plan"
+                      (if (and (= kind 1) (= old 1)) (recur (vector-at entry 0))
+                        (let [op (if (= kind 1) 77 (if (= old 0) 85 70))
+                              header (rs-header entry op)
+                              ok (if (= kind 0) (rs-data path (vector-at entry 1) length) true)]
+                          (if ok (recur (vector-at entry 0)) "fune/snapshot-read"))))))))]
+        (if (snapshot/close-snapshot path) result "fune/snapshot-close")))))

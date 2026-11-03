@@ -1,0 +1,79 @@
+;; Digest and inspect a bounded OCI tar on one held sealed snapshot.
+;; This candidate never extracts a file or authorizes image execution.
+(ns fune.snapshot-archive
+  (:export [verify-archive-and-hold snapshot-entry snapshot-terminator?])
+  (:capabilities [:fs/app-data])
+  (:require [fune.snapshot :as snapshot] [fune.layer-tar :as layer] [fune.image-manifest :as manifest]))
+
+(defn- sa-digit [n :i64] :string
+  (case n 0 "0" 1 "1" 2 "2" 3 "3" 4 "4" 5 "5" 6 "6" 7 "7" 8 "8" "9"))
+(defn- sa-dec [n :i64] :string
+  (if (< n 10) (sa-digit n) (str (sa-dec (quot n 10)) (sa-digit (rem n 10)))))
+(defn- sa-read [path :string offset :i64 count :i64] :bytes
+  (typed-cap-call :fs/app-data :string :bytes
+    (str "\u0000FS2\u0000W" path "\u0000" (sa-dec offset) ":" (sa-dec count))))
+(defn- sa-ack? [b :bytes n :i64] :bool
+  (and (= (bytes-count b) (+ n 5)) (= (bytes-at b 0) 0) (= (bytes-at b 1) 70)
+       (= (bytes-at b 2) 83) (= (bytes-at b 3) 50) (= (bytes-at b 4) 0)))
+
+;; Negative results are deliberately small fixed error codes, so no temporary
+;; bytes or vectors escape the arena. Payload bytes are not read as headers.
+(defn- sa-header [path :string offset :i64] :i64
+  (arena-scope
+    (let [b (sa-read path offset 512)]
+      (if (sa-ack? b 512) (layer/ustar-header-info (bytes-slice b 5 517)) -1))))
+(defn- sa-zeros [path :string offset :i64 count :i64] :bool
+  (arena-scope
+    (let [b (sa-read path offset count)]
+      (and (sa-ack? b count)
+           (loop [i 5]
+             (if (= i (+ count 5)) true
+               (if (= (bytes-at b i) 0) (recur (+ i 1)) false)))))))
+(defn- sa-tail-zero? [path :string offset :i64 size :i64] :bool
+  (loop [at offset]
+    (if (= at size) true
+      (let [remaining (- size at) n (if (> remaining 1048576) 1048576 remaining)]
+        (if (sa-zeros path at n) (recur (+ at n)) false)))))
+
+(defn- sa-structure [path :string size :i64] :string
+  (if (or (< size 1024) (not (= (rem size 512) 0))) "fune/tar-length"
+    (loop [offset 0 entries 0]
+      (cond (> (+ offset 1024) size) "fune/tar-terminator"
+            :else (let [length (sa-header path offset)]
+              (cond (= length -2) (if (sa-tail-zero? path (+ offset 512) size) "ok" "fune/tar-terminator")
+                    (< length 0) "fune/tar-header"
+                    (>= entries 50000) "fune/tar-entries"
+                    :else (let [next (+ offset 512 (* 512 (quot (+ length 511) 512)))]
+                      (if (> next size) "fune/tar-truncated" (recur next (+ entries 1))))))))))
+
+(defn verify-archive-and-hold [path :string m :vector-i64 expected :string index :i64] :string
+  (let [digest-result (snapshot/verify-layer-and-hold path m expected index)]
+    (if (not (= digest-result "ok")) digest-result
+      (let [problem (sa-structure path (manifest/layer-size m expected index))]
+        (if (= problem "ok") "ok"
+          (if (snapshot/close-snapshot path) problem "fune/snapshot-close"))))))
+
+;; Distinguish end-of-archive from an invalid header or a failed W read.
+;; Full tail validation is still the responsibility of verify-archive-and-hold.
+(defn snapshot-terminator? [path :string offset :i64 size :i64] :bool
+  (and (>= offset 0) (<= size 268435456) (>= size 1024)
+       (= (rem offset 512) 0) (<= offset (- size 1024))
+       (sa-zeros path offset 1024)))
+
+;; For a caller holding the same verified snapshot: [next-offset data-offset
+;; kind size mode path-byte...], or [-1] on refusal/end. The caller owns the
+;; snapshot lifetime and must not reuse this metadata after closing/reopening.
+;; This does not resolve path conflicts or authorize an extraction operation.
+(defn snapshot-entry [path :string offset :i64 archive-size :i64] :vector-i64
+  (if (or (< offset 0) (< archive-size 0) (> archive-size 268435456) (> offset archive-size)
+          (not (= (rem offset 512) 0)) (> (+ offset 512) archive-size)) [-1]
+    (let [reply (sa-read path offset 512)]
+      (if (not (sa-ack? reply 512)) [-1]
+        (let [entry (layer/ustar-entry-info (bytes-slice reply 5 517)) n (vector-count entry)]
+          (if (< n 4) [-1]
+            (let [size (vector-at entry 1) next (+ offset 512 (* 512 (quot (+ size 511) 512)))]
+              (if (> next archive-size) [-1]
+                (let [out (vector-alloc (+ n 2)) a (vector-assoc! out 0 next)
+                      b (vector-assoc! a 1 (+ offset 512))]
+                  (loop [i 0 v b]
+                    (if (= i n) v (recur (+ i 1) (vector-assoc! v (+ i 2) (vector-at entry i))))))))))))))

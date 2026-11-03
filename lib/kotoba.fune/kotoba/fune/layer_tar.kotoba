@@ -1,0 +1,156 @@
+;; Bounded ustar inspection over byte segments after OCI descriptor verification (JUN-776).
+;; This does not extract entries or establish rootfs or runtime safety.
+(ns fune.layer-tar
+  (:export [layer-archive-problem layer-segments-archive-problem ustar-header-info ustar-entry-info])
+  (:require [fune.image-manifest :as manifest]))
+
+;; Exclusive prefix ends allow a binary search even with empty chunks.
+(defn- tar-index [chunks [:list :bytes]] :vector-i64
+  (let [n (vector-count chunks) pos (vector-alloc (+ n 1))]
+    (loop [i 0 total 0 v pos]
+      (if (= i n) v
+        (let [next (+ total (bytes-count (typed-list-nth [:list :bytes] chunks i)))]
+          (recur (+ i 1) next (vector-assoc! v (+ i 1) next)))))))
+
+(defn- tar-at [chunks [:list :bytes] pos :vector-i64 offset :i64] :i64
+  (let [n (vector-count chunks)
+        i (loop [lo 0 hi n]
+          (if (= lo hi) lo
+            (let [mid (quot (+ lo hi) 2)]
+              (if (<= (vector-at pos (+ mid 1)) offset) (recur (+ mid 1) hi) (recur lo mid)))))
+        chunk (typed-list-nth [:list :bytes] chunks i)]
+    (bytes-at chunk (- offset (vector-at pos i)))))
+
+(defn- tar-zero? [b [:list :bytes] pos :vector-i64 start :i64 n :i64] :bool
+  (loop [i 0] (if (= i n) true (if (= (tar-at b pos (+ start i)) 0) (recur (+ i 1)) false))))
+
+;; Fields may terminate with NUL; all remaining bytes must be NUL. The MVP
+;; deliberately refuses non-ASCII names until filesystem decoding is qualified.
+(defn- tar-field-length [b [:list :bytes] pos :vector-i64 start :i64 n :i64] :i64
+  (loop [i 0 ended false len 0]
+    (if (= i n) len
+      (let [c (tar-at b pos (+ start i))]
+        (cond (= c 0) (recur (+ i 1) true len)
+              ended -1
+              (or (< c 32) (> c 126)) -1
+              :else (recur (+ i 1) false (+ len 1)))))))
+
+;; Positive octal only; leading spaces and trailing spaces/NUL are admitted.
+;; Any later digit after padding and base-256 encodings are refused.
+(defn- tar-octal [b [:list :bytes] pos :vector-i64 start :i64 n :i64] :i64
+  (loop [i 0 state 0 value 0]
+    (if (= i n) (if (or (= state 0) (= state 3)) -1 value)
+      (let [c (tar-at b pos (+ start i))]
+        (cond (and (>= c 48) (<= c 55) (or (= state 0) (= state 1)))
+                (if (> value 33554432) -1 (recur (+ i 1) 1 (+ (* value 8) (- c 48))))
+              (= c 32) (recur (+ i 1) (if (= state 1) 2 state) value)
+              (= c 0) (recur (+ i 1) (if (or (= state 0) (= state 3)) 3 2) value)
+              :else -1)))))
+
+(defn- tar-checksum [b [:list :bytes] pos :vector-i64 off :i64] :i64
+  (loop [i 0 n 0]
+    (if (= i 512) n
+      (recur (+ i 1) (+ n (if (and (>= i 148) (< i 156)) 32 (tar-at b pos (+ off i))))))))
+
+(defn- tar-path [b [:list :bytes] pos :vector-i64 off :i64 name-len :i64 prefix-len :i64] :vector-i64
+  (let [sep (if (> prefix-len 0) 1 0) out (vector-alloc (+ prefix-len (+ sep name-len)))
+        a (loop [i 0 v out] (if (= i prefix-len) v (recur (+ i 1) (vector-assoc! v i (tar-at b pos (+ off (+ 345 i)))))))
+        c (if (= sep 1) (vector-assoc! a prefix-len 47) a)]
+    (loop [i 0 v c] (if (= i name-len) v
+      (recur (+ i 1) (vector-assoc! v (+ prefix-len (+ sep i)) (tar-at b pos (+ off i))))))))
+
+(defn- tar-path-problem [p :vector-i64 dir :bool] :string
+  (let [count (vector-count p)
+        n (if (and dir (> count 0) (= (vector-at p (- count 1)) 47)) (- count 1) count)]
+    (if (or (= n 0) (= (vector-at p 0) 47)) "fune/tar-path"
+      (loop [i 0 start 0]
+        (if (or (= i n) (= (vector-at p i) 47))
+          (let [len (- i start)]
+            (cond (= len 0) "fune/tar-path"
+                  (and (= len 1) (= (vector-at p start) 46)) "fune/tar-path"
+                  (and (= len 2) (= (vector-at p start) 46) (= (vector-at p (+ start 1)) 46)) "fune/tar-path"
+                  (and (>= len 4) (= (vector-at p start) 46) (= (vector-at p (+ start 1)) 119)
+                       (= (vector-at p (+ start 2)) 104) (= (vector-at p (+ start 3)) 46)) "fune/tar-whiteout-unsupported"
+                  (= i n) "ok"
+                  :else (recur (+ i 1) (+ i 1))))
+          (recur (+ i 1) start))))))
+
+(defn- tar-magic? [b [:list :bytes] pos :vector-i64 off :i64] :bool
+  (and (= (tar-at b pos (+ off 257)) 117) (= (tar-at b pos (+ off 258)) 115)
+       (= (tar-at b pos (+ off 259)) 116) (= (tar-at b pos (+ off 260)) 97)
+       (= (tar-at b pos (+ off 261)) 114) (= (tar-at b pos (+ off 262)) 0)
+       (= (tar-at b pos (+ off 263)) 48) (= (tar-at b pos (+ off 264)) 48)))
+
+(defn- tar-header-problem [b [:list :bytes] pos :vector-i64 off :i64] :string
+  (let [size (tar-octal b pos (+ off 124) 12) mode (tar-octal b pos (+ off 100) 8) sum (tar-octal b pos (+ off 148) 8)
+        typ (tar-at b pos (+ off 156)) name-len (tar-field-length b pos off 100)
+        prefix-len (tar-field-length b pos (+ off 345) 155)]
+    (cond (not (tar-magic? b pos off)) "fune/tar-format"
+          (or (< sum 0) (not (= sum (tar-checksum b pos off)))) "fune/tar-checksum"
+          (or (< size 0) (> size 268435456)) "fune/tar-size"
+          (or (< mode 0) (> mode 511)) "fune/tar-mode"
+          (not (or (= typ 0) (= typ 48) (= typ 53))) "fune/tar-type"
+          (and (= typ 53) (not (= size 0))) "fune/tar-size"
+          (not (tar-zero? b pos (+ off 157) 100)) "fune/tar-link"
+          (or (<= name-len 0) (< prefix-len 0)) "fune/tar-path"
+          :else (tar-path-problem (tar-path b pos off name-len prefix-len) (= typ 53)))))
+
+;; Inspect exactly one already-read header. -2 is an all-zero end block, -1
+;; is invalid/unsupported and a nonnegative result is the payload byte size.
+;; This is structural inspection, not an image or extraction admission.
+(defn ustar-header-info [header :bytes] :i64
+  (if (not (= (bytes-count header) 512)) -1
+    (let [chunks (typed-list-conj [:list :bytes] (typed-list-new [:list :bytes]) header)
+          pos (tar-index chunks)]
+      (if (tar-zero? chunks pos 0 512) -2
+        (if (= (tar-header-problem chunks pos 0) "ok")
+          (tar-octal chunks pos 124 12) -1)))))
+
+;; [kind size mode path-byte...] for a valid non-terminator header; kind 0 is
+;; regular and 1 is directory. Directory trailing slash is removed. A single
+;; element [-1] means refusal. This is metadata, not extraction authorization.
+(defn ustar-entry-info [header :bytes] :vector-i64
+  (if (or (not (= (bytes-count header) 512)) (< (ustar-header-info header) 0)) [-1]
+    (let [chunks (typed-list-conj [:list :bytes] (typed-list-new [:list :bytes]) header)
+          pos (tar-index chunks) typ (tar-at chunks pos 156) dir (= typ 53)
+          name-len (tar-field-length chunks pos 0 100) prefix-len (tar-field-length chunks pos 345 155)
+          path (tar-path chunks pos 0 name-len prefix-len) length (vector-count path)
+          n (if (and dir (> length 0) (= (vector-at path (- length 1)) 47)) (- length 1) length)
+          out (vector-alloc (+ n 3)) a (vector-assoc! out 0 (if dir 1 0))
+          b (vector-assoc! a 1 (tar-octal chunks pos 124 12)) c (vector-assoc! b 2 (tar-octal chunks pos 100 8))]
+      (loop [i 0 v c]
+        (if (= i n) v (recur (+ i 1) (vector-assoc! v (+ i 3) (vector-at path i))))))))
+
+(defn- tar-structure-problem [b [:list :bytes] pos :vector-i64] :string
+  (let [n (vector-at pos (vector-count b))]
+    (if (or (< n 1024) (not (= (rem n 512) 0))) "fune/tar-length"
+      (loop [off 0 entries 0]
+        (cond (> (+ off 1024) n) "fune/tar-terminator"
+              (tar-zero? b pos off 512)
+                (if (and (tar-zero? b pos (+ off 512) 512) (tar-zero? b pos (+ off 1024) (- n (+ off 1024)))) "ok" "fune/tar-terminator")
+              (>= entries 50000) "fune/tar-entries"
+              :else (let [p (tar-header-problem b pos off)]
+                (if (not (= p "ok")) p
+                  (let [size (tar-octal b pos (+ off 124) 12)
+                        next (+ off (+ 512 (* 512 (quot (+ size 511) 512))))]
+                    (if (> next n) "fune/tar-truncated" (recur next (+ entries 1)))))))))))
+
+;; Compatibility entry for existing callers. The vector is verified first,
+;; then copied to bounded byte chunks for the shared archive inspector.
+(defn- tar-vector-chunks [layer :vector-i64] [:list :bytes]
+  (let [n (vector-count layer)]
+    (loop [off 0 out (typed-list-new [:list :bytes])]
+      (if (= off n) out
+        (let [left (- n off) size (if (> left 1048576) 1048576 left)
+              v (loop [i 0 chunk (vector-alloc size)]
+                  (if (= i size) chunk (recur (+ i 1) (vector-assoc! chunk i (vector-at layer (+ off i))))))]
+          (recur (+ off size) (typed-list-conj [:list :bytes] out (bytes-from-vector-i64 v))))))))
+
+(defn layer-archive-problem [manifest-bytes :vector-i64 expected :string index :i64 layer :vector-i64] :string
+  (let [p (manifest/layer-bytes-problem manifest-bytes expected index layer)]
+    (if (not (= p "ok")) p
+      (let [chunks (tar-vector-chunks layer)] (tar-structure-problem chunks (tar-index chunks))))))
+
+(defn layer-segments-archive-problem [manifest-bytes :vector-i64 expected :string index :i64 chunks [:list :bytes]] :string
+  (let [p (manifest/layer-segments-problem manifest-bytes expected index chunks)]
+    (if (not (= p "ok")) p (tar-structure-problem chunks (tar-index chunks)))))
