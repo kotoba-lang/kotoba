@@ -465,3 +465,13 @@ all 179 AOT inputs afresh and matched the native reference, and the macOS ARM64
 snapshot comparison passed. This remains a bounded experimental subset, not
 full program admission, independent artifact admission, a public VM or
 production host. Calls and broader resource/failure qualification remain open.
+
+The trusted-tree reference now has a provisional direct-call control frame.
+Arguments are staged before entering the callee; caller lexical slots are saved,
+cleared for the callee, and restored on return. A recur search stops at a call
+boundary. The native fixed fixture checks a direct call, caller-scope restoration,
+argument fault ordering and refusal to recur into a caller's loop; a mutant that
+skips restoration is rejected. These tests do not establish multi-method CBOR
+admission: the bridge still rejects parameters and calls, and no same-program
+AOT comparison for calls has been performed. Whole-program call validation,
+acyclicity, nested-call coverage, resource limits and host qualification remain.
