@@ -55,3 +55,14 @@ Measured in the source (2026-11-03):
   `auto-install` can be called qualified.
 - Hosted session and native desktop are separate surfaces; hosted parity with the native frame stays unqualified.
 - Native wi-fi has no driver in the tree (only RTL8168 wired); the wifi app is status-only until one exists.
+
+## Amendment 2026-11-04 — UI is authored once, in kotoba html/css (owner intent, JUN-805)
+
+Itonami OS follows the browser's render, so an Itonami dapp's UI is a `kotoba-lang/html` hiccup document with a
+`kotoba-lang/css` sheet (`distributions/awai/dapps/ui/ui.cljk`), not hand-written per-surface code. The hosted session
+emits that document as HTML (JUN-809, done: `generated/` spliced by `scripts/dapp-ui.py`), and the native desktop is to
+render the same document through the shared browser render (`browser`/`cssom`/`dom-gpu`; JUN-810), which replaces the
+`browser-frame2` mirror for dapp windows. Dynamic values and operations are declarative (`data-bind`, `data-action`);
+the host supplies them. Native rendering is blocked on JUN-93/JUN-134..137/JUN-353 (cssom typed calc AST, regex in
+layout, f64/document ABI, Browser graph link); until then the frame ABI v3 (JUN-811) is an interim, not the target.
+The hand-written JS DOM builder from PR #1187 is removed.
