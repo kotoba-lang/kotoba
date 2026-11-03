@@ -175,3 +175,41 @@ that a host independently binds the stack to an admitted artifact. The test
 does not exercise live process transport, identity checks, signed receipts,
 host integration, Linux ARM64, or whole-VM execution. The generated program
 returns the verdict as an i64: an observer must check 42, not just process exit.
+
+## Experimental live FS2 boundary
+
+On Linux x86-64, the current main compiler image (`f6c887b2…`) checked the
+source-locked FS2 and CLI test project, but refused compilation with `E7101`;
+the same refusal occurred for a CLI-only project. This is the existing
+source-locked x86 capability limitation, not a passing production route.
+
+For an isolated experiment, the Amu main `7a755126bbd8` 61-module full
+manifest was staged with only `seed/98-x86_64-project.kotoba` replaced by the
+existing `seed/experimental/98-x86_64-project-fs-cli.kotoba` candidate from
+AWAI-97. The candidate unity SHA-256 was
+`5553eb4c4e5130b75896ce79990b826854f0ce33d3203e08fb937d4e7169f9fa`.
+Native x86 builds F1, F2 and F3 all had SHA-256
+`c4cd294bf79339a38cd3a02d51997aa185043676888f9550727d5910d72e19ec`.
+This fixed point does not promote the experimental compiler or prove its
+complete product gates.
+
+Using F3, the source-locked `pure_i64_receipt_fs_gate.kotoba` and unchanged
+validator were compiled to KX64 and run under the native KX64 runner. A fresh
+execution of the Amu receipt/v2 `const` image (image SHA-256
+`f6aed1a910b690a4e1fc3f90d95ad705164c62292a67fcd05e8e894e35a4620d`)
+produced 64 bytes with SHA-256
+`ad805790638ff1c0f9aabf90862e8e7d402caf75399bcbb40cb004ce26e5713f`.
+The test consumer read that file through the explicit FS2 app-data capability
+and returned 1. It returned 0 for a changed magic byte, a truncated receipt,
+and an outside-scope path. Missing and symlink paths trapped/refused; denying
+the FS or CLI capability refused with exit 120 and did not return success.
+Changing the imported validator's magic comparison in a separately compiled
+negative control made the real receipt return 0. The linked candidate
+container SHA-256 was
+`029023a4998d51f1be01babedf93058abb06c956f9fe3d810c2690ff3237f9da`.
+
+The test fixture binds its known expected exit, budget and stack directly;
+it is not a process supervisor and does not independently admit artifacts.
+The separate staging process launched the producer and wrote its bytes to a
+private test directory. This does not establish a production host, signed
+receipt, same-process transport, host lifecycle or entire VM conformance.
