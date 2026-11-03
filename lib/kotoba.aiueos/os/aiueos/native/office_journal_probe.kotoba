@@ -1,0 +1,130 @@
+(ns aiueos.native.office-journal-probe
+  (:export [load save])
+  (:require [aiueos.native.office-block-probe :as disk]
+            [aiueos.sha256 :as sha]))
+
+;; Isolated test-disk journal, not an OS storage capability. Caller must own
+;; all buffers, serialize writers, and discard an output after any error.
+;; Three apps each have two 129-sector slots. A zero header is vacant; any
+;; other invalid header or payload is corruption, never silent rollback.
+;; Data are flushed and read back by disk/write before the header commits.
+;; A failed save can be indeterminate; callers must rescan before retrying.
+(defn- disjoint [a :i64 an :i64 b :i64 bn :i64] :bool
+  (or (and (<= a b) (>= (- b a) an))
+      (and (<= b a) (>= (- a b) bn))))
+(defn- buffers [data :i64 page :i64 scratch :i64 work :i64] :bool
+  (and (> data 0) (> page 0) (> scratch 0) (> work 0)
+       (disjoint data 65536 page 512) (disjoint data 65536 scratch 512)
+       (disjoint data 65536 work 4096) (disjoint page 512 scratch 512)
+       (disjoint page 512 work 4096) (disjoint scratch 512 work 4096)))
+(defn- zero [p :i64 at :i64 end :i64] :i64
+  (if (= at end) 1
+    (let [w (kernel-store-u8-4k p 512 at 0)] (zero p (+ at 1) end))))
+(defn- zero? [p :i64 at :i64 end :i64] :bool
+  (if (= at end) true
+    (and (= (kernel-load-u8-4k p 512 at) 0) (zero? p (+ at 1) end))))
+(defn- same32 [a :i64 b :i64 at :i64] :bool
+  (if (= at 32) true
+    (and (= (kernel-load-u8-4k a 32 at) (kernel-load-u8-4k b 32 at))
+         (same32 a b (+ at 1)))))
+(defn- copy32 [a :i64 b :i64 at :i64] :i64
+  (if (= at 32) 1
+    (let [v (kernel-load-u8-4k a 32 at) w (kernel-store-u8-4k b 32 at v)]
+      (copy32 a b (+ at 1)))))
+(defn- slot [app :i64 n :i64] :i64 (+ 16 (* (- app 1) 260) (* n 130)))
+(defn- to-page [data :i64 page :i64 offset :i64 length :i64 i :i64] :i64
+  (if (= i 512) 1
+    (let [v (if (< (+ offset i) length) (kernel-load-u8-64k data 65536 (+ offset i)) 0)
+          w (kernel-store-u8-4k page 512 i v)]
+      (to-page data page offset length (+ i 1)))))
+(defn- from-page [data :i64 page :i64 offset :i64 length :i64 i :i64] :i64
+  (if (or (= i 512) (= (+ offset i) length)) 1
+    (let [v (kernel-load-u8-4k page 512 i) w (kernel-store-u8-64k data 65536 (+ offset i) v)]
+      (from-page data page offset length (+ i 1)))))
+(defn- write-data [data :i64 page :i64 scratch :i64 base :i64 length :i64 i :i64] :i64
+  (if (>= (* i 512) length) 1
+    (if (and (= (to-page data page (* i 512) length 0) 1)
+             (= (disk/write page scratch (+ base 1 i)) 1))
+      (write-data data page scratch base length (+ i 1)) 0)))
+(defn- read-data [data :i64 page :i64 scratch :i64 base :i64 length :i64 i :i64] :i64
+  (if (>= (* i 512) length) 1
+    (if (and (= (disk/read page scratch (+ base 1 i)) 1)
+             (= (from-page data page (* i 512) length 0) 1))
+      (read-data data page scratch base length (+ i 1)) 0)))
+;; -1: I/O, malformed or corrupt; 0: vacant; positive: validated revision.
+;; work is one 4 KiB page: digest at 0, retained payload digest at 32,
+;; hash workspace at 512. page and scratch are independent 512-byte windows.
+(defn- read-slot [app :i64 n :i64 data :i64 page :i64 scratch :i64 work :i64] :i64
+  (let [base (slot app n) got (disk/read page scratch base)]
+    (if (not= got 1) -1
+      (if (zero? page 0 512) 0
+        (let [magic (kernel-load-u32-4k page 512 0)
+              version (kernel-load-u32-4k page 512 4)
+              owner (kernel-load-u32-4k page 512 8)
+              reserved (kernel-load-u32-4k page 512 12)
+              rev (kernel-load-u64-4k page 512 16)
+              length (kernel-load-u64-4k page 512 24)
+              src (kernel-subregion page 512 0 64)
+              stored (kernel-subregion page 512 64 32)
+              digest (kernel-subregion work 4096 0 32)
+              retained (kernel-subregion work 4096 32 32)
+              workspace (kernel-subregion work 4096 512 352)]
+          (if (or (not= magic 0x314a464f) (not= version 1) (not= owner app)
+                  (not= reserved 0) (< rev 1) (> rev 2147483647)
+                  (not= (mod rev 2) (if (= n 0) 1 0))
+                  (< length 1) (> length 65536) (not (zero? page 96 512))) -1
+            (if (not= (sha/aiueos-sha256 src 64 digest workspace 352) 1) -1
+              (if (not (same32 stored digest 0)) -1
+                (let [payload (kernel-subregion page 512 32 32)
+                      keep (copy32 payload retained 0)
+                      read (read-data data page scratch base length 0)]
+                  (if (not= read 1) -1
+                    (if (not= (sha/aiueos-sha256-64k data length digest 32 workspace 352) 1) -1
+                      (if (same32 retained digest 0)
+                        (let [written (kernel-store-u64-4k work 4096 96 length)] rev)
+                        -1))))))))))))
+(defn- scan [app :i64 data :i64 page :i64 scratch :i64 work :i64] :i64
+  (let [a (read-slot app 0 data page scratch work)
+        b (read-slot app 1 data page scratch work)]
+    (cond (or (< a 0) (< b 0)) -1
+          (and (> a 0) (> b 0) (not (or (= (+ a 1) b) (= (+ b 1) a)))) -1
+          (> a b) a :else b)))
+;; load returns revision, 0 for empty, -1 for any corruption or failure.
+;; On success only, work[96..103] contains the validated payload length.
+(defn load [app :i64 data :i64 page :i64 scratch :i64 work :i64] :i64
+  (if (or (< app 1) (> app 3) (not (buffers data page scratch work))) -1
+    (let [r (scan app data page scratch work)]
+      (if (<= r 0) r
+        (read-slot app (if (= (mod r 2) 1) 0 1) data page scratch work)))))
+;; save returns 1 on verified commit, 0 on refusal or indeterminate I/O.
+;; Input data is in the first buffer and cannot also be scan scratch. The
+;; caller supplies an independent 64 KiB read buffer for the current slots.
+(defn save [app :i64 data :i64 length :i64 expected :i64 readbuf :i64 page :i64 scratch :i64 work :i64] :i64
+  (if (or (< app 1) (> app 3) (< length 1) (> length 65536)
+          (< expected 0) (>= expected 2147483647)
+          (not (buffers data page scratch work)) (not (buffers readbuf page scratch work))
+          (not (disjoint data 65536 readbuf 65536))) 0
+    (let [current (scan app readbuf page scratch work)]
+      (if (not= current expected) 0
+        (let [next (+ expected 1) base (slot app (if (= (mod next 2) 1) 0 1))
+              clear (zero page 0 512)
+              invalidated (disk/write page scratch base)]
+          (if (not= invalidated 1) 0
+            (if (not= (write-data data page scratch base length 0) 1) 0
+              (let [digest (kernel-subregion work 4096 0 32)
+                    workspace (kernel-subregion work 4096 512 352)
+                    hashed (sha/aiueos-sha256-64k data length digest 32 workspace 352)
+                    blank (zero page 0 512)
+                    a (kernel-store-u32-4k page 512 0 0x314a464f)
+                    b (kernel-store-u32-4k page 512 4 1)
+                    c (kernel-store-u32-4k page 512 8 app)
+                    d (kernel-store-u64-4k page 512 16 next)
+                    e (kernel-store-u64-4k page 512 24 length)
+                    dst (kernel-subregion page 512 32 32)
+                    cp (copy32 digest dst 0)
+                    header (kernel-subregion page 512 0 64)
+                    hd (kernel-subregion page 512 64 32)
+                    hash (sha/aiueos-sha256 header 64 digest workspace 352)
+                    cp2 (copy32 digest hd 0)]
+                (if (or (not= hashed 1) (not= hash 1) (not= (disk/write page scratch base) 1)) 0
+                  (if (= (read-slot app (if (= (mod next 2) 1) 0 1) readbuf page scratch work) next) 1 0))))))))))
