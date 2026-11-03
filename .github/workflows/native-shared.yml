@@ -20,76 +20,115 @@ concurrency:
   group: native-shared-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  native-shared:
-    name: Native text (${{ matrix.target }}${{ matrix.lane && format(' / {0}', matrix.lane) || '' }})
-    runs-on: ${{ matrix.runner }}
-    # The x86 broker lane has taken 20-60+ minutes depending on the runner (it was cut
-    # at 60 while on its last control, kotoba#1020); 90 leaves room on a slow runner.
-    timeout-minutes: 90
+  # CI latency sharding (JUN-759). The old single `native-shared` matrix job ran every gate of a target in one
+  # sequence (arm64 ~18 min, x86 base ~16 min). Each target's gates are now independent shard jobs that run in
+  # parallel on their own runners, with the same commands, vectors and mutants as before. The required status
+  # contexts keep their names: `Native text (arm64)` and `Native text (x86_64 / base)` are now cheap gate jobs
+  # (below) that fail unless every shard of their target succeeded; `Native text (x86_64 / authority-f3)` is a
+  # shard job that keeps its original name.
+  #
+  # Pass-marker cache (input-hash skip). Each shard hashes the git tree ids of everything it reads (this workflow
+  # file, scripts/, lib/kotoba.hata/scripts and the lib/ directories listed in matrix.paths; the compilers and
+  # sibling checkouts are pinned by SHA in this file, so the workflow file is part of the hash) and looks up a
+  # marker in actions/cache keyed by shard, runner arch, runner image and that hash. A hit means this exact input
+  # already passed the shard, so the heavy steps are skipped and the job still reports success. A marker is saved
+  # only after every step of the shard succeeded. Push to main, the nightly schedule and workflow_dispatch never
+  # restore a marker: they run the full suite (and refresh the marker). Caches are scoped by ref, so a pull request
+  # or merge queue run can only read markers saved by itself or by the default branch.
+  # The paths below are what the shard's scripts read: the gates compile explicit file lists (scripts/check-pq-native.py
+  # MODULE_GATES / GATES), the vectors and ACVP files sit inside their lib directories, and the DOM batches compile
+  # only lib/kotoba.domGpu/src and test/native. A lib directory missing from a path list is a blind spot of the skip,
+  # so a new dependency of a gate must be added here.
+  native-arm64:
+    name: Native text (arm64 / ${{ matrix.lane }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      # The x86_64 gate is sharded into independent lanes that run in parallel; each lane re-runs the shared
-      # prelude (checkout, compiler verification, project runner). CI tiers (JUN-629, owner decision 2026-10-30):
-      # a pull request runs arm64, x86 base and x86 authority-f3 (a real x86 hata case on the candidate compiler),
-      # and the hata-macos job below runs the full broker and history sections natively. The x86 store, broker and
-      # history lanes take 9-60 minutes because x86 user code is 70-150x slower than arm64 for the same gate
-      # (x86 codegen, not the scenarios), so they run on every push to main and nightly instead, unchanged.
-      # The x86 pq-unity lane (ML-KEM-768, ML-DSA-65 and the print-free SHA-3 gate, with their mutants, AWAI-117) is in that tier too.
       matrix:
-        include: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"runner":"ubuntu-24.04-arm","target":"arm64"},{"runner":"ubuntu-latest","target":"x86_64","lane":"base"},{"runner":"ubuntu-latest","target":"x86_64","lane":"authority-f3"}]' || '[{"runner":"ubuntu-24.04-arm","target":"arm64"},{"runner":"ubuntu-latest","target":"x86_64","lane":"base"},{"runner":"ubuntu-latest","target":"x86_64","lane":"authority-f3"},{"runner":"ubuntu-latest","target":"x86_64","lane":"store"},{"runner":"ubuntu-latest","target":"x86_64","lane":"broker"},{"runner":"ubuntu-latest","target":"x86_64","lane":"history"},{"runner":"ubuntu-latest","target":"x86_64","lane":"pq-unity"}]') }}
+        include:
+          - lane: pq-kat
+            paths: lib/gov.nist.sha3 lib/gov.nist.mlKem lib/gov.nist.mlDsa lib/gov.nist.aes lib/gov.nist.sha2 lib/org.ietf.x25519 lib/org.ietf.chacha20Poly1305 lib/org.ietf.ed25519 lib/org.ietf.xwing lib/kotoba.pqh lib/kotoba.noise lib/kotoba.hata
+          - lane: broker
+            paths: lib/gov.nist.sha3 lib/gov.nist.mlKem lib/gov.nist.mlDsa lib/gov.nist.aes lib/gov.nist.sha2 lib/org.ietf.x25519 lib/org.ietf.chacha20Poly1305 lib/org.ietf.ed25519 lib/org.ietf.xwing lib/kotoba.pqh lib/kotoba.noise lib/kotoba.hata
+          - lane: wycheproof
+            paths: lib/org.ietf.x25519 lib/org.ietf.chacha20Poly1305
+          - lane: dom
+            paths: lib/gov.nist.sha3 lib/gov.nist.mlKem lib/gov.nist.mlDsa lib/gov.nist.sha2 lib/org.ietf.x25519 lib/org.ietf.chacha20Poly1305 lib/kotoba.hata lib/kotoba.domGpu lib/kotoba.text
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Audit AIUEOS library source pins (source preflight only)
         run: python3 scripts/check-library-local-changes-pins.py --root lib/kotoba.aiueos
+      - name: Fingerprint the inputs of this shard
+        id: key
+        env:
+          SHARD: arm64-${{ matrix.lane }}
+          INPUT_PATHS: ${{ matrix.paths }}
+          ARCH: ${{ runner.arch }}
+        run: |
+          set -eu
+          {
+            for p in .github/workflows/native-shared.yml scripts lib/kotoba.hata/scripts $INPUT_PATHS; do
+              t=$(git rev-parse "HEAD:$p")
+              printf '%s %s\n' "$p" "$t"
+            done
+          } > "$RUNNER_TEMP/inputs.txt"
+          cat "$RUNNER_TEMP/inputs.txt"
+          echo "key=native-pass-v1-$SHARD-$ARCH-${ImageVersion:-noimage}-$(sha256sum "$RUNNER_TEMP/inputs.txt" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - name: Look up the pass marker (pull request and merge queue only)
+        id: marker
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
+      - name: Pass marker found, the heavy steps of this shard are skipped
+        if: steps.marker.outputs.cache-hit == 'true'
+        run: echo "this exact input already passed shard arm64-${{ matrix.lane }}; marker $(cat "$RUNNER_TEMP/pass-marker/passed")"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane != 'broker'
         with:
           repository: kotoba-lang/amu
           ref: 6a77cd91182b858fff435c679e8ef71f514fc2ae
           path: _native/amu
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'dom'
         with:
           repository: kotoba-lang/browser
           ref: 6e3ca4e768d886060abe7bff70da07cf36f5dabc
           path: _shared/browser
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'dom'
         with:
           repository: kotoba-lang/dom-gpu
           ref: c0be10ca6b0089e5fbe061eb76a6c23e61f61b22
           path: _shared/dom
           persist-credentials: false
       - name: Verify the exact native compiler image
-        env:
-          TARGET: ${{ matrix.target }}
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane != 'broker'
         run: |
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json
           from pathlib import Path
           root = Path('_native/amu')
-          arm = os.environ['TARGET'] == 'arm64'
-          image = root / ('seed/bootstrap/aarch64-linux-static-root.elf' if arm else 'bin/amu')
-          meta = json.loads((root / ('seed/bootstrap/aarch64-linux-static-root.json' if arm else 'native-product.json')).read_text())
+          image = root / 'seed/bootstrap/aarch64-linux-static-root.elf'
+          meta = json.loads((root / 'seed/bootstrap/aarch64-linux-static-root.json').read_text())
           assert hashlib.sha256(image.read_bytes()).hexdigest() == meta['image']['sha256']
           PY
-      - name: Execute native x86 project and refusal controls
-        if: matrix.target == 'x86_64'
-        run: python3 _native/amu/scripts/seed/check-x86-project-native.py --compiler "$PWD/_native/amu/bin/amu" --output "$RUNNER_TEMP/project-native"
       - name: Execute native DOM batches on ARM
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'dom'
         run: python3 scripts/check-dom-batches-native.py --root "$PWD/lib/kotoba.domGpu" --compiler "$PWD/_native/amu/seed/bootstrap/aarch64-linux-static-root.elf" --target arm64 --runner-source "$PWD/_native/amu/seed/x86_64-kx64-runner.kotoba" --output "$RUNNER_TEMP/dom-batches"
-      - name: Execute native DOM batches on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'base'
-        run: python3 scripts/check-dom-batches-native.py --root "$PWD/lib/kotoba.domGpu" --compiler "$PWD/_native/amu/bin/amu" --target x86_64 --runner "$RUNNER_TEMP/project-native/runner.elf" --output "$RUNNER_TEMP/dom-batches"
       - name: Execute current owner source on ARM
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'dom'
         run: python3 "$PWD/_shared/browser/scripts/check-shared-native.py" --compiler "$PWD/_native/amu/seed/bootstrap/aarch64-linux-static-root.elf" --target arm64 --runner-source "$PWD/_native/amu/seed/x86_64-kx64-runner.kotoba" --browser "$PWD/_shared/browser" --dom "$PWD/_shared/dom" --text "$PWD/lib/kotoba.text" --case text --output "$RUNNER_TEMP/owner-native"
       - name: Execute post-quantum and secure-channel known answers and mutants on ARM
         # x86 runs the module gates on PRs (base lane) and ML-KEM / ML-DSA / print-free SHA-3 on main and nightly (pq-unity lane).
         # This lane runs the printing SHA-3 gate (sha3) as committed and compares its 126 oracle lines with Python hashlib.
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'pq-kat'
         run: |
           for lib in gov.nist.sha3 gov.nist.mlKem gov.nist.mlDsa org.ietf.x25519 org.ietf.chacha20Poly1305 kotoba.pqh gov.nist.aes org.ietf.xwing kotoba.noise; do
             python3 scripts/check-library-local-changes-pins.py --root "lib/$lib"
@@ -101,7 +140,7 @@ jobs:
             --runner-source "$PWD/_native/amu/seed/x86_64-kx64-runner.kotoba" \
             --output "$RUNNER_TEMP/pq-native"
       - name: Execute the Wycheproof X25519 and (X)ChaCha20-Poly1305 vectors and mutants on ARM (AWAI-117)
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'wycheproof'
         run: |
           compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/seed/bootstrap/aarch64-linux-static-root.json"))["image"]["sha256"])')
           python3 scripts/check-wycheproof-native.py \
@@ -110,7 +149,7 @@ jobs:
             --runner-source "$PWD/_native/amu/seed/x86_64-kx64-runner.kotoba" \
             --output "$RUNNER_TEMP/wycheproof-native"
       - name: Execute every committed ACVP ML-KEM-768 test and mutants on ARM (AWAI-117)
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'dom'
         run: |
           compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/seed/bootstrap/aarch64-linux-static-root.json"))["image"]["sha256"])')
           python3 scripts/check-acvp-mlkem-native.py \
@@ -118,54 +157,173 @@ jobs:
             --compiler-sha256 "$compiler_sha" \
             --runner-source "$PWD/_native/amu/seed/x86_64-kx64-runner.kotoba" \
             --output "$RUNNER_TEMP/acvp-mlkem-native"
-      - name: Execute the secure-channel module gates and mutants on x86 (AWAI-117)
-        # The module gates only. The unity gates are slow on x86 and run in the pq-unity lane;
-        # see scripts/check-pq-native.py for why x86 runs the print-free SHA-3 gate (sha3-x86).
-        if: matrix.target == 'x86_64' && matrix.lane == 'base'
-        run: |
-          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
-          python3 scripts/check-pq-native.py --module-gates-only \
-            --compiler "$PWD/_native/amu/bin/amu" --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/project-native/runner.elf" \
-            --output "$RUNNER_TEMP/pq-native-x86"
-      - name: Execute ML-KEM-768, ML-DSA-65 and print-free SHA-3 known answers and mutants on x86 (AWAI-117)
-        # KX64 admits the gates' hex string vectors. The SHA-3 gate prints through :io/write, which the
-        # locked x86 project adapter refuses (E7101 OP-CAP), so x86 runs sha3-x86: the same gate with its
-        # print rewritten away at build time, answering by its result value only, with both SHA-3 mutants.
-        if: matrix.target == 'x86_64' && matrix.lane == 'pq-unity'
-        run: |
-          for lib in gov.nist.sha3 gov.nist.mlKem gov.nist.mlDsa; do
-            python3 scripts/check-library-local-changes-pins.py --root "lib/$lib"
-          done
-          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
-          python3 scripts/check-pq-native.py --gates mlkem,mldsa,sha3-x86 \
-            --compiler "$PWD/_native/amu/bin/amu" --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/project-native/runner.elf" \
-            --output "$RUNNER_TEMP/pq-native-x86"
       # The sessions run on a newer amu than the rest of this workflow: the broker driver
       # built by the 6a77cd9 compiler traps (SIGILL) in prepare on aarch64-linux, and
       # 65359a0's compiler (image 8ebb44c5) runs every mode. Drop this checkout once the
       # _native/amu pin moves past it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'broker'
         with:
           repository: kotoba-lang/amu
           ref: 65359a092b6c552b5adf436a0c359bc91d1676d3
           path: _native/amu-session
           persist-credentials: false
       - name: Execute broker votes over authenticated native sessions on ARM
-        if: matrix.target == 'arm64'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'broker'
         run: |
           python3 lib/kotoba.hata/scripts/check-session-native.py \
             --compiler "$PWD/_native/amu-session/seed/bootstrap/aarch64-linux-static-root.elf" \
             --compiler-sha256 8ebb44c5d6babf3a02ef7d1785291b9741f1f7c410a9ee8dce9185c95d6bd34d \
             --runner-source "$PWD/_native/amu-session/seed/x86_64-kx64-runner.kotoba" \
             --output "$RUNNER_TEMP/broker-session-native"
+      - name: Write the pass marker for this exact input (after every step above succeeded)
+        if: success() && steps.marker.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pass-marker"
+          printf '%s %s\n' "${{ steps.key.outputs.key }}" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pass-marker/passed"
+      - name: Save the pass marker
+        if: success() && steps.marker.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: owner-native-arm64-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/owner-native/*.json
+            ${{ runner.temp }}/owner-native/*.ksl
+            ${{ runner.temp }}/owner-native/*.stdout
+            ${{ runner.temp }}/owner-native/*.stderr
+            ${{ runner.temp }}/dom-batches/*.json
+            ${{ runner.temp }}/dom-batches/*.ksl
+            ${{ runner.temp }}/dom-batches/*.stdout
+            ${{ runner.temp }}/dom-batches/*.stderr
+            ${{ runner.temp }}/*/evidence.json
+            ${{ runner.temp }}/pq-native/*.json
+            ${{ runner.temp }}/pq-native/*.ksl
+            ${{ runner.temp }}/pq-native/*.stdout
+            ${{ runner.temp }}/pq-native/*.stderr
+            ${{ runner.temp }}/broker-session-native/*.json
+            ${{ runner.temp }}/broker-session-native/*.ksl
+            ${{ runner.temp }}/broker-session-native/*.stdout
+            ${{ runner.temp }}/broker-session-native/*.stderr
+          if-no-files-found: ignore
+  native-arm64-gate:
+    # The required context `Native text (arm64)`: succeeds only when every arm64 shard succeeded (a failed,
+    # cancelled or skipped shard fails it).
+    name: Native text (arm64)
+    if: ${{ always() }}
+    needs: [native-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every arm64 shard
+        env:
+          SHARDS: ${{ needs.native-arm64.result }}
+        run: |
+          echo "arm64 shards: $SHARDS"
+          test "$SHARDS" = success
+  native-x86-base:
+    name: Native text (x86_64 / ${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: base-secure-channel
+            paths: lib/gov.nist.sha3 lib/gov.nist.mlKem lib/gov.nist.mlDsa lib/gov.nist.aes lib/gov.nist.sha2 lib/org.ietf.x25519 lib/org.ietf.chacha20Poly1305 lib/org.ietf.ed25519 lib/org.ietf.xwing lib/kotoba.pqh lib/kotoba.noise lib/kotoba.hata
+          - lane: base-dom
+            paths: lib/kotoba.domGpu
+          - lane: base-owner-c0
+            paths: lib/gov.nist.sha2 lib/org.ietf.ed25519 lib/kotoba.hata lib/kotoba.text
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Audit AIUEOS library source pins (source preflight only)
+        run: python3 scripts/check-library-local-changes-pins.py --root lib/kotoba.aiueos
+      - name: Fingerprint the inputs of this shard
+        id: key
+        env:
+          SHARD: x86_64-${{ matrix.lane }}
+          INPUT_PATHS: ${{ matrix.paths }}
+          ARCH: ${{ runner.arch }}
+        run: |
+          set -eu
+          {
+            for p in .github/workflows/native-shared.yml scripts lib/kotoba.hata/scripts $INPUT_PATHS; do
+              t=$(git rev-parse "HEAD:$p")
+              printf '%s %s\n' "$p" "$t"
+            done
+          } > "$RUNNER_TEMP/inputs.txt"
+          cat "$RUNNER_TEMP/inputs.txt"
+          echo "key=native-pass-v1-$SHARD-$ARCH-${ImageVersion:-noimage}-$(sha256sum "$RUNNER_TEMP/inputs.txt" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - name: Look up the pass marker (pull request and merge queue only)
+        id: marker
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
+      - name: Pass marker found, the heavy steps of this shard are skipped
+        if: steps.marker.outputs.cache-hit == 'true'
+        run: echo "this exact input already passed shard x86_64-${{ matrix.lane }}; marker $(cat "$RUNNER_TEMP/pass-marker/passed")"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true'
+        with:
+          repository: kotoba-lang/amu
+          ref: 6a77cd91182b858fff435c679e8ef71f514fc2ae
+          path: _native/amu
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-owner-c0'
+        with:
+          repository: kotoba-lang/browser
+          ref: 6e3ca4e768d886060abe7bff70da07cf36f5dabc
+          path: _shared/browser
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-owner-c0'
+        with:
+          repository: kotoba-lang/dom-gpu
+          ref: c0be10ca6b0089e5fbe061eb76a6c23e61f61b22
+          path: _shared/dom
+          persist-credentials: false
+      - name: Verify the exact native compiler image
+        if: steps.marker.outputs.cache-hit != 'true'
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('_native/amu')
+          image = root / 'bin/amu'
+          meta = json.loads((root / 'native-product.json').read_text())
+          assert hashlib.sha256(image.read_bytes()).hexdigest() == meta['image']['sha256']
+          PY
+      - name: Execute native x86 project and refusal controls
+        if: steps.marker.outputs.cache-hit != 'true'
+        run: python3 _native/amu/scripts/seed/check-x86-project-native.py --compiler "$PWD/_native/amu/bin/amu" --output "$RUNNER_TEMP/project-native"
+      - name: Execute native DOM batches on x86
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-dom'
+        run: python3 scripts/check-dom-batches-native.py --root "$PWD/lib/kotoba.domGpu" --compiler "$PWD/_native/amu/bin/amu" --target x86_64 --runner "$RUNNER_TEMP/project-native/runner.elf" --output "$RUNNER_TEMP/dom-batches"
+      - name: Execute the secure-channel module gates and mutants on x86 (AWAI-117)
+        # The module gates only. The unity gates are slow on x86 and run in the pq-unity lane;
+        # see scripts/check-pq-native.py for why x86 runs the print-free SHA-3 gate (sha3-x86).
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-secure-channel'
+        run: |
+          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
+          python3 scripts/check-pq-native.py --module-gates-only \
+            --compiler "$PWD/_native/amu/bin/amu" --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/project-native/runner.elf" \
+            --output "$RUNNER_TEMP/pq-native-x86"
       - name: Execute current owner source on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'base'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-owner-c0'
         run: python3 "$PWD/_shared/browser/scripts/check-shared-native.py" --compiler "$PWD/_native/amu/bin/amu" --target x86_64 --runner "$RUNNER_TEMP/project-native/runner.elf" --browser "$PWD/_shared/browser" --dom "$PWD/_shared/dom" --text "$PWD/lib/kotoba.text" --case text --output "$RUNNER_TEMP/owner-native"
       - name: Execute accountable admission and budget-bypass refusal on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'base'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-owner-c0'
         run: |
           compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
           python3 lib/kotoba.hata/scripts/check-admission-native.py \
@@ -174,7 +332,7 @@ jobs:
             --runner "$RUNNER_TEMP/project-native/runner.elf" \
             --output "$RUNNER_TEMP/admission-native"
       - name: Execute C0 signatures, responsibility credentials and signature-bypass refusal on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'base'
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'base-owner-c0'
         run: |
           compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
           python3 lib/kotoba.hata/scripts/check-authority-native.py \
@@ -183,67 +341,21 @@ jobs:
             --runner "$RUNNER_TEMP/project-native/runner.elf" \
             --output "$RUNNER_TEMP/authority-native" \
             --case authority
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        if: matrix.target == 'x86_64' && matrix.lane != 'base' && matrix.lane != 'pq-unity'
+      - name: Write the pass marker for this exact input (after every step above succeeded)
+        if: success() && steps.marker.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pass-marker"
+          printf '%s %s\n' "${{ steps.key.outputs.key }}" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pass-marker/passed"
+      - name: Save the pass marker
+        if: success() && steps.marker.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
-          repository: kotoba-lang/amu
-          ref: ${{ github.event_name == 'workflow_dispatch' && matrix.lane == 'store' && inputs.hata_store_amu_ref != '' && inputs.hata_store_amu_ref || 'a530b2262f0d4d138081d9f48bd3b59e0eb51e74' }}
-          path: _native/awai-project-candidate
-          persist-credentials: false
-      - name: Derive and qualify the explicit experimental FS35/CLI38 compiler
-        if: matrix.target == 'x86_64' && matrix.lane != 'base' && matrix.lane != 'pq-unity'
-        env:
-          AMU_CANDIDATE_COMPILER: ${{ github.event_name == 'workflow_dispatch' && matrix.lane == 'store' && inputs.hata_store_amu_ref != '' && 'bin/amu-linux-x86_64' || 'bin/amu' }}
-        run: |
-          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/awai-project-candidate/native-product.json"))["image"]["sha256"])')
-          python3 _native/awai-project-candidate/scripts/seed/check-x86-project-fs-native.py \
-            --compiler "$PWD/_native/awai-project-candidate/$AMU_CANDIDATE_COMPILER" --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/project-native/runner.elf" \
-            --output "$RUNNER_TEMP/awai-project-candidate" --derive
-      - name: Execute signed durable admission authority case on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'authority-f3'
-        run: |
-          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
-          python3 lib/kotoba.hata/scripts/check-authority-native.py \
-            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
-            --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
-            --output "$RUNNER_TEMP/authority-store-native" \
-            --case authority
-      - name: Execute durable store, races and process-crash boundaries on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'store'
-        run: |
-          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
-          python3 lib/kotoba.hata/scripts/check-authority-native.py \
-            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
-            --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
-            --output "$RUNNER_TEMP/authority-store-native" \
-            --case store
-      - name: Execute fixed-roster quorum and managed-object broker on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'broker'
-        run: |
-          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
-          python3 lib/kotoba.hata/scripts/check-broker-native.py \
-            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
-            --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
-            --output "$RUNNER_TEMP/broker-quorum-native" \
-            --section broker
-      - name: Execute quorum audit-history and fresh-read verdicts on x86
-        if: matrix.target == 'x86_64' && matrix.lane == 'history'
-        run: |
-          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
-          python3 lib/kotoba.hata/scripts/check-broker-native.py \
-            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
-            --compiler-sha256 "$compiler_sha" \
-            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
-            --output "$RUNNER_TEMP/broker-history-native" \
-            --section history
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
-          name: owner-native-${{ matrix.target }}${{ matrix.lane && format('-{0}', matrix.lane) || '' }}
+          name: owner-native-x86_64-${{ matrix.lane }}
           path: |
             ${{ runner.temp }}/owner-native/*.json
             ${{ runner.temp }}/owner-native/*.ksl
@@ -264,6 +376,186 @@ jobs:
             ${{ runner.temp }}/authority-native/*.ksl
             ${{ runner.temp }}/authority-native/*.stdout
             ${{ runner.temp }}/authority-native/*.stderr
+            ${{ runner.temp }}/*/evidence.json
+            ${{ runner.temp }}/pq-native-x86/*.stdout
+            ${{ runner.temp }}/pq-native-x86/*.stderr
+          if-no-files-found: ignore
+  native-x86-base-gate:
+    # The required context `Native text (x86_64 / base)`: succeeds only when every x86 base shard succeeded.
+    name: Native text (x86_64 / base)
+    if: ${{ always() }}
+    needs: [native-x86-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every x86_64 base shard
+        env:
+          SHARDS: ${{ needs.native-x86-base.result }}
+        run: |
+          echo "x86_64 base shards: $SHARDS"
+          test "$SHARDS" = success
+  native-x86-lanes:
+    # authority-f3 (PRs, merge queue and main) and the lanes that run on main and nightly only. The job name is
+    # unchanged, so `Native text (x86_64 / authority-f3)` stays a required context.
+    name: Native text (x86_64 / ${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    # The x86 broker lane has taken 20-60+ minutes depending on the runner (it was cut
+    # at 60 while on its last control, kotoba#1020); 90 leaves room on a slow runner.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # CI tiers (JUN-629, owner decision 2026-10-30): a pull request runs arm64, x86 base and x86 authority-f3 (a real
+      # x86 hata case on the candidate compiler), and the hata-macos job below runs the full broker and history sections
+      # natively. The x86 store, broker and history lanes take 9-60 minutes because x86 user code is 70-150x slower than
+      # arm64 for the same gate (x86 codegen, not the scenarios), so they run on every push to main and nightly instead,
+      # unchanged. The x86 pq-unity lane (ML-KEM-768, ML-DSA-65 and the print-free SHA-3 gate, with their mutants, AWAI-117)
+      # is in that tier too.
+      matrix:
+        include: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"lane":"authority-f3","paths":"lib/gov.nist.sha2 lib/org.ietf.ed25519 lib/kotoba.hata"}]' || '[{"lane":"authority-f3","paths":"lib/gov.nist.sha2 lib/org.ietf.ed25519 lib/kotoba.hata"},{"lane":"store"},{"lane":"broker"},{"lane":"history"},{"lane":"pq-unity"}]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Audit AIUEOS library source pins (source preflight only)
+        run: python3 scripts/check-library-local-changes-pins.py --root lib/kotoba.aiueos
+      - name: Fingerprint the inputs of this shard
+        id: key
+        if: matrix.paths != ''
+        env:
+          SHARD: x86_64-${{ matrix.lane }}
+          INPUT_PATHS: ${{ matrix.paths }}
+          ARCH: ${{ runner.arch }}
+        run: |
+          set -eu
+          {
+            for p in .github/workflows/native-shared.yml scripts lib/kotoba.hata/scripts $INPUT_PATHS; do
+              t=$(git rev-parse "HEAD:$p")
+              printf '%s %s\n' "$p" "$t"
+            done
+          } > "$RUNNER_TEMP/inputs.txt"
+          cat "$RUNNER_TEMP/inputs.txt"
+          echo "key=native-pass-v1-$SHARD-$ARCH-${ImageVersion:-noimage}-$(sha256sum "$RUNNER_TEMP/inputs.txt" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - name: Look up the pass marker (pull request and merge queue only)
+        id: marker
+        if: matrix.paths != '' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
+      - name: Pass marker found, the heavy steps of this shard are skipped
+        if: steps.marker.outputs.cache-hit == 'true'
+        run: echo "this exact input already passed shard x86_64-${{ matrix.lane }}; marker $(cat "$RUNNER_TEMP/pass-marker/passed")"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true'
+        with:
+          repository: kotoba-lang/amu
+          ref: 6a77cd91182b858fff435c679e8ef71f514fc2ae
+          path: _native/amu
+          persist-credentials: false
+      - name: Verify the exact native compiler image
+        if: steps.marker.outputs.cache-hit != 'true'
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('_native/amu')
+          image = root / 'bin/amu'
+          meta = json.loads((root / 'native-product.json').read_text())
+          assert hashlib.sha256(image.read_bytes()).hexdigest() == meta['image']['sha256']
+          PY
+      - name: Execute native x86 project and refusal controls
+        if: steps.marker.outputs.cache-hit != 'true'
+        run: python3 _native/amu/scripts/seed/check-x86-project-native.py --compiler "$PWD/_native/amu/bin/amu" --output "$RUNNER_TEMP/project-native"
+      - name: Execute ML-KEM-768, ML-DSA-65 and print-free SHA-3 known answers and mutants on x86 (AWAI-117)
+        # KX64 admits the gates' hex string vectors. The SHA-3 gate prints through :io/write, which the
+        # locked x86 project adapter refuses (E7101 OP-CAP), so x86 runs sha3-x86: the same gate with its
+        # print rewritten away at build time, answering by its result value only, with both SHA-3 mutants.
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'pq-unity'
+        run: |
+          for lib in gov.nist.sha3 gov.nist.mlKem gov.nist.mlDsa; do
+            python3 scripts/check-library-local-changes-pins.py --root "lib/$lib"
+          done
+          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/amu/native-product.json"))["image"]["sha256"])')
+          python3 scripts/check-pq-native.py --gates mlkem,mldsa,sha3-x86 \
+            --compiler "$PWD/_native/amu/bin/amu" --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/project-native/runner.elf" \
+            --output "$RUNNER_TEMP/pq-native-x86"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane != 'pq-unity'
+        with:
+          repository: kotoba-lang/amu
+          ref: ${{ github.event_name == 'workflow_dispatch' && matrix.lane == 'store' && inputs.hata_store_amu_ref != '' && inputs.hata_store_amu_ref || 'a530b2262f0d4d138081d9f48bd3b59e0eb51e74' }}
+          path: _native/awai-project-candidate
+          persist-credentials: false
+      - name: Derive and qualify the explicit experimental FS35/CLI38 compiler
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane != 'pq-unity'
+        env:
+          AMU_CANDIDATE_COMPILER: ${{ github.event_name == 'workflow_dispatch' && matrix.lane == 'store' && inputs.hata_store_amu_ref != '' && 'bin/amu-linux-x86_64' || 'bin/amu' }}
+        run: |
+          compiler_sha=$(python3 -c 'import json; print(json.load(open("_native/awai-project-candidate/native-product.json"))["image"]["sha256"])')
+          python3 _native/awai-project-candidate/scripts/seed/check-x86-project-fs-native.py \
+            --compiler "$PWD/_native/awai-project-candidate/$AMU_CANDIDATE_COMPILER" --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/project-native/runner.elf" \
+            --output "$RUNNER_TEMP/awai-project-candidate" --derive
+      - name: Execute signed durable admission authority case on x86
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'authority-f3'
+        run: |
+          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
+          python3 lib/kotoba.hata/scripts/check-authority-native.py \
+            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
+            --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
+            --output "$RUNNER_TEMP/authority-store-native" \
+            --case authority
+      - name: Execute durable store, races and process-crash boundaries on x86
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'store'
+        run: |
+          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
+          python3 lib/kotoba.hata/scripts/check-authority-native.py \
+            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
+            --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
+            --output "$RUNNER_TEMP/authority-store-native" \
+            --case store
+      - name: Execute fixed-roster quorum and managed-object broker on x86
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'broker'
+        run: |
+          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
+          python3 lib/kotoba.hata/scripts/check-broker-native.py \
+            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
+            --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
+            --output "$RUNNER_TEMP/broker-quorum-native" \
+            --section broker
+      - name: Execute quorum audit-history and fresh-read verdicts on x86
+        if: steps.marker.outputs.cache-hit != 'true' && matrix.lane == 'history'
+        run: |
+          compiler_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compilerSHA256"])' "$RUNNER_TEMP/awai-project-candidate/evidence.json")
+          python3 lib/kotoba.hata/scripts/check-broker-native.py \
+            --compiler "$RUNNER_TEMP/awai-project-candidate/candidate-F3.elf" \
+            --compiler-sha256 "$compiler_sha" \
+            --runner "$RUNNER_TEMP/awai-project-candidate/candidate-runner.elf" \
+            --output "$RUNNER_TEMP/broker-history-native" \
+            --section history
+      - name: Write the pass marker for this exact input (after every step above succeeded)
+        if: success() && matrix.paths != '' && steps.marker.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pass-marker"
+          printf '%s %s\n' "${{ steps.key.outputs.key }}" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pass-marker/passed"
+      - name: Save the pass marker
+        if: success() && matrix.paths != '' && steps.marker.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/pass-marker
+          key: ${{ steps.key.outputs.key }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: owner-native-x86_64-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/project-native/*.json
+            ${{ runner.temp }}/project-native/*.stdout
+            ${{ runner.temp }}/project-native/*.stderr
             ${{ runner.temp }}/awai-project-candidate/*.json
             ${{ runner.temp }}/awai-project-candidate/*.ksl
             ${{ runner.temp }}/awai-project-candidate/*.stdout
@@ -277,21 +569,13 @@ jobs:
             ${{ runner.temp }}/broker-quorum-native/*.ksl
             ${{ runner.temp }}/broker-quorum-native/*.stdout
             ${{ runner.temp }}/broker-quorum-native/*.stderr
-            ${{ runner.temp }}/pq-native/*.json
-            ${{ runner.temp }}/pq-native/*.ksl
-            ${{ runner.temp }}/pq-native/*.stdout
-            ${{ runner.temp }}/pq-native/*.stderr
             ${{ runner.temp }}/pq-native-x86/*.stdout
             ${{ runner.temp }}/pq-native-x86/*.stderr
             ${{ runner.temp }}/broker-history-native/*.json
             ${{ runner.temp }}/broker-history-native/*.ksl
             ${{ runner.temp }}/broker-history-native/*.stdout
             ${{ runner.temp }}/broker-history-native/*.stderr
-            ${{ runner.temp }}/broker-session-native/*.json
-            ${{ runner.temp }}/broker-session-native/*.ksl
-            ${{ runner.temp }}/broker-session-native/*.stdout
-            ${{ runner.temp }}/broker-session-native/*.stderr
-          if-no-files-found: warn
+          if-no-files-found: ignore
   aiueos-uefi:
     # JUN-709 / JUN-555: build and boot the AIUEOS UEFI image from lib/kotoba.aiueos. kotoba-lang/aiueos dropped its
     # image CI in #491 (it used nbb) and has had no os/ tree since #536, so the build is gated here. Main, nightly and
