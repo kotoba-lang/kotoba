@@ -364,3 +364,12 @@ was extended. The fixed fixture is now included in the Linux x86-64 CI job;
 the complete 98-input cross-engine experiment is still a local observation,
 not a CI gate. These results retain the admission, CPU/allocation and full VM
 limitations above.
+
+The 98 selected input and receipt bytes and the original 287-case x86 report
+are now retained in-tree. A macOS native gate checks their hashes and report
+bindings, stages the exact bytes, and runs the source-locked CBOR bridge and
+reference model, with an add-to-multiply mutant as a negative control. The
+local macOS run returned 42 for the snapshot and 0 for the mutant, and the
+gate has been added to CI. It replays a historical AOT snapshot: CI does not
+regenerate those AOT receipts, and this is not a live cross-engine execution
+or full VM conformance.
