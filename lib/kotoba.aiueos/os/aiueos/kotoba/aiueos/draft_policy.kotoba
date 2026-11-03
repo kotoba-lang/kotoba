@@ -1,0 +1,133 @@
+(ns aiueos.draft-policy (:export [classify classify-chunks units]))
+
+;; Pure recovery policy for the three office apps. The host supplies a parsed
+;; document, the original JSON's UTF-16 length and the visible input keys.
+;; Result 0 rejects preview, 1 permits preview only, 2 permits restoration.
+;; This policy does not parse JSON, render controls or access storage.
+;; Before UTF-8 encoding, a JavaScript host must reject unpaired surrogates;
+;; replacement by TextEncoder would change equality and duplicate checks.
+(defn field [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+(defn text [d :document] :string
+  (option-value-of [:option :string] (document-string-value d) ""))
+(defn units [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 count 0]
+      (if (= i n) count
+        (let [c (string-code-point-at s i)]
+          (cond (< c 128) (recur (+ i 1) (+ count 1))
+                (< c 2048) (recur (+ i 2) (+ count 1))
+                (< c 65536) (recur (+ i 3) (+ count 1))
+                :else (recur (+ i 4) (+ count 2))))))))
+(defn digest? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (and (= n 64)
+      (loop [i 0]
+        (if (= i 64) true
+          (let [c (string-code-point-at s i)]
+            (and (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+                 (recur (+ i 1)))))))))
+(defn at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+(defn contains-key? [v :document key :string i :i64] :bool
+  (if (= i (document-count v)) false
+    (or (and (string? (at v i)) (string=? (text (at v i)) key))
+        (contains-key? v key (+ i 1)))))
+(defn duplicate? [entries :document key :string i :i64] :bool
+  (if (= i 0) false
+    (let [prev (at entries (- i 1))]
+      (or (string=? (text (at prev 0)) key) (duplicate? entries key (- i 1))))))
+(defn entries-ok? [entries :document i :i64] :bool
+  (if (= i (document-count entries)) true
+    (let [entry (at entries i)]
+      (and (vector? entry) (= (document-count entry) 2)
+           (string? (at entry 0)) (string? (at entry 1))
+           (<= (units (text (at entry 0))) 128)
+           (<= (units (text (at entry 1))) 65536)
+           (not (duplicate? entries (text (at entry 0)) i))
+           (entries-ok? entries (+ i 1))))))
+(defn entries-visible? [entries :document visible :document i :i64] :bool
+  (if (= i (document-count entries)) true
+    (and (contains-key? visible (text (at (at entries i) 0)) 0)
+         (entries-visible? entries visible (+ i 1)))))
+(defn classify [draft :document raw-units :i64 program :string persisted :document snapshot :string
+                visible :document allow :bool limit :i64] :i64
+  (if (or (< raw-units 0) (> raw-units 1000000) (not (map? draft)) (not (vector? visible))) 0
+    (let [version (field draft :version) id (field draft :program) base (field draft :base)
+          base-option (document-get draft :base) state (field draft :baseState) entries (field draft :entries)
+          valid (and (= (option-value-of [:option :i64] (document-i64-value version) -1) 1)
+                     (string? id) (digest? (text id)) (option-some?-of [:option :document] base-option)
+                     (or (nil? base) (string? base)) (string? state) (<= (units (text state)) limit)
+                     (vector? entries) (> (document-count entries) 0) (<= (document-count entries) 33)
+                     (entries-ok? entries 0))]
+      (if (not valid) 0
+        (if (and allow (string=? (text id) program) (document-equal? base persisted)
+                 (string=? (text state) snapshot) (entries-visible? entries visible 0)) 2 1)))))
+
+;; Legacy drafts permit 33 entries but a native document vector admits at most
+;; 32. Store the optional 33rd pair separately; never drop it. Visible keys use
+;; length-prefixed UTF-8 bytes, because a page can have more than 32 controls.
+;; A frame is decimal-byte-length ':' bytes, with canonical decimal, <=128 bytes.
+;; -1 means invalid; otherwise encode start and end in a single bounded i64.
+(defn frame [v :string pos :i64] :i64
+  (let [n (string-byte-length v)]
+    (loop [i pos length 0 digits 0]
+      (if (>= i n) -1
+        (let [c (string-code-point-at v i)]
+          (cond (= c 58)
+                (if (or (= digits 0) (> length 128) (> (+ i 1 length) n)) -1
+                  (+ (* (+ i 1) 131072) (+ i 1 length)))
+                (or (< c 48) (> c 57) (>= digits 3)
+                    (and (> digits 0) (= (string-code-point-at v pos) 48))) -1
+                :else (recur (+ i 1) (+ (* length 10) (- c 48)) (+ digits 1))))))))
+(defn frame-start [f :i64] :i64 (quot f 131072))
+(defn frame-end [f :i64] :i64 (- f (* (frame-start f) 131072)))
+(defn frame-boundary? [v :string at :i64 end :i64] :bool
+  (if (= at end) true
+    (if (> at end) false
+      (let [c (string-code-point-at v at)
+            width (cond (< c 128) 1 (< c 2048) 2 (< c 65536) 3 :else 4)]
+        (frame-boundary? v (+ at width) end)))))
+(defn wire-valid? [v :string count :i64] :bool
+  (and (>= count 0) (<= count 512) (<= (string-byte-length v) 67584)
+    (loop [i 0 pos 0]
+      (if (= i count) (= pos (string-byte-length v))
+        (let [f (frame v pos)]
+          (if (or (< f 0) (not (frame-boundary? v (frame-start f) (frame-end f))))
+            false (recur (+ i 1) (frame-end f))))))))
+(defn wire-has? [v :string count :i64 key :string] :bool
+    (loop [i 0 pos 0]
+      (if (= i count) false
+        (let [f (frame v pos)]
+          (if (arena-scope (string=? (string-substring v (frame-start f) (frame-end f)) key))
+            true (recur (+ i 1) (frame-end f)))))))
+(defn entries-wire-visible? [entries :document v :string count :i64] :bool
+  (loop [i 0]
+    (if (= i (document-count entries)) true
+      (and (wire-has? v count (text (at (at entries i) 0))) (recur (+ i 1))))))
+(defn meta-ok? [entries :document i :i64] :bool
+  (if (= i (document-count entries)) true
+    (let [entry (at entries i)]
+      (and (vector? entry) (= (document-count entry) 2) (string? (at entry 0))
+           (let [value-units (option-value-of [:option :i64] (document-i64-value (at entry 1)) -1)]
+             (and (<= (units (text (at entry 0))) 128) (>= value-units 0) (<= value-units 65536)
+                  (not (duplicate? entries (text (at entry 0)) i)) (meta-ok? entries (+ i 1))))))))
+(defn tail-meta-ok? [entries :document tail :document] :bool
+  (or (nil? tail)
+      (and (vector? tail) (= (document-count entries) 32) (meta-ok? (document-vector tail) 0)
+           (not (duplicate? entries (text (at tail 0)) (document-count entries))))))
+;; The value is not copied into :document: only its Kotoba-calculated UTF-16
+;; unit count is needed for this decision. The host retains the original value.
+(defn classify-chunks [raw-units :i64 program :string persisted-kind :string persisted :string snapshot :string
+                       id :string base-kind :string base :string state :string entries :document tail :document
+                       visible-wire :string visible-count :i64 allow :bool limit :i64] :i64
+  (let [wire visible-wire]
+    (if (or (< raw-units 0) (> raw-units 1000000) (not (wire-valid? wire visible-count))) 0
+      (let [valid (and (digest? id) (or (string=? base-kind "null") (string=? base-kind "string"))
+                       (<= (units state) limit) (vector? entries) (> (document-count entries) 0)
+                       (<= (document-count entries) 32) (meta-ok? entries 0) (tail-meta-ok? entries tail))]
+        (if (not valid) 0
+          (if (and allow (string=? id program) (string=? base-kind persisted-kind)
+                   (or (string=? base-kind "null") (string=? base persisted))
+                   (string=? state snapshot) (entries-wire-visible? entries wire visible-count)
+                   (or (nil? tail) (wire-has? wire visible-count (text (at tail 0))))) 2 1))))))

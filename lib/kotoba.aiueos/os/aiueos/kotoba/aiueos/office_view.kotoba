@@ -1,0 +1,110 @@
+(ns aiueos.office-view (:export [decode action action-current]))
+
+;; BV2 is a user-side view description, never authority or a syscall grant.
+;; Input is an already strictly decoded UTF-8 string; byte streams must be
+;; checked by the host before this entry. Returns a bounded preorder index:
+;; count, then 18 integers per node: eight [start,end) UTF-8 byte ranges,
+;; depth, child count. The host retains raw and may render only after success.
+(defn bad [state :vector-i64] :string
+  (let [ignored (vector-assoc! state 1 1)] ""))
+(defn field [raw :string bytes :bytes state :vector-i64 out :vector-i64 slot :i64] :string
+  (if (not (= (vector-at state 1) 0)) ""
+    (let [limit (- (bytes-count bytes) 1) start (vector-at state 0)
+          header (loop [i start n 0 digits 0]
+            (if (>= i limit) [-1 -1]
+              (let [c (bytes-at bytes i)]
+                (cond (= c 58) (if (> digits 0) [(+ i 1) n] [-1 -1])
+                      (or (< c 48) (> c 57) (>= digits 7)
+                          (and (> digits 0) (= (bytes-at bytes start) 48))) [-1 -1]
+                      :else (recur (+ i 1) (+ (* n 10) (- c 48)) (+ digits 1))))))
+          begin (vector-at header 0) n (vector-at header 1) end (+ begin n)]
+      (if (or (< begin 0) (> n 1000000) (> end limit)
+              (and (< end limit) (= (bit-and (bytes-at bytes end) 192) 128)))
+        (bad state)
+        (let [ignored (vector-assoc! state 0 end) a (vector-assoc! out slot begin)
+              b (vector-assoc! out (+ slot 1) end)] (string-substring raw begin end))))))
+(defn count-field [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (or (< n 1) (> n 2)) -1
+      (let [bytes (string-to-utf8 s)
+            a (bytes-at bytes 0) b (if (= n 2) (bytes-at bytes 1) 48)]
+        (if (or (< a 48) (> a 57) (< b 48) (> b 57) (and (= n 2) (= a 48))) -1
+          (let [v (if (= n 1) (- a 48) (+ (* (- a 48) 10) (- b 48)))] (if (> v 32) -1 v)))))))
+(defn valid-tag? [tag :string] :bool
+  (or (string=? tag "div") (string=? tag "header") (string=? tag "main") (string=? tag "footer")
+      (string=? tag "input") (string=? tag "textarea") (string=? tag "button") (string=? tag "span")
+      (string=? tag "h1") (string=? tag "h2") (string=? tag "h3") (string=? tag "h4")
+      (string=? tag "h5") (string=? tag "h6") (string=? tag "p") (string=? tag "ul") (string=? tag "li")))
+(defn node [raw :string bytes :bytes state :vector-i64 depth :i64 out :vector-i64] :i64
+  (if (or (not (= (vector-at state 1) 0)) (> depth 12) (>= (vector-at state 2) 512))
+    (let [ignored (bad state)] 0)
+    (let [index (vector-at state 2) slot (+ 1 (* index 18))
+          ignored (vector-assoc! state 2 (+ index 1))
+          tag (field raw bytes state out slot) css (field raw bytes state out (+ slot 2))
+          typ (field raw bytes state out (+ slot 4)) key (field raw bytes state out (+ slot 6))
+          value (field raw bytes state out (+ slot 8)) text (field raw bytes state out (+ slot 10))
+          label (field raw bytes state out (+ slot 12)) children (count-field (field raw bytes state out (+ slot 14)))
+          editable (or (string=? tag "input") (string=? tag "textarea"))]
+      (if (or (not (= (vector-at state 1) 0)) (not (valid-tag? tag)) (< children 0)
+              (> (string-byte-length key) 128)
+              (not (or (string=? typ "") (string=? typ "text") (string=? typ "button")))
+              (and (not editable) (not (string=? value "")))
+              (and (string=? tag "textarea") (not (string=? typ "")))
+              (and editable (>= (string-index-of value "\r") 0))
+              (and (string=? tag "input") (>= (string-index-of value "\n") 0)))
+        (let [ignored (bad state)] 0)
+        (let [d (vector-assoc! out (+ slot 16) depth) c (vector-assoc! out (+ slot 17) children)]
+          (loop [i 0]
+            (if (or (= i children) (not (= (vector-at state 1) 0))) 0
+              (let [ignored (node raw bytes state (+ depth 1) out)] (recur (+ i 1))))))))))
+(defn decode [raw :string] [:option :vector-i64]
+  (let [n (string-byte-length raw)]
+    (if (or (< n 5) (> n 1000000)) (option-none-of [:option :vector-i64])
+      (let [bytes (string-to-utf8 raw)]
+        (if (or (not (= (bytes-at bytes 0) 66)) (not (= (bytes-at bytes 1) 86))
+                (not (= (bytes-at bytes 2) 50)) (not (= (bytes-at bytes 3) 124))
+                (not (= (bytes-at bytes (- n 1)) 10)))
+          (option-none-of [:option :vector-i64])
+          (let [state [4 0 0] result (vector-alloc 9217) ignored (node raw bytes state 0 result)]
+            (if (and (= (vector-at state 1) 0) (= (vector-at state 0) (- n 1)))
+              (let [count (vector-assoc! result 0 (vector-at state 2))] (option-some-of [:option :vector-i64] result))
+              (option-none-of [:option :vector-i64]))))))))
+
+;; Derive an event from a node in a validated view. App events feed step;
+;; host events require separately implemented backup/upgrade handling. This
+;; function does not open files or grant capabilities. The host must bind raw
+;; to the current rendered state and preserve unsaved input on refusal; an
+;; index from a previous render is not authority to mutate current state.
+(defn action [raw :string index :i64 kind :string value :string] [:option :document]
+  (let [parsed (decode raw)]
+    (if (not (option-some?-of [:option :vector-i64] parsed)) (option-none-of [:option :document])
+      (let [nodes (option-value-of [:option :vector-i64] parsed (vector-alloc 0)) n (vector-at nodes 0)]
+        (if (or (< index 0) (>= index n) (> (string-byte-length value) 1000000))
+          (option-none-of [:option :document])
+          (let [slot (+ 1 (* index 18)) tag (string-substring raw (vector-at nodes slot) (vector-at nodes (+ slot 1)))
+                key (string-substring raw (vector-at nodes (+ slot 6)) (vector-at nodes (+ slot 7)))
+                input (or (string=? tag "input") (string=? tag "textarea"))]
+            (if (or (string=? key "")
+                    (not (or (and (string=? kind "input") input)
+                             (and (string=? kind "click") (string=? tag "button") (string=? value ""))))
+                    (and input (>= (string-index-of value "\r") 0))
+                    (and (string=? tag "input") (>= (string-index-of value "\n") 0)))
+              (option-none-of [:option :document])
+              (option-some-of [:option :document]
+                (document-map :target (document-string key) :kind (document-string kind) :value (document-string value)
+                  :route (document-string (if (and (string=? kind "click")
+                    (or (string=? key "backup-import") (string=? key "backup-export")
+                        (string=? key "backup-restore") (string=? key "backup-original")
+                        (string=? key "backup-legacy-pull") (string=? key "backup-legacy-title")
+                        (string=? key "backup-legacy-sheets") (string=? key "backup-legacy-grid")
+                        (string=? key "workbook-upgrade"))) "host" "app")))))))))))
+
+;; The host must allocate a positive, never-reused generation for each state
+;; transition, including changes that leave the rendered view identical, and
+;; pass its authoritative current view and generation under the same lock as
+;; event dispatch. This check does not itself own or synchronize that state.
+(defn action-current [rendered :string current :string rendered-generation :i64 current-generation :i64
+                      index :i64 kind :string value :string] [:option :document]
+  (if (and (> rendered-generation 0) (= rendered-generation current-generation) (string=? rendered current))
+    (action rendered index kind value)
+    (option-none-of [:option :document])))
