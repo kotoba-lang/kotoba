@@ -373,3 +373,17 @@ local macOS run returned 42 for the snapshot and 0 for the mutant, and the
 gate has been added to CI. It replays a historical AOT snapshot: CI does not
 regenerate those AOT receipts, and this is not a live cross-engine execution
 or full VM conformance.
+
+The Linux x86-64 gate now also runs a **fresh** comparison: it takes the 98
+retained CBOR inputs and budgets, compiles each through the pinned native
+Amu receipt/v2 AOT path, runs the resulting images and transports their actual
+receipts to a source-locked native Kotoba gate. The native gate checks receipt
+framing, exit and budget consistency, evaluates the same CBOR through the
+experimental bridge/reference, and compares status, value and spent. Each
+receipt also has a native magic-corruption control; an add-to-multiply bridge
+mutant returns 0. The local x86 native run passed all 98 cases, and this gate
+has been added to CI. The compiler used to build the reference and the AOT
+images shares a backend, and the expected stack bound comes from the retained
+historical fixture rather than independent artifact admission. This bounded
+comparison is not general VM conformance, host integration or hostile-input
+qualification.
