@@ -68,11 +68,20 @@ def main():
             raise ValueError('source digest mismatch: ' + key)
     inputs = {str(path): digest(path) for path in
               (compiler, src, fixture, LEDGER, Path(__file__).resolve(), *extra_modules.values())}
+    refusal_fixtures = []
+    if a.fixture == 'cbor-reference':
+        for i in range(11):
+            key = f'test/kototama/experimental_cbor_refusals_{i}.kotoba'
+            path = LIB / key
+            if digest(path) != ledger[key]['sha256']:
+                raise ValueError('source digest mismatch: ' + key)
+            refusal_fixtures.append(path)
+            inputs[str(path)] = digest(path)
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = {'PATH': '/nonexistent', 'LANG': 'C'}
 
-    def observe(name, mutant, expected):
+    def observe(name, mutant, expected, fixture_override=None):
         work = output / name
         work.mkdir()
         source, gate = work / 'source.kotoba', work / 'gate.kotoba'
@@ -95,7 +104,7 @@ def main():
                 raise ValueError('negative-control anchor drift')
             text = text.replace(old, new)
         source.write_text(text)
-        shutil.copyfile(fixture, gate)
+        shutil.copyfile(fixture_override or fixture, gate)
         lock = work / 'project.ksl'
         modules = [(module, source), (gate_module, gate)]
         for mod, original_path in sorted(extra_modules.items()):
@@ -140,11 +149,12 @@ def main():
     parallel_negative = observe('mutant-parallel', True, 0) if a.fixture == 'reference' else None
     cycle_negative = observe('mutant-cycle', True, 0) if a.fixture == 'cbor-reference' else None
     call_scope_negative = observe('mutant-call-scope', True, 0) if a.fixture == 'reference' else None
+    refusals = [observe('refusals-' + str(i), False, 42, path) for i, path in enumerate(refusal_fixtures)]
     tail_negative = observe('mutant-tail', True, 0) if a.fixture == 'cbor-reference' else None
     if any(digest(Path(path)) != sha for path, sha in inputs.items()):
         raise ValueError('input changed during observation')
     receipt = {'status': 'PASS_BOUNDED_PURE_I64_' + a.fixture.upper() + '_MACOS', 'inputs': inputs,
-               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'cycleNegative': cycle_negative, 'tailNegative': tail_negative, 'fullVmQualified': False}
+               'positive': positive, 'negative': negative, 'methodNegative': method_negative, 'limitNegative': limit_negative, 'syntheticNegative': synthetic_negative, 'eagerNegative': eager_negative, 'shadowNegative': shadow_negative, 'parallelNegative': parallel_negative, 'callScopeNegative': call_scope_negative, 'cycleNegative': cycle_negative, 'refusals': refusals, 'tailNegative': tail_negative, 'fullVmQualified': False}
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(receipt['status'])
 

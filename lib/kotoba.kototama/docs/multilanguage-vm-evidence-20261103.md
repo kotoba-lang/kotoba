@@ -504,3 +504,17 @@ larger evaluation-frame storage, one combined macOS run terminated with signal
 frame-storage expansion was removed. Batching is not evidence of a resource
 bound for untrusted programs, and the remaining admission, backend-independence,
 artifact and host limitations continue to apply.
+
+The native CBOR reference now runs the program-refusal portion of the retained
+Amu pure-i64 corpus in 11 separate source-locked processes. On macOS ARM64 and
+Linux x86-64, it rejected the same bytes for 52 invalid programs, including
+unknown fields, unselected/unused invalid bodies, calls and cycles, malformed
+encoding, and size/depth boundaries. Amu's native `check-kototama` gate passed
+255 observations on x86-64 and physical ARM64 for both candidate profiles,
+including those inputs; its corrupted-observation control failed as expected.
+The 65,694-byte case is a length-equivalent all-zero vector on the reference
+side, not the same CBOR bytes: constructing the exact concatenation in the
+macOS native test terminated with signal 5, even in a separate process. Its
+cause and untrusted-input CPU/memory bounds remain unresolved. The experiment
+is bounded rejection evidence, not full admission equivalence, independent
+compiler provenance or production host qualification.
