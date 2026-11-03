@@ -103,3 +103,34 @@ observer `1b691de07dbccf7588bf1c47df678184486196ed1ebf87069cb9856e69b32f68`;
 IPLD stub `5ec8af7471eee46c5180ebc855c8867eb1c892aa7cee0857e9bc19f4351362c8`;
 stager `b560fbd0744047c68e34b30dbbc5964172481a4acf34e2908785e23dcf0aa6d8`.
 These vectors do not establish full evaluator or VM conformance.
+
+## Native receipt/v2 validation component
+
+`src/kototama/pure_i64_receipt.kotoba` defines a reusable, pure check of the
+complete 64-byte receipt, supplied normal exit code, independently admitted
+fuel budget and exact stack bound. It checks framing, byte domain, magic,
+status/exit consistency, failure result, budget, spent/remaining arithmetic,
+zero arena and stack bound. It does not authenticate the producer, establish
+artifact identity or fresh authorization, perform process I/O, or implement
+state/receipt semantics. No existing host has been switched to this function.
+The Amu cache host already performs its own low-level checks and remains the
+current implementation; this component is a candidate for typed consumers.
+
+On Linux x86-64, the source-locked two-module native test
+`test/kototama/pure_i64_receipt_gate.kotoba` was checked and compiled by the
+Amu main compiler image SHA-256
+`f6c887b23c8b8447dc397821cc82a972c3502a269ae51893075bf888a32aea9a`.
+The `kx64-v1` linked project ran through the Amu-native `kx64-runner` with
+result 42. The test includes two exact 64-byte outputs from the independent
+Amu receipt/v2 corpus (SHA-256
+`2c528254e9bec17fdea5f7102d738441325c1c795a88fe1673410d8e60feafb0` and
+`ad805790638ff1c0f9aabf90862e8e7d402caf75399bcbb40cb004ce26e5713f`),
+success and all three typed failures, malformed lengths, invalid byte values,
+wrong exits, contradictory resource fields, invalid budget and stack bounds.
+Changing only the magic check in a separate negative-control source made the
+same native gate return 0 instead of 42. The positive project container hash
+was `2990d843b8f43583fcac7ff5121df3695381f23af91e5a2c8d83247f517b415e`;
+the native runner hash was
+`27349b7edfea5833f41263cdbf6195e5f26848bfb491e406c2d826987194d3b2`.
+This tests a source-locked component on one ISA, not a host integration,
+independent compiler rebuild, cross-architecture parity or full VM contract.
