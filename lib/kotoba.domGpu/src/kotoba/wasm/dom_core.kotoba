@@ -4,15 +4,19 @@
    The host adapter keeps its idiomatic map representation. This module owns
    the bounded `:document` representation shared by Kotoba targets: no open
    row crosses an export and every node, attribute and operation is data."
-  {:kotoba/export [append-child consume-ops create-element create-text-node
-                   empty-document set-attribute set-root set-style tree]})
+  {:kotoba/export [append-child consume-ops consume-op-batch consume-op-transaction create-element create-text-node create-comment-node
+                   empty-document node-by-id set-attribute set-root set-style tree]})
 
 (defn empty-document [] :document
   (document-map :next-id (document-i64 1)
                 :root (document-null)
                 :nodes (document-vector)
+                :node-tail (document-vector)
+                :node-overflow (document-bool false)
                 :listeners (document-map)
-                :ops (document-vector)))
+                :ops (document-vector)
+                :op-tail (document-vector)
+                :op-overflow (document-bool false)))
 
 (defn- field [value :document key :keyword] :document
   (option-value-of [:option :document]
@@ -22,28 +26,78 @@
 (defn- number-value [value :document] :i64
   (option-value-of [:option :i64] (document-i64-value value) 0))
 
+(defn- op-tail [document :document] :document
+  ;; Documents created before batching have no tail field.
+  (let [tail (field document :op-tail)]
+    (if (= (document-kind tail) :vector) tail (document-vector))))
+
 (defn- next-id [document :document] :i64
   (number-value (field document :next-id)))
 
 (defn- nodes [document :document] :document
   (field document :nodes))
 
-(defn- node-at [document :document id :i64] :document
-  (option-value-of [:option :document]
-                   (document-vector-at (nodes document) (- id 1))
-                   (document-null)))
+(defn- node-tail [document :document] :document
+  (let [tail (field document :node-tail)]
+    (if (= (document-kind tail) :vector) tail (document-vector))))
+
+(defn node-by-id [document :document id :i64] :document
+  (let [index (- id 1)]
+    (if (< index 0) (document-null)
+      (let [batch (quot index 32) offset (bit-and index 31)
+            group (if (= batch 0) (nodes document)
+                    (option-or (document-vector-at (node-tail document) (- batch 1)) (document-vector)))]
+        (option-or (document-vector-at group offset) (document-null))))))
+
+(defn- node-at [document :document id :i64] :document (node-by-id document id))
 
 (defn- put-node [document :document id :i64 node :document] :document
-  (document-assoc document :nodes
-                  (document-vector-assoc (nodes document) (- id 1) node)))
+  (let [index (- id 1) batch (quot index 32) offset (bit-and index 31)]
+    (if (= batch 0)
+      (document-assoc document :nodes (document-vector-assoc (nodes document) offset node))
+      (let [tail (node-tail document)
+            group (option-or (document-vector-at tail (- batch 1)) (document-vector))]
+        (document-assoc document :node-tail
+          (document-vector-assoc tail (- batch 1) (document-vector-assoc group offset node)))))))
 
 (defn- append-node [document :document node :document] :document
-  (document-assoc document :nodes
-                  (document-vector-conj (nodes document) node)))
+  (let [head (nodes document) tail (node-tail document) n (document-count tail)]
+    (cond (failed? document) document
+          (and (= n 0) (< (document-count head) 32))
+          (document-assoc document :nodes (document-vector-conj head node))
+          (= n 0) (document-assoc document :node-tail (document-vector (document-vector node)))
+          :else (let [last (option-or (document-vector-at tail (- n 1)) (document-vector))]
+                  (cond (< (document-count last) 32)
+                        (document-assoc document :node-tail
+                          (document-vector-assoc tail (- n 1) (document-vector-conj last node)))
+                        (< n 7) (document-assoc document :node-tail (document-vector-conj tail (document-vector node)))
+                        :else (document-assoc document :node-overflow (document-bool true)))))))
+
+(defn- failed? [document :document] :bool
+  (or (option-or (document-bool-value (field document :op-overflow)) false)
+      (option-or (document-bool-value (field document :node-overflow)) false)))
 
 (defn- emit [document :document op :document] :document
-  (document-assoc document :ops
-                  (document-vector-conj (field document :ops) op)))
+  ;; Each document vector has at most 32 elements. Preserve the first batch
+  ;; in :ops for existing consumers, and queue subsequent bounded batches.
+  ;; Seven tail batches cap this representation at 256 operations. A full
+  ;; queue records an explicit failure; no batch can then be drained.
+  (let [head (field document :ops)
+        tail (op-tail document)
+        n (document-count tail)]
+    (cond (failed? document) document
+          (and (= n 0) (< (document-count head) 32))
+          (document-assoc document :ops (document-vector-conj head op))
+          (= n 0)
+          (document-assoc document :op-tail (document-vector (document-vector op)))
+          :else
+          (let [last (option-or (document-vector-at tail (- n 1)) (document-vector))]
+            (cond (< (document-count last) 32)
+                  (document-assoc document :op-tail
+                                  (document-vector-assoc tail (- n 1) (document-vector-conj last op)))
+                  (< n 7)
+                  (document-assoc document :op-tail (document-vector-conj tail (document-vector op)))
+                  :else (document-assoc document :op-overflow (document-bool true)))))))
 
 (defn create-element [document :document tag :keyword] :document
   (let [id (next-id document)
@@ -53,12 +107,12 @@
                            :attrs (document-map)
                            :children (document-vector))
         after-append (append-node document node)
-        after-id (document-assoc after-append :next-id (document-i64 (+ id 1)))
+        after-id (if (failed? after-append) after-append (document-assoc after-append :next-id (document-i64 (+ id 1))))
         after-op (emit after-id
                        (document-vector (document-keyword :dom/create-element)
                                         (document-i64 id)
                                         (document-keyword tag)))]
-    (document-vector (document-i64 id) after-op)))
+    (document-vector (document-i64 (if (failed? after-op) 0 id)) after-op)))
 
 (defn create-text-node [document :document text :string] :document
   (let [id (next-id document)
@@ -66,21 +120,34 @@
                            :node/type (document-keyword :text)
                            :text (document-string text))
         after-append (append-node document node)
-        after-id (document-assoc after-append :next-id (document-i64 (+ id 1)))
+        after-id (if (failed? after-append) after-append (document-assoc after-append :next-id (document-i64 (+ id 1))))
         after-op (emit after-id
                        (document-vector (document-keyword :dom/create-text)
                                         (document-i64 id)
                                         (document-string text)))]
-    (document-vector (document-i64 id) after-op)))
+    (document-vector (document-i64 (if (failed? after-op) 0 id)) after-op)))
+
+(defn create-comment-node [document :document text :string] :document
+  (let [id (next-id document)
+        node (document-map :node/id (document-i64 id)
+                           :node/type (document-keyword :comment)
+                           :text (document-string text))
+        after-append (append-node document node)
+        after-id (if (failed? after-append) after-append (document-assoc after-append :next-id (document-i64 (+ id 1))))
+        after-op (emit after-id
+                       (document-vector (document-keyword :dom/create-comment)
+                                        (document-i64 id)
+                                        (document-string text)))]
+    (document-vector (document-i64 (if (failed? after-op) 0 id)) after-op)))
 
 (defn set-root [document :document node-id :i64] :document
-  (emit (document-assoc document :root (document-i64 node-id))
+  (if (failed? document) document (emit (document-assoc document :root (document-i64 node-id))
         (document-vector (document-keyword :dom/set-root)
-                         (document-i64 node-id))))
+                         (document-i64 node-id)))))
 
 (defn set-attribute [document :document node-id :i64 key :keyword
                      value :document] :document
-  (let [old-node (node-at document node-id)
+  (if (failed? document) document (let [old-node (node-at document node-id)
         attrs (field old-node :attrs)
         new-node (document-assoc old-node :attrs (document-assoc attrs key value))
         updated-document (put-node document node-id new-node)]
@@ -88,23 +155,23 @@
           (document-vector (document-keyword :dom/set-attr)
                            (document-i64 node-id)
                            (document-keyword key)
-                           value))))
+                           value)))))
 
 (defn set-style [document :document node-id :i64 style :document] :document
   ;; The Kotoba surface writes CSS properties as `:style/<property>` keys.
   ;; CSSOM reads the same flattened attribute map as the host projection.
-  (let [old-node (node-at document node-id)
+  (if (failed? document) document (let [old-node (node-at document node-id)
         attrs (field old-node :attrs)
         new-node (document-assoc old-node :attrs (document-merge attrs style))
         updated-document (put-node document node-id new-node)]
     (emit updated-document
           (document-vector (document-keyword :dom/set-style)
                            (document-i64 node-id)
-                           style))))
+                           style)))))
 
 (defn append-child [document :document parent-id :i64 child-id :i64]
   :document
-  (let [old-parent (node-at document parent-id)
+  (if (failed? document) document (let [old-parent (node-at document parent-id)
         children (field old-parent :children)
         new-parent (document-assoc old-parent :children
                                    (document-vector-conj children
@@ -113,11 +180,50 @@
     (emit updated-document
           (document-vector (document-keyword :dom/append-child)
                            (document-i64 parent-id)
-                           (document-i64 child-id)))))
+                           (document-i64 child-id))))))
 
 (defn consume-ops [document :document] :document
-  (document-vector (field document :ops)
-                   (document-assoc document :ops (document-vector))))
+  ;; Legacy callers receive all operations or a null failure and unchanged
+  ;; state. They must not mistake the first batch for the whole transaction.
+  (if (or (> (document-count (op-tail document)) 0) (failed? document))
+    (document-vector (document-null) document)
+    (document-vector (field document :ops)
+                     (document-assoc document :ops (document-vector)))))
+
+(defn consume-op-batch [document :document] :document
+  ;; Returns [batch remaining-document], or [null original-document] on
+  ;; overflow. Consumers must validate and apply the complete stream as a
+  ;; transaction; one batch is not a complete update when more are pending.
+  (if (failed? document)
+    (document-vector (document-null) document)
+    (let [tail (op-tail document)
+          n (document-count tail)
+          next (if (= n 0) (document-vector)
+                 (option-or (document-vector-at tail 0) (document-vector)))
+          remaining (if (= n 0) tail (document-vector-drop tail 1))]
+      (document-vector (field document :ops)
+                       (document-assoc (document-assoc document :ops next) :op-tail remaining)))))
+
+(defn- collect-op-batches [tail :document i :i64 batches :document] :document
+  (if (>= i (document-count tail)) batches
+    (collect-op-batches tail (+ i 1)
+                        (document-vector-conj batches
+                          (option-or (document-vector-at tail i) (document-vector))))))
+
+(defn consume-op-transaction [document :document] :document
+  ;; Returns [all-batches cleared-document], or [null original-document]
+  ;; after overflow. The receiver must validate every batch before applying
+  ;; any operation and supply its own atomic host commit or rollback.
+  (if (failed? document)
+    (document-vector (document-null) document)
+    (let [head (field document :ops)
+          tail (op-tail document)
+          initial (if (= (document-count head) 0) (document-vector)
+                    (document-vector head))
+          batches (collect-op-batches tail 0 initial)
+          cleared (document-assoc (document-assoc document :ops (document-vector))
+                                  :op-tail (document-vector))]
+      (document-vector batches cleared))))
 
 (defn- tree-node [document :document id :i64] :document
   (let [node (node-at document id)
