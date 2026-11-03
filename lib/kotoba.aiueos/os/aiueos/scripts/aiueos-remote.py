@@ -12,6 +12,7 @@ a screenshot arrives on 7797 and is written as a PNG.
   aiueos-remote.py --key SEED type aba       # make codes for a-z and space
   aiueos-remote.py --key SEED shot out.png
   aiueos-remote.py --key SEED reboot
+  aiueos-remote.py --key SEED usb-select 0x0600  # profile6 only, one xHCI host at a time
   aiueos-remote.py --key SEED --wait 600 update   # pull and verify the image `aiueos-image.py serve` offers
   aiueos-remote.py --key SEED --wait 600 install  # pull, verify and install it as BOOTX64.EFI on the ESP
 
@@ -121,16 +122,19 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install"))
+    p.add_argument("--nonce", type=lambda value: int(value, 0), help="explicit last-observed boot nonce when periodic discovery is unavailable; stale values are refused by the board")
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
+    if args.nonce is not None and not 0 < args.nonce < 1 << 64:
+        p.error("--nonce must be a nonzero unsigned 64-bit boot nonce")
     if args.key.stat().st_mode & 0o077:
         raise SystemExit("the key file must not be readable by others")
     seed = args.key.read_bytes()
     assert len(seed) == 32, "the key file must hold a 32-byte seed"
     log = listen(7799, 0.5)
     shots = listen(7797, 0.5) if args.command == "shot" else None
-    nonce = wait_nonce(log, args.wait)
+    nonce = args.nonce if args.nonce is not None else wait_nonce(log, args.wait)
     counter = time.time_ns()
     print(f"nonce {nonce:016x}")
     if args.command == "ping":
@@ -147,6 +151,19 @@ def main():
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break
+    elif args.command in ("usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"):
+        slot = int(args.value, 0)
+        if not 0 <= slot <= 65535:
+            raise SystemExit("PCI slot must be bus<<8 | device<<3 | function (0..65535)")
+        done = {"usb-select": 0xC007, "bt-probe": 0xC008, "ble-init": 0xC009, "ble-crypto": 0xC00A, "ble-scan": 0xC00B, "ble-connect": 0xC00C, "ble-status": 0xC00D, "ble-firmware": 0xC010}[args.command]
+        send(args, seed, nonce, counter, {"usb-select": 7, "bt-probe": 8, "ble-init": 9, "ble-crypto": 10, "ble-scan": 11, "ble-connect": 12, "ble-status": 13, "ble-firmware": 16}[args.command], slot)
+        for tag, value in records(log, time.monotonic() + args.wait):
+            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC1FF:
+                print(f"{tag:04x} {value:016x}", flush=True)
+            if tag in (done, 0xC0FF):
+                break
+        else:
+            raise SystemExit("no USB selection result received")
     elif args.command == "key":
         send(args, seed, nonce, counter, 3, int(args.value, 0)); print(reply(log, {0xC003}, args.wait))
     elif args.command == "type":
