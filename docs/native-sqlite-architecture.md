@@ -626,3 +626,14 @@ It does not qualify arbitrary page trees, transaction/WAL recovery, standard
 SQLite locking, crash consistency, Linux x86_64, or Itonami integration. The
 separate x86 controller and wasm compile jobs had not completed when the
 receipt was written.
+
+
+## Bounded native Linux x86_64 legacy-file mutation (2026-11-03)
+
+Exact-head Kotoba run [41554671902](https://github.com/kotoba-lang/kotoba/actions/runs/41554671902) at `38646de7e0b6063a8d56c0b63bb9b3c62fdabd29` passed the Amu selfhost/Kotoba ARM64 and CLI gates, wasm32-browser compile, and native Linux x86_64 controller job. The x86 SQLite step pins Amu candidate `897c816bedb15f851558c2f857bfd2be3ef25d41`, builds project compiler F1/F2/F3 to identical SHA-256 `ca6ad35ac07b60e7dd958e84797707c33176f7c4c7b34ac946ff6a9fd1e0f206`, then compiles and runs the Kotoba guest through KX64. It uses explicit wires `3,35,37,38,39`; no host SQL engine participates in the native gate.
+
+Kotoba read the standard legacy `cron_notepad` fixture (SHA-256 `93d06242db9db564fd637caf9740d58d078f73d0bca20cba3d33a6cce2da61bd`), updated `job-update/cursor`, inserted `job-keep/note`, deleted `job-delete`, published through scoped FS2/FS35, reopened, and verified preserved/updated/deleted values through Kotoba. The published 12,288-byte SQLite image SHA-256 is `1f7068cc99ea96f9317381fe36127f583bba9a3fd12d10e0cfacafb4e55ca78e`.
+
+A separate one-time Python 3.15.0 / SQLite 3.54.1 immutable read-only check reports `integrity_check=ok`, three 4096-byte pages, the expected `cron_notepad` table and composite primary-key autoindex, and exactly the three expected rows. The native and oracle receipts are [native x86 receipt](../lib/kotoba.sql/evidence/legacy-notepad-mutation-native-linux-x86-20261103.json) and [read-only oracle receipt](../lib/kotoba.sql/evidence/legacy-notepad-mutation-readonly-oracle-linux-x86-20261103.json).
+
+This adds one bounded standard-file mutation shape on Linux x86_64. The Amu project profile remains a pinned candidate and is not canonical until its independent full gate passes. General SQLite API/layout coverage, WAL and rollback-journal recovery, standard SQLite locking/concurrency, crash consistency, arbitrary/deeper B-tree operations, and Itonami adapter wiring remain open.
