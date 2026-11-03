@@ -1,0 +1,690 @@
+(ns aiueos.native.xhci
+  ;; Polled, bounded xHCI host for two boot HID devices and one USB2 hub.
+  ;; Intel xHCI 1.2: command/event/transfer rings and input contexts.
+  ;; Owned pages 0..2 hold rings/contexts; 3 and 14 are scratchpad pages.
+  ;; Page 9 holds private host state; NVMe owns 4..8, RTL8168 owns 10..13.
+  ;; Profile 6 refuses update commands, whose staging page would be 14.
+  ;; Refuse >2 scratchpads, >16KiB registers, nested/USB3 hubs, non-boot HID
+  ;; and input above high speed. USB3 root devices are descriptor-probed only.
+  ;; Hotplug and report HID remain follow-ups.
+  (:require [capability.dma.map :as dma]
+            [aiueos.native.usb-hid :as hid]
+            [aiueos.native.bluetooth-hci :as hci])
+  (:export [start poll report-byte report-length report-kind acknowledge result next-key devices quarantine self-check diagnostic attempts controller-diagnostic port-state port-stage device-diagnostic hub-ports hub-port-state hub-port-stage next-controller inventory select-controller probe-bluetooth bluetooth-diagnostic ble-start ble-command ble-param ble-poll ble-byte ble-length ble-release ble-tx ble-tx-ready ble-send ble-state ble-put ble-diagnostic ble-map ble-map-put ble-hid-state ble-hid-put recovery superspeed-check]))
+
+(defn s [i] (kernel-load-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4)))
+(defn put [i v] (kernel-store-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4) v))
+(defn mem [i] (kernel-load-u32-16k (kernel-owned-window 0 16384) 16384 i))
+(defn mput [i v] (kernel-store-u32-16k (kernel-owned-window 0 16384) 16384 i v))
+(defn b [i] (kernel-load-u8-16k (kernel-owned-window 0 16384) 16384 i))
+(defn address [off] (+ (kernel-owned-window 0 16384) off))
+(defn m64 [off v] (do (mput off (bit-and v 4294967295)) (mput (+ off 4) (u64-shift-right v 32))))
+(defn zero [off end] (if (>= off end) 1 (do (mput off 0) (zero (+ off 4) end))))
+(defn pci [slot off]
+  (let [a (kernel-out-u32 3320 (bit-or 2147483648 (+ (* slot 256) (bit-and off 252))))]
+    (+ (kernel-in-u32 3324) (* a 0))))
+(defn pci-put [slot off v]
+  (do (kernel-out-u32 3320 (bit-or 2147483648 (+ (* slot 256) (bit-and off 252)))) (kernel-out-u32 3324 v)))
+(defn find [slot]
+  (if (> slot 65535) -1
+    (if (and (not (= (bit-and (pci slot 0) 65535) 65535))
+             (= (u64-shift-right (pci slot 8) 8) 787248)) slot (find (+ slot 1)))))
+;; Read-only inventory of other PCI xHCI functions. Never change PCI command,
+;; ownership, run state, DMA pointers or the selected host's private words.
+;; -1 means MMIO is disabled/unmapped or the bounded register is unavailable.
+(defn next-controller [from] (find from))
+(defn inventory-reg [slot off]
+  (let [bar (pci slot 16) hi (if (= (bit-and bar 6) 4) (pci slot 20) 0)]
+    (if (or (= (bit-and (pci slot 4) 2) 0)
+            (and (= (bit-and bar 4294967280) 0) (= hi 0))
+            (not (= (bit-and bar 1) 0)) (>= hi 128) (< off 0) (> off 16380)) -1
+      (kernel-load-u32-16k
+        (kernel-pci-mmio (quot slot 256) (bit-and (quot slot 8) 31) (bit-and slot 7)
+          (+ (bit-and bar 4294967280) (* hi 4294967296)) 16384) 16384 off))))
+(defn inventory [slot field]
+  (case field
+    0 (pci slot 0)
+    1 (bit-and (pci slot 4) 65535)
+    2 (inventory-reg slot 0)
+    3 (inventory-reg slot 4)
+    4 (inventory-reg slot 8)
+    5 (inventory-reg slot 16)
+    6 (inventory-reg slot 20)
+    7 (inventory-reg slot 24)
+    (if (and (>= field 8) (< field 24))
+      (let [cap (inventory-reg slot 0) hcs (inventory-reg slot 4) port (- field 7)]
+        (if (or (= cap -1) (= hcs -1) (< (bit-and cap 255) 32)
+                (> port (bit-and (quot hcs 16777216) 255))) -1
+          (inventory-reg slot (+ (bit-and cap 255) (+ 1024 (* (- port 1) 16)))))) -1)))
+(defn reg [off]
+  (kernel-load-u32-16k (kernel-pci-mmio (quot (s 1) 256) (bit-and (quot (s 1) 8) 31) (bit-and (s 1) 7)
+    (+ (s 2) (* (s 3) 4294967296)) 16384) 16384 off))
+(defn rput [off v]
+  (kernel-store-u32-16k (kernel-pci-mmio (quot (s 1) 256) (bit-and (quot (s 1) 8) 31) (bit-and (s 1) 7)
+    (+ (s 2) (* (s 3) 4294967296)) 16384) 16384 off v))
+(defn r64 [off v] (do (rput off (bit-and v 4294967295)) (rput (+ off 4) (u64-shift-right v 32))))
+(defn wait-reg [off mask want fuel]
+  (if (= (bit-and (reg off) mask) want) 1
+    (if (= fuel 0) 0 (do (kernel-pause) (wait-reg off mask want (- fuel 1))))))
+;; USB reset recovery is at least 10ms, and SetAddress recovery at least 2ms.
+;; PIT channel2 is idle after desktop TSC calibration. A fresh 14319-count
+;; mode0 one-shot measures >=12ms independently of CPU speed; restore gate/
+;; speaker control even on timeout. No raw TSC value is labeled time.
+(defn recovery-wait [fuel]
+  (let [v (kernel-in-u8 97)]
+    (if (= v 255) 0
+      (if (= (bit-and v 32) 32) 1
+        (if (= fuel 0) 0 (do (kernel-pause) (recovery-wait (- fuel 1))))))))
+(defn recovery []
+  (let [saved (kernel-in-u8 97)]
+    (if (= saved 255) 0
+      (let [low (kernel-out-u8 97 (bit-and saved 252))
+            mode (kernel-out-u8 67 176)
+            lo (kernel-out-u8 66 239) hi (kernel-out-u8 66 55)
+            gate (kernel-out-u8 97 (+ (bit-and saved 252) 1))
+            ready (recovery-wait 20000000)
+            restored (kernel-out-u8 97 saved)]
+        (+ ready (* 0 (+ low mode lo hi gate restored)))))))
+(defn fail [code] (do (put 0 code) code))
+(defn result [] (s 0))
+(defn diagnostic [i] (if (and (>= i 0) (< i 8)) (s (+ 24 i)) 0))
+(defn attempts [] (s 32))
+(defn record-base [host] (+ 128 (* host 56)))
+(defn controller-diagnostic [host i]
+  (if (and (>= host 0) (< host (s 32)) (>= i 0) (< i 8)) (s (+ (record-base host) i)) 0))
+(defn port-word [host port i]
+  (if (and (>= host 0) (< host (s 32)) (>= port 1) (<= port 16))
+    (s (+ (record-base host) (+ 8 (+ (* (- port 1) 3) i)))) 0))
+(defn port-state [host port]
+  (+ (port-word host port 0) (* (port-word host port 1) 4294967296)))
+(defn port-stage [host port] (port-word host port 2))
+(defn port-put [port i v]
+  (put (+ (record-base (- (s 32) 1)) (+ 8 (+ (* (- port 1) 3) i))) v))
+(defn record-capabilities [i]
+  (if (>= i 8) 1
+    (do (put (+ (record-base (- (s 32) 1)) i) (s (+ 24 i))) (record-capabilities (+ i 1)))))
+(defn self-check [] (hid/self-check))
+(defn legacy-handoff [off remaining]
+  (if (= off 0) 1
+    (if (or (= remaining 0) (< off 32) (> off 16376) (not (= (bit-and off 3) 0))) 0
+      (let [cap (reg off)]
+        (if (= (bit-and cap 255) 1)
+          (do (rput off (bit-or cap 16777216))
+              (if (= (wait-reg off 65536 0 2000000) 1)
+                (do (rput (+ off 4) 0) 1) 0))
+          (legacy-handoff (if (= (bit-and (quot cap 256) 255) 0) 0
+                            (+ off (* (bit-and (quot cap 256) 255) 4))) (- remaining 1)))))))
+
+;; Event ring: 16 entries at10816. Snapshot before releasing a consumed event.
+(defn event []
+  (let [at (+ 10816 (* (s 11) 16)) ctl (mem (+ at 12))]
+    (if (not (= (bit-and ctl 1) (s 12))) 0
+      (let [next (mod (+ (s 11) 1) 16)]
+        (do (dma/release-fence)
+            (put 14 (mem at)) (put 15 (mem (+ at 4))) (put 16 (mem (+ at 8))) (put 17 ctl)
+            (put 11 next) (if (= next 0) (put 12 (- 1 (s 12))) 0)
+            (r64 (+ (s 6) 56) (+ (address (+ 10816 (* next 16))) 8))
+            (bit-and (quot ctl 1024) 63))))))
+;; Full Bluetooth transport owns unused contexts only after single-device
+;; admission. Cached completions are not rearmed until their consumer releases.
+(defn bt-save [kind]
+  (if (and (= kind 32) (= (s 50) 1) (= (quot (s 17) 16777216) (s 64)))
+    (let [off (s 14) high (s 15) code (quot (s 16) 16777216)
+          ep (bit-and (quot (s 17) 65536) 31)
+          ch (if (and (= off (bit-and (address (s 54)) 4294967295))
+                      (= high (u64-shift-right (address (s 54)) 32)) (= ep (s 67))) 0
+               (if (and (= off (bit-and (address (s 55)) 4294967295))
+                        (= high (u64-shift-right (address (s 55)) 32)) (= ep (s 88))) 1
+                 (if (and (= off (bit-and (address (s 56)) 4294967295))
+                          (= high (u64-shift-right (address (s 56)) 32)) (= ep (s 90))) 2 -1)))]
+      (if (< ch 0) 0
+        (if (or (= code 1) (= code 13))
+          (do (put (+ 51 ch) (if (= ch 2) 1 (+ 1 (- 512 (bit-and (s 16) 16777215))))) 1)
+          (do (put 59 code) (put (+ 51 ch) 1024) 0)))) 0))
+(defn wait-event [kind ptr fuel]
+  (let [got (event)]
+    (if (and (= got kind) (= (s 14) (bit-and ptr 4294967295)) (= (s 15) (u64-shift-right ptr 32)))
+      (quot (s 16) 16777216)
+      (if (= fuel 0) -1 (do (bt-save got) (kernel-pause) (wait-event kind ptr (- fuel 1)))))))
+(defn trb [off parameter status ctl]
+  (do (m64 off parameter) (mput (+ off 8) status) (mput (+ off 12) ctl) 1))
+(defn command [kind parameter extra]
+  (let [idx (s 9) at (+ 11072 (* idx 16)) cycle (s 10)]
+    (do (trb at parameter 0 (+ (* kind 1024) extra cycle))
+        (if (= idx 14)
+          (do (trb 11312 (address 11072) 0 (+ 6146 cycle)) (put 9 0) (put 10 (- 1 cycle)))
+          (put 9 (+ idx 1)))
+        (dma/release-fence) (rput (s 5) 0)
+        (wait-event 33 (address at) 2000000))))
+
+;; Full input context8192..10303 is shared during synchronous enumeration.
+;; Three full output contexts0..6143 fit even when CSZ=64. Hub state starts
+;; at private word288, separate from HID64..127 and controller diagnostics.
+(defn device-base [d] (if (= d 2) 288 (+ 64 (* d 32))))
+(defn ds [d f] (s (+ (device-base d) f)))
+(defn dp [d f v] (put (+ (device-base d) f) v))
+(defn device-diagnostic [d i]
+  (if (and (>= d 0) (< d 3) (>= i 0) (< i 4))
+    (ds d (case i 0 1 1 17 2 18 19)) 0))
+(defn out-base [d] (* d 2048))
+(defn ep-ring [d ep] (if (= d 2) 10304 (+ 6144 (+ (* d 1024) (* ep 512)))))
+(defn ring-next [d ep count]
+  (let [field (if (= ep 0) 8 10) cyc (+ field 1)
+        idx (+ (ds d field) count)]
+    (if (>= idx 29)
+      (do (trb (+ (ep-ring d ep) (* idx 16)) (address (ep-ring d ep)) 0 (+ 6146 (ds d cyc)))
+          (dp d field 0) (dp d cyc (- 1 (ds d cyc))))
+      (dp d field idx))))
+(defn control [d setup length input]
+  (let [ring (ep-ring d 0) at (+ ring (* (ds d 8) 16)) cyc (ds d 9)
+        status (+ at (if (> length 0) 32 16))]
+    (do (trb at setup 8 (+ 2112 cyc (if (= length 0) 0 (if (= input 1) 196608 131072))))
+        (if (> length 0) (trb (+ at 16) (address 11648) length (+ 3072 cyc (* input 65536))) 0)
+        (trb status 0 0 (+ 4128 cyc (if (or (= length 0) (= input 0)) 65536 0)))
+        (ring-next d 0 (if (> length 0) 3 2))
+        (dma/release-fence) (rput (+ (s 5) (* (ds d 0) 4)) 1)
+        (wait-event 32 (address status) 2000000))))
+(defn setup-value [request value index length]
+  (+ request (+ (* value 65536) (+ (* index 4294967296) (* length 281474976710656)))))
+(defn descriptor [d typ length] (control d (setup-value 1664 (* typ 256) 0 length) length 1))
+(defn copy-slot [d i]
+  (if (>= i (s 7)) 1
+    (do (mput (+ 8192 (+ (s 7) i)) (mem (+ (out-base d) i))) (copy-slot d (+ i 4)))))
+
+;; Accept only an interface declaring HID boot keyboard/mouse and its bounded
+;; interrupt IN endpoint. The one USB2 hub uses only its polled control ring.
+(defn parse-config [d at end active]
+  (if (>= at end) 0
+    (let [len (b (+ 11648 at)) typ (b (+ 11649 at))]
+      (if (or (< len 2) (> (+ at len) end)) 0
+        (if (and (= typ 4) (>= len 9))
+          (let [protocol (b (+ 11655 at))
+                accepted (if (and (= (b (+ 11653 at)) 3) (= (b (+ 11654 at)) 1)
+                                  (or (= protocol 1) (= protocol 2))) protocol
+                           (if (and (= (s 34) 1) (= (b (+ 11653 at)) 224)
+                                    (= (b (+ 11654 at)) 1) (= protocol 1)) 3 0))]
+            (do (dp d 7 (b (+ 11650 at)))
+                (dp d 18 (+ (b (+ 11653 at)) (+ (* (b (+ 11654 at)) 256) (* protocol 65536))))
+                (parse-config d (+ at len) end accepted)))
+          (if (and (= typ 5) (>= len 7) (> active 0)
+                   (= (bit-and (b (+ 11650 at)) 128) 128)
+                   (= (bit-and (b (+ 11651 at)) 3) 3))
+            (let [ep (bit-and (b (+ 11650 at)) 15)
+                  mps (+ (b (+ 11652 at)) (* (b (+ 11653 at)) 256))]
+              (do (dp d 19 (+ mps (+ (* (b (+ 11654 at)) 65536) (* (b (+ 11650 at)) 16777216))))
+                  (if (or (= ep 0) (> mps 64) (< mps (case active 1 8 3 16 3))) 0
+                    (do (dp d 3 (+ (* ep 2) 1)) (dp d 4 active) (dp d 5 (b (+ 11654 at))) (dp d 6 mps) 1))))
+            (parse-config d (+ at len) end active)))))))
+(defn interval-log [n e] (if (or (>= e 10) (<= n 1)) e (interval-log (quot (+ n 1) 2) (+ e 1))))
+(defn arm [d]
+  (let [off (+ (ep-ring d 1) (* (ds d 10) 16))]
+    (do (trb off (address (+ 11520 (* d 64))) (ds d 6) (+ 1056 (ds d 11)))
+        (dp d 12 off) (ring-next d 1 1) (dma/release-fence)
+        (rput (+ (s 5) (* (ds d 0) 4)) (ds d 3)) 1)))
+(defn configure [d]
+  (let [cs (s 7) epid (ds d 3)
+        ep (+ 8192 (* (+ epid 1) cs))
+        interval (if (= (ds d 2) 3) (- (ds d 5) 1) (+ 3 (interval-log (ds d 5) 0)))]
+    (do (zero 8192 10304) (mput 8196 (+ 1 (i64-shift-left 1 epid))) (copy-slot d 0)
+        (mput (+ 8192 cs) (bit-or (bit-and (mem (+ 8192 cs)) 134217727) (* epid 134217728)))
+        (mput ep (* interval 65536))
+        (mput (+ ep 4) (+ 62 (* (ds d 6) 65536)))
+        (m64 (+ ep 8) (+ (address (ep-ring d 1)) 1))
+        (mput (+ ep 16) (+ 8 (* (ds d 6) 65536)))
+        (if (= (command 12 (address 8192) (* (ds d 0) 16777216)) 1)
+          (do (dp d 10 0) (dp d 11 1) (dp d 13 1) 1) 0))))
+(defn enum-fail [d stage]
+  (do (dp d 16 (+ stage (* (quot (s 16) 16777216) 256))) 0))
+(defn copy-ep0 [d i]
+  (if (>= i (s 7)) 1
+    (do (mput (+ 8192 (+ (* (s 7) 2) i)) (mem (+ (out-base d) (+ (s 7) i))))
+        (copy-ep0 d (+ i 4)))))
+(defn ep0-packet [speed raw]
+  ;; USB3 bMaxPacketSize0 is exponent9, not a literal packet length.
+  (if (= speed 4) (if (= raw 9) 512 0)
+    (if (= speed 3) (if (= raw 64) 64 0)
+      (if (= speed 2) (if (= raw 8) 8 0)
+        (if (and (= speed 1) (or (= raw 8) (= raw 16) (= raw 32) (= raw 64))) raw 0)))))
+(defn ep0-size [d raw]
+  (let [mps (ep0-packet (ds d 2) raw)]
+    (if (= mps 0) 0
+      (if (= mps (if (= (ds d 2) 4) 512 (if (= (ds d 2) 3) 64 8))) 1
+        (let [ep (+ 8192 (* (s 7) 2))]
+          (do (zero 8192 10304) (mput 8196 2) (copy-ep0 d 0)
+              (mput ep (bit-and (mem ep) 4294967288))
+              (mput (+ ep 4) (+ (bit-and (mem (+ ep 4)) 65535) (* mps 65536)))
+              (if (= (command 13 (address 8192) (* (ds d 0) 16777216)) 1) 1 0)))))))
+(defn usb3-port [port off fuel]
+  (if (or (= off 0) (= fuel 0) (< off 32) (> off 16368) (not (= (bit-and off 3) 0))) 0
+    (let [cap (reg off) next (bit-and (quot cap 256) 255)
+          match (if (and (= (bit-and cap 255) 2) (= (u64-shift-right cap 24) 3)
+                         (= (reg (+ off 4)) 0x20425355))
+                  (let [range (reg (+ off 8)) first (bit-and range 255)
+                        count (bit-and (quot range 256) 255)]
+                    (if (and (= (bit-and (reg (+ off 12)) 31) 0) (> first 0) (> count 0)
+                             (>= port first) (< port (+ first count))) 1 0)) 0)]
+      (if (= match 1) 1 (if (= next 0) 0 (usb3-port port (+ off (* next 4)) (- fuel 1)))))))
+(defn root-speed-admitted [port speed]
+  (if (and (>= speed 1) (<= speed 3)) 1
+    (if (= speed 4) (usb3-port port (* (u64-shift-right (reg 16) 16) 4) 50) 0)))
+(defn superspeed-check []
+  (+ (if (= (ep0-packet 4 9) 512) 1 0)
+     (if (= (ep0-packet 4 8) 0) 2 0)
+     (if (= (ep0-packet 4 10) 0) 4 0)
+     (if (= (ep0-packet 3 64) 64) 8 0)
+     (if (= (ep0-packet 3 8) 0) 16 0)
+     (if (= (ep0-packet 2 64) 0) 32 0)
+     (if (= (ep0-packet 1 32) 32) 64 0)
+     (if (= (ep0-packet 5 9) 0) 128 0)))
+(defn hub-wait [ms]
+  (if (<= ms 0) 1 (if (= (recovery) 1) (hub-wait (- ms 12)) 0)))
+(defn hub-power [port]
+  (if (> port (ds 2 20)) 1
+    (if (= (control 2 (setup-value 803 8 port 0) 0 0) 1) (hub-power (+ port 1)) 0)))
+(defn hub-context []
+  (let [cs (s 7) slot (+ 8192 cs)]
+    (do (zero 8192 10304) (mput 8196 1) (copy-slot 2 0)
+        (mput slot (bit-or (mem slot) (+ 67108864 (if (= (ds 2 22) 2) 33554432 0))))
+        (mput (+ slot 4) (+ (bit-and (mem (+ slot 4)) 16777215) (* (ds 2 20) 16777216)))
+        (mput (+ slot 8) (+ (bit-and (mem (+ slot 8)) 4294770687) (* (ds 2 21) 65536)))
+        (if (= (command 12 (address 8192) (* (ds 2 0) 16777216)) 1) 1 0))))
+(defn configure-hub []
+  (if (not (= (descriptor 2 2 9) 1)) (enum-fail 2 20)
+    (if (or (not (= (b 11648) 9)) (not (= (b 11649) 2)) (= (b 11653) 0)) (enum-fail 2 21)
+      (if (not (= (control 2 (setup-value 2304 (b 11653) 0 0) 0 0) 1)) (enum-fail 2 22)
+        (if (not (= (control 2 (setup-value 1696 10496 0 9) 9 1) 1)) (enum-fail 2 23)
+          (if (or (< (b 11648) 9) (> (b 11648) 11) (not (= (b 11649) 41))
+                  (< (b 11650) 1) (> (b 11650) 8)) (enum-fail 2 24)
+            (do (dp 2 20 (b 11650)) (dp 2 21 (bit-and (quot (b 11651) 32) 3))
+                (dp 2 23 (* (b 11653) 2)) (dp 2 18 9)
+                (if (not (= (hub-context) 1)) (enum-fail 2 25)
+                  (if (not (= (hub-power 1) 1)) (enum-fail 2 26)
+                    (if (not (= (hub-wait (max 100 (ds 2 23))) 1)) (enum-fail 2 27)
+                      (do (dp 2 13 1) (dp 2 4 9) (dp 2 16 589839) 1)))))))))))
+(defn parse-bulk [d at end active]
+  (if (>= at end) (if (and (> (ds d 24) 0) (> (ds d 26) 0)) 1 0)
+    (let [len (b (+ 11648 at)) typ (b (+ 11649 at))]
+      (if (or (< len 2) (> (+ at len) end)) 0
+        (if (and (= typ 4) (>= len 9))
+          (parse-bulk d (+ at len) end
+            (if (and (= (b (+ 11650 at)) (ds d 7)) (= (b (+ 11651 at)) 0)) 1 0))
+          (if (and (= active 1) (= typ 5) (>= len 7) (= (bit-and (b (+ 11651 at)) 3) 2))
+            (let [addr (b (+ 11650 at)) ep (bit-and addr 15)
+                  field (if (= (bit-and addr 128) 128) 24 26)
+                  mps (+ (b (+ 11652 at)) (* (b (+ 11653 at)) 256))]
+              (if (or (= ep 0) (< mps 8) (> mps 512)
+                      (not (= (bit-and mps (- mps 1)) 0)) (not (= (ds d field) 0))) 0
+                (do (dp d field (+ (* ep 2) (if (= field 24) 1 0)))
+                    (dp d (+ field 1) mps) (parse-bulk d (+ at len) end active))))
+            (parse-bulk d (+ at len) end active)))))))
+(defn configure-hid [d]
+  (if (not (= (descriptor d 2 9) 1)) (enum-fail d 5)
+    (let [total (+ (b 11650) (* (b 11651) 256)) config (b 11653)]
+      (if (or (< total 9) (> total 512)) (enum-fail d 6)
+        (if (not (= (descriptor d 2 total) 1)) (enum-fail d 7)
+          (if (not (= (parse-config d 0 total 0) 1)) (enum-fail d 8)
+            (if (and (= (ds d 4) 3) (not (= (parse-bulk d 0 total 0) 1))) (enum-fail d 29)
+            (if (not (= (control d (setup-value 2304 config 0 0) 0 0) 1)) (enum-fail d 9)
+              (if (and (not (= (ds d 4) 3))
+                       (not (= (control d (setup-value 2849 0 (ds d 7) 0) 0 0) 1))) (enum-fail d 10)
+                (if (= (configure d) 1) (do (dp d 16 (+ 15 (* (ds d 4) 65536))) 1) (enum-fail d 11)))))))))))
+(defn read-device [d]
+  (if (not (= (recovery) 1)) (enum-fail d 12)
+    (if (not (= (descriptor d 1 8) 1)) (enum-fail d 4)
+      (if (not (= (ep0-size d (b 11655)) 1)) (enum-fail d 13)
+        (if (not (= (descriptor d 1 18) 1)) (enum-fail d 4)
+          (do (dp d 17 (+ (b 11656) (+ (* (b 11657) 256) (+ (* (b 11658) 65536) (* (b 11659) 16777216)))))
+              (dp d 22 (b 11654)) (dp d 23 (b 11652))
+              (if (= (ds d 2) 4)
+                (if (and (= (b 11648) 18) (= (b 11649) 1)
+                         (>= (+ (b 11650) (* (b 11651) 256)) 768) (= (b 11655) 9))
+                  (do (dp d 18 (+ 2147483648 (b 11652) (* (b 11653) 256) (* (b 11654) 65536)))
+                      (dp d 19 (+ (b 11650) (* (b 11651) 256))) (enum-fail d 35))
+                  (enum-fail d 36))
+              (if (= (b 11652) 9)
+                (if (= d 2) (configure-hub) (do (dp d 16 14) 2))
+                (if (= d 2) (enum-fail d 28) (configure-hid d))))))))))
+(defn enumerate [d root speed route tt]
+  (if (not (= (command 9 0 0) 1)) (enum-fail d 1)
+    (let [slot (quot (s 17) 16777216) cs (s 7) mps (if (= speed 4) 512 (if (= speed 3) 64 8))]
+      (if (or (< slot 1) (> slot 3)) (enum-fail d 2)
+        (do (dp d 0 slot) (dp d 1 root) (dp d 2 speed) (dp d 8 0) (dp d 9 1)
+            (m64 (+ 11328 (* slot 8)) (address (out-base d)))
+            (zero 8192 10304) (mput 8196 3)
+            (mput (+ 8192 cs) (+ route (+ (* speed 1048576) 134217728)))
+            (mput (+ 8196 cs) (* root 65536)) (mput (+ 8200 cs) tt)
+            (mput (+ 8192 (* cs 2) 4) (+ 38 (* mps 65536)))
+            (m64 (+ 8192 (* cs 2) 8) (+ (address (ep-ring d 0)) 1))
+            (mput (+ 8192 (* cs 2) 16) 8)
+            (if (not (= (command 11 (address 8192) (* slot 16777216)) 1)) (enum-fail d 3)
+              (read-device d)))))))
+(defn disable-device [d]
+  (do (if (> (ds d 0) 0) (command 10 0 (* (ds d 0) 16777216)) 0) (dp d 0 0) 1))
+(defn hub-port-put [port i v] (put (+ 320 (+ (* (- port 1) 3) i)) v))
+(defn hub-port-state [port]
+  (if (and (>= port 1) (<= port 8))
+    (+ (s (+ 320 (* (- port 1) 3))) (* (s (+ 321 (* (- port 1) 3))) 4294967296)) 0))
+(defn hub-port-stage [port] (if (and (>= port 1) (<= port 8)) (s (+ 322 (* (- port 1) 3))) 0))
+(defn hub-ports [] (if (= (ds 2 13) 1) (ds 2 20) 0))
+(defn hub-status [port]
+  (if (= (control 2 (setup-value 163 0 port 4) 4 1) 1) (mem 11648) -1))
+(defn hub-reset-wait [port fuel]
+  (let [status (hub-status port)]
+    (if (< status 0) 0
+      (if (= (bit-and status 18) 2) 1
+        (if (= fuel 0) 0 (if (= (recovery) 1) (hub-reset-wait port (- fuel 1)) 0))))))
+(defn hub-child [port devices]
+  (if (not (= (control 2 (setup-value 803 4 port 0) 0 0) 1))
+    (do (hub-port-put port 2 30) devices)
+    (if (not (= (hub-reset-wait port 100) 1)) (do (hub-port-put port 2 31) devices)
+      (let [status (hub-status port)
+            speed (if (= (bit-and status 512) 512) 2 (if (= (bit-and status 1024) 1024) 3 1))
+            cleared (control 2 (setup-value 291 20 port 0) 0 0)
+            connection (control 2 (setup-value 291 16 port 0) 0 0)]
+        (do (hub-port-put port 1 status) (dp devices 0 0) (dp devices 16 0)
+            (if (or (< status 0) (not (= cleared 1)) (not (= connection 1)) (not (= (recovery) 1)))
+              (do (hub-port-put port 2 32) devices)
+              (let [tt (if (and (= (ds 2 2) 3) (< speed 3)) (+ (ds 2 0) (* port 256)) 0)
+                    ok (enumerate devices (ds 2 1) speed port tt)]
+                (do (hub-port-put port 2 (ds devices 16))
+                    (if (= ok 1) (+ devices 1) (do (disable-device devices) devices))))))))))
+(defn hub-scan [port devices]
+  (if (or (> port (ds 2 20)) (>= devices 2)) devices
+    (let [status (hub-status port)]
+      (do (hub-port-put port 0 status)
+          (if (or (< status 0) (= (bit-and status 1) 0)) (hub-scan (+ port 1) devices)
+            (hub-scan (+ port 1) (hub-child port devices)))))))
+(defn hub-at [root speed devices]
+  (let [off (+ (s 4) (+ 1024 (* (- root 1) 16))) val (reg off)]
+    (do (rput off (+ (bit-and val 3584) 16))
+        (if (or (= (wait-reg off 18 2 2000000) 0) (not (= (recovery) 1)))
+          (do (dp 2 16 33) devices)
+          (if (= (enumerate 2 root speed 0 0) 1) (hub-scan 1 devices)
+            (do (disable-device 2) devices))))))
+(defn ports [port devices]
+  (if (or (> port (s 8)) (>= devices 2)) devices
+    (let [off (+ (s 4) (+ 1024 (* (- port 1) 16))) val (reg off)]
+      (do (dp devices 0 0) (dp devices 16 0) (port-put port 0 val)
+          (if (= (bit-and val 1) 0) (ports (+ port 1) devices)
+            (do (rput off (+ (bit-and val 3584) 16))
+                (if (= (wait-reg off 18 2 2000000) 0)
+                  (do (port-put port 1 (reg off)) (port-put port 2 16) (ports (+ port 1) devices))
+                  (let [speed (bit-and (quot (reg off) 1024) 15)
+                        ok (if (= (root-speed-admitted port speed) 1)
+                             (if (= (recovery) 1) (enumerate devices port speed 0 0) (enum-fail devices 12)) 0)]
+                    (if (= ok 2)
+                      (do (disable-device devices)
+                          (if (= (ds 2 13) 1)
+                            (do (port-put port 2 34) (ports (+ port 1) devices))
+                            (let [total (hub-at port speed devices)]
+                              (do (port-put port 1 (reg off)) (port-put port 2 (ds 2 16))
+                                  (ports (+ port 1) total)))))
+                      (do (port-put port 1 (reg off))
+                          (port-put port 2 (if (= (root-speed-admitted port speed) 1) (ds devices 16) 17))
+                          (if (= ok 0) (disable-device devices) 0)
+                          (ports (+ port 1) (+ devices ok))))))))))))
+(defn arm-devices [d]
+  (if (>= d (s 18)) 1
+    (do (if (= (ds d 4) 3) 0 (arm d)) (arm-devices (+ d 1)))))
+(defn clear-pad [i offset]
+  (if (>= offset 4096) 1
+    (do (if (= i 0) (mput (+ 12288 offset) 0)
+          (kernel-store-u32-4k (kernel-owned-window 14 4096) 4096 offset 0))
+        (clear-pad i (+ offset 4)))))
+(defn scratchpads [i]
+  (if (>= i (s 19))
+    (if (> (s 19) 0) (m64 11328 (address 11456)) 0)
+    (do (clear-pad i 0)
+        (m64 (+ 11456 (* i 8)) (if (= i 0) (address 12288) (kernel-owned-window 14 4096)))
+        (scratchpads (+ i 1)))))
+(defn initialize []
+  (let [op (s 4) rt (s 6) hcs2 (reg 8)
+        pads (+ (bit-and (quot hcs2 134217728) 31) (* (bit-and (quot hcs2 2097152) 31) 32))]
+    (if (or (< (bit-and (reg 4) 255) 3) (> (s 8) 16) (> (s 5) 16368) (> rt 16320) (> (+ op 1280) 16384)
+            (> pads 2)) (fail 3)
+      (do (rput op 0)
+          (if (= (wait-reg (+ op 4) 1 1 2000000) 0) (fail 4)
+            (do (rput op 2)
+                (if (or (= (wait-reg op 2 0 2000000) 0) (= (wait-reg (+ op 4) 2048 0 2000000) 0)) (fail 5)
+                  (if (= (bit-and (reg (+ op 8)) 1) 0) (fail 6)
+                    (do (zero 0 12288) (put 19 pads) (put 9 0) (put 10 1) (put 11 0) (put 12 1)
+                        (m64 11392 (address 10816)) (mput 11400 16) (scratchpads 0)
+                        (r64 (+ op 48) (address 11328)) (r64 (+ op 24) (+ (address 11072) 1))
+                        (rput (+ op 56) 3) (rput (+ rt 40) 1)
+                        (r64 (+ rt 48) (address 11392)) (r64 (+ rt 56) (address 10816))
+                        (dma/release-fence) (rput op 1)
+                        (if (= (wait-reg (+ op 4) 1 0 2000000) 0) (fail 7)
+                          (do (put 18 (ports 1 0)) (arm-devices 0) (fail 15))))))))))))
+(defn clear-state [i]
+  (if (>= i 1536) 1
+    (do (kernel-store-u32-4k (kernel-owned-window 9 4096) 4096 i 0) (clear-state (+ i 4)))))
+(defn start-controller [slot]
+    (if (< slot 0) (fail 1)
+      (let [bar (pci slot 16) hi (if (= (bit-and bar 6) 4) (pci slot 20) 0)]
+        (if (or (and (= (bit-and bar 4294967280) 0) (= hi 0)) (not (= (bit-and bar 1) 0)) (>= hi 128)) (fail 2)
+          (do (put 1 slot) (put 2 (bit-and bar 4294967280)) (put 3 hi)
+              (pci-put slot 4 (bit-or (bit-and (pci slot 4) 65535) 1030))
+              (put 4 (bit-and (reg 0) 255)) (put 5 (bit-and (reg 20) 4294967292))
+              (put 6 (bit-and (reg 24) 4294967264))
+              (put 7 (if (= (bit-and (reg 16) 4) 0) 32 64))
+              (put 8 (bit-and (quot (reg 4) 16777216) 255))
+              ;; Preserve raw capabilities before a bounded refusal. These are
+              ;; public controller metadata, never device reports or state.
+              (put 24 (reg 0)) (put 25 (reg 4)) (put 26 (reg 8))
+              (put 27 (reg 16)) (put 28 (s 5)) (put 29 (s 6))
+              (put 30 slot) (put 31 (pci slot 0))
+              (record-capabilities 0)
+              (if (= (legacy-handoff (* (quot (reg 16) 65536) 4) 32) 1) (initialize) (fail 8)))))))
+(defn clear-hub [i]
+  (if (>= i 344) 1 (do (put i 0) (clear-hub (+ i 1)))))
+(defn clear-devices [i]
+  (if (>= i 128) 1 (do (put i 0) (clear-devices (+ i 1)))))
+;; HCHalted must be observed before another host reuses the DMA pages.
+(defn halt-selected []
+  (do (rput (s 4) 0) (wait-reg (+ (s 4) 4) 1 1 2000000)))
+(defn start-from [slot host]
+  (do (put 32 (+ host 1)) (put 18 0) (clear-devices 64) (clear-hub 288)
+      (let [r (start-controller slot) next (if (= host 0) (find (+ slot 1)) -1)]
+        (if (and (= r 15) (= (s 18) 0) (>= next 0))
+          ;; Never point a second controller at memory still owned by a
+          ;; running first controller. A failed halt stops the search.
+          (if (= (halt-selected) 1)
+            (start-from next (+ host 1)) (fail 4)) r))))
+(defn start []
+  (let [cleared (clear-state 0) slot (+ (find 0) (* cleared 0))]
+    (if (< slot 0) (fail 1) (start-from slot 0))))
+
+;; Signed debug operation, one host at a time. Invalid targets leave the
+;; selected host intact. Clear only USB private state, below draft/NVMe1536.
+;; This neither enables simultaneous-host input nor pairs Bluetooth devices.
+(defn select-mode [slot bluetooth]
+  (if (or (< slot 0) (> slot 65535)) -1
+    (if (or (= (bit-and (pci slot 0) 65535) 65535)
+            (not (= (u64-shift-right (pci slot 8) 8) 787248))) -1
+      ;; A failed initialization requires PXE reboot, never speculative DMA reuse.
+      (if (or (not (= (s 0) 15)) (< (s 4) 32) (> (s 4) 255)) -2
+        (if (not (= (halt-selected) 1)) (fail 16)
+          (do (clear-state 0) (put 32 1) (put 34 bluetooth) (start-controller slot)))))))
+(defn select-controller [slot] (select-mode slot 0))
+
+;; poll returns device index+1 for a completed HID report. Acknowledge only
+;; after the desktop has consumed it; errors never become input events.
+(defn match-device [d slot]
+  (if (>= d (s 18)) -1 (if (= (ds d 0) slot) d (match-device (+ d 1) slot))))
+(defn poll []
+  (if (= (s 50) 1) (do (bt-save (event)) 0)
+  (if (not (= (s 0) 15)) 0
+    (let [kind (event)]
+      (if (not (= kind 32)) 0
+        (let [d (match-device 0 (quot (s 17) 16777216)) code (quot (s 16) 16777216)]
+          (if (< d 0) 0
+            (if (and (= (s 14) (bit-and (address (ds d 12)) 4294967295))
+                     (= (bit-and (quot (s 17) 65536) 31) (ds d 3))
+                     (or (= code 1) (= code 13)))
+              (do (dp d 14 (- (ds d 6) (bit-and (s 16) 16777215))) (+ d 1))
+              (do (dp d 13 0) 0)))))))))
+(defn report-byte [d i] (b (+ 11520 (+ (* d 64) i))))
+(defn report-kind [d] (ds d 4))
+(defn report-length [d] (ds d 14))
+(defn devices [] (s 18))
+(defn quarantine-device [d]
+  (if (>= d (s 18)) 1 (do (dp d 15 1) (quarantine-device (+ d 1)))))
+(defn quarantine [] (if (= (s 0) 15) (quarantine-device 0) 0))
+(defn report-copy [d i dest]
+  (if (>= i 8) 1
+    (do (kernel-store-u8-4k (kernel-owned-window 9 4096) 4096 (+ dest i) (report-byte d i))
+        (report-copy d (+ i 1) dest))))
+(defn report-word [d base]
+  (+ (s (+ base (* d 8))) (* (s (+ base (+ (* d 8) 1))) 4294967296)))
+(defn next-key [d i]
+  (let [copied (report-copy d 0 (+ 1032 (* d 32)))
+        current (report-word d 258) previous (report-word d 256)]
+    (if (= (ds d 15) 1)
+      (do (if (= current 0) (dp d 15 0) 0) 0)
+    (if (= (hid/keyboard-valid current (report-length d)) 1)
+      (+ (hid/new-key previous current i) (* copied 0)) 0))))
+(defn acknowledge [d]
+  (do (report-copy d 0 (+ 1024 (* d 32))) (if (and (= (ds d 13) 1) (not (= (ds d 4) 3))) (arm d) 0)))
+
+;; Explicit HCI identification only. Kind3 never becomes keyboard/mouse input.
+;; The command is completed on EP0 before an event transfer is armed, so a
+;; synchronous control wait cannot discard its interrupt completion. No ACL,
+;; scan, connection, pairing, bond key or firmware-download command is sent.
+(defn hci-head [d i acc]
+  (if (>= i 8) acc
+    (hci-head d (+ i 1) (+ acc (i64-shift-left (report-byte d i) (* i 8))))))
+(defn hci-response [d opcode expected]
+  (do (put 44 (if (>= (report-length d) 6) (report-byte d 5) 255))
+      (put 45 (report-byte d 0))
+      (put 46 (+ (report-byte d 3) (* (report-byte d 4) 256)))
+      (put 47 (report-length d))
+      (if (= (hci/command-complete (hci-head d 0 0) (report-length d) opcode expected) 1) 1 -4)))
+(defn hci-wait [d opcode expected fuel]
+  (let [ready (poll)]
+    (if (= ready (+ d 1))
+      (if (and (> fuel 0) (= (ds d 17) 0xb8500bda)
+               (= (hci/ignorable-vendor (hci-head d 0 0) (report-length d)) 1))
+        (do (arm d) (hci-wait d opcode expected (- fuel 1)))
+        (hci-response d opcode expected))
+      (if (= fuel 0) -3
+        (if (not (= (recovery) 1)) -2 (hci-wait d opcode expected (- fuel 1)))))))
+(defn hci-query [d opcode expected]
+  (let [request (if (= (ds d 23) 224) 32 33)
+        index (if (= request 32) 0 (ds d 7))]
+    (do (zero (+ 11520 (* d 64)) (+ 11584 (* d 64)))
+        (mput 11648 opcode)
+        (if (not (= (control d (setup-value request 0 index 3) 3 0) 1)) -1
+          (do (arm d) (hci-wait d opcode expected 200))))))
+;; The Realtek vendor read is only valid for this observed VID/PID and
+;; version tuple. Other controllers never receive a vendor opcode.
+(defn rtl-rom []
+  (if (and (= (ds 0 17) 0xb8500bda) (= (s 38) 12) (= (s 39) 11)
+           (= (s 41) 93) (= (s 42) 0x8851))
+    (let [rom (hci-query 0 64621 7)]
+      (do (put 48 rom)
+          (if (= rom 1) (do (put 49 (report-byte 0 6)) 15) 20)))
+    15))
+(defn bluetooth-diagnostic [i]
+  (if (and (>= i 0) (< i 15)) (s (+ 35 i)) 0))
+(defn probe-bluetooth [slot]
+  (let [selected (select-mode slot 1)]
+    (if (not (= selected 15)) selected
+      (do (put 43 (hci/self-check))
+          (if (or (not (= (s 18) 1)) (not (= (ds 0 4) 3))) (do (put 35 17) 17)
+            (let [reset (hci-query 0 3075 6)]
+              (do (put 36 reset)
+                  (if (not (= reset 1)) (do (put 35 18) 18)
+                    (let [version (hci-query 0 4097 14)]
+                      (do (put 37 version)
+                          (if (not (= version 1)) (do (put 35 19) 19)
+                            (do (put 38 (report-byte 0 6))
+                                (put 39 (+ (report-byte 0 7) (* (report-byte 0 8) 256)))
+                                (put 40 (report-byte 0 9))
+                                (put 41 (+ (report-byte 0 10) (* (report-byte 0 11) 256)))
+                                (put 42 (+ (report-byte 0 12) (* (report-byte 0 13) 256)))
+                                (let [result (rtl-rom)] (do (put 35 result) result))))))))))))))
+
+;; Full LE transport: on this one-port, single-device radio only, output
+;; contexts1/2 are unreferenced. 2048..4095 is private host state,4096..4607
+;; event IN,4608..5119 ACL IN,5120..5631 ACL OUT,5632..6143 reserved.
+;; Completed input-context8192..10303 may hold crypto workspace after the
+;; final endpoint configuration. No NVMe/NIC/font/private-draft alias exists.
+(defn ble-state [i] (if (and (>= i 0) (< i 2048)) (b (+ 2048 i)) 0))
+(defn ble-put [i v]
+  (if (and (>= i 0) (< i 2048))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 2048 i) v) 0))
+(defn ble-diagnostic [i] (if (and (>= i 0) (< i 14)) (s (+ 50 i)) 0))
+(defn ble-param [i v]
+  (if (and (>= i 0) (< i 255))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 11651 i) v) 0))
+(defn bt-ctx [ep mps ring typ]
+  (let [at (+ 8192 (* (+ ep 1) (s 7)))]
+    (do (mput (+ at 4) (+ 6 (+ (* typ 8) (* mps 65536))))
+        (m64 (+ at 8) (+ (address ring) 1)) (mput (+ at 16) 512))))
+(defn bt-arm [ch length]
+  (let [field (case ch 0 10 1 28 30) idx (ds 0 field) cyc (ds 0 (+ field 1))
+        ring (+ 6656 (* ch 512)) at (+ ring (* idx 16))
+        ep (case ch 0 (ds 0 3) 1 (ds 0 24) (ds 0 26))]
+    (do (trb at (address (+ 4096 (* ch 512))) length (+ 1060 cyc))
+        (put (+ 54 ch) at)
+        (if (= idx 29)
+          (do (trb (+ ring 480) (address ring) 0 (+ 6146 cyc))
+              (dp 0 field 0) (dp 0 (+ field 1) (- 1 cyc)))
+          (dp 0 field (+ idx 1)))
+        (dma/release-fence) (rput (+ (s 5) (* (ds 0 0) 4)) ep) 1)))
+(defn ble-command [opcode n]
+  (if (or (not (= (s 50) 1)) (< n 0) (> n 255) (< opcode 0) (> opcode 65535)) 0
+    (let [request (if (= (ds 0 23) 224) 32 33) index (if (= request 32) 0 (ds 0 7))]
+      (do (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11648 (bit-and opcode 255))
+          (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11649 (quot opcode 256))
+          (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11650 n)
+          (control 0 (setup-value request 0 index (+ n 3)) (+ n 3) 0)))))
+(defn ble-poll []
+  (if (not (= (s 50) 1)) 0
+    (do (bt-save (event))
+        (if (> (s 59) 0) -1 (if (> (s 51) 0) 1 (if (> (s 52) 0) 2 0))))))
+(defn ble-length [ch] (if (and (>= ch 1) (<= ch 2)) (- (s (+ 50 ch)) 1) 0))
+(defn ble-byte [ch i]
+  (if (and (>= ch 1) (<= ch 2) (>= i 0) (< i 512)) (b (+ 4096 (+ (* (- ch 1) 512) i))) 0))
+(defn ble-release [ch]
+  (if (and (>= ch 1) (<= ch 2) (> (s (+ 50 ch)) 0))
+    (do (put (+ 50 ch) 0) (bt-arm (- ch 1) 512)) 0))
+(defn ble-tx-ready [] (if (and (= (s 50) 1) (= (s 53) 1)) 1 0))
+(defn ble-tx [i v]
+  (if (and (= (ble-tx-ready) 1) (>= i 0) (< i 512))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 5120 i) v) 0))
+(defn ble-send [n]
+  (if (or (not (= (s 50) 1)) (= (s 53) 0) (< n 4) (> n 512)) 0
+    (do (put 53 0) (bt-arm 2 n))))
+(defn ble-start [slot]
+  (let [probed (probe-bluetooth slot)]
+    (if (not (= probed 15)) probed
+      (if (or (not (= (s 8) 1)) (not (= (ds 0 0) 1))
+              (not (= (ds 0 17) 0xb8500bda)) (> (ds 2 13) 0)
+              (= (ds 0 24) (ds 0 26)) (= (ds 0 24) (ds 0 3))
+              (= (ds 0 26) (ds 0 3))) 21
+        (let [in (ds 0 24) out (ds 0 26) cs (s 7)]
+          (do (zero 2048 6144) (zero 7168 8192) (zero 8192 10304)
+              (mput 8196 (+ 1 (+ (i64-shift-left 1 in) (i64-shift-left 1 out)))) (copy-slot 0 0)
+              (mput (+ 8192 cs) (bit-or (bit-and (mem (+ 8192 cs)) 134217727)
+                (* (max (ds 0 3) (max in out)) 134217728)))
+              (bt-ctx in (ds 0 25) 7168 6) (bt-ctx out (ds 0 27) 7680 2)
+              (if (not (= (command 12 (address 8192) (* (ds 0 0) 16777216)) 1)) 22
+                (do (dp 0 28 0) (dp 0 29 1) (dp 0 30 0) (dp 0 31 1)
+                    (put 51 0) (put 52 0) (put 53 1) (put 59 0)
+                    (put 50 1) (bt-arm 0 512) (bt-arm 1 512) 15))))))))
+
+;; Endpoint input context is dead after ble-start's final ConfigureEndpoint.
+;; The single-radio owner may reuse its first1024 bytes as a bounded HID map.
+(defn ble-map [i]
+  (if (and (= (s 50) 1) (>= i 0) (< i 1024)) (b (+ 8192 i)) 0))
+(defn ble-map-put [i v]
+  (if (and (= (s 50) 1) (>= i 0) (< i 1024))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 8192 i) v) 0))
+
+;; HID parser scratch is the second1024 bytes of the dead input context.
+;; It never aliases the1024-byte Report Map or the radio/ACL DMA buffers.
+(defn ble-hid-state [i]
+  (if (and (= (s 50) 1) (>= i 0) (< i 256)) (mem (+ 9216 (* i 4))) 0))
+(defn ble-hid-put [i v]
+  (if (and (= (s 50) 1) (>= i 0) (< i 256)) (mput (+ 9216 (* i 4)) v) 0))
