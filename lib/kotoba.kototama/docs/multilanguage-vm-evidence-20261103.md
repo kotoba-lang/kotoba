@@ -387,3 +387,17 @@ images shares a backend, and the expected stack bound comes from the retained
 historical fixture rather than independent artifact admission. This bounded
 comparison is not general VM conformance, host integration or hostile-input
 qualification.
+
+The same fresh 98-input comparison was also run natively on a physical Linux
+ARM64 Xavier CPU, using packed Amu root SHA-256
+`690ae6785d32cd8d1baa2e7c64298d465a5b234dcf203f4987bb063ecd1e902d` and
+runner source SHA-256
+`c9f1fe1b5c1748450fb11b233cbdc9d9234880a60dc480c0387b173f60d905be`.
+All 98 live AOT receipts matched the native ARM64 reference gate; per-receipt
+corruption and the mapping mutant were rejected. A Linux ARM64 CI job now
+runs the same gate, while the existing x86-64 run was repeated after the
+shared script change. Expected stack values still come from the historical
+x86 fixture, not independent ARM artifact admission. Reference and AOT
+compilations use the same native compiler backend on each platform. These
+bounded observations do not establish general VM, release, hostile-input, or
+production host qualification.

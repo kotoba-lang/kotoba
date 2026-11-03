@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute pinned CBOR inputs through AOT and a native reference on Linux x86.
+"""Execute pinned CBOR inputs through AOT and a native reference on native Linux x86-64 or ARM64.
 
 Python stages fixed bytes and transports actual process outputs. The native
 Kotoba gate validates receipt framing/context and compares status/value/fuel.
@@ -36,13 +36,17 @@ def literal(data):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ('compiler', 'runner', 'output'):
+    for name in ('compiler', 'output'):
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument('--runner', type=Path, required=True, help='x86 runner image or ARM runner source')
     for name in ('compiler-sha256', 'runner-sha256'):
         p.add_argument('--' + name, required=True)
     a = p.parse_args()
-    if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'AMD64'):
-        raise ValueError('requires native Linux x86-64')
+    machine = platform.machine()
+    if platform.system() != 'Linux' or machine not in ('x86_64', 'AMD64', 'aarch64', 'arm64'):
+        raise ValueError('requires native Linux x86-64 or ARM64')
+    arm = machine in ('aarch64', 'arm64')
+    target = 'aarch64-linux' if arm else 'x86_64-linux'
     compiler, runner = a.compiler.resolve(strict=True), a.runner.resolve(strict=True)
     if sha(compiler.read_bytes()) != a.compiler_sha256 or sha(runner.read_bytes()) != a.runner_sha256:
         raise ValueError('compiler or runner digest mismatch')
@@ -87,7 +91,7 @@ def main():
             raise ValueError('snapshot case does not match retained report')
         source, binary = inputs / f'{i:03d}.cbor', inputs / f'{i:03d}.elf'
         source.write_bytes(program)
-        build = subprocess.run([str(compiler), 'compile-kototama', str(source), '--target', 'x86_64-linux',
+        build = subprocess.run([str(compiler), 'compile-kototama', str(source), '--target', target,
                                 '--output', str(binary), '--fuel', str(row['budget']), '--profile', snapshot['profile']],
                                cwd=out, env=env, capture_output=True, timeout=120)
         (inputs / f'{i:03d}-compile.stderr').write_bytes(build.stderr)
@@ -136,21 +140,38 @@ def main():
         lock = out / (name + '.ksl')
         lock.write_text('KSL1\nentry ' + str(gate) + '\nroot ' + str(root) + '\n' +
                         ''.join('file ' + sha(f.read_bytes()) + ' ' + str(f) + '\n' for f in sorted(root.rglob('*.kotoba'))))
-        image, payload = out / (name + '.kx64'), out / (name + '.bin')
-        build = subprocess.run([str(compiler), 'compile', str(gate), '--target', 'x86_64-linux', '--output', str(image),
-                                '--format', 'kx64-v1', '--source-path', str(root), '--source-lock', str(lock),
-                                '--source-lock-sha256', sha(lock.read_bytes())], cwd=out, env=env, capture_output=True, timeout=900)
+        image = out / (name + ('.kseed' if arm else '.kx64'))
+        command = [str(compiler), 'compile', str(gate), '--target', 'aarch64-macos' if arm else target,
+                   '--output', str(image), '--source-path', str(root), '--source-lock', str(lock),
+                   '--source-lock-sha256', sha(lock.read_bytes())]
+        if not arm:
+            command.extend(['--format', 'kx64-v1'])
+        build = subprocess.run(command, cwd=out, env=env, capture_output=True, timeout=900)
         (out / (name + '-compile.stderr')).write_bytes(build.stderr)
         if build.returncode or build.stderr:
             raise RuntimeError(f'{name} native compile failed: {build.stderr[-300:]!r}')
-        header, body = image.read_bytes().split(b'\n\n', 1)
-        m = re.fullmatch(rb'KX64V1 x86_64-linux sysv-ctx-v11 ([0-9]+) 0', header)
-        if not m or int(m[1]) != len(body) or body[:1] != b'\xe9':
-            raise ValueError('invalid KX64 artifact')
-        payload.write_bytes(body)
         runenv = dict(env, KEXE_ALLOW='-', KEXE_FUEL='off', KEXE_STRUCTURED_REPORT='1', KEXE_STRING_POOL='268435456')
-        result = subprocess.run([str(runner), str(payload), '0', '0', 'x86_64', '-', '--'],
-                                cwd=out, env=runenv, capture_output=True, timeout=300)
+        if arm:
+            runner_copy = out / (name + '-runner.kotoba')
+            shutil.copyfile(runner, runner_copy)
+            packed = out / (name + '-runner.elf')
+            pack = subprocess.run([str(compiler), 'compile', str(runner_copy), '--target', target,
+                                   '--output', str(packed), '--format', 'packed', '--payload', str(image)],
+                                  cwd=out, env=env, capture_output=True, timeout=900)
+            (out / (name + '-pack.stderr')).write_bytes(pack.stderr)
+            if pack.returncode or pack.stderr:
+                raise RuntimeError(f'{name} native pack failed: {pack.stderr[-300:]!r}')
+            packed.chmod(0o700)
+            command = [str(packed)]
+        else:
+            payload = out / (name + '.bin')
+            header, body = image.read_bytes().split(b'\n\n', 1)
+            m = re.fullmatch(rb'KX64V1 x86_64-linux sysv-ctx-v11 ([0-9]+) 0', header)
+            if not m or int(m[1]) != len(body) or body[:1] != b'\xe9':
+                raise ValueError('invalid KX64 artifact')
+            payload.write_bytes(body)
+            command = [str(runner), str(payload), '0', '0', 'x86_64', '-', '--']
+        result = subprocess.run(command, cwd=out, env=runenv, capture_output=True, timeout=300)
         (out / (name + '-run.stdout')).write_bytes(result.stdout)
         (out / (name + '-run.stderr')).write_bytes(result.stderr)
         if result.returncode or result.stderr or not re.search(rb':status :ok\s+:result ' + str(expected).encode() + rb'\b', result.stdout):
@@ -160,7 +181,7 @@ def main():
     positive, mutant = native('positive', False, 42), native('mutant', True, 0)
     if any(sha(Path(path).read_bytes()) != digest for path, digest in hashes.items()):
         raise ValueError('input changed during observation')
-    evidence = {'status': 'PASS_BOUNDED_LIVE_AOT_REFERENCE_LINUX_X86_64', 'caseCount': len(observations),
+    evidence = {'status': 'PASS_BOUNDED_LIVE_AOT_REFERENCE_' + target.upper().replace('-', '_'), 'caseCount': len(observations),
                 'compilerAndReferenceShareBackend': True, 'stackFromHistoricalFixture': True,
                 'wholeVmQualified': False, 'inputs': hashes, 'positive': positive, 'mutant': mutant}
     (out / 'receipt.json').write_text(json.dumps(evidence, indent=2) + '\n')
