@@ -74,8 +74,14 @@ def verify_layout_text(seed95_text, seed85_text, table):
     """native/layout-table.json must carry the compiler's page-table roots and text caps (one row per RW rung)."""
     pml4 = int(_seed_value(seed95_text, r"^\(def UV-PML4 (0x[0-9a-fA-F]+)\)", "UV-PML4").group(1), 16)
     v5 = int(_seed_value(seed95_text, r"^\(def UV-V5-PML4 (0x[0-9a-fA-F]+)\)", "UV-V5-PML4").group(1), 16)
-    cap = _seed_value(seed85_text, r"\(defn- kp-text-cap \[\] :i64 \(if \(or \(kp-v2\?\) \(kp-v3\?\)\) (\d+) (\d+)\)\)", "kp-text-cap")
-    want = {"0x200000": (pml4, int(cap.group(2))), "0x400000": (v5, int(cap.group(1)))}
+    # amu after JUN-811 separates v3 (2.5 MiB) from v2 (2 MiB) and v1 (1 MiB); before it v2 and v3 shared one cap.
+    new = re.search(r"\(defn- kp-text-cap \[\] :i64 \(if \(kp-v3\?\) (\d+) \(if \(kp-v2\?\) (\d+) (\d+)\)\)\)", seed85_text, re.M)
+    if new:
+        v3_cap, v1_cap = int(new.group(1)), int(new.group(3))
+    else:
+        old = _seed_value(seed85_text, r"\(defn- kp-text-cap \[\] :i64 \(if \(or \(kp-v2\?\) \(kp-v3\?\)\) (\d+) (\d+)\)\)", "kp-text-cap")
+        v3_cap, v1_cap = int(old.group(1)), int(old.group(2))
+    want = {"0x200000": (pml4, v1_cap), "0x400000": (v5, v3_cap)}
     rungs = table.get("rungs", {})
     if set(rungs) != set(want):
         raise RegionMismatch(f"the layout table has rungs {sorted(rungs)}, the compiler's are {sorted(want)}")
