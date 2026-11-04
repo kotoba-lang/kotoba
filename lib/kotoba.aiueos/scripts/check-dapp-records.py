@@ -14,7 +14,7 @@ REQUIRED = ("id", "dock", "title", "install", "entry", "core", "localCore",
 OP_REQUIRED = ("operation", "service", "endpoint", "data", "consent", "state")
 WANT = {"murakumo", "itonami", "yataverse", "aozora", "browser", "yotei", "shakai",
         "saifu", "bunsho", "hyokeisan", "zuhyo", "tokei", "wifi", "bluetooth",
-        "settei", "itonami-apps", "updates"}
+        "settei", "itonami-apps", "updates", "torihiki"}
 
 
 def fail(msg):
