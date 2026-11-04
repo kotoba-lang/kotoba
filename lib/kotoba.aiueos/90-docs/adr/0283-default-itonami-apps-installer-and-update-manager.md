@@ -37,6 +37,7 @@ Measured in the source (2026-11-03):
    limit and the 259-op budget stay, so each window still draws under the budget; only one full window is open per
    page of launcher. This needs a native Amu rebuild, the QEMU gates and a new KIR contract, and replaces the
    fixed-size `app-catalog` with a signed one (`app-catalog.sig`).
+   ADR-0285 (2026-11-04) fixes the launcher and slot rules for apps beyond four; the signed catalog stays open.
 3. **Itonami Apps installs by digest.** The app lists the signed catalog (offline copy first). Install of an entry
    fetches its artifact only after a fresh each-operation approval naming service, endpoint, operation and data
    (`fetch-catalog`, `download-app`), admits it by CID (`aiueos.cid-v1-admit`) and signature, then records it in the
