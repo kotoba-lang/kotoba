@@ -1,0 +1,224 @@
+;; Port of kotoba.webrtc.room (room.cljk), Kotoba-native, :document values.
+;;
+;; A room is a :document map {:webrtc.room/room-id id, :webrtc.room/participants
+;; {pid {:webrtc.room/tracks #{..} :webrtc.room/subscriptions #{..}}}}.
+;; No network, no media: the host SFU forwards media; this namespace tracks
+;; membership and subscriptions only.
+;;
+;; Named divergences from room.cljk:
+;;   - sets are built and updated through their EDN text (set insertion and
+;;     removal are not builtins). Each set operation re-reads the set as a
+;;     vector, and writes the result back as a set.
+;;   - a set read from EDN with two or more elements does not document-equal?
+;;     a document-set literal with the same elements (observed in amu,
+;;     2026-11). Compare results with document-edn-print or document-set-contains?.
+;;   - a missing :participants (or participant) reads as an empty map (or
+;;     document-null); the malformed-room cases of Clojure's nil-conj are not
+;;     modelled. A disj on a missing set yields an empty set.
+;;   - `(update m k f)` on a nil room starts from an empty map, as in the source.
+
+(ns kotoba.webrtc.room
+  (:export [create-room join leave publish-track unpublish-track subscribe
+            unsubscribe participant-ids tracks-of subscribers-of]))
+
+(defn- nil-doc? [d :document] :bool
+  (string=? (document-edn-print d) "nil"))
+
+(defn- vec-at [v :document i :i64] :document
+  (option-or (document-vector-at v i) (document-null)))
+
+;; elements of a collection as a :document vector (set/list re-read from EDN)
+(defn- elems [d :document] :document
+  (let [t (document-edn-print d)]
+    (if (string=? t "nil")
+      (document-vector)
+      (if (string=? (string-substring t 0 1) "[")
+        d
+        (if (string=? (string-substring t 0 1) "#")
+          (document-edn-read (string-concat "[" (string-concat (string-substring t 2 (- (string-length t) 1)) "]")))
+          (if (string=? (string-substring t 0 1) "(")
+            (document-edn-read (string-concat "[" (string-concat (string-substring t 1 (- (string-length t) 1)) "]")))
+            (document-vector)))))))
+
+(defn- has-doc? [v :document x :document] :bool
+  (loop [i 0]
+    (if (= i (document-count v))
+      false
+      (if (document-equal? (vec-at v i) x) true (recur (+ i 1))))))
+
+(defn- join-edn [v :document] :string
+  (loop [i 0 acc ""]
+    (if (= i (document-count v))
+      acc
+      (recur (+ i 1) (string-concat acc (string-concat (document-edn-print (vec-at v i)) " "))))))
+
+(defn- vec->set [v :document] :document
+  (document-edn-read (string-concat "#{" (string-concat (join-edn v) "}"))))
+
+;; distinct elements of a vector as a set
+(defn- to-set [v :document] :document
+  (loop [i 0 uniq (document-vector)]
+    (if (= i (document-count v))
+      (vec->set uniq)
+      (let [x (vec-at v i)]
+        (recur (+ i 1) (if (has-doc? uniq x) uniq (document-vector-conj uniq x)))))))
+
+(defn- set-has? [s :document x :document] :bool
+  (has-doc? (elems s) x))
+
+(defn- set-conj [s :document x :document] :document
+  (if (set-has? s x)
+    s
+    (vec->set (document-vector-conj (elems s) x))))
+
+(defn- set-disj [s :document x :document] :document
+  (let [es (elems s)]
+    (loop [i 0 out (document-vector)]
+      (if (= i (document-count es))
+        (vec->set out)
+        (let [y (vec-at es i)]
+          (recur (+ i 1) (if (document-equal? y x) out (document-vector-conj out y))))))))
+
+(defn- room-base [room :document] :document
+  (if (map? room) room (document-map)))
+
+(defn- pmap [room :document] :document
+  (let [ps (option-or (document-get (room-base room) (document-keyword :webrtc.room/participants)) (document-null))]
+    (if (map? ps) ps (document-map))))
+
+(defn- pget [ps :document pid :document] :document
+  (option-or (document-get ps pid) (document-null)))
+
+(defn- field [m :document k :keyword] :document
+  (if (map? m)
+    (option-or (document-get m k) (document-null))
+    (document-null)))
+
+(defn- entry-at [ps :document i :i64] :document
+  (option-or (document-map-entry-at ps i) (document-null)))
+
+(defn- with-participants [room :document ps :document] :document
+  (document-assoc (room-base room) (document-keyword :webrtc.room/participants) ps))
+
+(defn- new-participant [] :document
+  (document-map :webrtc.room/tracks (document-set)
+                :webrtc.room/subscriptions (document-set)))
+
+(defn create-room
+  "Construct an empty room record for room-id."
+  [room-id :document] :document
+  (document-map :webrtc.room/room-id room-id
+                :webrtc.room/participants (document-map)))
+
+(defn join
+  "Add participant-id to room with an empty track set. No-op when already
+  present."
+  [room :document participant-id :document] :document
+  (let [ps (pmap room)]
+    (if (document-contains ps participant-id)
+      (with-participants room ps)
+      (with-participants room (document-assoc ps participant-id (new-participant))))))
+
+(defn- drop-sub [ps :document pid :document] :document
+  (let [n (document-count ps)]
+    (loop [i 0 out (document-map)]
+      (if (= i n)
+        out
+        (let [e (entry-at ps i)
+              k (vec-at e 0)
+              p (vec-at e 1)]
+          (recur (+ i 1)
+                 (document-assoc out k
+                                 (document-assoc p (document-keyword :webrtc.room/subscriptions)
+                                                 (set-disj (field p :webrtc.room/subscriptions) pid)))))))))
+
+(defn leave
+  "Remove participant-id from room, and drop it from every other
+  participant's subscriptions."
+  [room :document participant-id :document] :document
+  (with-participants room (drop-sub (document-dissoc (pmap room) participant-id) participant-id)))
+
+(defn publish-track
+  "Add track-id to participant-id's published track set. No-op when the
+  participant is not in the room."
+  [room :document participant-id :document track-id :document] :document
+  (let [ps (pmap room)]
+    (if (document-contains ps participant-id)
+      (let [p (pget ps participant-id)]
+        (with-participants room
+          (document-assoc ps participant-id
+                          (document-assoc p (document-keyword :webrtc.room/tracks)
+                                          (set-conj (field p :webrtc.room/tracks) track-id)))))
+      room)))
+
+(defn unpublish-track
+  "Remove track-id from participant-id's published track set."
+  [room :document participant-id :document track-id :document] :document
+  (let [ps (pmap room)]
+    (if (document-contains ps participant-id)
+      (let [p (pget ps participant-id)]
+        (with-participants room
+          (document-assoc ps participant-id
+                          (document-assoc p (document-keyword :webrtc.room/tracks)
+                                          (set-disj (field p :webrtc.room/tracks) track-id)))))
+      room)))
+
+(defn subscribe
+  "Record that subscriber-id wants target-id's tracks. No-op when either
+  participant is not in the room, or subscriber-id == target-id."
+  [room :document subscriber-id :document target-id :document] :document
+  (let [ps (pmap room)]
+    (if (document-equal? subscriber-id target-id)
+      room
+      (if (document-contains ps subscriber-id)
+        (if (document-contains ps target-id)
+          (let [p (pget ps subscriber-id)]
+            (with-participants room
+              (document-assoc ps subscriber-id
+                              (document-assoc p (document-keyword :webrtc.room/subscriptions)
+                                              (set-conj (field p :webrtc.room/subscriptions) target-id)))))
+          room)
+        room))))
+
+(defn unsubscribe
+  "Remove target-id from subscriber-id's subscriptions."
+  [room :document subscriber-id :document target-id :document] :document
+  (let [ps (pmap room)]
+    (if (document-contains ps subscriber-id)
+      (let [p (pget ps subscriber-id)]
+        (with-participants room
+          (document-assoc ps subscriber-id
+                          (document-assoc p (document-keyword :webrtc.room/subscriptions)
+                                          (set-disj (field p :webrtc.room/subscriptions) target-id)))))
+      room)))
+
+(defn participant-ids
+  "Return the set of participant ids currently in room."
+  [room :document] :document
+  (let [ps (pmap room)
+        n (document-count ps)]
+    (loop [i 0 ks (document-vector)]
+      (if (= i n)
+        (to-set ks)
+        (recur (+ i 1) (document-vector-conj ks (vec-at (entry-at ps i) 0)))))))
+
+(defn tracks-of
+  "Return the set of track ids published by participant-id, or nil when not
+  in the room."
+  [room :document participant-id :document] :document
+  (field (pget (pmap room) participant-id) :webrtc.room/tracks))
+
+(defn subscribers-of
+  "Return the set of participant ids currently subscribed to target-id's
+  tracks."
+  [room :document target-id :document] :document
+  (let [ps (pmap room)
+        n (document-count ps)]
+    (loop [i 0 ks (document-vector)]
+      (if (= i n)
+        (to-set ks)
+        (let [e (entry-at ps i)]
+          (recur (+ i 1)
+                 (if (set-has? (field (vec-at e 1) :webrtc.room/subscriptions) target-id)
+                   (document-vector-conj ks (vec-at e 0))
+                   ks)))))))
