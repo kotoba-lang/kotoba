@@ -1,10 +1,11 @@
 #!/usr/bin/env python3 -I
 """Build and check the hosted session page from its Kotoba source (JUN-821).
 
-  session-page.py build          run index.kotoba with Amu and write index.html
+  session-page.py embed          copy assets/torihiki.js into index.kotoba as the js-3 constant
+  session-page.py build          embed, then run index.kotoba with Amu and write index.html
   session-page.py check          refuse if index.html is not what index.kotoba prints
                                  (needs Amu), and if the app table differs from the records
-  session-page.py check-table    only the table-versus-records check (no Amu)
+  session-page.py check-table    the table-versus-records check and the js-3 embed check (no Amu)
 
 index.kotoba is the source of the page; index.html is its generated output and is
 committed because the host serves that path. Amu is found through $AMU_HOME/bin/amu
@@ -25,6 +26,8 @@ SESSION = ROOT / "resources" / "aiueos" / "session"
 SRC = SESSION / "index.kotoba"
 PAGE = SESSION / "index.html"
 DAPPS = ROOT / "distributions" / "awai" / "dapps"
+ASSET_JS3 = SESSION / "assets" / "torihiki.js"
+JS3 = re.compile(r'^\(defn js-3 \[\] :string ".*"\)$', re.M)
 
 
 def fail(msg, code=1):
@@ -61,7 +64,38 @@ def table_rows(text, name):
     return {int(k): v for k, v in pairs}
 
 
+def klit(text):
+    return '"' + (text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                  .replace("\r", "\\r").replace("\t", "\\t")) + '"'
+
+
+def js3_line():
+    text = ASSET_JS3.read_text(encoding="utf-8")
+    if "</script" in text.lower():
+        fail("assets/torihiki.js contains </script")
+    return "(defn js-3 [] :string %s)" % klit(text)
+
+
+def embed():
+    src = SRC.read_text(encoding="utf-8")
+    line = js3_line()
+    if JS3.search(src):
+        src = JS3.sub(lambda m: line, src, count=1)
+    else:
+        src = re.sub(r"^(\(defn js-2 \[\] :string \".*\"\))$", lambda m: m.group(1) + "\n" + line, src, count=1, flags=re.M)
+        if not JS3.search(src):
+            fail("js-2 constant not found; cannot place js-3")
+    SRC.write_text(src, encoding="utf-8")
+
+
+def check_embed():
+    m = JS3.search(SRC.read_text(encoding="utf-8"))
+    if not m or m.group(0) != js3_line():
+        fail("js-3 in index.kotoba differs from assets/torihiki.js: run `session-page.py embed`")
+
+
 def check_table():
+    check_embed()
     text = SRC.read_text(encoding="utf-8")
     count = int(re.search(r"\(defn app-count \[\] :i64 (\d+)\)", text).group(1))
     recs = {}
@@ -87,7 +121,11 @@ def check_table():
 
 
 def main(mode):
-    if mode == "build":
+    if mode == "embed":
+        embed()
+        print("AIUEOS_SESSION_JS3_EMBEDDED")
+    elif mode == "build":
+        embed()
         check_table()
         PAGE.write_bytes(render())
         print("AIUEOS_SESSION_PAGE_BUILT bytes=%d" % PAGE.stat().st_size)

@@ -104,12 +104,16 @@ native frame ABI v3 should take its app count and titles from the fold, so a del
 - Catalog origin and the signing key (none registered); the install log's on-disk object format and capacity.
 - Whether a tombstone for an `os-image` default is stored as a record or as a hide flag (this ADR says record).
 - ML-DSA-65 for publisher and update signatures (Ed25519 is below the post-quantum floor, as ADR-0283 states).
-- Torihiki: its record is `planned`, devnet and demo accounts only. A dapp that signs orders needs the device key for each
-  order under its own consent, which sits next to ADR-0283 §5 and the kotoba repository rule that chain transaction
-  signing, broadcast and settlement are etzhayyim-exclusive. Torihiki is an exchange protocol, not a chain, but whether
-  `submit-order` counts as that boundary is an owner decision; its record says `blocked-owner-decision`, and `read-quotes`
-  is the only operation that could be implemented first. Real money, custody and
-  settlement stay out of scope until owner, legal and the torihiki decentralization roadmap (D1–D4) approve.
+- Torihiki: owner decision 2026-11-04 enables order submission in the hosted session, **devnet / demo only** (JUN-822). The
+  session signs a transaction with its own non-extractable Ed25519 key (a throwaway devnet key, not a wallet) and sends it to
+  the node endpoint the user typed, after approving the displayed operation (`read-quotes`, `read-account`,
+  `request-devnet-funds`, `submit-order`; each lists its requests and data). Nothing is signed or sent unless the node's chain
+  id contains `devnet`. This sits next to ADR-0283 §5 and the kotoba repository rule that chain transaction signing,
+  broadcast and settlement are etzhayyim-exclusive: torihiki is an exchange sequencer on a devnet whose collateral is
+  unbacked, and the owner decided that this is not that boundary; a mainnet or bridged-collateral chain stays refused by
+  the chain-id guard. Real money, custody and settlement remain out of scope until owner, legal and the torihiki
+  decentralization roadmap (D1–D4) approve. Open: the signing payload is a positional 37-field string that follows the
+  node's engine version, so a node on another version rejects every signature as `bad-signature`.
 
 ## Consequences
 
@@ -123,5 +127,6 @@ native frame ABI v3 should take its app count and titles from the fold, so a del
 
 ## Verification now
 
-`scripts/check-dapp-records.py` (host-side JSON check) covers the install record for `torihiki`. The log, tombstone and update
+`scripts/check-dapp-records.py` (host-side JSON check) covers the install record for `torihiki`; `scripts/session-torihiki-test.js` checks
+the page's signing payload and account derivation against vectors the torihiki engine produced. The log, tombstone and update
 rules above have no gate yet; each becomes a row only when its own gate prints its marker.
