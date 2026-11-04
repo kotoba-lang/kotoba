@@ -66,3 +66,14 @@ render the same document through the shared browser render (`browser`/`cssom`/`d
 the host supplies them. Native rendering is blocked on JUN-93/JUN-134..137/JUN-353 (cssom typed calc AST, regex in
 layout, f64/document ABI, Browser graph link); until then the frame ABI v3 (JUN-811) is an interim, not the target.
 The hand-written JS DOM builder from PR #1187 is removed.
+
+## Amendment 2 2026-11-04 — the hosted page is a Kotoba source (JUN-821)
+
+The hosted session page is authored as `resources/aiueos/session/index.kotoba`: HTML built by pure Kotoba functions
+(escape, attributes, elements; the tree lives in the call graph), run with Amu, printing `index.html`. This replaces the
+amendment above for the hosted surface: `ui.cljk` (kbb/SCI, JVM `java.io`), its `generated/` output and `dapp-ui.py` are
+removed. The app table (id, title, category, operations by dock id) lives in `index.kotoba`; `scripts/session-page.py check`
+refuses a table that differs from `distributions/awai/dapps/*.json` and a page that is not what the source prints. The
+stylesheet and the two inline scripts are carried as exact string constants, not re-authored. The native renderer path
+(JUN-810) is unchanged and still blocked. The html library's `.kotoba` port (`kotoba-lang/html` `kotoba/html_core.kotoba`) was
+not used: it does not pass `amu check` on the current compiler (`record-get` arity, E2103).

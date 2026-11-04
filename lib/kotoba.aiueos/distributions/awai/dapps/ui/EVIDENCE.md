@@ -1,5 +1,9 @@
 # Generated dapp UI: oracle run (JUN-808 / JUN-809)
 
+> **Superseded 2026-11-04 (JUN-821).** `ui.cljk`, `generated/` and `scripts/dapp-ui.py` were removed. The dapp UI is now
+> part of `resources/aiueos/session/index.kotoba` (Kotoba, run with Amu); see ADR-0283 amendment 2. This file is kept as the
+> dated record of the earlier cljk oracle run.
+
 Date: 2026-11-04. A one-shot local reference run, not CI, not a gate and not a build step; the CDCI rule (no
 JVM/nbb in CI/CD) is unchanged. It shows what the `kotoba-lang/html` and `kotoba-lang/css` libraries emit for the
 documents in `ui.cljk`. It does not show that a native build renders them (JUN-810).
