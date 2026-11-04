@@ -13,6 +13,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 SESSION = HERE.parent / "aiueos" / "session"
 SOURCE = SESSION / "app_catalog.json"
 TARGET = SESSION / "app_catalog.kotoba"
+DAPPS = HERE.parents[2] / "distributions" / "awai" / "dapps"
 PER_WORD = 8
 
 
@@ -38,6 +39,17 @@ def arms(rows):
     return "\n".join(out)
 
 
+def check_titles(apps):
+    """Every dapp record's title must equal the catalog title at its dock number, and the reverse."""
+    records = {}
+    for path in sorted(DAPPS.glob("*.json")):
+        rec = json.loads(path.read_text())
+        records[rec["dock"]] = rec["title"]
+    ours = {a["id"]: a["title"] for a in apps}
+    if ours != records:
+        raise ValueError("catalog titles differ from dapp records: %r" % sorted(set(ours.items()) ^ set(records.items())))
+
+
 def render():
     doc = json.loads(SOURCE.read_text())
     if doc.get("schema") != "aiueos.native-app-catalog.v1":
@@ -46,6 +58,7 @@ def render():
     ids = [a["id"] for a in apps]
     if ids != list(range(1, len(ids) + 1)):
         raise ValueError("app ids must be 1..N")
+    check_titles(apps)
     titles = {a["id"]: pack(a["title"], "title %d" % a["id"]) for a in apps}
     bodies = {a["id"]: pack(a["body"], "body %d" % a["id"]) for a in apps}
     tl = " ".join("%d %d" % (a["id"], len(a["title"])) for a in apps)
