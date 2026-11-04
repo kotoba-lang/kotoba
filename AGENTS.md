@@ -202,7 +202,8 @@ via `KBB_ENGINE`.
 - New public command shape belongs in `kotoba-lang/kotoba-lang`. Host
   launchers delegate to that CLJC contract; do not add independent command
   semantics here.
-- Domain actors/cells live in `etzhayyim/com-etzhayyim-*`; AT Protocol actors,
+- Domain actors/cells live in their own repositories (see
+  `docs/ADR-repository-boundaries.md`); AT Protocol actors,
   PDS/AppView and XRPC application surfaces in `network-awai/app-aozora`; hosting,
   placement, fleet and gateway operations in `kotoba-lang/murakumo`; the
   persistent database in `kotoba-lang/kotobase`; the OS product in
@@ -231,14 +232,14 @@ via `KBB_ENGINE`.
   `:kotoba.policy/interpreter-step-limit`; Wasm execution is fuel-bounded by
   `kotoba.wasm-exec/default-fuel-limit` or `:kotoba.policy/fuel`.
 - Chain integration is read + verify only. Transaction signing, broadcast,
-  on-chain settlement and AT-MST origination are **etzhayyim-exclusive**
-  (operating-entity boundary) and are not implemented here One exception:
+  on-chain settlement and AT-MST origination belong to the operating entity
+  (operating-entity boundary) and are not implemented here. One exception:
   the hosted session's Torihiki app signs devnet / demo orders with a
   throwaway session key and sends them only after per-operation approval
   (ADR-0284, `lib/kotoba.aiueos`); real-money settlement and custody stay out
   of scope.
 - Do not put non-spec bodies under `com.atproto.*` NSIDs; Kotoba surfaces use
-  the `com.etzhayyim.apps.kotoba.*` namespace (`lexicons/`).
+  the namespace declared in `lexicons/`.
 
 #### Code and tests
 
