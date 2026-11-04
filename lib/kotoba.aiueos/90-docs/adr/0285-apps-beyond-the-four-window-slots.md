@@ -172,3 +172,29 @@ Options: (1) free 4-6 KiB by removing or simplifying existing desktop features c
 (2) lower the refusal from 2 KiB to a few hundred bytes, which leaves no room for any later change and is not
 recommended; (3) keep the launcher at four apps in the kernel and run the other apps' windows in user space (a larger
 design); (4) the signed data-blob catalog (JUN-811 option B) removes the catalog text but not the code above.
+
+## Amendment 3 2026-11-05 — the cap was raised; steps 1 and 2 build with an 18-app catalog
+
+Option (1)/(2)/(3)/(4) above are moot: amu#1825 raised the kernel-v3 text cap from 2 MiB to 2.5 MiB (2,621,440 B) and
+kotoba#1227 follows it (layout table, region check, textMargin calibration). Amendment 2's table is history.
+
+Measured on the merged amu compiler (a4680af04, Mac compiler c126449b) with the default desktop profile, all build gates
+PASS (9):
+
+| state | text segment | estimated `textMargin` |
+|---|---|---|
+| steps 1 + 2, four-app catalog | 2,106,880 B | 524,960 B (OK) |
+| steps 1 + 2, 18-app catalog | 2,120,448 B | 511,392 B (OK) |
+
+The catalog has 18 entries, not 17: ids are the dapp records' `dock` numbers (distributions/awai/dapps/*.json, torihiki is
+18). Apps 5-18 share one short body; only apps 1-4 seed window labels and bodies. `gen-app-catalog.py` fails when a
+catalog title differs from the dapp record title at its dock number (negative control: renaming Zuhyo fails it).
+
+New gate `check-native-launcher-pages-qemu.py` (not yet one of the build script's pinned gates) observes in QEMU: 8 apps
+per page at 1280 wide; PageDown/PageUp page and clamp (18 apps end on page 2); page 1 scans out differently from page 0;
+digit 1 on page 1 launches app 9 into the first free slot; a held Itonami goal draft keeps slot 2 from foreign apps and
+survives; relaunching an open app focuses it; a launch with no free slot is refused; app 1 returns to its home slot.
+Run against the previous four-app media it fails at the first slot-map assertion.
+
+Not yet covered: the worst-case draw-list budget (259 ops) with four windows and a full page, and wiring the new gate
+into the build script's pins and receipt.
