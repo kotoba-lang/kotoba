@@ -4,48 +4,57 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 
 | rule | kind | status | tokens | distinct | repos |
 |---|---|---|---:|---:|---:|
-| did-web | DID (identity) | keep | 150493 | 52828 | 1665 |
-| vanity-url | service URL on etzhayyim.com | blocked | 98407 | 24018 | 619 |
+| did-web-entity | DID used as an entity identifier (did:web:etzhayyim.com:actor:..., :gov:...) | decide | 126494 | 33594 | 1465 |
+| vanity-url | service URL on etzhayyim.com | apply | 98407 | 24018 | 619 |
 | word | bare word (prose) | apply | 57920 | 4 | 916 |
-| urn | URN identifier (urn:etzhayyim:...) | keep | 43867 | 2130 | 15 |
-| nsid-generic | lexicon NSID (other) | alias | 38690 | 12394 | 610 |
+| urn | URN identifier (urn:etzhayyim:...) | decide | 43867 | 2130 | 15 |
+| nsid-generic | lexicon NSID (other) | apply | 38690 | 12394 | 610 |
+| did-web-service | DID of a service (did:web:<host>) | mint | 23999 | 19234 | 600 |
 | name-prefix | name etzhayyim-* | decide | 12869 | 5493 | 498 |
 | unclassified | NOT CLAIMED BY ANY RULE | decide | 11740 | 5254 | 685 |
-| nsid-apps | lexicon NSID (apps) | alias | 9116 | 550 | 8 |
-| purl | package URL (pkg:etzhayyim/...) | blocked | 8216 | 1031 | 1028 |
-| wit | WIT package | alias | 7619 | 686 | 230 |
+| nsid-apps | lexicon NSID (apps) | apply | 9116 | 550 | 8 |
+| purl | package URL (pkg:etzhayyim/...) | apply | 8216 | 1031 | 1028 |
+| wit | WIT package | apply | 7619 | 686 | 230 |
 | host | bare host name | decide | 7570 | 885 | 670 |
 | repo-path | repository path / URL | lookup | 6685 | 1778 | 1679 |
-| npm-scope | npm scope | blocked | 5016 | 439 | 356 |
+| npm-scope | npm scope | apply | 5016 | 439 | 356 |
 | dotted-id | dotted id (etzhayyim.x/v1) | decide | 3557 | 503 | 502 |
 | partial-host | host fragment (.etzhayyim.com, @x.etzhayyim.com, ...) | decide | 2848 | 709 | 374 |
 | http-header | wire header (x-etzhayyim-*) | decide | 2716 | 29 | 1211 |
 | name-com-prefix | name com-etzhayyim-* | apply | 2579 | 678 | 572 |
 | other-domain | other etzhayyim domain (.co.jp, .ai, dnsaddr) | decide | 1772 | 379 | 153 |
-| nsid-kotoba | lexicon NSID (kotoba) | alias | 1554 | 241 | 51 |
+| nsid-kotoba | lexicon NSID (kotoba) | apply | 1554 | 241 | 51 |
 | code-symbol | code symbol (MockEtzhayyim, EtzhayyimConfig, ...) | apply | 1329 | 69 | 258 |
-| jsonld-context | JSON-LD context / namespace URL | blocked | 1325 | 21 | 417 |
+| jsonld-context | JSON-LD context / namespace URL | apply | 1325 | 21 | 417 |
 | name-suffix | name *-etzhayyim (dns-etzhayyim, did-etzhayyim) | decide | 645 | 20 | 25 |
 | env-var | environment variable / secret name | decide | 449 | 93 | 52 |
-| did-method | DID (did:etzhayyim method) | keep | 160 | 23 | 11 |
+| did-method | DID (did:etzhayyim method) | decide | 160 | 23 | 11 |
+
+Lexicon ids defined in the scanned repositories: 822; ids defined in more than one organisation: 0.
+
+## Lexicon NSID tokens by owner (who defines the lexicon)
+
+- nsid-generic: kotoba-lang (guess: using repo): 16212, cloud-itonami (guess: using repo): 15139, cloud-itonami: 4913, network-awai (guess: using repo): 1604, network-awai: 503, kotoba-lang: 319
+- nsid-apps: kotoba-lang (guess: using repo): 9116
+- nsid-kotoba: kotoba-lang: 1215, kotoba-lang (guess: using repo): 302, network-awai (guess: using repo): 23, cloud-itonami (guess: using repo): 14
 
 ## Examples (token → preview of the rewritten token)
 
-### did-web (keep)
-- `did:web:etzhayyim.com` ×748
-- `did:web:cofog.etzhayyim.com` ×609
-- `did:web:maps.etzhayyim.com` ×140
-- `did:web:site.etzhayyim.com:` ×80
-- `did:web:akashi.etzhayyim.com` ×80
+### did-web-entity (decide)
 - `did:web:gov-jpn.etzhayyim.com:law:local-autonomy-act` ×73
+- `did:web:gov-usa.etzhayyim.com:law:state-municipal-charter` ×52
+- `did:web:etzhayyim.com:member:abel` ×51
+- `did:web:etzhayyim.com:hikari` ×35
+- `did:web:etzhayyim.com:actor:` ×34
+- `did:web:etzhayyim.com:member:seth` ×31
 
-### vanity-url (blocked) — blocked by: DNS, certificates and hosting for the new names; the old names keep redirecting.
-- `https://news.etzhayyim.com` ×43650 → `https://news.awai.network`
-- `https://yabai.etzhayyim.com/ontology/context.jsonld` ×1425 → `https://yabai.awai.network/ontology/context.jsonld`
-- `https://etzhayyim.com` ×578 → `https://awai.network`
-- `https://pds.etzhayyim.com` ×496 → `https://pds.awai.network`
-- `https://news.etzhayyim.com/en/articles/gow-ragnarok-guide-hub-2026` ×362 → `https://news.awai.network/en/articles/gow-ragnarok-guide-hub-2026`
-- `https://news.etzhayyim.com/ja/articles/fo76-beginner-guide-hub-2026` ×308 → `https://news.awai.network/ja/articles/fo76-beginner-guide-hub-2026`
+### vanity-url (apply) — blocked by: New names need DNS and certificates before the cut-over; redirects from the old names are optional.
+- `https://news.etzhayyim.com` ×43650 → `https://news.kotoba-lang.org`
+- `https://yabai.etzhayyim.com/ontology/context.jsonld` ×1425 → `https://yabai.kotoba-lang.org/ontology/context.jsonld`
+- `https://etzhayyim.com` ×578 → `https://kotoba-lang.org`
+- `https://pds.etzhayyim.com` ×496 → `https://pds.kotoba-lang.org`
+- `https://news.etzhayyim.com/en/articles/gow-ragnarok-guide-hub-2026` ×362 → `https://news.kotoba-lang.org/en/articles/gow-ragnarok-guide-hub-2026`
+- `https://news.etzhayyim.com/ja/articles/fo76-beginner-guide-hub-2026` ×308 → `https://news.kotoba-lang.org/ja/articles/fo76-beginner-guide-hub-2026`
 
 ### word (apply)
 - `Etzhayyim` ×49618
@@ -53,7 +62,7 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `ETZHAYYIM` ×435
 - `:etzhayyim` ×34
 
-### urn (keep)
+### urn (decide)
 - `urn:etzhayyim:news:chainsaw-man-series-essay-07-2026` ×40
 - `urn:etzhayyim:news:chainsaw-man-series-essay-08-2026` ×40
 - `urn:etzhayyim:news:chainsaw-man-series-essay-09-2026` ×40
@@ -61,13 +70,21 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `urn:etzhayyim:news:chainsaw-man-series-essay-11-2026` ×40
 - `urn:etzhayyim:news:chainsaw-man-series-essay-12-2026` ×40
 
-### nsid-generic (alias)
+### nsid-generic (apply)
 - `com.etzhayyim.apps.kouhou.publicBriefing` ×1064 → `network.awai.apps.kouhou.publicBriefing`
-- `https://mcp.etzhayyim.com/xrpc/com.etzhayyim.mcp.message` ×530 → `https://mcp.etzhayyim.com/xrpc/network.awai.mcp.message`
+- `https://mcp.etzhayyim.com/xrpc/com.etzhayyim.mcp.message` ×530 → `https://mcp.etzhayyim.com/xrpc/org.kotoba-lang.mcp.message`
 - `com.etzhayyim.toritsugi.procedure` ×322 → `network.awai.toritsugi.procedure`
-- `com.etzhayyim.encrypted.` ×263 → `network.awai.encrypted.`
-- `com.etzhayyim.apps.site.wat` ×217 → `network.awai.apps.site.wat`
-- `com.etzhayyim.apps.site.wet` ×215 → `network.awai.apps.site.wet`
+- `com.etzhayyim.encrypted.` ×263 → `org.kotoba-lang.encrypted.`
+- `com.etzhayyim.apps.site.wat` ×217 → `org.kotoba-lang.apps.site.wat`
+- `com.etzhayyim.apps.site.wet` ×215 → `org.kotoba-lang.apps.site.wet`
+
+### did-web-service (mint)
+- `did:web:etzhayyim.com` ×748
+- `did:web:cofog.etzhayyim.com` ×609
+- `did:web:maps.etzhayyim.com` ×140
+- `did:web:site.etzhayyim.com:` ×80
+- `did:web:akashi.etzhayyim.com` ×80
+- `did:web:kyber.etzhayyim.com` ×70
 
 ### name-prefix (decide)
 - `etzhayyim-gov-general` ×1301
@@ -85,29 +102,29 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `https://github.com/kotoba-lang/did-etzhayyim` ×51
 - `com-etzhayyim-` ×44
 
-### nsid-apps (alias)
-- `app.etzhayyim.apps.cofog.govFunction` ×1212 → `network.awai.apps.cofog.govFunction`
-- `app.etzhayyim.apps.cofog.budgetItem` ×1212 → `network.awai.apps.cofog.budgetItem`
-- `app.etzhayyim.apps.cofog.program` ×1212 → `network.awai.apps.cofog.program`
-- `app.etzhayyim.apps.cofog.policyUpdate` ×1212 → `network.awai.apps.cofog.policyUpdate`
-- `app.etzhayyim.apps.kyber_qzzg06nh.kyber_qzzg06nh_entity` ×84 → `network.awai.apps.kyber_qzzg06nh.kyber_qzzg06nh_entity`
-- `app.etzhayyim.apps.kyber_qzzg06nh.kyber_qzzg06nh_event` ×84 → `network.awai.apps.kyber_qzzg06nh.kyber_qzzg06nh_event`
+### nsid-apps (apply)
+- `app.etzhayyim.apps.cofog.govFunction` ×1212 → `org.kotoba-lang.apps.cofog.govFunction`
+- `app.etzhayyim.apps.cofog.budgetItem` ×1212 → `org.kotoba-lang.apps.cofog.budgetItem`
+- `app.etzhayyim.apps.cofog.program` ×1212 → `org.kotoba-lang.apps.cofog.program`
+- `app.etzhayyim.apps.cofog.policyUpdate` ×1212 → `org.kotoba-lang.apps.cofog.policyUpdate`
+- `app.etzhayyim.apps.kyber_qzzg06nh.kyber_qzzg06nh_entity` ×84 → `org.kotoba-lang.apps.kyber_qzzg06nh.kyber_qzzg06nh_entity`
+- `app.etzhayyim.apps.kyber_qzzg06nh.kyber_qzzg06nh_event` ×84 → `org.kotoba-lang.apps.kyber_qzzg06nh.kyber_qzzg06nh_event`
 
-### purl (blocked) — blocked by: Package names in registries / SBOMs; rename together with the packages.
-- `pkg:etzhayyim/kotoba` ×2054 → `pkg:kotoba-lang/kotoba`
-- `pkg:etzhayyim/kotodama-wasm` ×2002 → `pkg:kotoba-lang/kotodama-wasm`
-- `pkg:etzhayyim/datomic-client` ×2002 → `pkg:kotoba-lang/datomic-client`
-- `pkg:etzhayyim/kotodama-clj` ×52 → `pkg:kotoba-lang/kotodama-clj`
-- `pkg:etzhayyim/datomic-eavt` ×52 → `pkg:kotoba-lang/datomic-eavt`
-- `pkg:etzhayyim/unity_ads-compat` ×4 → `pkg:kotoba-lang/unity_ads-compat`
+### purl (apply) — blocked by: Rename together with the packages.
+- `pkg:etzhayyim/kotoba` ×2054 → `pkg:@kotoba-lang/kotoba`
+- `pkg:etzhayyim/kotodama-wasm` ×2002 → `pkg:@kotoba-lang/kotodama-wasm`
+- `pkg:etzhayyim/datomic-client` ×2002 → `pkg:@kotoba-lang/datomic-client`
+- `pkg:etzhayyim/kotodama-clj` ×52 → `pkg:@kotoba-lang/kotodama-clj`
+- `pkg:etzhayyim/datomic-eavt` ×52 → `pkg:@kotoba-lang/datomic-eavt`
+- `pkg:etzhayyim/unity_ads-compat` ×4 → `pkg:@kotoba-lang/unity_ads-compat`
 
-### wit (alias)
-- `etzhayyim:progress` ×495 → `awai:progress`
-- `etzhayyim:mcpEndpoint` ×492 → `awai:mcpEndpoint`
-- `etzhayyim:activities` ×492 → `awai:activities`
-- `etzhayyim:nanoid` ×492 → `awai:nanoid`
-- `etzhayyim:LegacyActorComponent` ×491 → `awai:LegacyActorComponent`
-- `etzhayyim:componentType` ×491 → `awai:componentType`
+### wit (apply)
+- `etzhayyim:progress` ×495 → `kotoba:progress`
+- `etzhayyim:mcpEndpoint` ×492 → `kotoba:mcpEndpoint`
+- `etzhayyim:activities` ×492 → `kotoba:activities`
+- `etzhayyim:nanoid` ×492 → `kotoba:nanoid`
+- `etzhayyim:LegacyActorComponent` ×491 → `kotoba:LegacyActorComponent`
+- `etzhayyim:componentType` ×491 → `kotoba:componentType`
 
 ### host (decide)
 - `etzhayyim.com` ×1580
@@ -125,7 +142,7 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `etzhayyim/kotoba` ×62
 - `etzhayyim/root:20-actors/kami-engine-sdk/.` ×54
 
-### npm-scope (blocked) — blocked by: The @kotoba-lang scope must exist and be owned; published packages need a deprecation notice pointing to the new name.
+### npm-scope (apply) — blocked by: The target scope must exist and be owned. For network-awai / cloud-itonami no scope is decided yet: those tokens stay decide.
 - `@etzhayyim/sdk` ×1530 → `@kotoba-lang/sdk`
 - `@etzhayyim/sdk-mock` ×652 → `@kotoba-lang/sdk-mock`
 - `@etzhayyim/kotodama-host-sdk` ×568 → `@kotoba-lang/kotodama-host-sdk`
@@ -173,7 +190,7 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `etzhayyimcojp` ×86
 - `etzhayyimcojp/20-actors` ×60
 
-### nsid-kotoba (alias)
+### nsid-kotoba (apply)
 - `/xrpc/com.etzhayyim.apps.kotoba.datomic.q` ×114 → `/xrpc/org.kotoba-lang.datomic.q`
 - `/xrpc/com.etzhayyim.apps.kotoba.datomic.transact` ×63 → `/xrpc/org.kotoba-lang.datomic.transact`
 - `com.etzhayyim.apps.kotoba.datomic.transact` ×47 → `org.kotoba-lang.datomic.transact`
@@ -189,13 +206,13 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `EtzhayyimConfig` ×51
 - `EtzhayyimWasmComponent` ×36
 
-### jsonld-context (blocked) — blocked by: Contexts are fetched: the new URL must serve the same document (and the old one keep serving) before any switch.
-- `https://etzhayyim.com/ns/kotodama/v1` ×781 → `https://awai.network/ns/kotodama/v1`
-- `https://ghosthacker.etzhayyim.com/ns/` ×284 → `https://awai.network/ns/`
-- `https://etzhayyim.com/ns/actor/v1` ×81 → `https://awai.network/ns/actor/v1`
-- `https://etzhayyim.com/ns/actor-manifest` ×69 → `https://awai.network/ns/actor-manifest`
-- `https://etzhayyim.com/ns/actor` ×20 → `https://awai.network/ns/actor`
-- `https://etzhayyim.com/ns/kabuto/bpmn` ×20 → `https://awai.network/ns/kabuto/bpmn`
+### jsonld-context (apply) — blocked by: The new URL must answer before the cut-over; the old one need not be served.
+- `https://etzhayyim.com/ns/kotodama/v1` ×781 → `https://kotoba-lang.org/ns/kotodama/v1`
+- `https://ghosthacker.etzhayyim.com/ns/` ×284 → `https://kotoba-lang.org/ns/`
+- `https://etzhayyim.com/ns/actor/v1` ×81 → `https://kotoba-lang.org/ns/actor/v1`
+- `https://etzhayyim.com/ns/actor-manifest` ×69 → `https://kotoba-lang.org/ns/actor-manifest`
+- `https://etzhayyim.com/ns/actor` ×20 → `https://kotoba-lang.org/ns/actor`
+- `https://etzhayyim.com/ns/kabuto/bpmn` ×20 → `https://kotoba-lang.org/ns/kabuto/bpmn`
 
 ### name-suffix (decide)
 - `dns-etzhayyim` ×508
@@ -213,7 +230,7 @@ Scanned 4789 repositories (skipped 3); 71654 tracked text files contain the word
 - `ETZHAYYIM_MST_PROJECTOR_URL` ×20
 - `ETZHAYYIM_PDS_URL` ×15
 
-### did-method (keep)
+### did-method (decide)
 - `did:etzhayyim:` ×64
 - `did:etzhayyim` ×55
 - `did:etzhayyim.` ×8

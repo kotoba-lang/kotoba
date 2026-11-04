@@ -3,6 +3,9 @@
 
   etzhayyim-rename-plan.py <map.json> <out-prefix> <org-dir-or-repo-dir>...
 
+Version 2: also builds the lexicon owner table (which repository defines each lexicon id, from lexicon JSON files) and
+resolves each rule's target by owner org through the map's `targets`.
+
 Each argument is a repository (has .git) or a directory of repositories. For each repository it runs
 `git grep` over the checked-out HEAD commit (tracked text files only, not the working tree), classifies every
 token containing the word by the first matching rule of the map, and writes <out-prefix>.json (full) and
@@ -39,11 +42,63 @@ def git(repo, *a):
     return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, errors="replace")
 
 
+targets = spec.get("targets", {})
+NSID = re.compile(r"(?:com|app)\.etzhayyim\.[A-Za-z0-9_.]+")
+
+
+def org_of(repo):
+    return os.path.basename(os.path.dirname(os.path.abspath(repo)))
+
+
+# Phase A: which repository defines each lexicon id (global ids need one owner)
+owners, conflicts = {}, []
+all_repos = list(repos(args))
+for repo in all_repos:
+    g = git(repo, "grep", "-I", "-l", "-E", r'"lexicon"[[:space:]]*:[[:space:]]*1', "HEAD", "--", "*.json")
+    for line in g.stdout.splitlines():
+        path = line.split(":", 1)[1] if ":" in line else line
+        j = git(repo, "show", "HEAD:" + path)
+        try:
+            lid = json.loads(j.stdout).get("id", "")
+        except Exception:
+            continue
+        if "etzhayyim" not in lid:
+            continue
+        o = org_of(repo)
+        if lid in owners and owners[lid] != o:
+            conflicts.append([lid, owners[lid], o])
+        owners.setdefault(lid, o)
+
+
+def owner_for(token, repo_org):
+    m = NSID.search(token)
+    if m:
+        t = m.group(0)
+        best = None
+        for lid, o in owners.items():
+            if t == lid or t.startswith(lid + ".") or lid.startswith(t + "."):
+                if best is None or len(lid) > len(best[0]):
+                    best = (lid, o)
+        if best:
+            return best[1], True
+    return repo_org, False
+
+
+def resolve(to, org):
+    t = targets.get(org) or {}
+    for k in ("nsid", "wit", "domain", "npm"):
+        if "{" + k + "}" in to:
+            if t.get(k) is None:
+                return None
+            to = to.replace("{" + k + "}", t[k])
+    return to
+
+
 by_rule = collections.defaultdict(lambda: {"tokens": 0, "distinct": collections.Counter(), "repos": collections.Counter()})
 by_repo = collections.Counter()
 files_total = 0
 scanned = skipped = 0
-for repo in repos(args):
+for repo in all_repos:
     head = git(repo, "rev-parse", "HEAD")
     if head.returncode != 0:
         skipped += 1
@@ -60,6 +115,9 @@ for repo in repos(args):
                 rid = r["id"]
                 break
         b = by_rule[rid]
+        if rid.startswith("nsid"):
+            own, found = owner_for(t, org_of(repo))
+            b.setdefault("owners", collections.Counter())[own + ("" if found else " (guess: using repo)")] += 1
         b["tokens"] += 1
         b["distinct"][t] += 1
         b["repos"][repo] += 1
@@ -67,7 +125,7 @@ for repo in repos(args):
     files_total += len([l for l in git(repo, "grep", "-I", "-l", "-i", "etzhayyim", "HEAD", "--").stdout.splitlines() if l])
 
 meta = {r["id"]: r for r in spec["rules"]}
-out = {"scanned_repos": scanned, "skipped": skipped, "files_with_word": files_total, "rules": {}}
+out = {"lexicons_defined": len(owners), "lexicon_owner_conflicts": conflicts, "scanned_repos": scanned, "skipped": skipped, "files_with_word": files_total, "rules": {}}
 for rid, b in sorted(by_rule.items(), key=lambda kv: -kv[1]["tokens"]):
     r = meta.get(rid, {"kind": "NOT CLAIMED BY ANY RULE", "status": "decide", "to": None})
     ex = []
@@ -75,15 +133,18 @@ for rid, b in sorted(by_rule.items(), key=lambda kv: -kv[1]["tokens"]):
         new = None
         if r.get("to"):
             try:
-                new = re.sub(r["match"], r["to"], t, flags=re.I)
+                own = org_of(next(iter(b["repos"]))) if not rid.startswith("nsid") else owner_for(t, org_of(next(iter(b["repos"]))))[0]
+                to = resolve(r["to"], own)
+                new = re.sub(r["match"], to, t, flags=re.I) if to else "(target undecided for " + own + ")"
             except Exception:
                 new = "(preview failed)"
         ex.append({"token": t, "count": n, "preview": new})
     out["rules"][rid] = {"kind": r["kind"], "status": r["status"], "tokens": b["tokens"], "distinct": len(b["distinct"]),
                          "repos": len(b["repos"]), "examples": ex, "top_repos": b["repos"].most_common(8),
-                         "blocker": r.get("blocker")}
+                         "blocker": r.get("blocker"), "owners": dict(b.get("owners", {}))}
 out["top_repos"] = by_repo.most_common(25)
 out["unclassified_top"] = by_rule["unclassified"]["distinct"].most_common(60) if "unclassified" in by_rule else []
+json.dump(owners, open(prefix + "-nsid-owners.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, sort_keys=True)
 json.dump(out, open(prefix + ".json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 L = ["# etzhayyim rename: dry-run report (read-only)", "",
@@ -91,6 +152,11 @@ L = ["# etzhayyim rename: dry-run report (read-only)", "",
      "| rule | kind | status | tokens | distinct | repos |", "|---|---|---|---:|---:|---:|"]
 for rid, v in out["rules"].items():
     L.append(f"| {rid} | {v['kind']} | {v['status']} | {v['tokens']} | {v['distinct']} | {v['repos']} |")
+L += ["", f"Lexicon ids defined in the scanned repositories: {len(owners)}; ids defined in more than one organisation: {len(conflicts)}.", "",
+      "## Lexicon NSID tokens by owner (who defines the lexicon)", ""]
+for rid, v in out["rules"].items():
+    if v["owners"]:
+        L.append(f"- {rid}: " + ", ".join(f"{k}: {n}" for k, n in sorted(v["owners"].items(), key=lambda kv: -kv[1])))
 L += ["", "## Examples (token → preview of the rewritten token)", ""]
 for rid, v in out["rules"].items():
     L.append(f"### {rid} ({v['status']})" + (f" — blocked by: {v['blocker']}" if v.get("blocker") else ""))
