@@ -23,3 +23,10 @@ approval flow, Updates mode and denial, Tokei/Wi-Fi binds; no network request.
 
 The reference run is evidence of the reference implementation's behavior, not proof that a native implementation is
 correct; any difference found later is reported, not matched.
+
+## 2026-11-04 rerun (JUN-812 / JUN-813)
+
+Same command and inputs (html f8f2e0c, css f9d9658). Itonami Apps now lists the built-in apps and says the catalog
+origin and signing key are unregistered; Updates says the update origin is unregistered. Both still send nothing.
+Source hash prefix `c768f19baa1a`. `scripts/dapp-ui.py check` and `scripts/check-dapp-records.py` pass.
+Not done (open, see ADR-0283): catalog origin and signing key, installed-state store, ML-DSA-65 verifier, update origin.
