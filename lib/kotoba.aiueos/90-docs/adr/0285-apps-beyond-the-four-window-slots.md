@@ -4,7 +4,8 @@ Date: 2026-11-04
 
 ## Status
 
-Proposed (JUN-811, under JUN-805). Nothing in this ADR is implemented. It closes the leftover named
+Accepted 2026-11-04 (owner, JUN-811 under JUN-805; the three open questions below were answered with the recommended
+options). Nothing in this ADR is implemented yet. It closes the leftover named
 `:no-app-registry-beyond-the-slots` in ADR-0233 and replaces the "paged grid, pinned dock" outline in decision 2 of
 ADR-0283 with concrete rules. It does not touch ADR-0282 (dapps run offline) or ADR-0284 (user-signed install).
 
@@ -52,7 +53,7 @@ The native desktop lists four apps and cannot list more. Measured in the source 
    with four windows open. A slot is free when it has no open window.
 3. **Slot reuse never destroys user text.** Slot 2's body holds the RAM-only Itonami goal draft (word 2038 is its
    length), so a free slot whose app has live user text is not a candidate for reuse. If every free slot is protected
-   the launch is refused. (Open question 1.)
+   the launch is refused. (Decided, question 1.)
 4. **The launcher row is paged.** `perPage = clamp((vw - 62) / 102, 1, 8)`; page p shows apps `p*perPage+1 ..`. Button j
    keeps today's geometry `(6 + 102j, 2, 96, 24)`. When the app count N exceeds perPage the row also draws two
    arrow buttons, `(vw - 58, 2, 24, 24)` ("<") and `(vw - 30, 2, 24, 24)` (">"), in the button colour. N is read from the
@@ -97,14 +98,14 @@ The signed variable-length catalog (JUN-811 option B, `app-catalog.sig`), dock p
 screens, and the native render of dapp HTML/CSS (JUN-810) are separate. The hosted session is unaffected: it already
 lists all 17 apps.
 
-## Open questions (owner)
+## Decisions on the open questions (owner, 2026-11-04)
 
-1. **Draft protection.** Is "never reuse a slot whose app has live user text, else refuse the launch" acceptable, or
-   should the launch evict and the draft move to a dedicated store first? The draft is RAM-only today.
-2. **perPage.** Is `clamp((vw - 62) / 102, 1, 8)` right, or should the page size be fixed at 4 (17 apps = 5 pages, no
-   viewport dependence)?
-3. **Frozen object copies.** Is it acceptable that the C-driven `guest-browser-*` object copies stay four-app, given
-   they are not part of the current native qualification?
+1. **Draft protection:** a slot whose app has live user text is never reused; if every free slot is protected the
+   launch is refused. Moving the draft to a dedicated store is a separate change.
+2. **perPage:** `clamp((vw - 62) / 102, 1, 8)`, as in decision 4. A fixed page of four was not chosen.
+3. **Object copies:** `kotoba/browser-frame2.kotoba`, `browser-reduce` and `browser-ime` (and their `.o` and provenance
+   records) stay at the four-app ABI and are not rebuilt. Their headers must say they are frozen at ABI v1 when the
+   desktop copy first diverges.
 
 ## Consequences
 
