@@ -139,6 +139,10 @@ def main(args):
     import native_regions
     native_regions.verify_amu(amu)
     native_regions.verify_layout(amu, OS / "native/layout-table.json")
+    # the app catalog is generated from app_catalog.json (JUN-811); a hand-edited or stale one is refused before any compile
+    stale = subprocess.run([sys.executable, "-I", str(HERE / "gen-app-catalog.py"), "check"], capture_output=True, text=True)
+    if stale.returncode:
+        raise ValueError("app catalog is stale against app_catalog.json: " + stale.stdout.strip())
     owners = args.owner_repo_root.resolve(strict=True)
     if not amu.is_dir() or not owners.is_dir():
         raise ValueError("source roots must be directories")
