@@ -46,7 +46,7 @@ Measured in the source (2026-11-03):
    it never contacts a service by itself, and check, download and install each wait for their own approval. Install
    uses the AWAI-122 signed-image path with its rollback copy. App updates apply to catalog entries whose digest and
    signature verify, and the old version stays until the new one is admitted.
-5. **Saifu is read and verify only.** It does not sign transactions, broadcast or settle (etzhayyim-exclusive).
+5. **Saifu is read and verify only in this build.** It does not sign transactions, broadcast or settle. Those are operations of the Awai network's own services (network-awai): an app declares them, and the user approves each one (ADR-0284). Nothing here depends on etzhayyim.
 
 ## Consequences
 

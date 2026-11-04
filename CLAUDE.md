@@ -138,9 +138,13 @@ via `KBB_ENGINE`.
   `kotoba.runtime/default-interpreter-step-limit` or
   `:kotoba.policy/interpreter-step-limit`; Wasm execution is fuel-bounded by
   `kotoba.wasm-exec/default-fuel-limit` or `:kotoba.policy/fuel`.
-- Chain integration is read + verify only. Transaction signing, broadcast,
-  on-chain settlement and AT-MST origination are **etzhayyim-exclusive**
-  (operating-entity boundary) and are not implemented here.
+- Chain integration here is read + verify only. Transaction signing, broadcast,
+  on-chain settlement and AT-MST origination are operations of the Awai
+  network's services (network-awai) and are not implemented in this
+  repository; this repository does not depend on etzhayyim for them. Devnet /
+  demo trading in the hosted session (ADR-0284) is the one exception, and
+  real-money settlement and custody stay out of scope until the owner and
+  legal approve.
 - Do not put non-spec bodies under `com.atproto.*` NSIDs; Kotoba surfaces use
   the `com.etzhayyim.apps.kotoba.*` namespace (`lexicons/`).
 

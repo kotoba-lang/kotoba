@@ -108,10 +108,7 @@ native frame ABI v3 should take its app count and titles from the fold, so a del
   session signs a transaction with its own non-extractable Ed25519 key (a throwaway devnet key, not a wallet) and sends it to
   the node endpoint the user typed, after approving the displayed operation (`read-quotes`, `read-account`,
   `request-devnet-funds`, `submit-order`; each lists its requests and data). Nothing is signed or sent unless the node's chain
-  id contains `devnet`. This sits next to ADR-0283 §5 and the kotoba repository rule that chain transaction signing,
-  broadcast and settlement are etzhayyim-exclusive: torihiki is an exchange sequencer on a devnet whose collateral is
-  unbacked, and the owner decided that this is not that boundary; a mainnet or bridged-collateral chain stays refused by
-  the chain-id guard. Real money, custody and settlement remain out of scope until owner, legal and the torihiki
+  id contains `devnet`. The premise is the Awai network (network-awai) and its services; there is no dependency on etzhayyim. Torihiki is an exchange sequencer on a devnet whose collateral is unbacked, so a mainnet or bridged-collateral chain stays refused by the chain-id guard. Real money, custody and settlement remain out of scope until owner, legal and the torihiki
   decentralization roadmap (D1–D4) approve. Open: the signing payload is a positional 37-field string that follows the
   node's engine version, so a node on another version rejects every signature as `bad-signature`.
 
