@@ -116,3 +116,29 @@ lists all 17 apps.
   budget and every other word keep their place. A future change that needs more surface words has none to take
   without shrinking the op budget.
 - Four windows remain the maximum open at once. More than four would need surface space that does not exist.
+
+## Amendment 2026-11-04 — what step 1 (frame2) measured
+
+1. **Arrows and page size.** The launcher row already has the status area ("local only", from `vw - 112`, only when `vw`
+   is at least 640). The arrows sit left of it: `(vw - 168)` and `(vw - 140)` at 640 or wider, `(vw - 56)` and
+   `(vw - 28)` below that, each 24 x 24. `perPage = clamp((vw - 6 - 56 - (vw < 640 ? 0 : 112)) / 102, 1, 8)`, so four
+   apps need no arrow from 470 px (below 640) or 582 px (640 and up). This replaces the formula in decision 4; the
+   owner's choice of a viewport-dependent page size stands.
+2. **Home slots.** An app from 1 to 4 is only ever shown in its own slot (its home slot). Launching it while a foreign app's
+   window is open in that slot closes that window and takes the slot back; other apps use a free slot as in decision 2. Reason:
+   `desktop.kotoba` keys app behavior on the focused window id (typing into the Itonami goal, the dapp requests, the
+   close handler: about twelve sites), and the goal editor writes slot 2's body. Those sites must test the app in the
+   focused slot (`slot-app`), not the slot id, so a foreign app in slot 2 is never edited as the goal.
+3. **Labels.** A button's label is the title slot of the slot already showing the app (so a changed title, such as the
+   Itonami diagnostic title, still shows on its button as today), else the catalog title, drawn one line and clipped.
+4. **Code cost.** Step 1 measured 5.0 KiB of kernel code (receipt `textMargin` 13,728 -> 8,736 bytes, still OK), which
+   is the whole 5 KiB budget set above, and the desktop-side steps are still to come. Two ways of reading a catalog
+   label were tried (a code-point accessor inside `lay`: 6.3 KiB first, 5.0 KiB after merging the arrow into one
+   button; a dedicated one-line drawer: 6.1 KiB); the compiler's per-call-site region proof, not the amount of new
+   logic, drives the cost, and even an identity wrapper around the code-point read cost 1.4 KiB. The budget therefore
+   needs an owner decision before the desktop steps: either accept a `textMargin` WARN (below 8 KiB, above the 2 KiB
+   refusal) for this feature, or cut scope.
+5. **Parity.** With the four-app catalog and page 0 the desktop build, `textMargin` OK and all native QEMU gates
+   (input, iso, material, effects absent/audio/muted) pass unchanged on the step 1 code. A canary build with words 25..29
+   pre-filled, and a loop that stops drawing when they change, also passed every gate, and the same build with a wrong
+   expected canary value failed them: nothing in the exercised desktop scenarios reads or writes words 25..29.
