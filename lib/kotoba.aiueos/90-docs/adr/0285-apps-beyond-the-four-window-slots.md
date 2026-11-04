@@ -142,3 +142,33 @@ lists all 17 apps.
    (input, iso, material, effects absent/audio/muted) pass unchanged on the step 1 code. A canary build with words 25..29
    pre-filled, and a loop that stops drawing when they change, also passed every gate, and the same build with a wrong
    expected canary value failed them: nothing in the exercised desktop scenarios reads or writes words 25..29.
+
+## Amendment 2 2026-11-04 — step 2 does not fit in the kernel text cap
+
+Step 2 (slot rules, page-aware hit-tests, digits 1-8 and PageUp/PageDown, the app-keyed key sites) is written on branch
+`claude/jun-811-launcher-pages-b` and, with a four-app catalog and page 0, every native QEMU gate passes unchanged (run
+with the receipt's refusal disabled locally). It does not fit:
+
+| state | estimated `textMargin` |
+|---|---|
+| main (#1194) | 13,728 B |
+| step 1, frame2 paged row | 8,736 B |
+| step 1 + step 2 | 672 B (below the 2 KiB refusal; the desktop build refuses it) |
+
+Step 2 cost 8.1 KiB although it is about 2 KiB of source: each small helper is inlined per call site (for example
+`page-per` 512 B before it was cached in context word 130, `hit-launcher` 1.8 KiB, `launch-key` 0.6 KiB, seven
+`focus-app` sites 0.25 KiB). Moving the page size into context word 130 and reverting `hit-launcher` to its original
+recursive shape recovered 0.5 KiB. The 17-app catalog is still to come: a 17-app packed catalog with one short line per
+app measured +12.9 KiB earlier (about 160 B per packed word), and a titles-only catalog with one shared body would still
+cost about 2.5 KiB. The feature therefore needs about 4-6 KiB freed before it can build, not a tolerated WARN.
+
+Existing desktop features measured by replacing one function body with `0` (margin gain, an upper bound because helpers
+are shared): tile blur pass 3.2 KiB, forget-confirm panel 4.0 KiB, model-confirm title 3.2 KiB, blur damage pass
+2.6 KiB, window drag inertia 2.4 KiB, clock calibration 1.9 KiB. Several others (remote console step, NVMe report,
+USB input, blur self-check, unlock-confirm, create-confirm, input polling, motion channels) do not compile when stubbed
+alone and were not attributed.
+
+Options: (1) free 4-6 KiB by removing or simplifying existing desktop features chosen by the owner (candidates above);
+(2) lower the refusal from 2 KiB to a few hundred bytes, which leaves no room for any later change and is not
+recommended; (3) keep the launcher at four apps in the kernel and run the other apps' windows in user space (a larger
+design); (4) the signed data-blob catalog (JUN-811 option B) removes the catalog text but not the code above.
