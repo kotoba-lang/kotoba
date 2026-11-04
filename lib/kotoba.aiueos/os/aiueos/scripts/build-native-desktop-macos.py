@@ -137,6 +137,7 @@ def main(args):
     # the gates keep one region table (native_regions.py); the compiler's definition (Amu seed/97) must equal it
     sys.path.insert(0, str(HERE))
     import native_regions
+    import native_text_margin
     native_regions.verify_amu(amu)
     native_regions.verify_layout(amu, OS / "native/layout-table.json")
     # the app catalog is generated from app_catalog.json (JUN-811); a hand-edited or stale one is refused before any compile
@@ -174,7 +175,7 @@ def main(args):
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
-            "check-native-media-format.py", "native_regions.py", "native_ops.py",
+            "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
         )
     }
@@ -288,6 +289,15 @@ def main(args):
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
                 or kernel_state["bootPayload"] != payload_pin):
             raise ValueError("kernel or EFI build receipt mismatch")
+        # JUN-811: the compiler prints no code extent when the kernel fits, so estimate the margin under its cap
+        layout = json.loads((OS / "native/layout-table.json").read_text())
+        rung = next(row for row in layout["rungs"].values() if row["target"] == args.kernel_target)
+        text_margin = native_text_margin.text_margin(image.read_bytes(), rung["compilerTextCapBytes"],
+                                                     args.compiler_sha256, rung)
+        if args.profile == "desktop" and text_margin["state"] == "FAIL":
+            raise ValueError("kernel text margin is below the minimum: " + json.dumps(text_margin, sort_keys=True))
+        if text_margin["state"] == "WARN":
+            print("warning: kernel text margin is low: " + json.dumps(text_margin, sort_keys=True), file=sys.stderr)
 
         call("media", scripts["build-native-media-macos.py"], [
             "--amu-source", amu, "--compiler-image", compiler,
@@ -570,7 +580,7 @@ def main(args):
                             else "MACOS_NATIVE_KEYSTORE_QEMU_CANDIDATE" if args.profile == "keystore"
                             else "MACOS_NATIVE_DAPPS_QEMU_CANDIDATE" if args.profile == "dapps"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
-                     font=font_state["padded"], kernel=kernel_state["kernel"],
+                     font=font_state["padded"], kernel=kernel_state["kernel"], textMargin=text_margin,
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
