@@ -1,0 +1,133 @@
+;; JUN-813 stage 3 (ADR-0286): ML-DSA-65 sampling and bit packing over a kernel window, no heap.
+;; One 4096-byte window. Bytes 0..511 are the aiueos.keccak sponge; bytes 1024 * slot are polynomial slots 1..3 (256 little-endian
+;; u32 coefficients, as in aiueos.mldsa-ntt, whose slot 0 is therefore not available here). Scratch inside the first 1024 bytes:
+;;   512..543   rho (32 bytes)             544..591   c-tilde (48 bytes)        592..599   sign bytes of SampleInBall
+;;   640..700   hint bytes (omega + k = 61) 704..895   hint bitmap (1536 bits)   896..1023  free
+;; Each function returns 1 (or the value named), or 0 when an argument is out of range, the input is malformed or a bounded
+;; rejection loop ran out; a window under 4096 bytes is refused the same way.
+;;   sm-expand-a w length slot s r      Algorithm 30 RejNTTPoly(rho || s || r): SHAKE128, 3 bytes per candidate; writes A-hat[r][s]
+;;   sm-sample-in-ball w length slot    Algorithm 29 (tau = 49, SHAKE256 over c-tilde): coefficients 0, 1 or q - 1
+;;   sm-hint-unpack w length            Algorithm 21 for (omega, k) = (55, 6): hint bytes -> bitmap; 0 when malformed
+;;   sm-hint w length n                 bit n (0..1535) of the bitmap, or -1
+;;   sm-unpack w length src bits slot   SimpleBitUnpack: 256 values of `bits` (1..24) bits, little-endian, from window byte src
+;;   sm-rsub w length slot top          c = (top - c) mod q for each coefficient (BitUnpack(z, gamma1 - 1, gamma1) is unpack 20 then top 524288)
+;;   sm-pack w length slot bits dst     SimpleBitPack of coefficients below 2^bits to window byte dst; 0 when a coefficient is too large
+;; The rejection loops stop after 1400 candidates (ExpandA) or 2048 bytes (SampleInBall); an honest input needs about 257 and 54.
+(ns aiueos.mldsa-sample
+  (:require [aiueos.keccak :refer [kc-init kc-absorb kc-finish kc-squeeze]])
+  (:export [sm-expand-a sm-sample-in-ball sm-hint-unpack sm-hint sm-unpack sm-rsub sm-pack]))
+
+(defn- b8 [st i] (kernel-load-u8-4k st 4096 i))
+(defn- b8! [st i v] (kernel-store-u8-4k st 4096 i v))
+(defn- cf [st slot t] (kernel-load-u32-4k st 4096 (+ (* 1024 slot) (* 4 t))))
+(defn- cf! [st slot t v] (kernel-store-u32-4k st 4096 (+ (* 1024 slot) (* 4 t)) v))
+(defn- md [x] (let [r (rem x 8380417)] (if (< r 0) (+ r 8380417) r)))
+(defn- sq [st] (kc-squeeze st 4096))
+(defn- slot-ok [length slot] (and (>= length 4096) (>= slot 1) (<= slot 3)))
+
+;; absorb n bytes of the window starting at byte `from`
+(defn- absorb-from [st from i n]
+  (if (= i n) 1 (absorb-from st from (+ i 1 (* 0 (kc-absorb st 4096 (b8 st (+ from i))))) n)))
+(defn- zero-slot [st slot t] (if (= t 256) 1 (zero-slot st slot (+ t 1 (* 0 (cf! st slot t 0))))))
+
+;; ---- Algorithm 30 ----
+(defn- rej-loop [st slot n tries]
+  (if (or (= n 256) (>= tries 1400)) n
+    (let [x0 (sq st) x1 (sq st) x2 (sq st)
+          x (+ x0 (+ (* 256 x1) (* 65536 (bit-and x2 127))))]
+      (if (< x 8380417)
+        (rej-loop st slot (+ n 1 (* 0 (cf! st slot n x))) (+ tries 1))
+        (rej-loop st slot n (+ tries 1))))))
+(defn- expand-a* [st slot s r]
+  (do (kc-init st 4096 168) (absorb-from st 512 0 32) (kc-absorb st 4096 s) (kc-absorb st 4096 r) (kc-finish st 4096 31)
+      (if (= (rej-loop st slot 0 0) 256) 1 0)))
+(defn sm-expand-a [w length slot s r]
+  (if (and (slot-ok length slot) (>= s 0) (<= s 255) (>= r 0) (<= r 255))
+    (expand-a* (kernel-subregion w length 0 4096) slot s r)
+    0))
+
+;; ---- Algorithm 29 ----
+(defn- take-signs [st i] (if (= i 8) 1 (take-signs st (+ i 1 (* 0 (b8! st (+ 592 i) (sq st)))))))
+(defn- ball-step [st slot i j]
+  (let [sg (bit-and (u64-shift-right (b8 st (+ 592 (quot (- i 207) 8))) (mod (- i 207) 8)) 1)]
+    (do (cf! st slot i (cf st slot j))
+        (cf! st slot j (if (= sg 0) 1 8380416)))))
+(defn- ball-loop [st slot i tries]
+  (if (= i 256) 1
+    (if (>= tries 2048) 0
+      (let [j (sq st)]
+        (if (> j i)
+          (ball-loop st slot i (+ tries 1))
+          (ball-loop st slot (+ i 1 (* 0 (ball-step st slot i j))) (+ tries 1)))))))
+(defn- ball* [st slot]
+  (do (zero-slot st slot 0) (kc-init st 4096 136) (absorb-from st 544 0 48) (kc-finish st 4096 31)
+      (take-signs st 0) (ball-loop st slot 207 8)))
+(defn sm-sample-in-ball [w length slot]
+  (if (slot-ok length slot) (ball* (kernel-subregion w length 0 4096) slot) 0))
+
+;; ---- Algorithm 21 ----
+(defn- hb [st i] (b8 st (+ 640 i)))
+(defn- set-bit [st n]
+  (let [at (+ 704 (quot n 8))] (b8! st at (bit-or (b8 st at) (i64-shift-left 1 (mod n 8))))))
+(defn- clear-map [st i] (if (= i 192) 1 (clear-map st (+ i 1 (* 0 (b8! st (+ 704 i) 0))))))
+(defn- hint-seg [st i p lim idx]
+  (if (= p lim) p
+    (if (and (> p idx) (>= (hb st (- p 1)) (hb st p))) -1
+      (hint-seg st i (+ p 1 (* 0 (set-bit st (+ (* 256 i) (hb st p))))) lim idx))))
+(defn- hint-rows [st i idx]
+  (if (= i 6) idx
+    (let [lim (hb st (+ 55 i))]
+      (if (or (< lim idx) (> lim 55)) -1
+        (let [r (hint-seg st i idx lim idx)]
+          (if (< r 0) -1 (hint-rows st (+ i 1) r)))))))
+(defn- hint-pad [st p] (if (= p 55) 1 (if (= (hb st p) 0) (hint-pad st (+ p 1)) 0)))
+(defn- hint* [st]
+  (do (clear-map st 0)
+      (let [end (hint-rows st 0 0)]
+        (if (< end 0) 0 (hint-pad st end)))))
+(defn sm-hint-unpack [w length] (if (>= length 4096) (hint* (kernel-subregion w length 0 4096)) 0))
+(defn sm-hint [w length n]
+  (if (and (>= length 4096) (>= n 0) (< n 1536))
+    (let [st (kernel-subregion w length 0 4096)]
+      (bit-and (u64-shift-right (b8 st (+ 704 (quot n 8))) (mod n 8)) 1))
+    -1))
+
+;; ---- SimpleBitUnpack / SimpleBitPack ----
+(defn- sbyte [st src nb k] (if (< k nb) (b8 st (+ src k)) 0))
+(defn- unpack-loop [st src bits slot t]
+  (if (= t 256) 1
+    (let [pos (* t bits) k (quot pos 8) nb (* 32 bits)
+          v (+ (sbyte st src nb k) (+ (* 256 (sbyte st src nb (+ k 1)))
+                                      (+ (* 65536 (sbyte st src nb (+ k 2))) (* 16777216 (sbyte st src nb (+ k 3))))))
+          x (bit-and (u64-shift-right v (mod pos 8)) (- (i64-shift-left 1 bits) 1))]
+      (unpack-loop st src bits slot (+ t 1 (* 0 (cf! st slot t x)))))))
+(defn- span-ok [length at bits] (and (>= length 4096) (>= bits 1) (<= bits 24) (>= at 0) (<= (+ at (* 32 bits)) 4096)))
+(defn sm-unpack [w length src bits slot]
+  (if (and (span-ok length src bits) (>= slot 1) (<= slot 3))
+    (unpack-loop (kernel-subregion w length 0 4096) src bits slot 0)
+    0))
+
+(defn- rsub-loop [st slot top t]
+  (if (= t 256) 1 (rsub-loop st slot top (+ t 1 (* 0 (cf! st slot t (md (- top (cf st slot t)))))))))
+(defn sm-rsub [w length slot top]
+  (if (and (slot-ok length slot) (>= top 0) (< top 8380417))
+    (rsub-loop (kernel-subregion w length 0 4096) slot top 0)
+    0))
+
+(defn- small-loop [st slot bits t]
+  (if (= t 256) 1 (if (< (cf st slot t) (i64-shift-left 1 bits)) (small-loop st slot bits (+ t 1)) 0)))
+(defn- contrib [st slot bits b t]
+  (let [s (- (* t bits) (* 8 b)) c (cf st slot t)]
+    (bit-and (if (>= s 0) (i64-shift-left c s) (u64-shift-right c (- 0 s))) 255)))
+(defn- pack-or [st slot bits b t hi acc]
+  (if (> t hi) acc (pack-or st slot bits b (+ t 1) hi (bit-or acc (contrib st slot bits b t)))))
+(defn- pack-loop [st slot bits dst b]
+  (if (= b (* 32 bits)) 1
+    (pack-loop st slot bits dst
+               (+ b 1 (* 0 (b8! st (+ dst b) (pack-or st slot bits b (quot (* 8 b) bits) (quot (+ (* 8 b) 7) bits) 0)))))))
+(defn- pack* [st slot bits dst]
+  (if (= (small-loop st slot bits 0) 1) (pack-loop st slot bits dst 0) 0))
+(defn sm-pack [w length slot bits dst]
+  (if (and (span-ok length dst bits) (>= slot 1) (<= slot 3))
+    (pack* (kernel-subregion w length 0 4096) slot bits dst)
+    0))
