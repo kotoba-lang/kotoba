@@ -176,7 +176,7 @@ def main(args):
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
-            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
+            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}
@@ -528,6 +528,22 @@ def main(args):
                         "reduced-effects", "effects-restored", "home-pointer-launch"]
                     or material_observed["physicalHardware"] or material_observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("native shell materials observation is not bound to this build")
+        launcher_observed = None
+        if args.profile == "desktop":
+            call("qemu-launcher-pages", scripts["check-native-launcher-pages-qemu.py"], [
+                "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                "--qemu", qemu, "--firmware", firmware, "--output", output / "qemu-launcher-pages"])
+            launcher_observed = json.loads((output / "qemu-launcher-pages/native-launcher-pages-qemu.json").read_text())
+            if (launcher_observed["status"] != "PASS_NATIVE_LAUNCHER_PAGES_QEMU"
+                    or launcher_observed["kernel"] != kernel_state["kernel"]
+                    or launcher_observed["efi"] != kernel_state["efi"]
+                    or launcher_observed["media"] != media_state["image"]
+                    or launcher_observed["font"] != font_state["padded"]
+                    or launcher_observed["qemu"] != qemu_pin or launcher_observed["firmware"] != firmware_pin
+                    or launcher_observed["observer"] != script_pins["check-native-launcher-pages-qemu.py"]
+                    or launcher_observed["opsFourWindowsFullPage"] > launcher_observed["opsLimit"]
+                    or launcher_observed["physicalHardware"] or launcher_observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("launcher pages observation is not bound to this build")
         gui_observed = []
         if args.profile == "desktop":
             for name, options in (("absent", []), ("audio", ["--audio"]),
@@ -586,6 +602,9 @@ def main(args):
                      guestInputQualified=True, nativeFormatEmission=True,
                      isoBootQualified=iso_observed is not None,
                      nativeShellMaterialsQualified=material_observed is not None,
+                     nativeLauncherPagesQualified=launcher_observed is not None,
+                     nativeLauncherPagesEvents=len(launcher_observed["events"]) if launcher_observed else 0,
+                     nativeLauncherPagesOpsFourWindows=launcher_observed["opsFourWindowsFullPage"] if launcher_observed else None,
                      nativeGUIEffectsQualified=len(gui_observed) == 3,
                      nativeGUIEffectsEvents=sum(len(g["events"]) for g in gui_observed),
                      nativePCMDevice="Intel 8086:2415 AC97" if gui_observed else None,

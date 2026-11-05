@@ -5,16 +5,24 @@ Keys are synthetic QEMU input. The checks read the guest's surface (slot->app wo
 records, titles), so they observe guest decisions, not pixels, except that page 1 must scan out differently from page 0.
 Run it on the same media the build gates use; it is not yet one of the build script's pinned gates.
 """
-import argparse, json, os, re, select, struct, subprocess, time
+import argparse, hashlib, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
 import native_regions
 
 HERE = Path(__file__).resolve().parent
+OPS_LIMIT = 259  # surface words 480.. hold 6-word draw ops; word 416 is the count, 427 the overflow flag
+
+
+def pin(path):
+    raw = path.read_bytes()
+    return dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+
+
 TITLES = {1: "Murakumo", 2: "Itonami", 3: "Yataverse", 4: "Aozora", 9: "Bunsho", 10: "Hyokeisan", 11: "Zuhyo", 12: "Tokei"}
 
 
-def main(media, efi, kernel, qemu, firmware, out):
+def main(media, efi, kernel, font, qemu, firmware, out):
     image = kernel.read_bytes()
     rw = struct.unpack_from("<IIQQQQQQ", image, 120)
     context = rw[3]
@@ -31,6 +39,7 @@ def main(media, efi, kernel, qemu, firmware, out):
     os.chdir(out)
     seq = 0
     events = []
+    ops_seen = []
     try:
         assert select.select([p.stdout], [], [], 15)[0], "QMP greeting timeout"
         assert "QMP" in json.loads(p.stdout.readline())
@@ -68,7 +77,7 @@ def main(media, efi, kernel, qemu, firmware, out):
             return dict(windows=surface[1], focus=surface[2], slotApps=list(surface[25:29]), page=surface[29],
                         goalLength=surface[2038], titles={i: title(surface, i) for i in range(1, 5)},
                         open=[surface[5 + 5 * i] for i in range(surface[1])], perPage=work[130],
-                        magic=work[72], keys=work[73], lastKey=work[77], started=work[78], completed=work[79])
+                        ops=surface[416], opsOverflow=surface[427], magic=work[72], keys=work[73], lastKey=work[77], started=work[78], completed=work[79])
 
         def wait(name, predicate, timeout=120):
             end = time.monotonic() + timeout
@@ -77,6 +86,8 @@ def main(media, efi, kernel, qemu, firmware, out):
                 assert p.poll() is None, ("guest exited", p.returncode)
                 s = state()
                 if predicate(s) and s["started"] == s["completed"]:
+                    assert s["opsOverflow"] == 0 and 0 < s["ops"] <= OPS_LIMIT, ("draw list outside its budget", name, s["ops"], s["opsOverflow"])
+                    ops_seen.append((s["windows"], s["ops"]))
                     events.append(dict(name=name, state=s))
                     return s
                 time.sleep(.2)
@@ -125,14 +136,23 @@ def main(media, efi, kernel, qemu, firmware, out):
         s = key("1", 2, s)
         assert s["slotApps"] == [1, 2, 10, 11] and s["titles"][1] == TITLES[1] and s["windows"] == 3, s
         assert s["goalLength"] == draft, "Itonami draft lost"
+        # Worst case for the draw list: four open windows and a full 8-button page 0.
+        s = key("4", 5, s)  # app 4 -> home slot 4, replaces app 11
+        assert s["slotApps"] == [1, 2, 10, 4] and s["windows"] == 3, s
+        s = key("2", 3, s)  # app 2 -> home slot 2 (its window was closed, draft kept)
+        assert s["windows"] == 4 and s["page"] == 0 and s["slotApps"] == [1, 2, 10, 4], s
+        assert s["goalLength"] == draft
+        four = s["ops"]
         # Paging clamps at both ends.
         s = key("pgup", 73, s)
         assert s["page"] == 0
         for _ in range(3):
             s = key("pgdn", 81, s)
         assert s["page"] == 2, ("18 apps at 8 per page end on page 2", s["page"])
-        report = dict(status="PASS_NATIVE_LAUNCHER_PAGES_QEMU", observer=Path(__file__).name, media=str(media), events=events,
-                      guestEmulation="QEMU TCG", physicalHardware=False)
+        report = dict(status="PASS_NATIVE_LAUNCHER_PAGES_QEMU", observer=pin(Path(__file__)),
+                      kernel=pin(kernel), efi=pin(efi), media=pin(media), font=pin(font), qemu=pin(qemu), firmware=pin(firmware),
+                      events=events, opsLimit=OPS_LIMIT, opsFourWindowsFullPage=four, opsMaxObserved=max(o for _, o in ops_seen),
+                      guestEmulation="QEMU TCG", physicalHardware=False, syntheticInputProvesHumanConsent=False)
         (out / "native-launcher-pages-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
         print(report["status"])
     finally:
@@ -154,7 +174,7 @@ def main(media, efi, kernel, qemu, firmware, out):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    for n in ["media", "efi", "kernel", "qemu", "firmware", "output"]:
+    for n in ["media", "efi", "kernel", "font", "qemu", "firmware", "output"]:
         ap.add_argument("--" + n, type=Path, required=True)
     a = ap.parse_args()
-    main(*(getattr(a, n).resolve() for n in ["media", "efi", "kernel", "qemu", "firmware", "output"]))
+    main(*(getattr(a, n).resolve() for n in ["media", "efi", "kernel", "font", "qemu", "firmware", "output"]))
