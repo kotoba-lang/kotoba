@@ -174,7 +174,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -266,6 +266,7 @@ def main(args):
                         else "consent-entry.kotoba" if args.profile in ("consent", "keystore")
                         else "cid-entry.kotoba" if args.profile == "cid"
                         else "sha512-entry.kotoba" if args.profile == "sha512"
+                        else "keccak-entry.kotoba" if args.profile == "keccak"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
@@ -283,7 +284,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 44
+                or kernel_state["sourceModuleCount"] != (45 if args.profile == "keccak" else 44)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -323,6 +324,7 @@ def main(args):
                         else "check-native-idle-silent-qemu.py" if args.profile == "idle"
                         else "check-native-cid-qemu.py" if args.profile == "cid"
                         else "check-native-sha512-qemu.py" if args.profile == "sha512"
+                        else "check-native-keccak-qemu.py" if args.profile == "keccak"
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
@@ -345,6 +347,7 @@ def main(args):
                         else "native-idle-silent-qemu.json" if args.profile == "idle"
                         else "native-cid-qemu.json" if args.profile == "cid"
                         else "native-sha512-qemu.json" if args.profile == "sha512"
+                        else "native-keccak-qemu.json" if args.profile == "keccak"
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
@@ -360,6 +363,7 @@ def main(args):
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
                            else "PASS_NATIVE_SHA512_QEMU" if args.profile == "sha512"
+                           else "PASS_NATIVE_KECCAK_QEMU" if args.profile == "keccak"
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
@@ -377,7 +381,7 @@ def main(args):
                            else 11 if args.profile == "dapps"
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
+                           else 2 if args.profile in ("cid", "sha512", "keccak", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -420,6 +424,12 @@ def main(args):
                     or observed["events"][1]["matches"] != ["abc", "fips-two-block", "abd"]
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("sha512 verdict is incomplete")
+        elif args.profile == "keccak":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "keccak-outputs"]
+                    or observed["events"][1]["matches"] != ["shake128-empty", "shake256-abc", "shake128-200-squeeze-400"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("keccak verdict is incomplete")
         elif args.profile == "gf25519":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "gf25519"]
@@ -590,6 +600,7 @@ def main(args):
                             else "MACOS_NATIVE_IDLE_SILENT_QEMU_CANDIDATE" if args.profile == "idle"
                             else "MACOS_NATIVE_CID_QEMU_CANDIDATE" if args.profile == "cid"
                             else "MACOS_NATIVE_SHA512_QEMU_CANDIDATE" if args.profile == "sha512"
+                            else "MACOS_NATIVE_KECCAK_QEMU_CANDIDATE" if args.profile == "keccak"
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
@@ -621,6 +632,8 @@ def main(args):
                                     if args.profile == "cid"
                                     else "Mac native SHA-512 self-test (FIPS 180-4 vectors) on QEMU"
                                     if args.profile == "sha512"
+                                    else "Mac native Keccak (SHAKE128/256) sponge self-test on QEMU"
+                                    if args.profile == "keccak"
                                     else "Mac native GF(2^255-19) arithmetic self-test on QEMU"
                                     if args.profile == "gf25519"
                                     else "Mac native Ed25519 public keys from RFC 8032 seeds on QEMU"
@@ -660,7 +673,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "

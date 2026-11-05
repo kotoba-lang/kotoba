@@ -1,0 +1,79 @@
+;; JUN-813: Keccak-f[1600] and a SHAKE sponge over a kernel state region, for the ML-DSA-65 verifier (ADR-0286).
+;; No heap. The state is a 4096-byte window (the 4k tier takes a variable offset); the first 512 bytes are used: 25 lanes
+;; of A at 0, C at 200, D at 240, B at 280, then
+;; word 480 = byte position in the rate, 488 = rate (168 SHAKE128, 136 SHAKE256), 496 = mode (0 absorbing, 1 squeezing).
+;; kc-init st length rate       -> 1, or 0 for another rate
+;; kc-absorb st length v        -> 1; 0 when not absorbing or v is not a byte
+;; kc-finish st length ds       -> 1; ds is the domain byte (31 for SHAKE: 0x1F), then the sponge squeezes
+;; kc-squeeze st length         -> the next output byte, or -1 when not squeezing
+;; Lanes are little-endian 64-bit values; rotations use the same i64 shift pair as aiueos.sha512.
+(ns aiueos.keccak
+  (:export [kc-init kc-absorb kc-finish kc-squeeze]))
+
+(defn- lane [st i] (kernel-load-u64-4k st 4096 (* i 8)))
+(defn- lane! [st i v] (kernel-store-u64-4k st 4096 (* i 8) v))
+(defn- bget [st i] (kernel-load-u8-4k st 4096 i))
+(defn- bput [st i v] (kernel-store-u8-4k st 4096 i v))
+(defn- rotl [x n] (if (= n 0) x (bit-or (i64-shift-left x n) (u64-shift-right x (- 64 n)))))
+(defn- rho-offset [i] (case i 0 0 1 1 2 62 3 28 4 27 5 36 6 44 7 6 8 55 9 20 10 3 11 10 12 43 13 25 14 39 15 41 16 45 17 15 18 21 19 8 20 18 21 2 22 61 23 56 24 14 0))
+(defn- round-constant [r] (case r 0 1 1 32898 2 -9223372036854742902 3 -9223372034707259392 4 32907 5 2147483649 6 -9223372034707259263 7 -9223372036854743031 8 138 9 136 10 2147516425 11 2147483658 12 2147516555 13 -9223372036854775669 14 -9223372036854742903 15 -9223372036854743037 16 -9223372036854743038 17 -9223372036854775680 18 32778 19 -9223372034707292150 20 -9223372034707259263 21 -9223372036854742912 22 2147483649 23 -9223372034707259384 0))
+
+(defn- theta-c [st x]
+  (lane! st (+ 25 x)
+         (bit-xor (bit-xor (bit-xor (lane st x) (lane st (+ x 5))) (bit-xor (lane st (+ x 10)) (lane st (+ x 15))))
+                  (lane st (+ x 20)))))
+(defn- theta-cs [st x] (if (= x 5) 1 (theta-cs st (+ x 1 (* 0 (theta-c st x))))))
+(defn- theta-d [st x]
+  (lane! st (+ 30 x) (bit-xor (lane st (+ 25 (mod (+ x 4) 5))) (rotl (lane st (+ 25 (mod (+ x 1) 5))) 1))))
+(defn- theta-ds [st x] (if (= x 5) 1 (theta-ds st (+ x 1 (* 0 (theta-d st x))))))
+(defn- theta-apply [st i]
+  (if (= i 25) 1
+    (theta-apply st (+ i 1 (* 0 (lane! st i (bit-xor (lane st i) (lane st (+ 30 (mod i 5))))))))))
+(defn- rho-pi-step [st i]
+  (let [x (mod i 5) y (quot i 5)]
+    (lane! st (+ 35 (+ y (* 5 (mod (+ (* 2 x) (* 3 y)) 5)))) (rotl (lane st i) (rho-offset i)))))
+(defn- rho-pi [st i] (if (= i 25) 1 (rho-pi st (+ i 1 (* 0 (rho-pi-step st i))))))
+(defn- chi-step [st i]
+  (let [x (mod i 5) row (* 5 (quot i 5))]
+    (lane! st i (bit-xor (lane st (+ 35 i))
+                         (bit-and (bit-not (lane st (+ 35 (+ row (mod (+ x 1) 5))))) (lane st (+ 35 (+ row (mod (+ x 2) 5)))))))))
+(defn- chi [st i] (if (= i 25) 1 (chi st (+ i 1 (* 0 (chi-step st i))))))
+(defn- kround [st r]
+  (do (theta-cs st 0) (theta-ds st 0) (theta-apply st 0) (rho-pi st 0) (chi st 0)
+      (lane! st 0 (bit-xor (lane st 0) (round-constant r)))))
+(defn- krounds [st r] (if (= r 24) 1 (krounds st (+ r 1 (* 0 (kround st r))))))
+(defn- kc-f [st] (krounds st 0))
+
+(defn- kc-zero [st i] (if (>= i 512) 1 (kc-zero st (+ i 1 (* 0 (bput st i 0))))))
+(defn- kc-init* [st rate]
+  (if (or (= rate 168) (= rate 136))
+    (do (kc-zero st 0) (lane! st 61 rate) 1)
+    0))
+(defn- kc-absorb* [st v]
+  (if (and (= (lane st 62) 0) (>= v 0) (<= v 255))
+    (let [pos (lane st 60)]
+      (do (bput st pos (bit-xor (bget st pos) v))
+          (lane! st 60 (+ pos 1))
+          (if (= (+ pos 1) (lane st 61)) (do (kc-f st) (lane! st 60 0)) 1)
+          1))
+    0))
+(defn- kc-finish* [st ds]
+  (if (= (lane st 62) 0)
+    (let [pos (lane st 60) rate (lane st 61)]
+      (do (bput st pos (bit-xor (bget st pos) ds))
+          (bput st (- rate 1) (bit-xor (bget st (- rate 1)) 128))
+          (kc-f st) (lane! st 60 0) (lane! st 62 1) 1))
+    0))
+(defn- kc-squeeze* [st]
+  (if (= (lane st 62) 1)
+    (do (if (= (lane st 60) (lane st 61)) (do (kc-f st) (lane! st 60 0)) 1)
+        (let [pos (lane st 60) b (bget st pos)]
+          (do (lane! st 60 (+ pos 1)) b)))
+    -1))
+
+;; Public entry points take the window and its length, like aiueos.sha512-stream: the length is checked once and the window is
+;; re-derived with a known extent for everything below.
+(defn kc-init [st length rate] (if (< length 4096) 0 (kc-init* (kernel-subregion st length 0 4096) rate)))
+(defn kc-absorb [st length v] (if (< length 4096) 0 (kc-absorb* (kernel-subregion st length 0 4096) v)))
+(defn kc-finish [st length ds] (if (< length 4096) 0 (kc-finish* (kernel-subregion st length 0 4096) ds)))
+(defn kc-squeeze [st length] (if (< length 4096) -1 (kc-squeeze* (kernel-subregion st length 0 4096))))
