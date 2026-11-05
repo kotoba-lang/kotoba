@@ -196,5 +196,10 @@ digit 1 on page 1 launches app 9 into the first free slot; a held Itonami goal d
 survives; relaunching an open app focuses it; a launch with no free slot is refused; app 1 returns to its home slot.
 Run against the previous four-app media it fails at the first slot-map assertion.
 
-Not yet covered: the worst-case draw-list budget (259 ops) with four windows and a full page, and wiring the new gate
-into the build script's pins and receipt.
+## Amendment 4 2026-11-05 — the launcher gate is a build gate; draw-list budget
+
+`check-native-launcher-pages-qemu.py` is now pinned and run by `build-native-desktop-macos.py` for the desktop profile
+(receipt fields `nativeLauncherPages*`; it checks kernel, efi, media, font, qemu, firmware and observer pins). It also
+asserts the draw list stays within 259 ops with no overflow after every observed state. Measured: 253 ops with four
+windows open and a full 8-button page 0, 254 at most over the whole run, so the headroom is 5 ops. A later window or
+launcher feature that adds ops must re-measure; the gate fails when the list overflows.
