@@ -174,7 +174,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -269,6 +269,7 @@ def main(args):
                         else "keccak-entry.kotoba" if args.profile == "keccak"
                         else "mldsa-ntt-entry.kotoba" if args.profile == "mldsa-ntt"
                         else "mldsa-sample-entry.kotoba" if args.profile == "mldsa-sample"
+                        else "mldsa-verify-entry.kotoba" if args.profile == "mldsa-verify"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
@@ -286,7 +287,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (46 if args.profile == "mldsa-sample" else 45 if args.profile in ("keccak", "mldsa-ntt") else 44)
+                or kernel_state["sourceModuleCount"] != (48 if args.profile == "mldsa-verify" else 46 if args.profile == "mldsa-sample" else 45 if args.profile in ("keccak", "mldsa-ntt") else 44)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -329,6 +330,7 @@ def main(args):
                         else "check-native-keccak-qemu.py" if args.profile == "keccak"
                         else "check-native-mldsa-ntt-qemu.py" if args.profile == "mldsa-ntt"
                         else "check-native-mldsa-sample-qemu.py" if args.profile == "mldsa-sample"
+                        else "check-native-mldsa-verify-qemu.py" if args.profile == "mldsa-verify"
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
@@ -354,6 +356,7 @@ def main(args):
                         else "native-keccak-qemu.json" if args.profile == "keccak"
                         else "native-mldsa-ntt-qemu.json" if args.profile == "mldsa-ntt"
                         else "native-mldsa-sample-qemu.json" if args.profile == "mldsa-sample"
+                        else "native-mldsa-verify-qemu.json" if args.profile == "mldsa-verify"
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
@@ -372,6 +375,7 @@ def main(args):
                            else "PASS_NATIVE_KECCAK_QEMU" if args.profile == "keccak"
                            else "PASS_NATIVE_MLDSA_NTT_QEMU" if args.profile == "mldsa-ntt"
                            else "PASS_NATIVE_MLDSA_SAMPLE_QEMU" if args.profile == "mldsa-sample"
+                           else "PASS_NATIVE_MLDSA_VERIFY_QEMU" if args.profile == "mldsa-verify"
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
@@ -389,7 +393,7 @@ def main(args):
                            else 11 if args.profile == "dapps"
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
-                           else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "gf25519", "keyseal") else 24)
+                           else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -451,6 +455,13 @@ def main(args):
                                                             "rsub20", "unpack4", "pack4", "pack10", "hint-bitmap", "hint-refusals"]
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("mldsa-sample verdict is incomplete")
+        elif args.profile == "mldsa-verify":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "verify-cases"]
+                    or observed["events"][1]["matches"] != ["valid-a", "valid-b", "wrong-message", "flip-ctilde", "flip-z",
+                                                            "hint-order", "hint-padding", "hint-limit", "z-over-bound"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("mldsa-verify verdict is incomplete")
         elif args.profile == "gf25519":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "gf25519"]
@@ -624,6 +635,7 @@ def main(args):
                             else "MACOS_NATIVE_KECCAK_QEMU_CANDIDATE" if args.profile == "keccak"
                             else "MACOS_NATIVE_MLDSA_NTT_QEMU_CANDIDATE" if args.profile == "mldsa-ntt"
                             else "MACOS_NATIVE_MLDSA_SAMPLE_QEMU_CANDIDATE" if args.profile == "mldsa-sample"
+                            else "MACOS_NATIVE_MLDSA_VERIFY_QEMU_CANDIDATE" if args.profile == "mldsa-verify"
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
@@ -661,6 +673,8 @@ def main(args):
                                     if args.profile == "mldsa-ntt"
                                     else "Mac native ML-DSA-65 sampling (ExpandA, SampleInBall, hint unpack) and bit packing self-test on QEMU"
                                     if args.profile == "mldsa-sample"
+                                    else "Mac native ML-DSA-65 signature verification (nine signatures from the Python reference) on QEMU"
+                                    if args.profile == "mldsa-verify"
                                     else "Mac native GF(2^255-19) arithmetic self-test on QEMU"
                                     if args.profile == "gf25519"
                                     else "Mac native Ed25519 public keys from RFC 8032 seeds on QEMU"
@@ -700,7 +714,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "

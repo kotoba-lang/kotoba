@@ -1,0 +1,129 @@
+;; JUN-813 stage 4 (ADR-0286): ML-DSA-65 verification (FIPS 204 Algorithm 8, lambda = 192) over kernel memory, no heap.
+;; The caller owns a 20480-byte arena of five 4096-byte windows and fills these bytes before calling:
+;;   window 0 (W1)  sponge at 0; sampling scratch (aiueos.mldsa-sample layout: rho 512, c-tilde 544, hint bytes 640, bitmap 704, slots 1..3)
+;;   window 1 (W2)  four polynomial slots (aiueos.mldsa-ntt layout) for the arithmetic
+;;   window 2 (S)   the signature at 0..3308; mu at 3328..3391; the message M' (0 || |ctx| || ctx || M) at 3392, at most 704 bytes
+;;   window 3 (P)   the public key at 0..1951; w1' (768 bytes) is written at 2048..2815
+;; Each call returns a code: 1 valid; 0 the recomputed c-tilde differs; 2 the hint bytes are malformed; 3 ||z|| >= gamma1 - beta;
+;; 4 a bounded sampling loop ran out; 5 the arena is under 20480 bytes. mv-mu returns 1, or 0 for a bad length.
+;;   mv-mu base length mlen      tr = SHAKE256(pk, 64); mu = SHAKE256(tr || M', 64), written to S 3328
+;;   mv-verify base length       Algorithm 8 from line 7, with mu taken from S 3328
+;; Memory: A-hat[r][s] and z[s] are recomputed per (r, s) instead of kept, so five transforms of z are done per row; this trades
+;; time for the arena size. q = 8380417; every product of two reduced values stays below 2^46.
+(ns aiueos.mldsa-verify
+  (:require [aiueos.keccak :refer [kc-init kc-absorb kc-finish kc-squeeze]]
+            [aiueos.mldsa-ntt :refer [nt-ntt nt-intt nt-mul]]
+            [aiueos.mldsa-sample :refer [sm-expand-a sm-sample-in-ball sm-hint-unpack sm-hint]])
+  (:export [mv-mu mv-verify]))
+
+(defn- g8 [st i] (kernel-load-u8-4k st 4096 i))
+(defn- p8! [st i v] (kernel-store-u8-4k st 4096 i v))
+(defn- cf [st slot t] (kernel-load-u32-4k st 4096 (+ (* 1024 slot) (* 4 t))))
+(defn- cf! [st slot t v] (kernel-store-u32-4k st 4096 (+ (* 1024 slot) (* 4 t)) v))
+(defn- md [x] (let [r (rem x 8380417)] (if (< r 0) (+ r 8380417) r)))
+
+(defn- copy-bytes [src so dst d n i]
+  (if (= i n) 1 (copy-bytes src so dst d n (+ i 1 (* 0 (p8! dst (+ d i) (g8 src (+ so i))))))))
+(defn- absorb-bytes [sp so st n i]
+  (if (= i n) 1 (absorb-bytes sp so st n (+ i 1 (* 0 (kc-absorb st 4096 (g8 sp (+ so i))))))))
+(defn- squeeze-to [st dst d n i]
+  (if (= i n) 1 (squeeze-to st dst d n (+ i 1 (* 0 (p8! dst (+ d i) (kc-squeeze st 4096)))))))
+
+;; ---- mu ----
+(defn- mu* [w1 sg pp mlen]
+  (do (kc-init w1 4096 136) (absorb-bytes pp 0 w1 1952 0) (kc-finish w1 4096 31) (squeeze-to w1 w1 896 64 0)
+      (kc-init w1 4096 136) (absorb-bytes w1 896 w1 64 0) (absorb-bytes sg 3392 w1 mlen 0) (kc-finish w1 4096 31)
+      (squeeze-to w1 sg 3328 64 0)
+      1))
+(defn mv-mu [base length mlen]
+  (if (or (< length 20480) (< mlen 0) (> mlen 704)) 0
+    (mu* (kernel-subregion base length 0 4096) (kernel-subregion base length 8192 4096) (kernel-subregion base length 12288 4096) mlen)))
+
+;; ---- polynomial helpers (slots of a window) ----
+(defn- zero-slot [st slot t] (if (= t 256) 1 (zero-slot st slot (+ t 1 (* 0 (cf! st slot t 0))))))
+(defn- copy-poly [src ss dst ds t]
+  (if (= t 256) 1 (copy-poly src ss dst ds (+ t 1 (* 0 (cf! dst ds t (cf src ss t)))))))
+(defn- add-slot [st d a t]
+  (if (= t 256) 1 (add-slot st d a (+ t 1 (* 0 (cf! st d t (md (+ (cf st d t) (cf st a t)))))))))
+(defn- sub-slot [st d a t]
+  (if (= t 256) 1 (sub-slot st d a (+ t 1 (* 0 (cf! st d t (md (- (cf st d t) (cf st a t)))))))))
+(defn- scale-slot [st slot k t]
+  (if (= t 256) 1 (scale-slot st slot k (+ t 1 (* 0 (cf! st slot t (md (* (cf st slot t) k))))))))
+(defn- rsub-slot [st slot top t]
+  (if (= t 256) 1 (rsub-slot st slot top (+ t 1 (* 0 (cf! st slot t (md (- top (cf st slot t)))))))))
+;; every centered coefficient has absolute value below 524092
+(defn- bound-ok [st slot t]
+  (if (= t 256) 1
+    (let [c (cf st slot t)]
+      (if (or (< c 524092) (> c 7856325)) (bound-ok st slot (+ t 1)) 0))))
+
+;; SimpleBitUnpack of 256 values of `bits` bits from window sp byte off into a slot of dst
+(defn- sbyte [sp nb off k] (if (< k nb) (g8 sp (+ off k)) 0))
+(defn- unpack-to [sp off bits dst slot t]
+  (if (= t 256) 1
+    (let [pos (* t bits) k (quot pos 8) nb (* 32 bits)
+          v (+ (sbyte sp nb off k) (+ (* 256 (sbyte sp nb off (+ k 1)))
+                                      (+ (* 65536 (sbyte sp nb off (+ k 2))) (* 16777216 (sbyte sp nb off (+ k 3))))))
+          x (bit-and (u64-shift-right v (mod pos 8)) (- (i64-shift-left 1 bits) 1))]
+      (unpack-to sp off bits dst slot (+ t 1 (* 0 (cf! dst slot t x)))))))
+
+;; z[s] = gamma1 - (20 bits at sig byte 48 + 640 s), reduced; a slot of w2
+(defn- load-z [sg w2 s slot]
+  (do (unpack-to sg (+ 48 (* 640 s)) 20 w2 slot 0) (rsub-slot w2 slot 524288 0)))
+(defn- z-check [sg w2 s]
+  (if (= s 5) 1
+    (if (= (load-z sg w2 s 1) 1)
+      (if (= (bound-ok w2 1 0) 1) (z-check sg w2 (+ s 1)) 0)
+      0)))
+
+;; ---- UseHint (Algorithm 40, m = 16) ----
+(defn- use-hint [a h]
+  (let [x (rem a 523776)
+        r0 (if (> x 261888) (- x 523776) x)
+        top (= (- a r0) 8380416)
+        r1 (if top 0 (quot (- a r0) 523776))
+        r0b (if top (- r0 1) r0)]
+    (if (= h 0) r1 (if (> r0b 0) (mod (+ r1 1) 16) (mod (+ r1 15) 16)))))
+(defn- emit [w1 w2 pp r k]
+  (if (= k 128) 1
+    (let [i (* 2 k) n (+ (* 256 r) i)
+          lo (use-hint (cf w2 1 i) (sm-hint w1 4096 n))
+          hi (use-hint (cf w2 1 (+ i 1)) (sm-hint w1 4096 (+ n 1)))]
+      (emit w1 w2 pp r (+ k 1 (* 0 (p8! pp (+ 2048 (+ (* 128 r) k)) (+ lo (* 16 hi)))))))))
+
+;; ---- one row r: acc(slot 1) = sum_s A[r][s] * NTT(z[s]) - NTT(c) * NTT(t1[r] * 2^13), then INTT and w1' ----
+(defn- row-acc [w1 w2 sg r s]
+  (if (= s 5) 1
+    (if (= (sm-expand-a w1 4096 1 s r) 1)
+      (row-acc w1 w2 sg r
+               (+ s 1 (* 0 (do (copy-poly w1 1 w2 2 0) (load-z sg w2 s 3) (nt-ntt w2 4096 3)
+                               (nt-mul w2 4096 2 3 2) (add-slot w2 1 2 0)))))
+      0)))
+(defn- row [w1 w2 sg pp r]
+  (do (zero-slot w2 1 0)
+      (if (= (row-acc w1 w2 sg r 0) 1)
+        (do (unpack-to pp (+ 32 (* 320 r)) 10 w2 3 0) (scale-slot w2 3 8192 0) (nt-ntt w2 4096 3)
+            (nt-mul w2 4096 3 0 3) (sub-slot w2 1 3 0) (nt-intt w2 4096 1)
+            (emit w1 w2 pp r 0))
+        0)))
+(defn- rows [w1 w2 sg pp r]
+  (if (= r 6) 1 (if (= (row w1 w2 sg pp r) 1) (rows w1 w2 sg pp (+ r 1)) 0)))
+
+;; c-tilde' = SHAKE256(mu || w1', 48) against the signature's c-tilde
+(defn- same48 [sg w1 i] (if (= i 48) 1 (if (= (g8 sg i) (g8 w1 (+ 896 i))) (same48 sg w1 (+ i 1)) 0)))
+(defn- final [w1 sg pp]
+  (do (kc-init w1 4096 136) (absorb-bytes sg 3328 w1 64 0) (absorb-bytes pp 2048 w1 768 0) (kc-finish w1 4096 31)
+      (squeeze-to w1 w1 896 48 0)
+      (same48 sg w1 0)))
+
+(defn- verify* [w1 w2 sg pp]
+  (do (copy-bytes pp 0 w1 512 32 0) (copy-bytes sg 0 w1 544 48 0) (copy-bytes sg 3248 w1 640 61 0)
+      (if (= (sm-hint-unpack w1 4096) 0) 2
+        (if (= (z-check sg w2 0) 0) 3
+          (if (= (sm-sample-in-ball w1 4096 2) 0) 4
+            (do (copy-poly w1 2 w2 0 0) (nt-ntt w2 4096 0)
+                (if (= (rows w1 w2 sg pp 0) 1) (final w1 sg pp) 4)))))))
+(defn mv-verify [base length]
+  (if (< length 20480) 5
+    (verify* (kernel-subregion base length 0 4096) (kernel-subregion base length 4096 4096)
+             (kernel-subregion base length 8192 4096) (kernel-subregion base length 12288 4096))))
