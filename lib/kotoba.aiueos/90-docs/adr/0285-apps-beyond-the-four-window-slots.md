@@ -116,3 +116,85 @@ lists all 17 apps.
   budget and every other word keep their place. A future change that needs more surface words has none to take
   without shrinking the op budget.
 - Four windows remain the maximum open at once. More than four would need surface space that does not exist.
+
+## Amendment 2026-11-04 — what step 1 (frame2) measured
+
+1. **Arrows and page size.** The launcher row already has the status area ("local only", from `vw - 112`, only when `vw`
+   is at least 640). The arrows sit left of it: `(vw - 168)` and `(vw - 140)` at 640 or wider, `(vw - 56)` and
+   `(vw - 28)` below that, each 24 x 24. `perPage = clamp((vw - 6 - 56 - (vw < 640 ? 0 : 112)) / 102, 1, 8)`, so four
+   apps need no arrow from 470 px (below 640) or 582 px (640 and up). This replaces the formula in decision 4; the
+   owner's choice of a viewport-dependent page size stands.
+2. **Home slots.** An app from 1 to 4 is only ever shown in its own slot (its home slot). Launching it while a foreign app's
+   window is open in that slot closes that window and takes the slot back; other apps use a free slot as in decision 2. Reason:
+   `desktop.kotoba` keys app behavior on the focused window id (typing into the Itonami goal, the dapp requests, the
+   close handler: about twelve sites), and the goal editor writes slot 2's body. Those sites must test the app in the
+   focused slot (`slot-app`), not the slot id, so a foreign app in slot 2 is never edited as the goal.
+3. **Labels.** A button's label is the title slot of the slot already showing the app (so a changed title, such as the
+   Itonami diagnostic title, still shows on its button as today), else the catalog title, drawn one line and clipped.
+4. **Code cost.** Step 1 measured 5.0 KiB of kernel code (receipt `textMargin` 13,728 -> 8,736 bytes, still OK), which
+   is the whole 5 KiB budget set above, and the desktop-side steps are still to come. Two ways of reading a catalog
+   label were tried (a code-point accessor inside `lay`: 6.3 KiB first, 5.0 KiB after merging the arrow into one
+   button; a dedicated one-line drawer: 6.1 KiB); the compiler's per-call-site region proof, not the amount of new
+   logic, drives the cost, and even an identity wrapper around the code-point read cost 1.4 KiB. The budget therefore
+   needs an owner decision before the desktop steps: either accept a `textMargin` WARN (below 8 KiB, above the 2 KiB
+   refusal) for this feature, or cut scope.
+5. **Parity.** With the four-app catalog and page 0 the desktop build, `textMargin` OK and all native QEMU gates
+   (input, iso, material, effects absent/audio/muted) pass unchanged on the step 1 code. A canary build with words 25..29
+   pre-filled, and a loop that stops drawing when they change, also passed every gate, and the same build with a wrong
+   expected canary value failed them: nothing in the exercised desktop scenarios reads or writes words 25..29.
+
+## Amendment 2 2026-11-04 — step 2 does not fit in the kernel text cap
+
+Step 2 (slot rules, page-aware hit-tests, digits 1-8 and PageUp/PageDown, the app-keyed key sites) is written on branch
+`claude/jun-811-launcher-pages-b` and, with a four-app catalog and page 0, every native QEMU gate passes unchanged (run
+with the receipt's refusal disabled locally). It does not fit:
+
+| state | estimated `textMargin` |
+|---|---|
+| main (#1194) | 13,728 B |
+| step 1, frame2 paged row | 8,736 B |
+| step 1 + step 2 | 672 B (below the 2 KiB refusal; the desktop build refuses it) |
+
+Step 2 cost 8.1 KiB although it is about 2 KiB of source: each small helper is inlined per call site (for example
+`page-per` 512 B before it was cached in context word 130, `hit-launcher` 1.8 KiB, `launch-key` 0.6 KiB, seven
+`focus-app` sites 0.25 KiB). Moving the page size into context word 130 and reverting `hit-launcher` to its original
+recursive shape recovered 0.5 KiB. The 17-app catalog is still to come: a 17-app packed catalog with one short line per
+app measured +12.9 KiB earlier (about 160 B per packed word), and a titles-only catalog with one shared body would still
+cost about 2.5 KiB. The feature therefore needs about 4-6 KiB freed before it can build, not a tolerated WARN.
+
+Existing desktop features measured by replacing one function body with `0` (margin gain, an upper bound because helpers
+are shared): tile blur pass 3.2 KiB, forget-confirm panel 4.0 KiB, model-confirm title 3.2 KiB, blur damage pass
+2.6 KiB, window drag inertia 2.4 KiB, clock calibration 1.9 KiB. Several others (remote console step, NVMe report,
+USB input, blur self-check, unlock-confirm, create-confirm, input polling, motion channels) do not compile when stubbed
+alone and were not attributed.
+
+Options: (1) free 4-6 KiB by removing or simplifying existing desktop features chosen by the owner (candidates above);
+(2) lower the refusal from 2 KiB to a few hundred bytes, which leaves no room for any later change and is not
+recommended; (3) keep the launcher at four apps in the kernel and run the other apps' windows in user space (a larger
+design); (4) the signed data-blob catalog (JUN-811 option B) removes the catalog text but not the code above.
+
+## Amendment 3 2026-11-05 — the cap was raised; steps 1 and 2 build with an 18-app catalog
+
+Option (1)/(2)/(3)/(4) above are moot: amu#1825 raised the kernel-v3 text cap from 2 MiB to 2.5 MiB (2,621,440 B) and
+kotoba#1227 follows it (layout table, region check, textMargin calibration). Amendment 2's table is history.
+
+Measured on the merged amu compiler (a4680af04, Mac compiler c126449b) with the default desktop profile, all build gates
+PASS (9):
+
+| state | text segment | estimated `textMargin` |
+|---|---|---|
+| steps 1 + 2, four-app catalog | 2,106,880 B | 524,960 B (OK) |
+| steps 1 + 2, 18-app catalog | 2,120,448 B | 511,392 B (OK) |
+
+The catalog has 18 entries, not 17: ids are the dapp records' `dock` numbers (distributions/awai/dapps/*.json, torihiki is
+18). Apps 5-18 share one short body; only apps 1-4 seed window labels and bodies. `gen-app-catalog.py` fails when a
+catalog title differs from the dapp record title at its dock number (negative control: renaming Zuhyo fails it).
+
+New gate `check-native-launcher-pages-qemu.py` (not yet one of the build script's pinned gates) observes in QEMU: 8 apps
+per page at 1280 wide; PageDown/PageUp page and clamp (18 apps end on page 2); page 1 scans out differently from page 0;
+digit 1 on page 1 launches app 9 into the first free slot; a held Itonami goal draft keeps slot 2 from foreign apps and
+survives; relaunching an open app focuses it; a launch with no free slot is refused; app 1 returns to its home slot.
+Run against the previous four-app media it fails at the first slot-map assertion.
+
+Not yet covered: the worst-case draw-list budget (259 ops) with four windows and a full page, and wiring the new gate
+into the build script's pins and receipt.
