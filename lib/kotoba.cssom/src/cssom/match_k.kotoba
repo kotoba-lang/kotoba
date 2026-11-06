@@ -1,0 +1,134 @@
+(ns cssom.match-k (:require [cssom.intern-k :as ik]) (:export [mk-doc mk-match]))
+;; Style slice, kernel dialect: the document half of the input stream becomes the bounded node table, and selector
+;; matching runs over it (ADR-0287, JUN-920).
+;; Stream (after the sheet): op* 0x00, op = 0x45 tag-length tag id-length id class-length classes (open an element) |
+;; 0x2F (close the current element). Text is not part of the document: only elements exist, as for the sibling
+;; combinators of core.cljk (preceding-element-siblings). One root, at most 128 elements, depth at most 32. `class` is
+;; split on the space byte only (core.cljk classes/split-value-components), repeats collapse (it is a set), at most 8.
+;; Node table at 24576, 32 bytes each: u16 tag id @0, id id @2 (0 none), parent @4 and previous sibling @6 (65535 none),
+;; depth @8, class count @10, class ids @12. Header words: 2 nodes, 11 open depth, 12 input length, 13/15 first compound
+;; and compound count of the selector being matched; u16 open-element stack at 512 + 2 d, u16 last child at 640 + 2 d.
+;; Match matrix (page at 45056): row s = 16 bytes, bit n set when selector entry s matches node n. Scratch u8 per node
+;; at +2048 (P), +2176 (ANC), +2304 (SIB): bit k of P[n] says compounds 0..k of the selector match ending at n; ANC[n]
+;; is the OR of P over the ancestors, SIB[n] the OR over the preceding element siblings. A compound k is satisfied at
+;; n when its own tests hold and, by its combinator, bit k-1 is set in ANC[n] (descendant), P[parent] (child), P[previous]
+;; (adjacent) or SIB[n] (general sibling). Nodes come in document order, so parents and previous siblings are done first
+;; and no backtracking or recursion is needed; the selector matches n when bit (count-1) of P[n] is set.
+;; Status of mk-doc: new offset (after the 0x00) or -1 malformed, -3 elements, -9 classes, -11 depth, -4/-5 interning.
+(defn- hd [st i] (kernel-load-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i)))
+(defn- hd! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i) v))
+(defn- h16 [st at] (kernel-load-u16-4k (kernel-subregion st 61440 49152 4096) 4096 at))
+(defn- h16! [st at v] (kernel-store-u16-4k (kernel-subregion st 61440 49152 4096) 4096 at v))
+(defn- inb [st i] (if (and (>= i 0) (< i (hd st 12))) (kernel-load-u8-16k (kernel-subregion st 61440 0 16384) 16384 i) 0))
+(defn- fits [st p n] (<= (+ p n) (hd st 12)))
+(defn- nd [st n at] (kernel-load-u16-4k (kernel-subregion st 61440 24576 4096) 4096 (+ (* 32 n) at)))
+(defn- nd! [st n at v] (kernel-store-u16-4k (kernel-subregion st 61440 24576 4096) 4096 (+ (* 32 n) at) v))
+(defn- cp [st c at] (kernel-load-u16-4k (kernel-subregion st 61440 36864 4096) 4096 (+ (* 16 c) at)))
+(defn- rl [st s at] (kernel-load-u16-4k (kernel-subregion st 61440 28672 4096) 4096 (+ (* 32 s) at)))
+(defn- mm [st i] (kernel-load-u8-4k (kernel-subregion st 61440 45056 4096) 4096 i))
+(defn- mm! [st i v] (kernel-store-u8-4k (kernel-subregion st 61440 45056 4096) 4096 i v))
+(defn- bit [m j] (bit-and (u64-shift-right m j) 1))
+
+;; ---- document ----
+(defn- tok-end [st p end] (if (and (< p end) (not (= (inb st p) 32))) (tok-end st (+ p 1) end) p))
+(defn- has-class [st n sid i k] (if (>= i k) 0 (if (= (nd st n (+ 12 (* 2 i))) sid) 1 (has-class st n sid (+ i 1) k))))
+(defn- cls-loop [st n p end]
+  (if (>= p end) 1
+    (if (= (inb st p) 32) (cls-loop st n (+ p 1) end)
+      (let [te (tok-end st p end) sid (ik/ik-intern st 61440 p (- te p) 0)]
+        (if (< sid 0) sid
+          (if (= sid 0) -1
+            (let [k (nd st n 10)]
+              (if (= (has-class st n sid 0 k) 1) (cls-loop st n te end)
+                (if (>= k 8) -9
+                  (cls-loop st n te (+ end (* 0 (+ (nd! st n (+ 12 (* 2 k)) sid) (nd! st n 10 (+ k 1)))))))))))))))
+(defn- node1! [st n tag idv]
+  (+ 1 (* 0 (+ (nd! st n 0 tag) (+ (nd! st n 2 idv) (nd! st n 10 0))))))
+(defn- node2! [st n par prev d]
+  (+ 1 (* 0 (+ (nd! st n 4 par) (+ (nd! st n 6 prev) (nd! st n 8 d))))))
+(defn- link! [st n d]
+  (+ 1 (* 0 (+ (h16! st (+ 512 (* 2 d)) n) (+ (h16! st (+ 640 (* 2 d)) n) (+ (h16! st (+ 640 (* 2 (+ d 1))) 65535) (+ (hd! st 11 (+ d 1)) (hd! st 2 (+ n 1)))))))))
+(defn- open2 [st p iq cq]
+  (let [n (hd st 2) d (hd st 11) tl (- iq (+ p 2)) il (- cq (+ iq 1)) cl (inb st cq)]
+    (if (>= n 128) -3
+      (if (>= d 32) -11
+        (if (and (= d 0) (> n 0)) -1
+          (let [tag (ik/ik-intern st 61440 (+ p 2) tl 0)
+                idv (if (= il 0) 0 (ik/ik-intern st 61440 (+ iq 1) il 0))]
+            (if (< tag 0) tag
+              (if (< idv 0) idv
+                (let [par (if (= d 0) 65535 (h16 st (+ 512 (* 2 (- d 1)))))
+                      prev (h16 st (+ 640 (* 2 d)))
+                      z (+ (node1! st n tag idv) (node2! st n par prev d))
+                      r (cls-loop st n (+ cq 1) (+ cq (+ 1 cl)))]
+                  (if (< r 0) r (+ (+ cq (+ 1 cl)) (* 0 (link! st n d)))))))))))))
+;; returns the offset after the element header, or a negative status
+(defn- open [st p]
+  (if (not (fits st p 3)) -1
+    (let [tl (inb st (+ p 1)) iq (+ p (+ 2 tl))]
+      (if (or (= tl 0) (not (fits st iq 1))) -1
+        (let [il (inb st iq) cq (+ iq (+ 1 il))]
+          (if (not (fits st cq 1)) -1
+            (let [cl (inb st cq)]
+              (if (not (fits st cq (+ 1 cl))) -1 (open2 st p iq cq)))))))))
+(defn- ops [st p]
+  (if (not (fits st p 1)) -1
+    (let [b (inb st p)]
+      (if (= b 0) (if (= (hd st 11) 0) (+ p 1) -1)
+        (if (= b 69)
+          (let [q (open st p)] (if (< q 0) q (ops st q)))
+          (if (= b 47)
+            (if (= (hd st 11) 0) -1 (ops st (+ p (+ 1 (* 0 (hd! st 11 (- (hd st 11) 1)))))))
+            -1))))))
+(defn mk-doc [w length p]
+  (if (and (>= length 61440) (and (>= p 0) (<= p 16384)))
+    (let [st (kernel-subregion w length 0 61440)
+          z (+ (hd! st 2 0) (+ (hd! st 11 0) (h16! st 640 65535)))]
+      (ops st (+ p (* 0 z))))
+    -1))
+
+;; ---- matching ----
+(defn- all-cls [st ci n j nc]
+  (if (>= j nc) 1
+    (if (= (has-class st n (cp st ci (+ 8 (* 2 j))) 0 (nd st n 10)) 1) (all-cls st ci n (+ j 1) nc) 0)))
+(defn- cmatch [st ci n]
+  (let [t (cp st ci 2) i (cp st ci 4)]
+    (if (and (or (= t 0) (= t (nd st n 0))) (or (= i 0) (= i (nd st n 2))))
+      (all-cls st ci n 0 (cp st ci 6))
+      0)))
+(defn- rel [st ci n k]
+  (if (= k 0) 1
+    (let [c (cp st ci 0) p (nd st n 4) q (nd st n 6)]
+      (if (= c 1) (bit (mm st (+ 2176 n)) (- k 1))
+        (if (= c 2) (if (= p 65535) 0 (bit (mm st (+ 2048 p)) (- k 1)))
+          (if (= c 3) (if (= q 65535) 0 (bit (mm st (+ 2048 q)) (- k 1)))
+            (if (= c 4) (bit (mm st (+ 2304 n)) (- k 1)) 0)))))))
+(defn- pbits [st n k nc acc]
+  (if (>= k nc) acc
+    (let [ci (+ (hd st 13) k)]
+      (if (and (= (cmatch st ci n) 1) (= (rel st ci n k) 1))
+        (pbits st n (+ k 1) nc (bit-or acc (i64-shift-left 1 k)))
+        (pbits st n (+ k 1) nc acc)))))
+(defn- node-step [st n nc]
+  (let [p (nd st n 4) q (nd st n 6)
+        a (if (= p 65535) 0 (bit-or (mm st (+ 2176 p)) (mm st (+ 2048 p))))
+        sb (if (= q 65535) 0 (bit-or (mm st (+ 2304 q)) (mm st (+ 2048 q))))
+        z (+ (mm! st (+ 2176 n) a) (mm! st (+ 2304 n) sb))
+        pb (pbits st n (+ 0 (* 0 z)) nc 0)
+        y (mm! st (+ 2048 n) pb)]
+    (bit pb (- nc (+ 1 (* 0 y))))))
+(defn- row-clear [st s i] (if (= i 16) 1 (row-clear st s (+ i (+ 1 (* 0 (mm! st (+ (* 16 s) i) 0)))))))
+(defn- set-bit [st s n]
+  (let [at (+ (* 16 s) (u64-shift-right n 3))] (mm! st at (bit-or (mm st at) (i64-shift-left 1 (bit-and n 7))))))
+(defn- mark [st s n nc] (if (= (node-step st n nc) 1) (set-bit st s n) 0))
+(defn- nodes-loop [st s n nn nc]
+  (if (>= n nn) 1 (nodes-loop st s (+ n (+ 1 (* 0 (mark st s n nc)))) nn nc)))
+;; fills row s of the match matrix for selector entry s
+(defn mk-match [w length s]
+  (if (and (>= length 61440) (and (>= s 0) (< s 128)))
+    (let [st (kernel-subregion w length 0 61440)
+          nc (rl st s 2)
+          z (+ (row-clear st s 0) (+ (hd! st 13 (rl st s 4)) (hd! st 15 nc)))]
+      (if (or (< nc 1) (> nc 8)) 0
+        (nodes-loop st s (* 0 z) (hd st 2) nc)))
+    0))

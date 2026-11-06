@@ -1,0 +1,72 @@
+(ns cssom.intern-k (:export [ik-reset ik-intern ik-len ik-byte ik-word]))
+;; JUN-134/135/920 (ADR-0287), style slice, kernel dialect: the bounded string table of the style resolver.
+;; One owned window of 61440 bytes holds every table (map in 90-docs/evidence/cssom-style-slice-20261106/README.md):
+;;   0      input stream (16 KiB)      16384  string entries: 8 bytes each, id 1..511 (u16 pool offset, u16 length, u32 hash)
+;;   20480  string pool (4 KiB)        49152  header and scratch words (u32 word i at byte 4 i)
+;; Header words used here: 0 strings, 1 pool bytes used. Identifiers are interned once; every other module compares ids.
+;; ik-intern returns the id (1..511), -4 when the table holds 511 strings, -5 when the pool would pass 4096 bytes. Nothing
+;; is truncated: a refused string leaves the table unchanged. `fold` 1 lower-cases ASCII A-Z before hashing and storing.
+(defn- hd [st i] (kernel-load-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i)))
+(defn- hd! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i) v))
+(defn- inb [st i] (kernel-load-u8-16k (kernel-subregion st 61440 0 16384) 16384 i))
+(defn- se16 [st e at] (kernel-load-u16-4k (kernel-subregion st 61440 16384 4096) 4096 (+ (* 8 e) at)))
+(defn- se32 [st e at] (kernel-load-u32-4k (kernel-subregion st 61440 16384 4096) 4096 (+ (* 8 e) at)))
+(defn- se16! [st e at v] (kernel-store-u16-4k (kernel-subregion st 61440 16384 4096) 4096 (+ (* 8 e) at) v))
+(defn- se32! [st e at v] (kernel-store-u32-4k (kernel-subregion st 61440 16384 4096) 4096 (+ (* 8 e) at) v))
+(defn- pb [st i] (kernel-load-u8-4k (kernel-subregion st 61440 20480 4096) 4096 i))
+(defn- pb! [st i v] (kernel-store-u8-4k (kernel-subregion st 61440 20480 4096) 4096 i v))
+(defn- fb [b fold] (if (and (= fold 1) (and (>= b 65) (<= b 90))) (+ b 32) b))
+
+(defn- hash-loop [st p end h fold]
+  (if (>= p end) h
+    (hash-loop st (+ p 1) end (bit-and (+ (* h 257) (+ 1 (fb (inb st p) fold))) 4294967295) fold)))
+(defn- same-loop [st p q end fold]
+  (if (>= p end) 1
+    (if (= (fb (inb st p) fold) (pb st q)) (same-loop st (+ p 1) (+ q 1) end fold) 0)))
+;; pk = off * 512 + n * 2 + fold
+(defn- find-loop [st e h pk]
+  (if (> e (hd st 0)) 0
+    (let [fold (bit-and pk 1) n (bit-and (u64-shift-right pk 1) 255) off (u64-shift-right pk 9)]
+      (if (and (= (se32 st e 4) h) (and (= (se16 st e 2) n) (= (same-loop st off (se16 st e 0) (+ off n) fold) 1)))
+        e
+        (find-loop st (+ e 1) h pk)))))
+(defn- copy-loop [st p q end fold]
+  (if (>= p end) 1
+    (copy-loop st (+ p 1) (+ q 1) end (+ fold (* 0 (pb! st q (fb (inb st p) fold)))))))
+(defn- add [st off n fold h]
+  (let [ns (hd st 0) used (hd st 1) e (+ ns 1)]
+    (if (>= ns 511) -4
+      (if (> (+ used n) 4096) -5
+        (let [c (copy-loop st off used (+ off n) fold)
+              a (se16! st e 0 used) b (se16! st e 2 n) d (se32! st e 4 h)
+              u (hd! st 1 (+ used n)) k (hd! st 0 e)]
+          (+ e (* 0 (+ c (+ a (+ b (+ d (+ u k)))))))))))) 
+(defn- intern* [st off n fold]
+  (let [h (hash-loop st off (+ off n) 5381 fold)
+        hit (find-loop st 1 h (+ (* off 512) (+ (* n 2) fold)))]
+    (if (> hit 0) hit (add st off n fold h))))
+(defn ik-reset [w length]
+  (if (>= length 61440)
+    (let [st (kernel-subregion w length 0 61440)] (+ 1 (* 0 (+ (hd! st 0 0) (hd! st 1 0)))))
+    0))
+;; intern the n bytes (1..255) at input offset off
+(defn ik-intern [w length off n fold]
+  (if (and (>= length 61440) (and (>= off 0) (and (>= n 1) (and (<= n 255) (<= (+ off n) 16384)))))
+    (intern* (kernel-subregion w length 0 61440) off n fold)
+    0))
+(defn ik-len [w length id]
+  (if (and (>= length 61440) (and (>= id 1) (<= id 511))) (se16 (kernel-subregion w length 0 61440) id 2) 0))
+(defn ik-byte [w length id i]
+  (if (and (>= length 61440) (and (>= id 1) (<= id 511)))
+    (let [st (kernel-subregion w length 0 61440)]
+      (if (and (>= i 0) (< i (se16 st id 2))) (pb st (+ (se16 st id 0) i)) -1))
+    -1))
+;; bytes 7k..7k+6 of string id as one little-endian number (zero past the end); fold 1 lower-cases ASCII
+(defn- word-loop [st q lim j acc]
+  (if (or (>= j 7) (>= q (u64-shift-right lim 1))) acc
+    (word-loop st (+ q 1) lim (+ j 1) (+ acc (i64-shift-left (fb (pb st q) (bit-and lim 1)) (* 8 j))))))
+(defn ik-word [w length id k fold]
+  (if (and (>= length 61440) (and (>= id 1) (and (<= id 511) (and (>= k 0) (< k 36)))))
+    (let [st (kernel-subregion w length 0 61440) off (se16 st id 0) n (se16 st id 2) from (* 7 k)]
+      (if (>= from n) 0 (word-loop st (+ off from) (+ (* 2 (+ off n)) fold) 0 0)))
+    0))
