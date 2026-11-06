@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Proposed (JUN-812, JUN-813). Amendment 1 (2026-11-06, owner): key custody and distribution are decentralized; see the end. Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
+Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Nothing in this ADR is implemented except the region-based ML-DSA-65 verifier (kotoba#1231-#1234); no key exists and no origin is registered. Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -119,4 +119,27 @@ a freshness statement is required; the layout of the signature block.
 
 Not verified: no signature block, multi-signer verification or mirror fetch exists; the size figures are estimates from the
 numbers above.
+
+## Amendment 2 (2026-11-06, owner: recommended options): the open parameters
+
+The owner answered every open question of this ADR and of Amendment 1 with "the recommended option". The recommendations and
+their reasons follow. Where a choice needs a real-world fact only the owner has (who holds a key, which host serves a
+gateway), the decision is the rule, and the fact is named as still to be supplied; nothing is invented here.
+
+| Question | Decision | Reason |
+| -- | -- | -- |
+| Signers | N = 3 pinned signer slots, M = 2 required | Survives the loss or compromise of one key; the smallest set with no single point. |
+| Who holds them | Three independent custodians: (1) the operator's Mac, as for `AIUEIMG1`; (2) a hardware token kept apart from the Mac; (3) an offline cold key in a third place. No custodian holds two. | Different failure and theft modes. Real holders and devices are the owner's to name; seeds never enter this repository. |
+| `AIUEIMG2` layout | Header 16384 bytes: 128 fixed bytes as in decision 2 without the signature fields, then up to 4 signature entries of 3392 bytes each (key id u32, 4 reserved, Ed25519 64 B, ML-DSA-65 3309 B, padding), rest zero. The count is a fixed field. `AIUEIMG1` is retired once `AIUEIMG2` ships. | 3 x 3381 B does not fit 4096; 16 KiB holds the four entries (three signers plus one slot for a rotation overlap) with room to spare. |
+| Admission rule | At least M entries with distinct key ids, each with both signatures valid under the pinned pair for that id. Duplicates, unknown ids and a missing half are refused, never counted. | Decision 1 per signer; distinctness stops one key counting twice. |
+| `AIUECAT1` | Same signature-block rule, same key ids; body as decision 5. | One rule for both objects. |
+| Rotation and removal | A new signer set (up to 4 slots) is accepted when the current set signs it with M of its own entries, and takes effect for the next object. | Generalizes decision 3; no network supplied root. |
+| Freshness | Required for the update channel: a signed "latest" record (version, issued-at, valid-until) under the same admission rule, valid 30 days. A stale or missing record does not block installing a verified object that is newer than the stored version; it makes `check` report "not fresh" so a hidden update is visible. | Rollback protection stops old images, not a source hiding new ones (Amendment 1). Blocking offline devices would be worse than warning. |
+| Distribution network | Content-addressed (CID). Sources are interchangeable and untrusted: IPFS-style retrieval by CID, with HTTPS gateways as declared service origins. Acceptance is by CID plus signatures, never by source. | Matches `aiueos.cid-v1-admit` and decision 5. |
+| Origins | No origin is named by this ADR. The owner supplies the gateway host list; each host is declared as a service endpoint with its own each-operation approval and enters the static CSP. A peer-to-peer transport needs its own declared service and is out of scope. | Registering a host is a real-world act; the rule is fixed, the hostnames are not mine to invent. **Still to be supplied by the owner.** |
+
+**Consequences for the work order.** Step 3 becomes: `AIUEIMG2` with the 16 KiB signature block and the admission rule,
+fixtures signed by published *test* keys (the fixtures prove the path, not a key). Pinned production keys, the real
+custodians and the gateway hosts are separate, later and owner-supplied. Kernel text for three pinned ML-DSA keys is to be
+measured, estimated at order 120 KB.
 
