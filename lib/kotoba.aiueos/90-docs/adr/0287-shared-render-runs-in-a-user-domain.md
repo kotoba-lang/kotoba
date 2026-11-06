@@ -5,7 +5,7 @@ Date: 2026-11-06
 ## Status
 
 Accepted 2026-11-06 (owner: render outside the kernel image, "描画をカーネル外に出す"; the open questions below were answered
-"おすすめで決定" with the recommended options, listed under Decisions on the open questions). Nothing here is implemented.
+"おすすめで決定" with the recommended options, listed under Decisions on the open questions). No renderer domain is implemented. Amendments 1 (floats), 2 (user targets cannot host a renderer yet; measured addendum; owner confirmation) and 3 (the interim kernel-image placement is a deviation with a stated exit; the kernel/user partition; a separate renderer object, proposal) follow the decisions below. Amendment 3 records measurements and PROPOSALS; its owner decisions are pending (listed at its end).
 
 ## Context
 
@@ -107,3 +107,55 @@ The owner answered the open points of this amendment with "proceed with the reco
 - **Placement: confirmed as recommended.** The renderer is written in the kernel dialect behind the document-in / draw-list-out interface; whether it lives in the kernel image or in a separate object is decided on the measured total (about 160 bytes per code line so far), and the CPL3 domain remains the destination (JUN-919).
 - **Flex rounding.** The flex slice (JUN-920 slice 3, kotoba#1260) rounds each item on its own, as the hosted code does; a line's sizes may then differ from the free space by at most n/2 raw (n/128 px). Largest-remainder rounding, proposed by the census, is not adopted until Blink's behaviour is measured. The same slice caps a flex line at 4 items because scalar parameters leave no room for more; larger lines are refused, never truncated (JUN-932).
 
+## Amendment 3 (2026-11-07, JUN-805 / JUN-856 slices): the interim kernel-image placement is a deviation with a stated exit
+
+Tags: **[M]** measured (evidence README in this repository), **[R]** read from source, **PROPOSAL** not decided, **OWNER** decision pending. Nothing below changes decisions 1 to 4 of this ADR; it records where the work stands against them and what the exit needs.
+
+### 1. Measured state: the kernel image is nearly full
+
+* **[M]** Compiler cap for `x86_64-aiueos-kernel-v3` text: 3,080,192 bytes, which is 3 MiB less a 64 KiB reserve (amu `seed/85-aiueos-project.kotoba:16-17`, read on amu main; the reserve holds the user shim, the ISR table and alignment; E7104 is raised at line 73 when base plus size passes the cap).
+* **[M]** Whole-image text of the two render slices, same run, kernel-v3: `draw` profile 2,974,208 B (`evidence/cssom-draw-slice-20261107`), `uidoc` profile 3,007,744 B, 64 modules (`evidence/cssom-uidoc-slice-20261107`, Size). The uidoc slice added 33,536 B for a 79-code-line module plus its entry glue.
+* **Headroom.** Cap minus image is **72,448 B** (uidoc) and **105,984 B** (draw). The two READMEs state "estimated margin" 82,848 and 116,384; both are exactly 10,400 B larger than the plain subtraction, and the READMEs do not say why. This amendment uses the plain subtraction; the range "about 73 to 83 KB" for the current image is the plain figure to the README figure. The draw image is also not a shipping image: the `desktop` profile does not link cssom, so the headroom of the shipping desktop was not measured.
+* **[M]** Cost per slice so far: `draw_k` 22,837 kernel-v1 text B (92 code lines, 248 B per line); `uidoc_k` 19,297 B (79 lines, 244 B per line). The Q6 slice was about 160 B per line (Amendment 2, addendum). The closure the renderer must reach was about 14.8k code lines (Amendment 2); the slices written so far total a few hundred lines.
+* **Consequence.** At roughly 160 to 250 text B per code line, the 72 to 83 KB left holds on the order of 300 to 500 more code lines. Every further render slice (text, images, events, flex and grid in the chain, the compositor-side op encoding) lands in the same cap, and the cap cannot be raised without moving the data offset (`kp-data-offset`, line 18) and the boot-image rules, which is a layout change (Context above).
+* **Deviation, stated.** Amendment 2 allowed an interim placement inside the kernel image "if the measured text fits" and gave the measurement as the test. The slices are in the kernel image today because they fit. That is the opposite of decision 1 (the renderer is not part of the kernel image). It is accepted as a measurement vehicle only. **Exit:** the first slice that would take the image past the cap, or the first slice that needs text or images, does not enter the kernel image; the renderer then becomes the separate object of section 3 (**PROPOSAL** for the trigger; **OWNER** may choose an earlier one).
+
+### 2. The partition the renderer should end in
+
+This section is a **PROPOSAL** consistent with decisions 1, 2 and 4.
+
+* **Kernel:** memory, scheduling, IPC and the shared regions, signature verification (ADR-0286), drivers. It contains no UI, no CSS, no layout.
+* **User domain (renderer):** UI document and input events in; draw list out, through the three shared regions already decided above (document read-only, event ring read-only, draw list read-write to the renderer and read-only to the compositor). It holds no authority beyond those regions (decision 4).
+* **Compositor:** consumes the draw list and owns the frame. Where it runs is not decided here: today it is in the kernel (decision 1), and whether it moves to its own domain is **OWNER** open. A renderer fault must not stop it drawing the last frame (decision 4 and the restart rule above).
+* **Design references only, not verified against any repo source.** The owner asked how iOS and ChromeOS divide kernel and user space. In general terms, and from general knowledge rather than from anything in this repository or a checked source: both keep the kernel free of UI; a compositor or render server process owns the screen, and the code that interprets untrusted documents or pages (web content) runs in sandboxed processes without privilege that hand drawing results to that compositor over IPC or shared memory. This is cited only as precedent for the shape above. No claim is made about their exact process names, IPC mechanisms or sandbox rules, and none of it was checked.
+* **[R]** The slices already respect the interface direction: draw list in a region with 32-byte slots, header `DLv1`, ops 255 (`evidence/cssom-draw-slice-20261107`); document in a region with magic `UID1` (`evidence/cssom-uidoc-slice-20261107`). Both layouts are labelled proposals in their READMEs, and neither equals the compositor's existing encoding.
+
+### 3. The separate-object loader (PROPOSAL)
+
+* **Object.** The renderer is one object, loaded outside the kernel image, built for a user target (decision 1), with the interface above.
+* **Signing.** Signed like the other artifacts of ADR-0286: both Ed25519 and ML-DSA-65, at least M of N distinct pinned signers (ADR-0286 Amendment 2: N = 3, M = 2), manifest of 64 bytes, up to four 3392-byte signature entries. A **new** context string is proposed, for example `"AIUEOBJ1"`, used as the object magic in the manifest and as the ML-DSA context, with `M' = 0 || 8 || "AIUEOBJ1" || manifest`, the same domain separation as `AIUECAT1` and `AIUEFRS1` (ADR-0286 Amendments 5 and 6), so that an image, catalog or freshness signature cannot be presented as a renderer object and the reverse. The name is a placeholder. Verification is the existing region-based verifier. **OWNER:** the name, and whether renderer objects share the image signer set or get their own.
+* **Version and rollback.** Not designed. ADR-0286 Amendment 4's version floor covers images; whether renderer objects need their own floor is open.
+* **Load path.** Embedded first, signed later was decided above. Under this proposal the first loadable form is still embedded in the boot image (covered by the image signature) but as a separate segment or file outside the capped kernel text; the signed form follows. It is never fetched unsigned.
+* **What the object needs from user targets (JUN-919).** **[M]** (Amendment 2): `user-v1` to `user-v5` emit one 4096-byte text page (E7104) and refuse strings (E7101 detail 16), records and vector parameters (E7102), floats (E7101 detail 9, 33, 36), `/`, `rem`, `mod` (E2101) and functions with six or more parameters; there is no store primitive (`kernel-store-u32` is E2101), only `kernel-load-u32` on the 64-byte request from v2. For the renderer these become requirements: a text segment far above 4 KiB (the kernel-v1 text of `draw_k` alone is 22,837 B, 5.6 times the page); a store primitive on a region the process owns (the draw list is written); bounded strings and records (selectors, property names, tables); division and remainder (layout, Q6 rounding). The measured text of the whole renderer, not these slices, sets the final size.
+* **Floats.** No change: fixed point (Amendment 1). The user targets still refuse floats, which is why the arithmetic is scalar i64 with a Q6 scale and the round-half-up rule confirmed in Amendment 2. Reopen conditions are those of Amendment 1; JUN-855's measurement of FP state on CPL3 preemption (`evidence/jun-855-fp-state-preemption-20261106`) is unchanged.
+
+### 4. The interim path, and what is not done
+
+Until section 3 exists, the render modules are written in the kernel dialect and gated natively under QEMU: style, layout (`flow_k`), draw (`draw_k`, `dk-run`) and the UI-document front end (`uidoc_k`, `ud-run`), chained document to style to layout to draw list, on the 18 dapp windows (uidoc README). Gates `PASS_NATIVE_CSSOM_DRAW_K` and `PASS_NATIVE_CSSOM_UIDOC_K` (receipts in the two evidence directories). Not done, as those READMEs state:
+
+* Not wired into `browser.surface` or `layout.cljk`; the native chain does not run the hosted Browser/CSSOM code.
+* No CPL3 region mapping; the "regions" are two free pages (13 and 14) of the owned window used as stand-ins. No renderer domain, no event ring.
+* No text and no images: text nodes are placeholders that emit nothing; no gradients, opacity, clipping, positioned or floated boxes, stacking contexts. Flex and grid are not wired into the chain (`flow_k` is block flow only). Only `background-color` and `border-color`.
+* No `style` attribute and no attributes but `id` and `class`; the sheet is limited to 16 distinct properties, and the sheet used for the dapp windows is a reduced one, so the result is not claimed to equal the page.
+* The draw region holds 255 ops while this ADR's kernel budget is 259 (decision 2 says 253 are used with four windows); the 259-op budget is not checked by the draw slice.
+* Draw-list and document layouts are proposals of the slices, not the compositor's encoding.
+* Not wired to the desktop profile; the shipping desktop image was not measured with cssom linked.
+
+### 5. Owner decisions pending
+
+1. Accept the partition of section 2, in particular whether the compositor stays in the kernel or becomes its own domain.
+2. The exit trigger of section 1 (cap reached, or text or images needed) or an earlier date; and whether any further slice may enter the kernel image before then.
+3. The object context string and signer set (section 3: `"AIUEOBJ1"` is a placeholder), and whether renderer objects get a version floor.
+4. The byte layouts of the three regions and the event and draw-list encodings (still open above); the two slice layouts are proposals.
+5. The scope of JUN-919 (which user-target capabilities to build first: text segment above 4 KiB, store primitive, bounded strings and records, division) and who owns that compiler work.
+6. The draw-op budget: 255 in the slice region against 259 in the kernel.
