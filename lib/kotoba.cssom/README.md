@@ -359,6 +359,31 @@ arguments), the zero-argument core `E7104` (detail 43,882, the 4096-byte text ca
 (`flex_q6` 26,470, `multicol_q6` 9,945, `style_num_q6` 5,937, `inline_q6` 6,679, `color_q6` 11,183). A six-parameter function is
 refused `E7102`. The flex solver alone is more than six times the user text cap.
 
+## Q6 fixed-point slice 4: CSS transforms, sin / cos / tan and the 2D matrices (JUN-929 / C2b-4)
+
+Census group G05 (95 float hits, all in `layout.cljk` 17593-18130) as two scalar-i64 modules: `src/cssom/trig_q6.kotoba` (sin, cos, tan of an
+angle in deg, grad, rad or turn; D6 input, domain 32 turns, exact quadrant reduction, Horner polynomial in Q30, Q17 results) and
+`src/cssom/transform_q6.kotoba` (the 2D affine matrix: constructors, product in three parts, the origin conjugation in one rounding, point and
+bounding-box maps, `sqrt|det|` by a 23-step unrolled integer root, origin point, `flow-rotation` by signed permutation). Coefficients are Q17
+(`|c| < 64`), lengths Q6 (`<= 65536 px`), every product below 2^46, out of range = the sentinel `-2^62`, never a wrap.
+**There is no native runtime oracle** (the native f64 dialect has no sin / cos / tan): the reference is data from a one-off Python run
+(`math` for the 12,609-row trig table, `fractions.Fraction` for the matrix algebra), pinned by sha256 in the gate; both generators, the data, the
+grid sizes, the measured errors (sin17 and cos17 0 ulp of Q17 on all 12,600 valid rows, tan17 1 ulp, the matrix algebra bit-exact against the exact
+rational reference on 22,500 words and 6,561 flow pairs, end-to-end up to 0.58 px at 65536 px) and what is not covered are in
+`../kotoba.aiueos/90-docs/evidence/cssom-q6-transform-20261106/README.md`. `layout.cljk` has **no 4x4 matrix, no 3D, no inverse**
+(`matrix3d`, `perspective`, `rotate3d`, `rotateX/Y` return nil and drop the declaration), so none is ported (code beats the task text).
+
+```bash
+python3 lib/kotoba.cssom/scripts/check-transform-q6-native-macos.py \
+  --amu /path/to/amu-cli.macho --amu-full-root /path/to/amu-full-root.macho --output /path/to/new-empty-dir
+# prints PASS_NATIVE_CSSOM_TRANSFORM_Q6 (28 mutants, 9 of them of the golden tables)
+```
+
+**AIUEOS size** (`x86_64-aiueos-kernel-v1` text bytes): `trig_q6` 18,360 (with `length_q6`), `transform_q6` 49,363 (with `trig_q6`, `length_q6`,
+`pack_q6`); the core with every export reached 50,619 (two arguments) and 50,956 (zero arguments). `x86_64-aiueos-user-v1`: the two-argument
+entry `E7102` (detail 121), the zero-argument core `E7104` (detail 50,604, the 4096-byte text cap), a six-parameter function `E7102`.
+Not covered: parsing, the domain limits above, output at Q6 instead of the oracle's 1e-4, no CPL3 run, no wiring into `layout.cljk`.
+
 ## Test
 
 ```bash
