@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates, test keys only; Amendments 3 to 6): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6). Not implemented: any production key or signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
+Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates; test keys except where Amendment 7 says otherwise; Amendments 3 to 8): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6) and an RTC probe for the real board (Amendment 8). Amendment 7 pins a VERIFICATION-ONLY signer set kept on one Mac so the production path can be exercised end to end; it is not a custody set. Not implemented: any custody-separated production signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -401,3 +401,89 @@ in words 273..280; QEMU hooks `opt/aiueos/fresh` (cases) and `opt/aiueos/clock` 
 not verified are in the evidence README and the pull request.
 
 **Documentation that disagreed with the code (corrected in this change).** The Status paragraph above said "Design only, nothing here is implemented" although `native/update.kotoba` implements stages 5a to 6; and `distributions/awai/update-policy.json` said the ML-DSA-65 verifier was open work and that versions "must rise (>= 1)". Both now state the real state (comments and text only).
+
+## Amendment 7 (2026-11-06, owner decision, JUN-813): a VERIFICATION-ONLY production signer set, and what it is not
+
+The owner decided, for verification, that "all of it is on this same Mac" and that there is "no dependency on Cloudflare". Until now the kernel
+had no production signer set: production mode (`test = 0`, the network paths) refused every `AIUEIMG2`, `AIUECAT1` and `AIUEFRS1` object with result
+8, so the production path was never exercised past the structural checks. This amendment pins a signer set so that it is.
+
+**What it is.** Three slots (ids 0..2), two required, as Amendment 2. Each slot has an Ed25519 key and an ML-DSA-65 key. They were generated on
+the Mac that builds this repository by `scripts/aiueos-signer.py keygen --slot N` (32 random bytes from `os.urandom` for the Ed25519 seed and 32 for
+the ML-DSA-65 seed, the latter expanded by the repository's FIPS 204 reference) and live only in `~/.itonami/aiueos-signers/slot<N>/` (directory 0700,
+files 0600). The tool refuses a key directory or seed that is readable by anyone else, a symbolic link, or a path inside a git work tree. The
+repository holds only the public keys: `fixtures/signers/prod-pubkeys.json` and the generated Kotoba module `aiueos.imgsig-prodkeys`
+(`ims-ed-word` / `ims-ml-word`, the same shape as the TEST keys' module), made by `aiueos-signer.py emit-pinned`. A host test checks that the module is
+exactly what `emit-pinned` makes from the JSON.
+
+**Kernel wiring.** Bit 0 of `admit`'s test argument now picks the pinned set: 1 the TEST keys (`aiueos.imgsig-testkeys`, self-test and QEMU hooks), 0 the
+production keys (`aiueos.imgsig-prodkeys`). In production mode `update.kotoba` admits the three object kinds under the pinned production keys instead of
+refusing with 8; test mode keeps the TEST keys, and a header signed by the TEST keys is refused in production mode (result 1, no slot counted).
+Result 8 is retired: nothing returns it. Nothing else in the admission rule changed (two distinct valid slots, both signatures, contexts `AIUEIMG2` /
+`AIUECAT1` / `AIUEFRS1`, the version floor, the clock).
+
+**What it is NOT.**
+
+- **No custody separation.** All three slots are on one Mac. Anyone with access to that Mac (the user account, a backup of it, an agent running as that
+  user) can produce a header that the pinned production mode admits. Two of three is a number of files here, not a number of people.
+- **No protection against anyone with access to this Mac.** The signer set exists to exercise the production path end to end (signing tool, pinned keys,
+  admission, refusal of a one-signer header, of the TEST keys and of tampered bytes). It must not guard any image that anyone else is asked to run.
+- **No deployment.** Amendment 3 requires that `AIUEIMG1` be retired in the same change that pins a production signer set. This change keeps the
+  `AIUEIMG1` branch of `admit` (and its single Ed25519 key, still admissible in production mode) and the self-test that depends on it, and that is a
+  deliberate exception for a verification-only set, stated here so it cannot be read as the retirement having been done: **`AIUEIMG1` MUST still be
+  retired in the change that makes production real** (the change that replaces this set with a custody set). A release that contains this pinned set must not
+  be distributed; a release that contains a custody set and `AIUEIMG1` is still not acceptable (Amendment 3, item 2).
+- **Not a statement about hardware.** Everything is measured on QEMU TCG; nothing here ran on a board.
+
+**Rotation to a real custody set, before any deployment.** The kernel pins are compiled in, so rotation is a new image, not a configuration change:
+
+1. The real signers generate their own keys, each on a device only that signer controls (the tool's `keygen` is the reference for the key formats; the
+   seeds never leave the signer; the custody holders are independent of each other, Amendment 1).
+2. Their public keys replace `fixtures/signers/prod-pubkeys.json`; `emit-pinned` regenerates `aiueos.imgsig-prodkeys`; the golden fixtures are re-signed once
+   by the new slots and the gate's cases follow (the cases are derived from the golden fixtures, so only they change).
+3. The image that carries the new pins is itself an `AIUEIMG2` object signed by M = 2 of the CURRENT set. A device accepts the new pins only through that
+   admission, so rotation needs two of the old signers and no one else. Removing a signer is the same step.
+4. The old (verification-only) keys are then destroyed: `rm` is not enough on a journaled volume that has a backup, so the destruction record names every copy
+   and backup that existed. Until step 4 the old keys must be assumed able to sign for any device still pinning them.
+5. In the same change, the `AIUEIMG1` branch and its pin are removed (Amendment 3, item 2) and the gates drop the `AIUEIMG1` self-test.
+
+**Distribution rule: no dependency on Cloudflare.** Integrity comes from the signed objects and the content identifiers (Amendment 1), so a source is untrusted
+bytes and any number of sources may be listed: **content-addressed mirrors**, namely (a) a **self-operated static host** and (b) an **IPFS gateway**. No object, no
+build step, no verification step and no gate of this ADR may depend on a Cloudflare product (Workers, Pages, R2, KV, DNS-hosted verdicts), as a source, a signer, a
+clock or a registry. The concrete host names and gateways are **the owner's to supply and are not named here**; each is declared as its own service and approved per
+operation under the shared contract (the workspace `AGENTS.md`), and none is a trust root. An untrusted source can withhold; the freshness record (Amendment 6) is how a
+device notices.
+
+**Built and gated.** `scripts/aiueos-signer.py` (`keygen`, `pubkeys`, `emit-pinned`, `sign-image`, `sign-catalog`, `sign-fresh`, `verify`); host test
+`tests/test_aiueos_signer.py` (temporary HOME, throwaway slots; permission refusals; signed bytes verified by the independent references; the pinned module and the
+golden fixtures checked against the committed public keys, no private key needed). Golden fixtures `fixtures/signers/golden/` (an `AIUEIMG2`, an `AIUECAT1` and an
+`AIUEFRS1` header signed once with the real slots, public data). QEMU gate `prodsig` (`check-native-prodsig-qemu.py`, `prodsig_oracle.py`): production mode admits exactly
+the three golden fixtures and refuses a one-signer header, a header signed by the TEST keys, a flipped byte (manifest, Ed25519 signature, ML-DSA signature, image, body) and
+one kind presented as another; verdicts come from the independent references under the production public keys. The existing `update2`, `catalog` and `fresh` gates' former
+"production-mode" case (a header signed by TEST keys, previously refused with 8) is now refused with 1. Negative controls are rebuilt kernels (production mode that accepts
+the TEST keys; production mode that ignores the signer count) and mutated copies of the tool; results are in the pull request.
+
+## Amendment 8 (2026-11-06, JUN-813, owner decision): the CMOS RTC is adopted as the freshness clock, subject to the 6600H probe
+
+**Decision (owner, 2026-11-06).** Amendment 6's clock choice stands and is now **adopted**: the CMOS real-time clock (ports 0x70/0x71), read by `rtc-now` in
+`native/update.kotoba`, is the clock a freshness record (`AIUEFRS1`) is judged against. The adoption is **subject to the result of a probe on the real 6600H
+board**. Amendment 6 rests on a PC architecture argument and a QEMU measurement; its own evidence lists the board as "not measured". Nothing here changes
+the verdict rules, the build floor, the one-day slack or any record layout of Amendment 6.
+
+**What was added.** A read-only probe, `rtc-probe` in `native/update.kotoba`, run once by the desktop debug entry before the QEMU-only hook, and a QEMU gate for it
+(`build-native-desktop-macos.py --profile rtc`, `check-native-rtc-qemu.py`, `rtc_probe_decode.py`). It reads the CMOS through ports 0x70/0x71 only (no fw_cfg, no disk,
+no RTC write), waits out the update-in-progress flag, requires two equal snapshots, takes a second snapshot one RTC second later, and reports through the netlog /
+debug link (KDBG 0xc400..0xc40b): registers 0x00..0x0D and 0x32 raw, the conversion with the face value read as UTC (the assumption `rtc-now` makes; whether the
+RTC is UTC or local is for the operator to read off by comparing with the Mac's UTC), the TSC ticks between the two reads, the production `rtc-now` answer, and a
+verdict word. Operator instructions: `docs/runbook-6600h-rtc-probe.md`. QEMU results and negative controls: `90-docs/evidence/rtc-probe-qemu-20261106/README.md`.
+
+**What the probe result decides.** The adoption holds on this board only if the probe shows: register D bit 7 set, including after a full power-off of at least ten
+minutes (a battery that keeps the clock); the registers decode to a valid date (BCD or binary, 12 or 24 hour, whichever register B says); the seconds register
+advances once a second; and the face value is within 14 hours of the Mac's UTC at a quarter-hour zone (UTC, or local time that the one day of slack on issued-at
+covers). The century register 0x32 being absent or implausible is not a failure (20 is assumed, correct to 2099). If register D bit 7 is clear, the clock is reset after
+a power-off, or the clock is wrong by more than a zone, the RTC is not usable on that board; the fail-safe of Amendment 6 already applies (a reading below the build floor
+or without register D bit 7 is "no usable clock", so the record is "not fresh"), and the adoption is withdrawn for that board until the battery or setup is fixed.
+
+**Status.** Source, QEMU gate and runbook: built. **The 6600H RTC facts are NOT VERIFIED**: UTC or local, century register, battery retention, binary/BCD and
+12/24-hour mode, seconds advance and TSC rate are all unmeasured until the operator runs the runbook and files the evidence. No claim in Amendments 2, 4 or 6 about the
+board's clock is strengthened by this amendment.

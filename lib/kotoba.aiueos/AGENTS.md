@@ -143,6 +143,11 @@ iterations need no power cycle. Evidence:
 Ed25519 only (below the post-quantum floor) and exists only in the debug
 entry; KDBG tags 0x2000.. are taken by the blur timing log.
 
+The debug entry also runs a read-only CMOS RTC probe once at boot (JUN-813, ADR-0286 Amendment 8): `rtc-probe` in `native/update.kotoba` reports KDBG
+0xc400..0xc40b (raw registers, the conversion, two reads a second apart with the TSC between them, the production `rtc-now` answer, a verdict word) and keeps the
+same records in context words 1498..1535. Gate: `build-native-desktop-macos.py --profile rtc` (`check-native-rtc-qemu.py`, decoder `rtc_probe_decode.py`, which the
+operator also uses to record and decode the board's report). Operator steps for the 6600H: `docs/runbook-6600h-rtc-probe.md`. The 6600H's RTC is not yet measured.
+
 ## Verified network update, stage 1: read-only NVMe (AWAI-122)
 
 A network update is verified only if the installed OS boots from disk, fetches

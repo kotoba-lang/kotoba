@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# JUN-942: the image's version N (the version it will be signed as: aiueos-image.py sign --version N) is required and has no default;
+# the builder writes OSMETA.BIN with floor = active = N.
+: "${AIUEOS_IMAGE_VERSION:?AIUEOS_IMAGE_VERSION is required (a positive integer: the version this image will be signed as)}"
+
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 aiueos="$repo/os/aiueos"
 out=${AIUEOS_OUT:-"$repo/build/aiueos"}
@@ -19,12 +23,12 @@ python3 "$aiueos/scripts/make-aiuefs-image.py" \
   --catalog-signature "$aiueos/kotoba/app-catalog.sig" --output "$data_image"
 set -- build \
   --efi "$efi" --kernel "$kernel" --initramfs "$initramfs" --data "$data_image" \
-  --output "$image" --iso "$iso" --receipt "$receipt"
+  --output "$image" --iso "$iso" --receipt "$receipt" --version "$AIUEOS_IMAGE_VERSION"
 if [ -n "${AIUEOS_DISTRIBUTION_JSON:-}" ]; then
   set -- "$@" --distribution-json "$AIUEOS_DISTRIBUTION_JSON"
 fi
 python3 "$aiueos/scripts/make-release-image.py" "$@"
 python3 "$aiueos/scripts/make-release-image.py" verify \
   --image "$image" --iso "$iso" --efi "$efi" --kernel "$kernel" \
-  --initramfs "$initramfs"
+  --initramfs "$initramfs" --version "$AIUEOS_IMAGE_VERSION"
 echo "$receipt"
