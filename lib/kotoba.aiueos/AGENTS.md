@@ -200,8 +200,16 @@ image and wait for KDBG 0008 (desktop loop up) before sending commands; a
 command sent during boot is lost with that boot's nonce. A board running
 the installed OS, powered off, or on an image without the watchdog still
 needs a manual (or switched-outlet) power cycle.
-Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
-protection beyond version >= 1, since no installed version is kept.
+Still open at stage 3: Ed25519 only (no ML-DSA verifier yet). Rollback
+protection (JUN-813 stage 5c, ADR-0286 amendment 4; this replaces the former
+"no rollback protection beyond version >= 1"): `native/update.kotoba` refuses
+a header whose version is not strictly above a hash-checked (not signed,
+interim) floor kept in `\EFI\ITONAMI\OSMETA.BIN` (result 9) and refuses
+with 10 when that journal is missing, unreadable or corrupt (fail closed,
+never floor 0). A board gets the journal from
+`os/aiueos/scripts/aiueos-provision-esp.py DISK --version N` (N = the image
+version the board runs now); nothing at boot or on the network path creates
+it, and no image builder creates `\EFI\ITONAMI\` (open gap).
 Stage 4 writes the ESP (FAT32 only): remote command 6 (`aiueos-remote.py
 install`) pulls and verifies the image as stage 3 and also writes it into the
 staging file `\EFI\ITONAMI\UPDATE.BIN`. `native/esp.kotoba` creates that

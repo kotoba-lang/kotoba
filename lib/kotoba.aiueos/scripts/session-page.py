@@ -49,13 +49,36 @@ def amu():
 
 
 HTML_LIB = ROOT.parent / "kotoba.html" / "kotoba"
-MODULES = {"index": SRC, "html-core": HTML_LIB / "html_core.kotoba", "html-hiccup": HTML_LIB / "html_hiccup.kotoba",
-           "ui-components": HTML_LIB / "ui_components.kotoba"}
+APPS = SESSION / "apps"
+DOC_ID = re.compile(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?")
+MAX_DOCUMENTS = 64
+
+
+def documents():
+    """Ids named by the records' ui.document, sorted and bounded: the app modules of the lock."""
+    ids = []
+    for p in sorted(DAPPS.glob("*.json")):
+        d = json.loads(p.read_text(encoding="utf-8")).get("ui", {}).get("document")
+        if d is not None:
+            if not isinstance(d, str) or not DOC_ID.fullmatch(d):
+                fail("%s: ui.document %r is not an id" % (p.name, d))
+            ids.append(d)
+    if len(ids) > MAX_DOCUMENTS:
+        fail("more than %d documents" % MAX_DOCUMENTS)
+    return sorted(ids)
+
+
+def modules():
+    mods = {"index": SRC, "html-core": HTML_LIB / "html_core.kotoba", "html-hiccup": HTML_LIB / "html_hiccup.kotoba",
+            "ui-components": HTML_LIB / "ui_components.kotoba"}
+    for d in documents():
+        mods["app-" + d] = APPS / (d + ".kotoba")
+    return mods
 
 
 def source_lock(path):
     """KSL2 source lock over the page and the shared html libraries it requires (JUN-856)."""
-    mods = {n: p.resolve(strict=True) for n, p in MODULES.items()}
+    mods = {n: p.resolve(strict=True) for n, p in modules().items()}
     text = "KSL2\nentry %s\n" % mods["index"]
     text += "".join("module %s %s\n" % (n, p) for n, p in sorted(mods.items()))
     text += "".join("file %s %s\n" % (hashlib.sha256(p.read_bytes()).hexdigest(), p) for p in sorted(mods.values()))
@@ -136,7 +159,14 @@ def check_table():
                 fail("%s row %d is %r, record %s says %r" % (fn, dock, rows.get(dock), r["id"], get(r)))
         if set(rows) != set(recs):
             fail("%s has rows %s, records have %s" % (fn, sorted(rows), sorted(recs)))
-    print("AIUEOS_SESSION_TABLE_OK apps=%d" % count)
+    want_req = sorted("app-" + d for d in documents())
+    ns = re.match(r"\(ns index \(:require (.*?)\)\)\n", text, re.S)
+    if not ns:
+        fail("index.kotoba does not start with (ns index (:require ...))")
+    got_req = sorted(re.findall(r"\[(app-[a-z0-9-]+) :as [a-z0-9]+\]", ns.group(1)))
+    if got_req != want_req:
+        fail("index.kotoba requires %s, the records' ui.document name %s" % (got_req, want_req))
+    print("AIUEOS_SESSION_TABLE_OK apps=%d documents=%d" % (count, len(want_req)))
 
 
 def main(mode):
