@@ -72,6 +72,6 @@ The owner left the choice to the recommended option. What was measured (evidence
 - **Read, not run (Kotoba-native kernel, amu seed/95).** One `FXRSTOR64` at user entry and no `FXSAVE` anywhere in seeds 74/86/88/92/95/96; `uv-enable` refuses CR4.OSXSAVE.
 
 **Decision.** The renderer uses fixed point (integer arithmetic with a documented scale), with a hosted-oracle error bound per operation, as JUN-855 item 2(b) proposed. Reasons: adding `f64` to the user targets means new code generation, a new ABI for float arguments, and FXSAVE/FXRSTOR in the context switch of the compiler's own kernel, each of which changes the compiler that builds itself (a new fixed point and pin regeneration), where fixed point changes only the cssom port that has to be rewritten for the canonical dialect anyway (JUN-134/135).
-**Cost, stated plainly.** cssom has 58 float sites (core and layout 7, dom-gpu 4, the rest in other modules); each needs a scale and a bound, and parity with the f64 hosted oracle becomes "within the bound", not "equal". Layout results that depend on exact float behaviour (percent and calc rounding) need cases.
+**Cost, stated plainly.** JUN-854 counted 58 float sites in cssom (`double`, `Math/`) and 4 in dom-gpu; each needs a scale and a bound, and parity with the f64 hosted oracle becomes "within the bound", not "equal". Layout results that depend on exact float behaviour (percent and calc rounding) need cases.
 **Reopen when** the compiler gains `f64` for the user targets and the context switch saves FP state; this ADR then gets a further amendment.
 
