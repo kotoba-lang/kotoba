@@ -1,0 +1,81 @@
+(ns cssom.block-width-q6
+  (:export [invalid pack hi lo in-range? flags-of solve-pick solve-constrained-pick]))
+
+;; CSS 2.2 10.3.3 horizontal equation for a non-replaced block in normal flow (and 10.4 min/max re-solve), in
+;; Q6 fixed point (1 unit = 1/64 px). Scalar i64 only, at most five parameters per function, no strings, records
+;; or floats, so the arithmetic core compiles for x86_64-aiueos-kernel-v1 (and is shaped for user targets).
+;; Mirrors cssom.block-width `solve` / `solve-constrained` (f64), which stays the oracle.
+;;
+;; Differences from the f64 module, all stated:
+;;  * finite? / nonnegative? become the range guard |raw| <= 2^30 (nonnegative: 0..2^30). Out of range -> (invalid).
+;;  * padding-left + padding-right + border-left + border-right enter the equation only as their sum `extra`, so the
+;;    caller passes the sum (block-style-q6 sums them with the per-term guards); extra is guarded as nonnegative.
+;;  * half of an odd remaining is split floor / ceil: left = remaining >> 1, right = remaining - left (the sum is
+;;    exact, no 2^-7 px loss as in the census prototype; the f64 oracle halves exactly, so it is within 1/128 px).
+;;
+;; Words (five parameters):
+;;   p0 = sel * 64 + flags   sel 1 content, 2 border, 3 margin-left, 4 margin-right
+;;        flags bit0 width-auto, bit1 border-box, bit2 left-auto, bit3 right-auto, bit4 rtl, bit5 has-max
+;;   p1 = pack(containing, width)       p2 = pack(left, right)
+;;   p3 = extra (the sum of paddings and borders)      p4 = pack(min-width, max-width)  (solve-constrained-pick only)
+;; pack(hi, lo) clamps each field to +-(2^30 + 1) so that an out-of-range input stays out of range (and is refused
+;; by the guard) instead of aliasing into a neighbouring field.
+;; Result: the selected Q6 raw, or (invalid) = -2^62 when any guard fails (the whole result is invalid, as in the oracle).
+(defn invalid [] :i64 -4611686018427387904)
+(defn clamp [x :i64] :i64 (cond (> x 1073741825) 1073741825 (< x -1073741825) -1073741825 :else x))
+(defn pack [hi :i64 lo :i64] :i64 (+ (i64-shift-left (clamp hi) 32) (+ (clamp lo) 1073741825)))
+(defn hi [p :i64] :i64 (i64-shift-right p 32))
+(defn lo [p :i64] :i64 (- (bit-and p 4294967295) 1073741825))
+(defn in-range? [x :i64] :bool (and (>= x -1073741824) (<= x 1073741824)))
+(defn nonneg? [x :i64] :bool (and (>= x 0) (<= x 1073741824)))
+(defn max0 [x :i64] :i64 (if (< x 0) 0 x))
+(defn flag [f :i64 bit :i64] :bool (not= (bit-and (i64-shift-right f bit) 1) 0))
+(defn flags-of [auto :i64 border-box :i64 left-auto :i64 right-auto :i64 rtl :i64] :i64
+  (+ (+ auto (* 2 border-box)) (+ (+ (* 4 left-auto) (* 8 right-auto)) (* 16 rtl))))
+(defn pick [sel :i64 content :i64 border :i64 l :i64 r :i64] :i64
+  (cond (= sel 1) content (= sel 2) border (= sel 3) l :else r))
+;; the equation itself: sel, flags, pack(containing, width), pack(left, right), extra
+(defn eq [sel :i64 flags :i64 cbw :i64 lr :i64 extra :i64] :i64
+  (let [cb (hi cbw) w (lo cbw) left (hi lr) right (lo lr)]
+    (if (not (and (nonneg? cb) (nonneg? w) (in-range? left) (in-range? right) (nonneg? extra)))
+      (invalid)
+      (let [auto (flag flags 0) border-box (flag flags 1) left-auto (flag flags 2) right-auto (flag flags 3) rtl (flag flags 4)
+            l0 (if left-auto 0 left) r0 (if right-auto 0 right)
+            fixed (if auto 0 (if border-box (max0 (- w extra)) w))
+            over (and (not auto) (> (+ (+ (+ fixed extra) l0) r0) cb))
+            la (and left-auto (not over) (not auto)) ra (and right-auto (not over) (not auto))
+            content (if auto (max0 (- (- (- cb extra) l0) r0)) fixed)
+            border (+ content extra)
+            remaining (- (- (- cb border) l0) r0)
+            half (i64-shift-right remaining 1)
+            l (cond (and la ra) half la remaining (and (not ra) rtl) (+ l0 remaining) :else l0)
+            r (cond (and la ra) (- remaining half) ra remaining (and (not la) (not rtl)) (+ r0 remaining) :else r0)]
+        (if (and (in-range? content) (in-range? border) (in-range? l) (in-range? r))
+          (pick sel content border l r)
+          (invalid))))))
+(defn solve-pick [p0 :i64 p1 :i64 p2 :i64 p3 :i64] :i64
+  (eq (i64-shift-right p0 6) (bit-and p0 63) p1 p2 p3))
+
+;; CSS 2.2 10.4: max first, then min, re-solving the whole equation with a definite content width and the
+;; original auto-margin flags. Returns (invalid), -1 (the first solution stands) or the definite content width
+;; W >= 0 to re-solve with (width-auto and border-box cleared, as cssom.block-width with-content-width).
+(defn constrained-width [fx :i64 cbw :i64 lr :i64 mm :i64] :i64
+  (let [flags (bit-and fx 63) extra (i64-shift-right fx 6)
+        c0 (eq 1 flags cbw lr extra)
+        minw (hi mm) maxw (lo mm)]
+    (if (or (= c0 (invalid)) (not (and (nonneg? minw) (nonneg? maxw)))) (invalid)
+      (let [box (flag flags 1)
+            min-content (if box (max0 (- minw extra)) minw)
+            max-content (if box (max0 (- maxw extra)) maxw)
+            maxed (and (flag flags 5) (> c0 max-content))
+            c1 (if maxed (eq 1 (- flags (bit-and flags 3)) (pack (hi cbw) max-content) lr extra) c0)]
+        (cond (= c1 (invalid)) (invalid)
+              (< c1 min-content) min-content
+              maxed max-content
+              :else -1)))))
+(defn solve-constrained-pick [p0 :i64 p1 :i64 p2 :i64 p3 :i64 p4 :i64] :i64
+  (let [sel (i64-shift-right p0 6) flags (bit-and p0 63)
+        w (constrained-width (+ (i64-shift-left (if (nonneg? p3) p3 -1) 6) flags) p1 p2 p4)]
+    (cond (= w (invalid)) (invalid)
+          (= w -1) (eq sel flags p1 p2 p3)
+          :else (eq sel (- flags (bit-and flags 3)) (pack (hi p1) w) p2 p3))))
