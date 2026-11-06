@@ -315,7 +315,7 @@ are reported, never copied.
 | `shift-keyword` 80,002, `middle-box` 327,184, `middle-inherited` 682,864, `leading-ascent` 119,652 | 1,209,702 | 0 violations (the halves are exact in doubles: 163,592 and 341,432 exact ties, oracle never differs) |
 | colour: `unit-byte` 256 (round trip to byte exact for all 256), 4 token grids 8,777 each, `final-alpha` 27,248, hsl 871,926 | 934,538 | 0 violations; max deviation 0.498 raw (unit), 1.560 raw (hsl, Q16); 31,048 hsl channels differ from `round(o * 255)` by one **only within 0.002 of a half** (exact gray `l = 50%` is 127.5: the doubles land on either side), 0 away from it |
 
-**Not covered.** Flex lines of more than four items (and the `flex-wrap` line breaking, `layout-flex-wrap-row`); `flex-item-base-size`
+**Not covered.** Flex lines of more than four items (done as region code in the next section; the `flex-wrap` line breaking, `layout-flex-wrap-row`); `flex-item-base-size`
 (a `flex-basis` percentage is `length_q6` of slice 1 with the measured size as the `auto` fallback); `flex-main-clamp` (the
 box-sizing conversion of the min / max declarations is integer-px addition with the already resolved insets, not ported);
 `flex-item-min-content-width` and `flex-item-baseline` (text measurement, with the `half` of `(lh - (ascent + descent)) / 2` at
@@ -383,6 +383,34 @@ python3 lib/kotoba.cssom/scripts/check-transform-q6-native-macos.py \
 `pack_q6`); the core with every export reached 50,619 (two arguments) and 50,956 (zero arguments). `x86_64-aiueos-user-v1`: the two-argument
 entry `E7102` (detail 121), the zero-argument core `E7104` (detail 50,604, the 4096-byte text cap), a six-parameter function `E7102`.
 Not covered: parsing, the domain limits above, output at Q6 instead of the oracle's 1e-4, no CPL3 run, no wiring into `layout.cljk`.
+
+## Flex lines of up to sixteen items, kernel region code (JUN-932 part 1, JUN-920 follow-up)
+
+`flex_q6` stops at four items because a line has to travel in five scalar words. `fxdiv_k`, `flex_k` and `flexplace_k` hold the line in
+an owned window instead (the region-code technique of the style slice: bounded tables, inline `kernel-subregion` at constant
+offsets, tail-recursive loops, at most five parameters, no heap) and solve **up to sixteen items per line** with the semantics of
+`flex_q6`: grow, or shrink scaled by the base size; min/max clamp; freeze-and-redistribute; the freeze test on the exact proposal;
+one half-up rounding of the exact share per item that is not frozen; a zero factor is a frozen item; justify-content (six modes,
+`safe`) and auto margins. **A line of more than sixteen items is refused (status 1), never truncated.**
+
+| module | role |
+| --- | --- |
+| `fxdiv_k` | the exact share `R * w / W = F + f / W` by long division on 7-bit chunks (four chunks: `|R|` below `2^23`, `W` below `2^38`), every product below `2^46` |
+| `flex_k` | `fx-run`: load and validate the line from the window, passes until nothing changes; `fx-size`; the same ranges as `flex_q6` (base, min below 262143, max below 262143 or none, factor 0..65535, net within +-524288) |
+| `flexplace_k` | `fp-offset`, `fp-auto`: the offsets of `flex_q6` `offset` / `auto-offset`, with the prefix sums taken from the stored sizes |
+
+Statuses of `fx-run` (negative): 1 more than sixteen items, 2 no item, 3 an item field out of range, 4 net out of range, 5 and 6
+guards that cannot be reached inside the ranges, 7 window too short. The wire format and the window map are at the head of
+`flex_k.kotoba`. The host-native reference is `flex_ref.kotoba` (the n-item f64 transcription of `resolve-flexible-lengths` and the
+placement, written with typed lists, checked against `cssom.flex` on the lines `cssom.flex` can take); the exact model and the case
+grid are `scripts/flex_k_cases.py` (Python Fractions, no float). Evidence and measurements:
+`lib/kotoba.aiueos/90-docs/evidence/cssom-flex-k-20261106/`.
+
+```
+python3 -I lib/kotoba.cssom/scripts/check-flex-k-native-macos.py --amu amu-cli.macho --amu-full-root amu-full-root.macho \
+  --amu-source <amu checkout> --owner-repo-root <github/kotoba-lang> --qemu ... --firmware ... --output NEW
+# prints PASS_NATIVE_CSSOM_FLEX_K
+```
 
 ## Test
 

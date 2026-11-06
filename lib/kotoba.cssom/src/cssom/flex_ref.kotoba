@@ -1,0 +1,228 @@
+(ns cssom.flex-ref
+  (:require [cssom.flex :as f4] [cssom.flex-q6 :as q6])
+  (:export [stats]))
+
+;; Host-native reference (macOS, f64) for flex lines of up to SIXTEEN items (JUN-932 part 1, JUN-920 follow-up). cssom.flex is the
+;; f64 transcription of resolve-flexible-lengths / place-main-axis / place-main-axis-auto-margins for at most four items (six for
+;; the placement); this file is the same transcription for n items, written with typed lists instead of one parameter per item.
+;; It is NOT a region module: maps, lists and floats are allowed here, the kernel dialect has none of them.
+;;   solve-n   the loop of cssom.flex/solve over lists: sizes s, frozen flags, guard (initially n), grow decided once from the
+;;             original sizes, weight = grow ? factor : factor * base, used = sum(frozen ? s : base), remaining = net - used,
+;;             proposal = frozen ? s : max(0, base + remaining * (weight / total)), clamp = min(max, max(min, p)), the pass answers
+;;             when every clamp equals its proposal, else s := clamp and flags |= (clamp != proposal);
+;;   place-n   cssom.flex/place for n items; auto-n cssom.flex/auto-place for n items.
+;; Lengths are Q6 raw units carried as f64, a factor is the correctly rounded f64 of raw / 10000.0, a maximum of -1 is "none".
+;;
+;; stats takes one batch document {:cases [case ...]}, case = {:net :items [[base min max factor] ...] :sizes [exact integer sizes]
+;; :mode (-1 none) :safe :container :gap :offs [exact offsets] :leads :trails :autos [exact auto offsets]} (the integers come from
+;; the Fraction model of scripts/flex_k_cases.py) and a mode, and answers ONE packed i64:
+;;   mode 0   the f64 side against the exact integers. Each comparison is classified as in q6_flex_vs_f64: eq (the integer is
+;;            round-half-up of the f64 value), tie (the f64 value is within 1e-6 of a half and the integer is the other
+;;            neighbour: the f64 oracle disagrees at an EXACT tie, reported and not copied), anything else a violation.
+;;            eq | tie << 14 | violations << 28 | maxDeviation1000 << 42   (deviation = |integer - f64 value| * 1000, capped)
+;;   mode 1   flex_q6 against the exact integers, for the lines of at most four items (solve) and for every placement
+;;            (offset, auto-offset): sizes compared | size mismatches << 15 | placements compared << 30 | placement mismatches << 45
+;;   mode 2   cssom.flex (the existing four-item f64 reference) against this n-item reference, for the lines of at most four items
+;;            (solve) and six (place, auto-place): comparisons | differences (> 1e-9) << 20
+(defn- fx [x :i64] :f64 (i64-to-f64-rounded x))
+(defn- fabs [x :f64] :f64 (f64-abs x))
+(defn- fmax [a :f64 b :f64] :f64 (if (f64-gt a b) a b))
+(defn- feq [a :f64 b :f64] :bool (not (or (f64-lt a b) (f64-gt a b))))
+(defn- floor-f [x :f64] :i64 (let [t (f64-to-i64-truncating x)] (if (f64-lt x (i64-to-f64-rounded t)) (- t 1) t)))
+(defn- at [d :document i :i64] :document (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+(defn- fld [d :document k :keyword] :document (option-or (document-get d k) (document-null)))
+(defn- num [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) 0))
+(defn- gi [d :document k :keyword] :i64 (num (fld d k)))
+(defn- cnt [d :document] :i64 (document-count d))
+(defn- fl [l [:list :f64] i :i64] :f64 (typed-list-nth [:list :f64] l i))
+(defn- il [l [:list :i64] i :i64] :i64 (typed-list-nth [:list :i64] l i))
+
+;; ---- lists from the document ----
+(defn- col [items :document n :i64 c :i64 div :f64] [:list :f64]
+  (loop [i 0 out (typed-list-new [:list :f64])]
+    (if (= i n) out (recur (+ i 1) (typed-list-conj [:list :f64] out (f64-div (fx (num (at (at items i) c))) div))))))
+(defn- ints [d :document n :i64] [:list :f64]
+  (loop [i 0 out (typed-list-new [:list :f64])]
+    (if (= i n) out (recur (+ i 1) (typed-list-conj [:list :f64] out (fx (num (at d i))))))))
+(defn- sum-l [l [:list :f64] n :i64] :f64
+  (loop [i 0 a 0.0] (if (= i n) a (recur (+ i 1) (f64-add a (fl l i))))))
+(defn- sum-before [l [:list :f64] i :i64] :f64 (sum-l l i))
+
+;; ---- solve-n ----
+(defn- weights [grow :bool b [:list :f64] fa [:list :f64] n :i64] [:list :f64]
+  (loop [i 0 out (typed-list-new [:list :f64])]
+    (if (= i n) out
+      (recur (+ i 1) (typed-list-conj [:list :f64] out (if grow (fl fa i) (f64-mul (fl fa i) (fl b i))))))))
+(defn- frozen0 [w [:list :f64] n :i64] [:list :i64]
+  (loop [i 0 out (typed-list-new [:list :i64])]
+    (if (= i n) out (recur (+ i 1) (typed-list-conj [:list :i64] out (if (f64-gt (fl w i) 0.0) 0 1))))))
+(defn- all-frozen? [fr [:list :i64] n :i64] :bool
+  (loop [i 0] (if (= i n) true (if (= (il fr i) 1) (recur (+ i 1)) false))))
+(defn- used-of [fr [:list :i64] s [:list :f64] b [:list :f64] n :i64] :f64
+  (loop [i 0 a 0.0] (if (= i n) a (recur (+ i 1) (f64-add a (if (= (il fr i) 1) (fl s i) (fl b i)))))))
+(defn- tw-of [fr [:list :i64] w [:list :f64] n :i64] :f64
+  (loop [i 0 a 0.0] (if (= i n) a (recur (+ i 1) (f64-add a (if (= (il fr i) 1) 0.0 (fl w i)))))))
+(defn- prop [fr [:list :i64] s [:list :f64] b [:list :f64] w [:list :f64] rem :f64 tw :f64 n :i64] [:list :f64]
+  (loop [i 0 out (typed-list-new [:list :f64])]
+    (if (= i n) out
+      (recur (+ i 1) (typed-list-conj [:list :f64] out
+                       (if (= (il fr i) 1) (fl s i) (fmax 0.0 (f64-add (fl b i) (f64-mul rem (f64-div (fl w i) tw))))))))))
+(defn- clampf [v :f64 mn :f64 mx :f64] :f64
+  (let [v1 (fmax mn v)] (if (f64-lt mx 0.0) v1 (if (f64-lt mx v1) mx v1))))
+(defn- clamp-l [p [:list :f64] mn [:list :f64] mx [:list :f64] n :i64] [:list :f64]
+  (loop [i 0 out (typed-list-new [:list :f64])]
+    (if (= i n) out (recur (+ i 1) (typed-list-conj [:list :f64] out (clampf (fl p i) (fl mn i) (fl mx i)))))))
+(defn- same? [c [:list :f64] p [:list :f64] n :i64] :bool
+  (loop [i 0] (if (= i n) true (if (feq (fl c i) (fl p i)) (recur (+ i 1)) false))))
+(defn- frozen-next [fr [:list :i64] c [:list :f64] p [:list :f64] n :i64] [:list :i64]
+  (loop [i 0 out (typed-list-new [:list :i64])]
+    (if (= i n) out
+      (recur (+ i 1) (typed-list-conj [:list :i64] out (if (or (= (il fr i) 1) (not (feq (fl c i) (fl p i)))) 1 0))))))
+(defn solve-n [net :f64 n :i64 b [:list :f64] mn [:list :f64] mx [:list :f64] fa [:list :f64]] [:list :f64]
+  (let [grow (f64-gt net (sum-l b n))
+        w (weights grow b fa n)]
+    (loop [s b fr (frozen0 w n) guard n]
+      (if (or (all-frozen? fr n) (< guard 0)) s
+        (let [rem (f64-sub net (used-of fr s b n))
+              tw (tw-of fr w n)
+              p (prop fr s b w rem tw n)
+              c (clamp-l p mn mx n)]
+          (if (same? c p n) c (recur c (frozen-next fr c p n) (- guard 1))))))))
+
+;; ---- place-n, auto-n ----
+(defn place-n [mode :i64 safe :i64 container :f64 gap :f64 n :i64 i :i64 sz [:list :f64]] :f64
+  (let [total (f64-add (sum-l sz n) (f64-mul gap (fx (if (> n 1) (- n 1) 0))))
+        free (f64-sub container total)
+        freep (fmax 0.0 free)
+        fs (if (= safe 1) freep free)
+        nf (fx n)
+        step (cond (= mode 1) (f64-add gap (if (> n 1) (f64-div freep (fx (- n 1))) 0.0))
+                   (= mode 4) (f64-add gap (f64-div freep nf))
+                   (= mode 5) (f64-add gap (f64-div freep (f64-add nf 1.0)))
+                   :else gap)
+        start (cond (= mode 2) (f64-div fs 2.0) (= mode 3) fs
+                    (= mode 4) (f64-div (f64-div freep nf) 2.0)
+                    (= mode 5) (f64-div freep (f64-add nf 1.0))
+                    :else 0.0)]
+    (loop [j 0 pos start]
+      (if (= j i) pos (recur (+ j 1) (f64-add pos (f64-add (fl sz j) step)))))))
+(defn- bit [m :i64 j :i64] :i64 (bit-and (i64-shift-right m j) 1))
+(defn- pop [m :i64 n :i64] :i64 (loop [j 0 a 0] (if (= j n) a (recur (+ j 1) (+ a (bit m j))))))
+(defn auto-n [container :f64 gap :f64 n :i64 i :i64 leads :i64 trails :i64 sz [:list :f64]] :f64
+  (let [total (f64-add (sum-l sz n) (f64-mul gap (fx (if (> n 1) (- n 1) 0))))
+        nauto (+ (pop leads n) (pop trails n))
+        share (if (> nauto 0) (f64-div (fmax 0.0 (f64-sub container total)) (fx nauto)) 0.0)]
+    (loop [j 0 pos 0.0]
+      (let [p (f64-add pos (f64-mul (fx (bit leads j)) share))]
+        (if (= j i) p
+          (recur (+ j 1) (f64-add (f64-add p (fl sz j)) (f64-add (f64-mul (fx (bit trails j)) share) gap))))))))
+
+;; ---- classification (as q6_flex_vs_f64) ----
+;; 0 eq, 1 tie, 3 violation
+(defn- classify [q :i64 o :f64] :i64
+  (let [r (floor-f (f64-add o 0.5))
+        t (f64-sub o (i64-to-f64-rounded (floor-f o)))
+        d (fabs (f64-sub (fx q) o))]
+    (cond (= q r) 0
+          (and (f64-lt (fabs (f64-sub t 0.5)) 0.000001) (f64-lt d 0.500001)) 1
+          :else 3)))
+(defn- dev1000 [q :i64 o :f64] :i64
+  (let [d (f64-to-i64-truncating (f64-mul (fabs (f64-sub (fx q) o)) 1000.0))] (if (> d 1048575) 1048575 d)))
+(defn- pack0 [eq :i64 tie :i64 viol :i64 dev :i64] :i64
+  (+ (+ eq (i64-shift-left tie 14)) (+ (i64-shift-left viol 28) (i64-shift-left dev 42))))
+
+(defn- case-stats0 [c :document acc :i64] :i64
+  (let [n (cnt (fld c :items)) items (fld c :items)
+        b (col items n 0 1.0) mn (col items n 1 1.0) mx (col items n 2 1.0) fa (col items n 3 10000.0)
+        sizes (fld c :sizes) o (solve-n (fx (gi c :net)) n b mn mx fa)
+        ex (ints sizes n)
+        mode (gi c :mode)
+        offs (fld c :offs) autos (fld c :autos)]
+    (loop [i 0 a acc]
+      (if (= i (+ (+ n (cnt offs)) (cnt autos))) a
+        (let [q (num (at (if (< i n) sizes (if (< i (+ n (cnt offs))) offs autos)) (if (< i n) i (if (< i (+ n (cnt offs))) (- i n) (- i (+ n (cnt offs)))))))
+              v (cond (< i n) (fl o i)
+                      (< i (+ n (cnt offs))) (place-n mode (gi c :safe) (fx (gi c :container)) (fx (gi c :gap)) n (- i n) ex)
+                      :else (auto-n (fx (gi c :container)) (fx (gi c :gap)) n (- i (+ n (cnt offs))) (gi c :leads) (gi c :trails) ex))
+              invalid (< q -1000000000000)
+              cl (if invalid 0 (classify q v))
+              dv (if invalid 0 (dev1000 q v))
+              eqc (bit-and a 16383) tiec (bit-and (i64-shift-right a 14) 16383) vc (bit-and (i64-shift-right a 28) 16383) dm (i64-shift-right a 42)]
+          (recur (+ i 1) (pack0 (+ eqc (if (= cl 0) 1 0)) (+ tiec (if (= cl 1) 1 0)) (+ vc (if (= cl 3) 1 0)) (if (> dv dm) dv dm))))))))
+
+;; ---- mode 1: flex_q6 against the exact integers ----
+(defn- iv [items :document j :i64 c :i64] :i64 (if (< j (cnt items)) (num (at (at items j) c)) (if (= c 2) -1 0)))
+(defn- wq [items :document j :i64] :i64
+  (if (< j (cnt items)) (q6/item-word (iv items j 0) (iv items j 1) (iv items j 2) (iv items j 3)) 0))
+(defn- q6-size [net :i64 items :document k :i64] :i64
+  (let [hi (q6/hi-bytes (iv items 0 3) (iv items 1 3) (iv items 2 3) (iv items 3 3))]
+    (q6/solve (wq items 0) (wq items 1) (wq items 2) (wq items 3) (q6/with-select (q6/line-word net (cnt items) hi) k))))
+(defn- isum [d :document n :i64] :i64 (loop [j 0 a 0] (if (= j n) a (recur (+ j 1) (+ a (num (at d j)))))))
+(defn- pop-i [m :i64 n :i64] :i64 (pop m n))
+(defn- pk1 [a :i64 b :i64 c :i64 d :i64] :i64
+  (+ (+ a (i64-shift-left b 15)) (+ (i64-shift-left c 30) (i64-shift-left d 45))))
+(defn- place-q6 [c :document n :i64 i :i64] :i64
+  (let [sizes (fld c :sizes) container (gi c :container) gap (gi c :gap)
+        total (isum sizes n) prefix (isum sizes i)]
+    (q6/offset (+ (+ (gi c :mode) (* 8 (gi c :safe))) (+ (* 16 n) (* 4096 i))) container total gap prefix)))
+(defn- auto-q6 [c :document n :i64 i :i64] :i64
+  (let [sizes (fld c :sizes) container (gi c :container) gap (gi c :gap) leads (gi c :leads) trails (gi c :trails)
+        nauto (+ (pop leads n) (pop trails n))
+        before (+ (pop leads (+ i 1)) (pop trails i))
+        totalg (+ (isum sizes n) (* gap (- n 1))) prefix (+ (isum sizes i) (* i gap))]
+    ;; q6/auto-offset has no gap check of its own (its caller adds the gaps); flex_k's fp-auto adds them itself and refuses a
+    ;; negative gap as q6/offset does, so the comparison carries that one rule of the caller
+    (if (< gap 0) (q6/invalid) (if (= nauto 0) prefix (q6/auto-offset container totalg nauto before prefix)))))
+(defn- case-stats1 [c :document acc :i64] :i64
+  (let [items (fld c :items) n (cnt items) sizes (fld c :sizes) offs (fld c :offs) autos (fld c :autos)
+        ns (if (<= n 4) n 0)
+        total (+ (+ ns (cnt offs)) (cnt autos))]
+    (loop [i 0 a acc]
+      (if (= i total) a
+        (let [cs (bit-and a 32767) ms (bit-and (i64-shift-right a 15) 32767)
+              cp (bit-and (i64-shift-right a 30) 32767) mp (i64-shift-right a 45)]
+          (cond (< i ns)
+                (recur (+ i 1) (pk1 (+ cs 1) (+ ms (if (= (q6-size (gi c :net) items i) (num (at sizes i))) 0 1)) cp mp))
+                (< i (+ ns (cnt offs)))
+                (recur (+ i 1) (pk1 cs ms (+ cp 1) (+ mp (if (= (place-q6 c n (- i ns)) (num (at offs (- i ns)))) 0 1))))
+                :else
+                (let [j (- i (+ ns (cnt offs)))]
+                  (recur (+ i 1) (pk1 cs ms (+ cp 1) (+ mp (if (= (auto-q6 c n j) (num (at autos j))) 0 1)))))))))))
+
+;; ---- mode 2: cssom.flex (four items, six for the placement) against solve-n / place-n / auto-n ----
+(defn- f4-item [items :document j :i64] [:ref :cssom.flex/item]
+  (if (< j (cnt items))
+    (f4/item (fx (iv items j 0)) (f64-div (fx (iv items j 3)) 10000.0) (f64-div (fx (iv items j 3)) 10000.0) (fx (iv items j 1)) (fx (iv items j 2)))
+    (f4/item 0.0 0.0 0.0 0.0 -1.0)))
+(defn- szf [sizes :document j :i64 n :i64] :f64 (if (< j n) (fx (num (at sizes j))) 0.0))
+(defn- bad [x :f64 y :f64] :i64 (if (f64-gt (fabs (f64-sub x y)) 0.000000001) 1 0)
+)
+(defn- case-stats2 [c :document acc :i64] :i64
+  (let [items (fld c :items) n (cnt items) sizes (fld c :sizes) ex (ints sizes n)
+        b (col items n 0 1.0) mn (col items n 1 1.0) mx (col items n 2 1.0) fa (col items n 3 10000.0)
+        o (solve-n (fx (gi c :net)) n b mn mx fa)
+        mode (gi c :mode) container (fx (gi c :container)) gap (fx (gi c :gap)) safe (gi c :safe)
+        leads (gi c :leads) trails (gi c :trails)
+        ns (if (<= n 4) n 0) np (if (<= n 6) n 0)
+        offs (fld c :offs) autos (fld c :autos)
+        no (if (> (cnt offs) 0) np 0) na (if (> (cnt autos) 0) np 0)]
+    (loop [i 0 a acc]
+      (if (= i (+ (+ ns no) na)) a
+        (let [cmp (bit-and a 1048575) df (i64-shift-right a 20)
+              d (cond (< i ns)
+                      (bad (f4/solve i n (fx (gi c :net)) 0.0 (f4-item items 0) (f4-item items 1) (f4-item items 2) (f4-item items 3)) (fl o i))
+                      (< i (+ ns no))
+                      (bad (f4/place mode safe container gap n (- i ns) (szf sizes 0 n) (szf sizes 1 n) (szf sizes 2 n) (szf sizes 3 n) (szf sizes 4 n) (szf sizes 5 n))
+                           (place-n mode safe container gap n (- i ns) ex))
+                      :else
+                      (let [j (- i (+ ns no))]
+                        (bad (f4/auto-place container gap n j leads trails (szf sizes 0 n) (szf sizes 1 n) (szf sizes 2 n) (szf sizes 3 n) (szf sizes 4 n) (szf sizes 5 n))
+                             (auto-n container gap n j leads trails ex))))]
+          (recur (+ i 1) (+ (+ cmp 1) (i64-shift-left (+ df d) 20))))))))
+
+(defn stats [doc :document mode :i64] :i64
+  (let [cases (fld doc :cases)]
+    (loop [k 0 acc 0]
+      (if (= k (cnt cases)) acc
+        (let [c (at cases k)]
+          (recur (+ k 1) (cond (= mode 0) (case-stats0 c acc) (= mode 1) (case-stats1 c acc) :else (case-stats2 c acc))))))))
