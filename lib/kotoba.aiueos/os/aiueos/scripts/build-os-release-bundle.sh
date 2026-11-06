@@ -4,7 +4,7 @@ set -eu
 # Build the downloadable OS release bundle: one signed release per
 # aiueos.distribution.v1 descriptor in AIUEOS_DISTRIBUTIONS_DIR.
 #
-#   AIUEOS_DISTRIBUTIONS_DIR=/path/kotoba-lang/aiueos/distributions \
+#   AIUEOS_IMAGE_VERSION=N AIUEOS_DISTRIBUTIONS_DIR=/path/kotoba-lang/aiueos/distributions \
 #     os/aiueos/scripts/build-os-release-bundle.sh \
 #       --out OUT --key release-signing-key.pem \
 #       --signing-note "qualification key; QEMU/OVMF evidence only" \
@@ -55,6 +55,10 @@ dist_dir=${AIUEOS_DISTRIBUTIONS_DIR:-}
 [ -n "$dist_dir" ] || { echo "AIUEOS_DISTRIBUTIONS_DIR is required" >&2; exit 2; }
 [ -d "$dist_dir" ] || { echo "no such distributions dir: $dist_dir" >&2; exit 2; }
 
+# JUN-942: the version N the images of this release will be signed as; required, no default (OSMETA.BIN gets floor = active = N).
+: "${AIUEOS_IMAGE_VERSION:?AIUEOS_IMAGE_VERSION is required (a positive integer: the version this release will be signed as)}"
+export AIUEOS_IMAGE_VERSION
+
 work="$out/work"
 mkdir -p "$out" "$work"
 
@@ -76,10 +80,11 @@ print(re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"))' "$descriptor")
   python3 "$aiueos/scripts/make-release-image.py" build \
     --efi "$efi" --kernel "$kernel" --initramfs "$initramfs" --data "$data" \
     --output "$out/$stem-gpt.img" --iso "$out/$stem.iso" \
-    --receipt "$out/$stem-build-receipt.json" --distribution-json "$descriptor"
+    --receipt "$out/$stem-build-receipt.json" --distribution-json "$descriptor" \
+    --version "$AIUEOS_IMAGE_VERSION"
   python3 "$aiueos/scripts/make-release-image.py" verify \
     --image "$out/$stem-gpt.img" --iso "$out/$stem.iso" \
-    --efi "$efi" --kernel "$kernel" --initramfs "$initramfs"
+    --efi "$efi" --kernel "$kernel" --initramfs "$initramfs" --version "$AIUEOS_IMAGE_VERSION"
   openssl dgst -sha256 -sign "$key" \
     -out "$out/$stem-build-receipt.sig" "$out/$stem-build-receipt.json"
   python3 "$aiueos/scripts/verify-release-signature.py" \
