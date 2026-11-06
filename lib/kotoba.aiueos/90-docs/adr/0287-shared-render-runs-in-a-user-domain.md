@@ -50,7 +50,7 @@ measured the size (evidence: `90-docs/evidence/render-closure-size-20261105/READ
 - **Boundary: shared regions, not per-operation syscalls.** The kernel maps three regions into the renderer domain: the UI document (read-only to the renderer), an input event ring (read-only), and the draw-list region (read-write to the renderer, read-only to the compositor). Syscalls are used only to signal "frame ready" and to yield. Per-op syscalls would cost a ring crossing for each of up to 259 ops per frame.
 - **Loading: embedded first, signed later.** The renderer object is embedded in the boot image, so it is covered by the existing image signature. Once ADR-0286's multi-signer scheme ships, it is updated as a signed system object under the same rule. It is never fetched unsigned.
 - **One renderer domain, per-window arenas.** One domain serves all windows with a separate arena per window, and the kernel restarts the domain if it faults while the compositor keeps drawing the last frame. Per-app domains give stronger isolation against a hostile document, but multiply the renderer's memory by the window count; revisit once the memory of the renderer is measured.
-- **Floats: f64 in the user domain, conditional.** `cssom` uses doubles in 58 places and the hosted oracle is f64, so fixed point would add a parity risk. This holds only if the kernel saves and restores floating-point state on a CPL3 process switch; checking that (and fixing it if absent) is the first task of JUN-855. If it cannot be done, fixed point is the fallback and this line is reopened.
+- **Floats: fixed point in the user domain (amended 2026-11-06, see Amendment 1).** The first answer here was f64 in the user domain on the condition that the kernel saves floating-point state across a CPL3 switch. Measurement showed that condition cannot hold today, for two independent reasons, so the renderer uses fixed point.
 
 ## Still open
 
@@ -62,3 +62,16 @@ measured the size (evidence: `90-docs/evidence/render-closure-size-20261105/READ
 
 No renderer domain exists. The existence of the user target and CPL3 processes is read from ADR-0111, ADR-0175 and ADR-0211,
 not re-run for this ADR.
+
+## Amendment 1 (2026-11-06, owner delegation: recommended options): floats
+
+The owner left the choice to the recommended option. What was measured (evidence pull request kotoba-lang/kotoba#1246, JUN-855), and what was only read:
+
+- **Measured, compiler.** Every `x86_64-aiueos-user-v1` to `user-v5` target refuses `f64` (E7101 detail 33) and `f32` (detail 36); `kernel-v1` admits f32 and f64 comparison. A user-domain renderer therefore cannot be written with floats at all today.
+- **Measured, context switch (C UEFI kernel).** Under QEMU TCG, two CPL3 processes holding different values in xmm0/xmm7, x87 st0, the x87 control word and MXCSR each found the other's values in their own registers about 47-70 times per class over 414 timer-driven task switches; an FXSAVE64/FXRSTOR64 pair around the timer ISR removed every event in the run. This was measured on the C kernel, not on the Kotoba-native kernel the desktop uses.
+- **Read, not run (Kotoba-native kernel, amu seed/95).** One `FXRSTOR64` at user entry and no `FXSAVE` anywhere in seeds 74/86/88/92/95/96; `uv-enable` refuses CR4.OSXSAVE.
+
+**Decision.** The renderer uses fixed point (integer arithmetic with a documented scale), with a hosted-oracle error bound per operation, as JUN-855 item 2(b) proposed. Reasons: adding `f64` to the user targets means new code generation, a new ABI for float arguments, and FXSAVE/FXRSTOR in the context switch of the compiler's own kernel, each of which changes the compiler that builds itself (a new fixed point and pin regeneration), where fixed point changes only the cssom port that has to be rewritten for the canonical dialect anyway (JUN-134/135).
+**Cost, stated plainly.** cssom has 58 float sites (core and layout 7, dom-gpu 4, the rest in other modules); each needs a scale and a bound, and parity with the f64 hosted oracle becomes "within the bound", not "equal". Layout results that depend on exact float behaviour (percent and calc rounding) need cases.
+**Reopen when** the compiler gains `f64` for the user targets and the context switch saves FP state; this ADR then gets a further amendment.
+
