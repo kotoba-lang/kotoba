@@ -1,0 +1,88 @@
+(ns cssom.calc-q6
+  (:require [cssom.length-q6 :as len] [cssom.pack-q6 :as pk])
+  (:export [invalid check result-unit eval-q6]))
+
+;; calc() / min() / max() / clamp() evaluator in Q6 fixed point (JUN-920 slice 2, census group G03; ADR-0287).
+;; Mirrors cssom.core / cssom.layout `eval-calc-node` (f64 oracle: cssom.calc). Scalar i64 only, at most five
+;; parameters, no heap, no strings, records or floats; the stack is a shift register held in two i64 words.
+;;
+;; BOUNDED PROGRAM. The host parser (not ported, runs outside the kernel dialect) flattens the precedence-climbed
+;; AST into a POSTFIX program:
+;;   p0 = the operator stream, one nibble per operation, FIRST operation in the LOW nibble, 15 nibbles at most
+;;        (bits 0..59; bits 60..63 must be zero), terminated by the end of the word: a zero nibble inside the
+;;        stream is refused.   1 push-number  2 push-px  3 add  4 sub  5 mul  6 div  7 neg  8 min  9 max  10 clamp
+;;        (a variadic min/max is a chain of binary min/max; calc(x) is x; clamp(lo, v, hi) pops hi, v, lo)
+;;   p1 = pack(operand0, operand1)   p2 = pack(operand2, operand3)   operands are consumed in push order
+;; BOUNDS (chosen from the corpus and census sites: the largest expression seen is
+;; `max(min(8px, 12px), min(12px, 40px))`, 4 operands and 7 operations): at most 15 operations, at most 4 operands
+;; (pushes), stack depth at most 4. A program beyond any bound, a type violation, a stray end nibble, a stack
+;; underflow, or a result that is not exactly one value is REFUSED with (invalid) / -1; nothing is truncated.
+;;
+;; SCALES. px operand: Q6 raw (1/64 px). number operand: D4 raw (1/10000, so a decimal literal with at most four
+;; fraction digits is exact; Q10 would make 0.1 inexact and move exact products off integer boundaries). Every operand
+;; and every intermediate must satisfy |raw| <= 2^30, otherwise (invalid).
+;;   add sub min max neg clamp: exact.   mul: round-half-up(a * b / 10000) for px*number, number*px, number*number (the
+;;   result keeps the scale of the non-number side).   div: round-half-up(a * 10000 / b) (px/number -> px, number/number
+;;   -> number); b = 0 is refused (calc division by zero is invalid, not Infinity).
+;;   Product bound (<2^46, enforced by operand ranges, not by checking an overflowed product): a multiplication needs one
+;;   factor with |raw| < 2^16 and the other within 2^30; otherwise (invalid).
+;; UNITS (checked by the first pass, no values needed): add sub min max clamp need equal units; mul needs at least one
+;; plain number; div needs a plain-number divisor; the result unit is that of the non-number side. A percentage leaf is
+;; resolved by the caller with len/percent-of before it is pushed as a px operand.
+(defn invalid [] :i64 -4611686018427387904)
+(defn abs [x :i64] :i64 (if (< x 0) (- 0 x) x))
+;; type state: depth (bits 0..2), unit bits (bits 3..6, bit i = stack slot i from the top is px), pushes (bits 8..10)
+(defn mk [d :i64 ub :i64 np :i64] :i64 (+ d (+ (* ub 8) (* np 256))))
+(defn tc-step [op :i64 st :i64] :i64
+  (let [d (bit-and st 7) ub (bit-and (i64-shift-right st 3) 15) np (i64-shift-right st 8)
+        u0 (bit-and ub 1) u1 (bit-and (i64-shift-right ub 1) 1) u2 (bit-and (i64-shift-right ub 2) 1)]
+    (cond (or (= op 1) (= op 2)) (if (and (< d 4) (< np 4)) (mk (+ d 1) (+ (* ub 2) (- op 1)) (+ np 1)) -1)
+          (or (or (= op 3) (= op 4)) (or (= op 8) (= op 9))) (if (and (>= d 2) (= u0 u1)) (mk (- d 1) (i64-shift-right ub 1) np) -1)
+          (= op 5) (if (and (>= d 2) (or (= u0 0) (= u1 0))) (mk (- d 1) (+ (* (i64-shift-right ub 2) 2) (+ u0 u1)) np) -1)
+          (= op 6) (if (and (>= d 2) (= u0 0)) (mk (- d 1) (i64-shift-right ub 1) np) -1)
+          (= op 7) (if (>= d 1) st -1)
+          (= op 10) (if (and (>= d 3) (and (= u0 u1) (= u1 u2))) (mk (- d 2) (i64-shift-right ub 2) np) -1)
+          :else -1)))
+(defn tc [ops :i64 st :i64] :i64
+  (cond (< st 0) -1
+        (= ops 0) st
+        (= (bit-and ops 15) 0) -1
+        :else (tc (i64-shift-right ops 4) (tc-step (bit-and ops 15) st))))
+;; the final type state of a well-formed program (exactly one value left), or -1
+(defn check [ops :i64] :i64
+  (if (and (>= ops 0) (< ops 1152921504606846976))
+    (let [s (tc ops 0)] (if (and (>= s 0) (= (bit-and s 7) 1)) s -1))
+    -1))
+;; 0 number, 1 px, -1 refused
+(defn result-unit [ops :i64] :i64
+  (let [s (check ops)] (if (< s 0) -1 (bit-and (i64-shift-right s 3) 1))))
+
+(defn chk [r :i64] :i64 (if (len/in-range? r) r (invalid)))
+(defn mul-ok? [a :i64 b :i64] :bool
+  (or (and (<= (abs a) 1073741824) (< (abs b) 65536)) (and (<= (abs b) 1073741824) (< (abs a) 65536))))
+(defn mul [a :i64 b :i64] :i64 (if (mul-ok? a b) (chk (len/rdiv (* a b) 10000)) (invalid)))
+(defn div-pos [a :i64 b :i64] :i64 (chk (len/rdiv (* a 10000) b)))
+(defn div [a :i64 b :i64] :i64 (cond (= b 0) (invalid) (< b 0) (div-pos (- 0 a) (- 0 b)) :else (div-pos a b)))
+(defn bin [op :i64 a :i64 b :i64] :i64
+  (cond (= op 3) (chk (+ a b)) (= op 4) (chk (- a b)) (= op 5) (mul a b) (= op 6) (div a b)
+        (= op 8) (if (< a b) a b) :else (if (> a b) a b)))
+(defn bin-op? [op :i64] :bool (or (or (= op 3) (= op 4)) (or (or (= op 5) (= op 6)) (or (= op 8) (= op 9)))))
+;; ops: the remaining stream (-1 = failed); pa, pb: the operand queue; sa = pack(s0, s1), sb = pack(s2, s3): the stack
+;; (s0 on top). Every push shifts the register, every pop shifts it back.
+(defn ev [ops :i64 pa :i64 pb :i64 sa :i64 sb :i64] :i64
+  (let [op (bit-and ops 15) rest (i64-shift-right ops 4)
+        s0 (pk/hi sa) s1 (pk/lo sa) s2 (pk/hi sb) s3 (pk/lo sb)
+        v (pk/hi pa)]
+    (cond (< ops 0) (invalid)
+          (= ops 0) s0
+          (or (= op 1) (= op 2))
+          (ev (if (len/in-range? v) rest -1) (pk/pack (pk/lo pa) (pk/hi pb)) (pk/pack (pk/lo pb) 0)
+              (pk/pack v s0) (pk/pack s1 s2))
+          (bin-op? op)
+          (let [r (bin op s1 s0)]
+            (ev (if (= r (invalid)) -1 rest) pa pb (pk/pack r s2) (pk/pack s3 0)))
+          (= op 7) (ev rest pa pb (pk/pack (- 0 s0) s1) sb)
+          :else (let [r (if (> s2 (if (< s1 s0) s1 s0)) s2 (if (< s1 s0) s1 s0))]
+                  (ev rest pa pb (pk/pack r s3) (pk/pack 0 0))))))
+(defn eval-q6 [ops :i64 p1 :i64 p2 :i64] :i64
+  (if (< (check ops) 0) (invalid) (ev ops p1 p2 (pk/pack 0 0) (pk/pack 0 0))))
