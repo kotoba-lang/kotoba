@@ -123,6 +123,129 @@ python3 lib/kotoba.cssom/scripts/check-block-q6-native-macos.py \
 # prints PASS_NATIVE_CSSOM_BLOCK_Q6
 ```
 
+## Q6 fixed-point slice 2: calc(), line-height and metrics, aspect-ratio and replaced sizing (JUN-920 / C2b)
+
+Second slice of the same method (census groups G03, G06, G08; evidence `cssom-port-census-20261106`, merged with #1252). Same
+rules as slice 1: scalar `i64`, at most five parameters, no heap, round half up, failure is the sentinel `-2^62`, nothing wired
+into `layout.cljk`, nothing run at CPL3. Built on the head of #1255 (slice 1, still open when this was written).
+
+| module (`src/cssom/`) | role | native f64 reference (new) |
+| --- | --- | --- |
+| `pack_q6` | two Q6 lengths in one `i64` (same packing as `block_width_q6`, which keeps its own copy) | |
+| `calc_q6` | `calc()` / `min()` / `max()` / `clamp()` evaluator over a bounded postfix program | `calc` (transcribes `eval-calc-node`, core.cljk 977-1048) |
+| `line_height_q6` | `resolve-line-height`, `(long (* m fs))`, descent, glyph advance, leading, marker advance, option height, tab stops | `line_height` |
+| `aspect_ratio_q6` | `aspect-ratio-block-height` / `-width`, the `replaced-content-size` tables, intrinsic rounding | `aspect_ratio` |
+
+**Calc: the bounded program.** The host parser (not ported) flattens the AST to a postfix program of at most **15 operations
+and 4 operands**: `p0` holds one nibble per operation (1 push-number, 2 push-px, 3 add, 4 sub, 5 mul, 6 div, 7 neg, 8 min,
+9 max, 10 clamp; a variadic `min`/`max` is a chain; `calc(x)` is `x`), `p1`/`p2` hold the four operands in push order. The
+bound comes from the corpus: the largest expression in `core_test.cljk` / `cases.edn` is `max(min(8px, 12px), min(12px, 40px))`
+(4 operands, 7 operations). The evaluator runs in two passes with no heap: a type pass over the nibbles (units, stack depth
+at most 4, at most 4 pushes, exactly one value left) and a value pass whose stack is a shift register in two `i64`. **Beyond the
+bound the program is refused** (`-2^62`, `-1` from `check`): a 16th operation (bit 60 set), a fifth push, depth above 4, a
+stray end nibble, underflow, a leftover value, an unknown opcode, an operand beyond `2^30`, a unit violation, division by zero,
+an intermediate beyond `2^30`, or a product with no factor below `2^16` raw. Nothing is truncated. Units follow
+`eval-calc-node` (`+ - min max clamp` need equal units, `*` at least one plain number, `/` a plain non-zero divisor).
+
+**Scales (a deliberate difference from the census proposal).** px is Q6; a plain number or a multiplier is **D4**, a decimal
+with four fraction digits (1/10000), not the census's Q10. Q10 cannot hold `0.1`: `0.1 * 10px` would be 63.75 raw, and the
+`long` truncation of the source would then lose a whole pixel the exact decimal gives (`(= (q6/mul-trunc 1000 640) 1)` in the
+test). A percentage `H` (hundredths of a percent) is the same integer as a D4 multiplier (150 % = 15000 = 1.5). The cost: a
+product needs one factor below `2^16` raw (6.5535) and the other within `2^30` (the `2^46` product rule enforced by the operand
+ranges). Where `layout.cljk` applies `long` the result is integer px, not Q6 (`mul-trunc`, `resolve`, `leading-ascent`,
+`block-height` / `-width` as multiples of 64 raw). The aspect ratio is an integer pair `(rn, rd)`, each 1..65535 (the census
+said "keep the integer pair"); a ratio that does not fit is refused, never rounded.
+
+**Oracle method.**
+(1) The f64 references are native transcriptions of the `.cljk` semantics (`calc` is one function per AST node kind and is nested
+by the test exactly as the parser would nest the tree, so the postfix words are checked against the trees too).
+(2) **The original code could not be run on this machine.** `kbb` and `nbb v1.4.208` stop with `Can only recur from tail position`
+while loading `cssom.layout` / `cssom.core`, and `kbb` fails on the repository's `deps.edn` graph; the command, tool versions and
+output are recorded in `lib/kotoba.aiueos/90-docs/evidence/cssom-q6-slice2-20261106/oracle-attempt.txt`. So the transcription is checked
+against **hand-derived cases**: the assertions of `core_test.cljk` `calc-probe` (24 expressions, flattened to postfix by hand) and the
+Brave measurements quoted in the `layout.cljk` comments (leading points, tab stops, the 40x20 image, 3/1 and 120px boxes);
+`evidence/.../hand-derived-cases.tsv` lists 33 with file and line. These were not executed against the original; they only agree
+with the references and the Q6 modules. (3) Q6 against the references on deterministic grids, below.
+
+**Differential results** (`scripts/check-calc-q6-native-macos.py`, about a minute, all verdicts 42, 0 violations):
+
+| grid | cases | compared | justified refusals | both invalid | edge band (not judged) |
+| --- | --: | --: | --: | --: | --: |
+| calc: 34 shapes (postfix and tree), 16-value operand catalogue, 1..4 operands | 245,584 | 143,144 | 83,866 | 5,920 | 12,654 |
+| line-height `resolve`: 3 kinds x 4 flags x 20 values x 15 font sizes x 7 themes | 25,200 | 19,488 (24 at a boundary) | 5,712 | | |
+| aspect block height and width: 2 x 20 x 21 ratios x 10 insets, both directions | 16,800 | 9,088 (12 at a boundary) | 7,712 | | |
+| replaced width / height tables | 5,760 / 7,680 | 4,526 / 5,804 | 1,234 / 1,876 | | |
+| leading-ascent, marker, option height, tab stop (exhaustive small grids) | 1,139,727 iterations | all equal | | | |
+
+A "justified refusal" is a Q6 refusal where the oracle accepts but an input is outside the Q6 domain, an intermediate or result
+leaves `+-2^30`, or a product has no small factor; the grids fail if Q6 accepts what the domain forbids or refuses what it allows.
+The edge band is a result within the rounding tolerance of `2^30`; those cases are counted, not judged.
+
+**Maximum deviation** (half-raw units, `|2q - 2*scale*o|`; 1 = 1/128 px for a px result). Exact programs (add, sub, min, max, neg,
+clamp, a lone leaf): **0**. One rounding (a `*` or `/`, then exact operations): **1.000**, the half-up bound. Two roundings in a
+row: 7.446 (`(p*n)*m`), 7.437 (`(p/n)*m`), 10,000 (`(p*n)/d` with `d = 0.0001`), each inside the per-case bound
+`1 + |factor|` or `1 + 1/|divisor|` that the test applies. Line height and aspect ratio have no tolerance: integer results are
+equal, or differ by one px at a truncation boundary (below).
+
+**Tie and boundary report** (the exact rule against the inexact f64 oracle; a tie is where the exact value is a half or, for
+`long`, a whole number of px):
+
+| sweep | pairs | ties / boundaries | oracle differs there | oracle differs elsewhere |
+| --- | --: | --: | --: | --: |
+| calc `px * number`, px raw -1024..1023 x D4 0..20000 | 40,962,048 | 31,504 | 805 | 0 |
+| calc `px / number`, px raw -1024..1023 x D4 1..20000 | 40,960,000 | 17,416 | 542 | 0 |
+| `(long (* m fs))`, 2-decimal m 0.00..5.00 x 1..256 px (the census sweep) | 128,256 | 6,716 | **183** | 0 |
+| `(long (* m fs))`, D4 m 0..65535 step 7 x fs raw 0..4096 | 38,360,211 | 14,128 | 17 | 0 |
+| `block-height` border-box, ratios 1..24 / 1..24 x 0..2048 px | 1,180,224 | 332,661 | 2,291 | 0 |
+| `block-width` border-box, same grid | 1,180,224 | 332,661 | 2,475 | 0 |
+
+The 183 reproduces the census count; the oracle is one px low where the double product misses a whole number (`0.29 * 100 =
+28.999999999999996`, Q6 gives 29; `21 / (3/17)` is 118.99999999999999 in doubles, Q6 gives 119). Q6 is the exact value. Whether Blink agrees was not
+measured; the half-up and truncation rules need the owner's confirmation as in slice 1.
+
+**AIUEOS size** (pinned `amu-full-root`, compile only, not run). The slice-2 core is 140 code lines (`pack_q6` 6, `calc_q6` 54,
+`line_height_q6` 36, `aspect_ratio_q6` 44) plus the 39 lines of `length_q6` they use:
+
+| | kernel-v1 `.text` | user-v1 |
+| --- | --: | --- |
+| whole slice-2 core, zero-argument entry | 29,789 B | **`E7104` detail 29,437** (limit 4,096 B: 7.2x over) |
+| whole core, two-argument entry | 29,662 B | `E7102` detail 66 (entry shape) |
+| `pack_q6` alone | 1,425 B | accepted |
+| `calc_q6` (with `length_q6`, `pack_q6`) | 16,833 B | `E7104` detail 16,482 |
+| `line_height_q6` (with `length_q6`) | 9,788 B | `E7104` detail 9,467 |
+| `aspect_ratio_q6` (with `length_q6`, `pack_q6`) | 12,251 B | `E7104` detail 11,939 |
+| six-parameter function (control) | `E7102` detail 1 | |
+| the three f64 references with a trivial `main` | `E2104` type mismatch (records) | `E2104` |
+
+About 166 B of kernel text per code line (slice 1: 160). Each slice-2 module on its own already exceeds the user-v1 text cap
+except the packing helper.
+
+**Negative controls** (each makes the verdict print 7 and a violation counter positive): `calc_q6` product truncates (13 violations
+in shape 4), unit equality dropped (199 in shape 19), operand cap removed (caught by the refusal programs); `pack_q6` bias off by one; `line_height_q6` truncation
+replaced by rounding (62,480 non-boundary differences); `aspect_ratio_q6` truncation replaced by rounding (461,696); and one mutation
+in each f64 reference (`calc` subtraction adds (210 in shape 3), `line_height` natural leading 1.3, `aspect_ratio` ratio inverted).
+
+**Not covered.** The host parsers (calc tokenizer and precedence climbing, `line-height-multiplier`, `aspect-ratio` term parsing,
+decimal text to D4 / ratio pair); a decimal with more than four fraction digits or a ratio term above 65535 is outside the domain.
+The `%` leaf of a calc is resolved by the caller with `length_q6/percent-of` (slice 1) and pushed as px. `calc-result->number` (whole
+results as integers, fractional as doubles) disappears in fixed point. The clamp functions between the two replaced-size tables,
+`clamp-width` / `clamp-height`, and `resolve-width` (G02, partly slice 1). G06 sites not ported: `tab-stop-width` (type tower),
+`text-lines` / `line-align-offset` (plain `quot`), `ua-control-font` (literal 13.3333 = 853 raw), `atomic-intrinsic-width`
+(`Math/ceil` of host text widths), `inline-line-metrics`. G05 (transforms), G07 (flex), G04, G10, G13 are untouched. No CPL3 run,
+no browser verdict, no wiring into `layout.cljk`, no comparison with the original `.cljk` (it did not load).
+
+**Doc / code mismatches found (reported, not edited).** (1) `layout.cljk` 4858-4861, the docstring of `line-height-factor`, says
+`resolve-line-height` still reads `150%` as `150 x font-size` through `parse-dbl`; the code (`line-height-multiplier`, 4767, and
+4816-4818) divides a percentage by 100.0. The code is followed here. (2) The census table (`README.md` section 2.2) lists G08 as
+"exact"; the exact integer pair is exact, but the hosted f64 code is one px low at truncation boundaries (2,291 / 2,475 of
+332,661 in the sweep above). (3) The census proposes a Q10 multiplier for G03/G06; D4 is used (see Scales).
+
+```bash
+python3 lib/kotoba.cssom/scripts/check-calc-q6-native-macos.py \
+  --amu /path/to/amu-cli.macho --amu-full-root /path/to/amu-full-root.macho --output /path/to/new-empty-dir
+# prints PASS_NATIVE_CSSOM_CALC_LINE_ASPECT_Q6
+```
+
 ## Test
 
 ```bash
