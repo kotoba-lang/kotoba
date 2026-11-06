@@ -14,8 +14,8 @@ Manifest (64 bytes, signed): 0 "AIUEFRS1", 8 latest version u64 (1..2^63-1), 16 
 u32 (1 = the update image channel), 36..63 zero. Both signatures cover the manifest; the ML-DSA message is M' = 0 || 8 || "AIUEFRS1" || manifest.
 Structure: 1 <= issued-at < 2^63, issued-at < valid-until < 2^63, valid-until - issued-at <= 30 days (2592000 s), channel = 1.
 Result codes of update.kotoba (word 180): 15 record verified; 1 fewer than two distinct valid signers; 2 bad magic (including the image and
-catalog magics); 3 signature count / layout bytes, or the structure above; 4 version below 1; 5 manifest reserved bytes 36..63 not zero; 8 no
-production signer set pinned. Freshness verdict (word 273, only when the result is 15), against the RTC reading `now`: 1 fresh
+catalog magics); 3 signature count / layout bytes, or the structure above; 4 version below 1; 5 manifest reserved bytes 36..63 not zero; 8 retired
+(no production signer set pinned until amendment 7). Freshness verdict (word 273, only when the result is 15), against the RTC reading `now`: 1 fresh
 (issued-at <= now + 86400 and now <= valid-until), 2 expired (now > valid-until), 3 the clock is more than a day behind issued-at
 (issued-at > now + 86400), 4 no usable clock. The case word is result | counted mask << 8 | verdict << 16.
 """
@@ -54,12 +54,11 @@ def two_of_three(man, slots=(0, 1), ctx=CTX):
     return [o.entry(s, *sign(s, man, ctx)) for s in slots]
 
 
-def ml_valid(slot, man, sig):
-    pk = o.keys()[slot][2]
-    return ref.verify_mu(pk, ref.mu_of(pk, o.mprime(man, CTX)), sig)
+def ml_valid(slot, man, sig, ks="test"):
+    return o.ml_valid(slot, man, sig, ks, CTX)
 
 
-def counted(hdr):
+def counted(hdr, ks="test"):
     """Mask of the pinned slots whose entry counts: pinned id not seen, zero reserved/padding, Ed25519 and ML-DSA-65 valid."""
     man, seen, mask = hdr[:64], set(), 0
     for i in range(struct.unpack_from("<I", hdr, 64)[0]):
@@ -67,7 +66,7 @@ def counted(hdr):
         kid = struct.unpack_from("<I", e, 0)[0]
         if kid >= o.N_SLOTS or kid in seen or e[4:8] != bytes(4) or e[3381:] != bytes(11):
             continue
-        if o.ed_valid(kid, man, e[8:72]) and ml_valid(kid, man, e[72:3381]):
+        if o.ed_valid(kid, man, e[8:72], ks) and ml_valid(kid, man, e[72:3381], ks):
             seen.add(kid); mask |= 1 << kid
     return mask
 
@@ -90,9 +89,7 @@ def verdict(hdr, mode, now):
     sigs = struct.unpack_from("<I", hdr, 64)[0]
     if not 1 <= sigs <= 4 or hdr[68:128] != bytes(60):
         return 3, 0, 0
-    if mode == 1:
-        return 8, 0, 0
-    mask = counted(hdr)
+    mask = counted(hdr, "prod" if mode == 1 else "test")   # mode 1: the production signer set's PUBLIC keys (amendment 7)
     if bin(mask).count("1") < 2:
         return 1, mask, 0
     version, issued, until, chan = struct.unpack_from("<QQQI", hdr, 8)
@@ -179,7 +176,7 @@ def rows(base):
     add("layout-68", o.header(m, two_of_three(m), layout=(68, 1)), (3, 0, 0))
     add("signature-count-five", o.header(m, two_of_three(m), count=5), (3, 0, 0))
     add("signature-count-zero", o.header(m, two_of_three(m), count=0), (3, 0, 0))
-    add("production-mode", o.header(m, two_of_three(m)), (8, 0, 0), mode=1)
+    add("production-mode", o.header(m, two_of_three(m)), (1, 0, 0), mode=1)
     return out
 
 
