@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """JUN-813 stage 5a (ADR-0286 amendment 2): the native desktop kernel admits AIUEIMG2 headers by the multi-signer rule (aiueos.imgsig).
 
-Before the desktop starts the guest reads the fw_cfg file opt/aiueos/imgsig (QEMU only, never a disk or the network): sixteen 16 KiB
+Before the desktop starts the guest reads the fw_cfg file opt/aiueos/imgsig (QEMU only, never a disk or the network): twenty-seven 16 KiB
 AIUEIMG2 headers made by scripts/imgsig_oracle.py with fixed public TEST keys (two, three and reordered signers; one signer, a duplicate
 id, an unknown id, a bad Ed25519 half, a bad ML-DSA half, Ed25519-only, ML-DSA-only, a tampered manifest, a signature under another
-context; bad magic, bad count, nonzero reserved). For each it runs Ed25519 and ML-DSA-65 verification per entry and applies the 2-of-3
-rule; the verdict and the mask of counted slots go to the browser context (byte 1280 + 16 k). This gate boots once, waits for the first
+context; bad magic, bad count, nonzero reserved; review hardening: nonzero entry padding / entry reserved / layout bytes 68..127, four entries, key ids 256, 65536 and 2^24). For each it runs Ed25519 and ML-DSA-65 verification per entry and applies the 2-of-3
+rule; the verdict and the mask of counted slots go to the browser context (byte 1280 + 8 k). This gate boots once, waits for the first
 frame, reads the marker (effects word 51 = "IS01") and compares verdicts and masks with the oracle, whose expectations come from the
 independent Ed25519 and ML-DSA references. No key here is a real key; QEMU TCG only.
 """
@@ -60,10 +60,12 @@ def main(a):
         marker = words(2048 + 51, 1)[0]
         assert marker == MARKER, ("the admission self-test did not finish", hex(marker))
         assert words(319, 1)[0] == len(CASES), "case count"
+        bad = []
         for k, c in enumerate(CASES):
-            raw = words(320 + 4 * k, 2)
-            assert raw[0] == c["code"] and raw[1] == c["mask"], (c["name"], raw, c["code"], c["mask"])
-            matches.append(c["name"])
+            raw = words(320 + 2 * k, 2)
+            if raw[0] == c["code"] and raw[1] == c["mask"]: matches.append(c["name"])
+            else: bad.append((c["name"], raw, c["code"], c["mask"]))
+        assert not bad, ("admission cases differ from the oracle (name, got verdict+mask, want verdict, want mask)", bad)
         events.append(dict(name="admission-cases", marker=hex(marker), matches=matches))
         send("quit", 0.5)
     finally:

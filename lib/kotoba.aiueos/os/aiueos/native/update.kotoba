@@ -62,8 +62,8 @@
   ;; JUN-813 stage 5b (ADR-0286 amendment 2): AIUEIMG2. The header is 16384 bytes: the 64-byte manifest (as AIUEIMG1, magic
   ;; "AIUEIMG2"), the entry count u32 at 64 (1..4, bytes 68..127 zero), then up to four 3392-byte entries from byte 128 (key id
   ;; u32, 4 zero bytes, Ed25519 signature 64, ML-DSA-65 signature 3309, 11 zero bytes); the image follows the header. It does not fit
-  ;; the 4096-byte page, so it arrives in the same chunks as the image (the first 128 bytes, then 1024-byte pieces that never
-  ;; cross a 1 KiB line) and each byte is consumed as it lands: the manifest into the verifier buffers, the signatures into
+  ;; the 4096-byte page, so it arrives in the same chunks as the image (the first 128 bytes, then pieces that end at the next
+  ;; 1 KiB line, so the first is 896 bytes and the rest 1024, none crossing a line) and each byte is consumed as it lands: the manifest into the verifier buffers, the signatures into
   ;; their buffers, and when an entry's last byte lands both of its signatures are verified (aiueos.ed25519 and
   ;; aiueos.mldsa-verify) and counted with aiueos.imgsig (N = 3 pinned slots, M = 2 distinct valid signers). Only after the header
   ;; is admitted are the manifest's size and version checked and the image hashed against its SHA-256.
@@ -80,9 +80,9 @@
   ;; state stays 3072..3647. AIUEIMG2 state words: 212 header length (128 or 16384), 216 count, 218 mask of counted slots, 220 key
   ;; id of the entry in progress, 221 its reserved bytes, 222 its padding, 223 flags (1 size out of range, 2 version below 1),
   ;; 224 size, 225/226 version, 227 header end, 228 ML-DSA ran, 229 stream bytes consumed from the QEMU file, 233 storage walk after
-  ;; the cases, 234 marker "UP02", 235 case count, 236.. per case k < 20: result | counted mask << 8. New result codes:
+  ;; the cases, 234 marker "UP02", 235 case count, 236.. per case k < 40, two cases per word (even k low 16 bits, odd k high 16 bits): result | counted mask << 8; 230 QEMU truncation flag. New result codes:
   ;; 8 no production signer set pinned; 1 is also "fewer than two distinct valid signers" for AIUEIMG2.
-  ;; QEMU hook: fw_cfg file opt/aiueos/update2 (hypervisor only): [count][per case: mode (0 test keys, 1 production), 16384 header
+  ;; QEMU hook: fw_cfg file opt/aiueos/update2 (hypervisor only): [count][per case: mode (0 test keys, 1 production, 2 test keys with the stream broken before byte 7200), 16384 header
   ;; bytes, 5000 image bytes]; with no install request every case is run to its verdict, with install request "3" case 0 is installed.
   (:require [aiueos.native.storage-state :as storage]
             [aiueos.native.rtl8168-debug :as nic]
@@ -409,7 +409,9 @@
 ;; src 0 the network (stream offset `off`), src 1 the QEMU file. n <= 1024 bytes land at page byte dst.
 (defn get-chunk [ctx src off n dst]
   (if (= src 1)
-    (do (put-word ctx 229 (+ (word ctx 229) n)) (fw-fill dst n 0))
+    ;; word 230 = 1 (QEMU case mode 2): the stream breaks before the piece that would pass byte 7200, like a lost network answer
+    (if (and (= (word ctx 230) 1) (> (+ (word ctx 229) n) 7200)) 0
+      (do (put-word ctx 229 (+ (word ctx 229) n)) (fw-fill dst n 0)))
     (fetch ctx off n dst 0)))
 ;; Header bytes h .. end in pieces that end at a 1 KiB line, so none crosses the page end.
 (defn h2-loop [ctx src h end]
@@ -430,7 +432,9 @@
 (defn begin2 [ctx src test]
   (let [s (h2-start ctx test)]
     (if (not (= s 14)) s
-      (if (= (h2-loop ctx src 128 (word ctx 227)) 0) (fail ctx 21)
+      (if (= (h2-loop ctx src 128 (word ctx 227)) 0)
+        ;; the stream broke after some entries may have been verified: the verifier left the NVMe/ESP state overwritten
+        (do (restore-storage ctx) (fail ctx 21))
         (do (restore-storage ctx) (h2-admit ctx))))))
 ;; Fetch the first 128 bytes and dispatch on the magic's last byte: "2" AIUEIMG2, anything else the AIUEIMG1 path.
 (defn admit [ctx src test]
@@ -530,22 +534,26 @@
       (do (get-chunk ctx 1 0 n (bit-and at 4095))
           (chunk-done ctx n)
           (feed2 ctx (+ at n))))))
+(defn test-of [mode] (if (= mode 1) 0 1))
 (defn run-case2 [ctx k]
   (let [mode (fw-byte)]
-    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0)
-        (let [a (admit ctx 1 (if (= mode 0) 1 0))
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 230 (if (= mode 2) 1 0))
+        (let [a (admit ctx 1 (test-of mode))
               hn (- 16384 (word ctx 229))
               hs (fw-skip hn)
               r (if (= a 14) (feed2 ctx 0) (word ctx 180))
               is (fw-skip (- 21384 (+ hn (word ctx 229))))]
-          (do (put-word ctx (+ 236 k) (+ r (* 256 (word ctx 218))))
-              (+ 1 (* 0 (+ hs is))))))))
+          ;; two cases per word: case k at word 236 + k / 2, low half for even k, high half for odd k
+          (let [v (+ r (* 256 (word ctx 218)))
+                w (+ 236 (quot k 2))]
+            (do (put-word ctx w (if (= (bit-and k 1) 0) v (+ (word ctx w) (* 65536 v))))
+                (+ 1 (* 0 (+ hs is)))))))))
 (defn cases2 [ctx k n]
   (if (>= k n) 1 (do (run-case2 ctx k) (cases2 ctx (+ k 1) n))))
 (defn self-test2 [ctx]
   (if (= (fw-open 1) 0) 0
     (let [count (fw-byte)]
-      (do (cases2 ctx 0 (least count 20))
+      (do (cases2 ctx 0 (least count 40))
           (put-word ctx 233 (esp/run ctx))
           (put-word ctx 235 count)
           (put-word ctx 234 1431318578)
@@ -553,11 +561,11 @@
           count))))
 ;; Install case 0 of the file through the same admit / ready / stream / commit as the network install.
 (defn install2 [ctx]
-  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 229 0)
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 229 0) (put-word ctx 230 0)
       (if (= (fw-open 1) 0) (ifail ctx 21)
         (do (fw-byte)
             (let [mode (fw-byte)]
-              (if (not (= (admit ctx 1 (if (= mode 0) 1 0)) 14)) (ifail ctx (word ctx 180))
+              (if (not (= (admit ctx 1 (test-of mode)) 14)) (ifail ctx (word ctx 180))
                 (do (fw-skip (- 16384 (word ctx 229)))
                     (let [r (ready ctx)]
                       (if (> r 0) (ifail ctx r)

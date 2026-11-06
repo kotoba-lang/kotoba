@@ -476,7 +476,10 @@ def main(args):
                     or observed["events"][1]["matches"] != ["two-signers", "three-signers", "order-2-0", "one-signer", "duplicate-id",
                                                             "unknown-id", "ed-half-bad", "ml-half-bad", "ed25519-only", "mldsa-only",
                                                             "manifest-tamper", "wrong-context", "bad-magic", "count-zero", "count-five",
-                                                            "manifest-reserved"]
+                                                            "manifest-reserved", "pad-nonzero-first", "pad-nonzero-last",
+                                                            "entry-reserved-4", "entry-reserved-7", "layout-68", "layout-127",
+                                                            "count-four-dup", "count-four-last-counts", "id-256", "id-65536",
+                                                            "id-16777216"]
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("imgsig verdict is incomplete")
         elif args.profile == "gf25519":
@@ -534,7 +537,10 @@ def main(args):
                     or observed["events"][0]["matches"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "one-signer", "ml-half-bad",
                                                             "ed-half-bad", "tampered-image", "tampered-manifest", "duplicate-id", "unknown-id",
                                                             "production-mode", "bad-magic", "count-zero", "manifest-reserved", "version-zero",
-                                                            "size-too-big"]
+                                                            "size-too-big", "entry-reserved-4", "entry-reserved-7", "pad-nonzero-first",
+                                                            "pad-nonzero-last", "layout-68", "layout-127", "count-five", "count-four-dup",
+                                                            "count-four-last-counts", "id-256", "id-65536", "id-16777216", "wrong-context",
+                                                            "stream-broken-after-verify"]
                     or [row["install"] for row in observed["events"][1:]] != [15, 7, 1]
                     or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
                 raise ValueError("update2 verdict is incomplete")

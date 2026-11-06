@@ -6,11 +6,16 @@ fixture ESP attached as an NVMe disk with QEMU `-nic none`, with the fw_cfg file
 hypervisor-only hook; a physical board has no fw_cfg). Every header is 16384 bytes and reaches the verifier through the same chunk
 path as the network pull: the first 128 bytes, then 1 KiB pieces, each entry's Ed25519 and ML-DSA-65 signatures verified as the
 entry's last byte lands, then (only for an admitted header) the 5000-byte image hashed against the manifest.
-  update2-cases       16 cases, no install request: three signers, two of three (0+1, 2+0), one signer, an ML-DSA half bad, an Ed25519 half
+  update2-cases       30 cases, no install request: three signers, two of three (0+1, 2+0), one signer, an ML-DSA half bad, an Ed25519 half
                       bad, a tampered image byte (digest), a tampered manifest, a duplicate id, an unknown id, the same valid header
                       under the production signer set (no keys pinned: refused), bad magic, count 0, nonzero reserved, version 0, an
-                      oversize image. Each result word (236 + k) must equal the oracle's result | counted-mask << 8. Afterwards the
-                      ESP walk (word 233) must still read the fixture's own BOOTX64.EFI: the ML-DSA arena shares owned window 4
+                      oversize image; review hardening: nonzero entry reserved/padding bytes (first and last), nonzero layout bytes 68
+                      and 127, count 5, count 4 (a duplicate fourth entry, and a fourth entry that is the second counted signer), key ids
+                      256, 65536 and 2^24, a signature made under context AIUEIMG1; last, a case whose header stream breaks (mode 2)
+                      after entries 0 and 1 were verified: result 21 with mask 3. Case k is the low (even k) or high (odd k) 16 bits
+                      of word 236 + k / 2 and must equal the oracle's result | counted-mask << 8. Afterwards the
+                      ESP walk (word 233) must still read the fixture's own BOOTX64.EFI (with the broken-stream case last, this also shows that a
+                      failed header stream restores the NVMe/ESP driver state, finding B): the ML-DSA arena shares owned window 4
                       with the NVMe queues and the walk's data page, and update.kotoba re-probes the driver after it.
   update2-install     install request "3" with a 2-of-3 image: the staging file and BOOTX64.EFI hold the 5000-byte image; only ESP sectors
                       change.
@@ -45,7 +50,9 @@ def boot(args, out, name, disk, request, fwfile, events):
         r = dict(hook=b.W(211), install=b.W(208), stream=b.W(180), marker=b.W(234), count=b.W(235), walk=b.W(233),
                  nvme=b.W(600), v1=[b.W(188), b.W(189) & 255, (b.W(189) >> 8) & 255, (b.W(189) >> 16) & 255])
         r["results"] = b.words(236, 20)
-        r["results"] = [int.from_bytes(r["results"][i:i + 4], "little") for i in range(0, 80, 4)]
+        # two cases per word: case k is the low (even k) or high (odd k) 16 bits of word 236 + k / 2
+        halves = [int.from_bytes(r["results"][i:i + 4], "little") for i in range(0, 80, 4)]
+        r["results"] = [(halves[k // 2] >> (16 * (k & 1))) & 0xffff for k in range(40)]
         digest = b.words(680, 8)
         r["esp"] = dict(path=b.W(677), fat=b.W(662), size=b.W(675),
                         sha256=b"".join(digest[i:i + 4][::-1] for i in range(0, 32, 4)).hex())
@@ -72,9 +79,11 @@ def main(args):
     r = boot(args, out, "update2-cases", disk, None, fw_all, events)
     assert r["marker"] == MARKER and r["count"] == len(cases), ("the cases did not finish", hex(r["marker"]), r["count"])
     matches = []
+    bad = []
     for k, c in enumerate(cases):
-        assert r["results"][k] == c["code"] + 256 * c["mask"], (c["name"], hex(r["results"][k]), c["code"], c["mask"])
-        matches.append(c["name"])
+        if r["results"][k] == c["code"] + 256 * c["mask"]: matches.append(c["name"])
+        else: bad.append((c["name"], hex(r["results"][k]), c["code"], c["mask"]))
+    assert not bad, ("update2 cases differ from the oracle (name, got result|mask<<8, want result, want mask)", bad)
     assert r["walk"] == 15 and r["nvme"] == 15, ("the storage walk after the ML-DSA arena failed", r["walk"], r["nvme"])
     assert r["esp"] == dict(path=want["path"], fat=want["fat"], size=want["size"], sha256=want["sha256"]), (r["esp"], want)
     assert disk.read_bytes() == before, "a verify-only boot must not write the disk"
