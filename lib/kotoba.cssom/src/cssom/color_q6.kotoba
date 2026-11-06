@@ -1,0 +1,64 @@
+(ns cssom.color-q6
+  (:require [cssom.length-q6 :as len])
+  (:export [invalid unit-byte nibble-byte channel-number channel-percent alpha-number alpha-percent
+            hsl-percent hue-wrap hsl-channel final-alpha to-byte pack-rgba]))
+
+;; CSS colour arithmetic in fixed point (JUN-920 slice 3, census group G04; ADR-0287). Mirrors the arithmetic of
+;; lib/kotoba.domGpu/src/kotoba/wasm/host/color.cljk: `unit` (byte / 255), parse-channel-token, parse-alpha-token,
+;; parse-percent-token, hsl->rgb and the alpha product of ->rgba (f64 oracle: cssom.color). Scalar i64 only, at most five
+;; parameters, no heap. The census listed three float sites; what the code actually computes (read, not run): every colour
+;; component leaves color.cljk as a UNIT FRACTION 0..1 (a double or, on the JVM, a rational), never as an 8-bit integer -
+;; `unit` is the only place a byte appears, and webgl/webgpu consume the fractions. The tokenizer, the 148-name table and the
+;; regex checks are not arithmetic and are not ported here (the table is byte triples and needs only `unit-byte`).
+;;
+;; Scales. A unit fraction (channel, alpha, saturation, lightness) is a Q16 raw: 0..65536 = 0..1. A parsed CSS number is a D4
+;; raw (1/10000: `50.5` = 505000; a percentage token carries its number the same way). A hue is D4 degrees. An opacity is D4
+;; (cssom.style-num-q6). Each function does ONE exact rational division, rounded half up (floor(x + 1/2)), except hsl-channel,
+;; which does two (the product a = s * min(l, 1 - l), then a * t), so its total deviation from the real value is below 1.5
+;; raw (23 millionths).
+;;   unit-byte(b)        = round(b * 65536 / 255)                       b 0..255                  (hex, named colours)
+;;   nibble-byte(n)      = unit-byte(17 n)                              n 0..15                   (#rgb / #rgba)
+;;   channel-number(n)   = clamp(n, 0, 255) / 255                        n D4, |n| <= 2^30         (rgb(255, ...))
+;;   channel-percent(n)  = clamp(n / 100 * 255, 0, 255) / 255           = clamp(n/100, 0, 1)      (rgb(50%, ...))
+;;   alpha-number(n)     = clamp(n, 0, 1)                                n D4
+;;   alpha-percent(n)    = clamp(n / 100, 0, 1)                          (also the hsl saturation / lightness token)
+;;   hue-wrap(h)         = h mod 360 in D4 degrees, 0 <= result < 3,600,000       (any |h| <= 2^30)
+;;   hsl-channel(hw, s, l, which)  which 0 red, 1 green, 2 blue (n = 0, 8, 4 of the CSS Color 4 algorithm); hw a WRAPPED hue;
+;;        k = (n + h/30) mod 12, a = s * min(l, 1 - l), f = l - a * max(-1, min(k - 3, 9 - k, 1)); all in exact integers:
+;;        K = (hw + n * 300000) mod 3600000, t = max(-300000, min(K - 900000, 2700000 - K, 300000)) / 300000
+;;   final-alpha(opacity, own) = round(opacity * own / 10000)             D4 x Q16 -> Q16  (the alpha of ->rgba)
+;;   to-byte(q)          = round(q * 255 / 65536), 0..255               (a Q16 unit to an 8-bit channel)
+;;   pack-rgba(r, g, b, a) = r << 24 | g << 16 | b << 8 | a             bytes -> one u32 (the kernel colour word)
+(defn invalid [] :i64 -4611686018427387904)
+(defn imax [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn imin [a :i64 b :i64] :i64 (if (< a b) a b))
+(defn clampi [x :i64 lo :i64 hi :i64] :i64 (imax lo (imin hi x)))
+(defn n-ok? [n :i64] :bool (and (>= n -1073741824) (<= n 1073741824)))
+(defn unit-byte [b :i64] :i64 (if (and (>= b 0) (<= b 255)) (len/rdiv (* b 65536) 255) (invalid)))
+(defn nibble-byte [n :i64] :i64 (if (and (>= n 0) (<= n 15)) (unit-byte (* n 17)) (invalid)))
+(defn channel-number [n :i64] :i64
+  (if (n-ok? n) (len/rdiv (* (clampi n 0 2550000) 65536) 2550000) (invalid)))
+(defn alpha-percent [n :i64] :i64
+  (if (n-ok? n) (len/rdiv (* (clampi n 0 1000000) 65536) 1000000) (invalid)))
+(defn channel-percent [n :i64] :i64 (alpha-percent n))
+(defn hsl-percent [n :i64] :i64 (alpha-percent n))
+(defn alpha-number [n :i64] :i64
+  (if (n-ok? n) (len/rdiv (* (clampi n 0 10000) 65536) 10000) (invalid)))
+(defn hue-wrap [h :i64] :i64
+  (if (n-ok? h) (- h (* 3600000 (len/fdiv h 3600000))) (invalid)))
+(defn hsl-channel [hw :i64 s :i64 l :i64 which :i64] :i64
+  (if (and (and (>= hw 0) (< hw 3600000)) (and (and (>= s 0) (<= s 65536)) (and (and (>= l 0) (<= l 65536)) (and (>= which 0) (<= which 2)))))
+    (let [n (if (= which 0) 0 (if (= which 1) 8 4))
+          k0 (+ hw (* n 300000))
+          kk (- k0 (* 3600000 (len/fdiv k0 3600000)))
+          t (imax -300000 (imin (- kk 900000) (imin (- 2700000 kk) 300000)))
+          a (len/rdiv (* s (imin l (- 65536 l))) 65536)]
+      (- l (len/rdiv (* a t) 300000)))
+    (invalid)))
+(defn final-alpha [opacity :i64 own :i64] :i64
+  (if (and (and (>= opacity 0) (<= opacity 10000)) (and (>= own 0) (<= own 65536))) (len/rdiv (* opacity own) 10000) (invalid)))
+(defn to-byte [q :i64] :i64 (if (and (>= q 0) (<= q 65536)) (len/rdiv (* q 255) 65536) (invalid)))
+(defn pack-rgba [r :i64 g :i64 b :i64 a :i64] :i64
+  (if (and (and (and (>= r 0) (<= r 255)) (and (>= g 0) (<= g 255))) (and (and (>= b 0) (<= b 255)) (and (>= a 0) (<= a 255))))
+    (+ (+ (i64-shift-left r 24) (i64-shift-left g 16)) (+ (i64-shift-left b 8) a))
+    (invalid)))

@@ -246,6 +246,119 @@ python3 lib/kotoba.cssom/scripts/check-calc-q6-native-macos.py \
 # prints PASS_NATIVE_CSSOM_CALC_LINE_ASPECT_Q6
 ```
 
+## Q6 fixed-point slice 3: flex, multi-column, style numbers, inline shifts, colour (JUN-920 / C2b)
+
+Third slice of the same method (census groups G07 flex and multicol, G11, G09, G04; evidence `cssom-port-census-20261106`). Same
+rules: scalar `i64`, at most five parameters, no heap, round half up (`floor(x + 1/2)`), failure is the sentinel `-2^62`, nothing
+wired into `layout.cljk`, nothing run at CPL3. Built on the head of #1259 (slice 2, open when this was written).
+
+| module (`src/cssom/`) | role | native f64 reference (new) |
+| --- | --- | --- |
+| `flex_q6` | `resolve-flexible-lengths` (grow / scaled shrink, min / max, freeze-and-redistribute), `place-main-axis` (all justify-content keywords), `place-main-axis-auto-margins` | `flex` |
+| `multicol_q6` | `multicol-spec` column count, kept-fractional column width, `lay-w`, column pitch `dx`, rule position | `multicol` |
+| `style_num_q6` (+ host-only `parse_d4_q6`) | opacity clamp / product / `(< opacity 1.0)`, flex factors | `style_num` |
+| `inline_q6` | `vertical-align` `super` / `sub`, the `middle` box law and the inherited `middle` shift, `leading-ascent` | `inline` |
+| `color_q6` | `unit`, rgb / alpha / percent tokens, `hsl->rgb`, the alpha product of `->rgba`, byte and u32 packing | `color` |
+
+**Flex: the bounded line.** At most **four items per line** (`n = 1..4`), refused beyond (the caller splits or falls back; nothing
+is truncated). The census suggested 8 or 16; four is what five scalar parameters of 63 bits can carry: the whole line has to
+travel in five words because the target has no store, no vector and no sixth parameter (a six-parameter function is refused,
+`E7102`, pinned below), and one item needs 70 bits (base 18, min 18, max 18, factor 16). Four items and the header use 300 of the
+310 bits. Item `k` is one word `base | min << 18 | max << 36 | (factor & 255) << 54` (`item-word`; max field `262143` = no
+maximum, min `0` = no minimum, which is what `(or min 0)` means in the source); the line word holds `net + 2^19`, `n - 1`, the
+item to answer for, the grow bit, a pass counter and the high bytes of the four factors (`line-word`, `hi-bytes`,
+`with-select`); `solve` returns the final size of the selected item. **Ranges that follow:** base, min, max below `262143` raw
+(4096 px), factor 0..65535 D4 (below 6.5535), `net = avail - gaps` within +-524288 raw (+-8192 px), free space below `2^21` raw
+(32768 px); outside them the encoders answer `-2^62`. The census proposed lengths to `2^30`; five words cannot carry that. The
+justify and auto-margin placement has no item bound (it needs sums only: `offset(mi, container, total, gap, prefix)` with
+`mi = mode + 8 safe + 16 n + 4096 i`, `n <= 255`).
+
+**Flex: the solver.** The loop state of `layout.cljk` (`sizes`, `frozen`, `guard`) is rewritten into the words: a frozen item
+gets `base := its clamped size` and `factor := 0`, and a zero weight *is* the frozen flag, because the source freezes exactly the
+items whose weight is not positive. The source guard (`n` passes) cannot fire (every pass after the first freezes an item), so
+the Q6 recursion has none; the f64 reference keeps it literally and it never fired in 2,500,000 comparisons (evidence, not a
+proof). The share `R * weight / W` is one exact rational: floor and remainder by long division on 7-bit chunks of `|R|`, every
+product below `2^44`, rounded half up once. **Found by the grid, kept as a spec point:** the freeze test must use the *exact*
+proposal. Testing the rounded one let an item whose proposal was 99.994 against a minimum of 100 stay unfrozen and absorb 30000 raw
+that another item gave back (30100 instead of 100). **Rounding of a line:** every item is rounded on its own, so the sizes of a
+line need not add up to the free space (two items sharing 3 raw both get 2). The error is at most `n/2` raw. Largest-remainder
+rounding (the census proposal) would conserve the sum; it is an owner decision and is not done here.
+
+**Other scales.** Lengths Q6 raw, factors / opacity / numbers D4 (as slice 2), colour components **Q16** (0..65536 = 0..1, because
+`color.cljk` produces unit fractions, not bytes: `unit` is the only byte, `(/ byte 255)`; 255 does not divide a power of ten) and
+hue D4 degrees. `multicol_q6` takes lengths up to `2^24` raw and `n <= 255`; the whole-pixel results (`lay-w`, `dx`, rule `x`)
+are multiples of 64 raw because the source applies `Math/floor` / `Math/round` there, computed from the exact rational (the
+source multiplies the kept-fractional width by `k`, which the doubles do not round). `shift-keyword` is `(fs + 192)/3` and
+`-(fs + 320)/5`: one rounding each. `color_q6` keeps a hsl channel within 1.56 raw of Q16 (2.4e-5 of full scale).
+
+**Oracle method.** (1) The f64 references are native transcriptions of the `.cljk` semantics (`flex` keeps `sizes`, `frozen`,
+`guard`, `settle` literally, one proposal per item, on doubles; the unused `quot` of the source is an exact half in `center`).
+(2) The original `.cljk` still could not be loaded on this machine (slice 2 recorded the kbb / nbb failure as dated data); no
+value of it is used. The transcriptions are validated against **hand-derived cases** from the `resolve-flexible-lengths`
+docstring (the Brave 151 measurements of 2026-08-06, derived by hand from the algorithm: 150/50, 60/240, 200/50/50, 30/135/135,
+30/40/230, 80/80, 140/60, 60/140, 50/250, the scope-cut shape 17.5/95/87.5, 147/7, and the 30/200/70 pair), from the `multicol`
+comment (93.33 px columns, the third starting at 206.67 which rounds to 207), and from the CSS Color 4 primaries
+(`hsl(0|60|120|180|240, 100%, 50%)`). (3) Q6 and the reference are compared on deterministic grids; oracle disagreements at ties
+are reported, never copied.
+
+**Grids and results** (macOS arm64, pinned compiler; every count is pinned in the gate):
+
+| grid | cases | result |
+| --- | ---: | --- |
+| flex solver, 8 slices of 125,000 pseudo-random lines (1..4 items; bases 0, 1, 63, 64, 65 ... 262143; factors 0 .. 65535; 1,655,847 results sit on a min or max bound) | 1,000,000 lines, 2,500,000 items | 2,500,000 equal after half-up rounding, 0 ties, 0 other, max deviation 0.5 raw (the rounding itself) |
+| `share` against the exact integer formula `floor((2 r w + W) / 2W)` | 5,520 | 0 violations, 59 exact ties |
+| `offset` (6 modes x safe x up to 6 items, 4,000 lines) against `place-main-axis` | 168,264 | 0 violations, max 0.5 raw, 68 exact ties where the oracle differs |
+| `auto-offset` against `place-main-axis-auto-margins` | 672,384 | 0 violations, 60 ties where the oracle differs |
+| `multicol` count 11,466, `col-raw` 1,386, `lay-w` 73,728, `dx` 430,080, rule `x` 1,474,560 | 1,991,220 | 0 violations; 1,279 exact `dx` ties, the oracle misses 9; 90,513 exact rule ties, the oracle misses 12; 0 `lay-w` boundary differences |
+| opacity product, all `a, b` in 0..10000 | 100,020,001 | 84,000 exact ties, oracle differs at 11,364 of them, **0 away from a tie**; clamp 50,001 and stacking 10,111: 0 differences |
+| `parse-opacity` / `parse-d4` string table | 23 | 0 violations, 2 below-one adjustments |
+| `shift-keyword` 80,002, `middle-box` 327,184, `middle-inherited` 682,864, `leading-ascent` 119,652 | 1,209,702 | 0 violations (the halves are exact in doubles: 163,592 and 341,432 exact ties, oracle never differs) |
+| colour: `unit-byte` 256 (round trip to byte exact for all 256), 4 token grids 8,777 each, `final-alpha` 27,248, hsl 871,926 | 934,538 | 0 violations; max deviation 0.498 raw (unit), 1.560 raw (hsl, Q16); 31,048 hsl channels differ from `round(o * 255)` by one **only within 0.002 of a half** (exact gray `l = 50%` is 127.5: the doubles land on either side), 0 away from it |
+
+**Not covered.** Flex lines of more than four items (and the `flex-wrap` line breaking, `layout-flex-wrap-row`); `flex-item-base-size`
+(a `flex-basis` percentage is `length_q6` of slice 1 with the measured size as the `auto` fallback); `flex-main-clamp` (the
+box-sizing conversion of the min / max declarations is integer-px addition with the already resolved insets, not ported);
+`flex-item-min-content-width` and `flex-item-baseline` (text measurement, with the `half` of `(lh - (ascent + descent)) / 2` at
+9546, which is `inline_q6/leading-ascent` for integer metrics); the `quot` sites of the integer-pixel policy (`cross-offset`
+center `(quot ... 2)`, 5169 `center` in `place-main-axis`, 15458 / 15462 block centring, 15813 absolute centring, 17200 legend
+centring: here `center` is an exact half, the source truncates a whole-pixel difference, **a behaviour difference**). Grid and
+table sizing (`distribute-fr`, `distribute-equally-with-caps`, `table-column-widths`, `layout-table`, `layout-grid` `fr` tracks) are
+not done: they distribute over an unbounded number of tracks / columns and need the same word-packing as the flex line with a
+different loop each; they were left rather than bounded to a size that matches no page. `multicol-balanced-height` (binary
+search over fragments), `frag-keep-orphans` and `frag-slice-ops` (`0.5` tolerances are comparisons, `y - 0.5 <= t` is
+`y - 32 <= t`). Colour: the tokenizer, the 148-name table, `parse-css-double` (the `Double/parseDouble` grammar) and
+`split-fn-args` are not arithmetic. `parse_d4_q6` accepts a decimal only: Java's `Double/parseDouble` also takes an exponent, an
+`f` / `d` suffix, `NaN`, `Infinity` and hex floats, which answer `-2^62` there and fall back to the default - **a behaviour
+difference**. G05 (transforms), G10, G13 untouched. No CPL3 run, no browser verdict, no wiring into `layout.cljk`, no comparison
+with the original `.cljk`. D4 opacity is cumulative: each level of the tree rounds once (the source does not), so k nested
+opacities can differ by k/2 raw of 1/10000.
+
+**Doc / code mismatches found (reported, not edited).** (1) The census (section 2.2) estimates the G07 oracle bound at "<= 1 px per
+item"; measured, the solver equals the exact rational rounded half up in all 2,500,000 comparisons (0.5 raw), so the bound is
+1/128 px. (2) The census proposes largest-remainder rounding for G07; per-item rounding is used (spec: "round half up"), and
+the sum is therefore not conserved (above). (3) The census proposes hue Q6 and s / l Q10 for G04; hue D4 degrees (a decimal
+degree such as 0.1 is exact in D4 and not in Q6) and Q16 are used. (4) The census counts G04 as "3 float sites in
+`color.cljk`"; the file has 3 *strong* hits but the arithmetic is `unit`, the channel and alpha clamps, `hsl->rgb`, and the alpha
+product (about 9 lines of arithmetic), all ported. (5) The `resolve-flexible-lengths` docstring says its freeze-everything rule "gives
+the same answer on every one of the eleven shapes above"; the table lists ten rows plus the 30/200/70 pair; all of them are
+reproduced here (by hand derivation, not by running the `.cljk`), and the docstring's remark that `§9.7.4` freezes by the SIGN
+of the total violation is a deliberate difference of the code from the specification, which the port follows. (6) In
+`place-main-axis` the divisions `(/ free (dec n))`, `(/ free n)` are written `/` on possibly integer operands: on the JVM they
+are ratios, in ClojureScript doubles; the port treats them as real division.
+
+```bash
+python3 lib/kotoba.cssom/scripts/check-flex-q6-native-macos.py \
+  --amu /path/to/amu-cli.macho --amu-full-root /path/to/amu-full-root.macho --output /path/to/new-empty-dir
+# prints PASS_NATIVE_CSSOM_FLEX_COLOUR_Q6
+```
+
+**AIUEOS size** (pinned compiler `amu-full-root.macho`, `x86_64-aiueos-kernel-v1` text bytes): `flex_q6` 26,743, `multicol_q6`
+10,254, `style_num_q6` 6,288, `inline_q6` 7,012, `color_q6` 11,492; the five together (every export reached, two arguments)
+43,993, zero-argument 44,234. `x86_64-aiueos-user-v1`: the two-argument entry is refused `E7102` (detail 96, the entry takes
+arguments), the zero-argument core `E7104` (detail 43,882, the 4096-byte text cap), and each module alone `E7104` as well
+(`flex_q6` 26,470, `multicol_q6` 9,945, `style_num_q6` 5,937, `inline_q6` 6,679, `color_q6` 11,183). A six-parameter function is
+refused `E7102`. The flex solver alone is more than six times the user text cap.
+
 ## Test
 
 ```bash
