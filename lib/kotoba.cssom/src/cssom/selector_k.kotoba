@@ -1,0 +1,163 @@
+(ns cssom.selector-k (:require [cssom.intern-k :as ik]) (:export [sk-reset sk-sheet]))
+;; Style slice, kernel dialect: the sheet half of the input stream becomes the bounded rule table (ADR-0287, JUN-920).
+;; Stream: rule* 0x00, rule = 0x52 origin(0 user agent, 1 author) selector-length selector declaration-count
+;; declaration*, declaration = property-length property value-length value flags (bit 0 !important). All lengths are
+;; one byte. Tables (byte offsets in the 61440-byte window):
+;;   28672 selector entries, 32 bytes each, at most 128: u16 origin @0, compound count @2, first compound @4, first
+;;         declaration @6, declaration count @8, u64 packed specificity @16 = ids << 32 | classes << 16 | tags
+;;   32768 declarations, 8 bytes each, at most 512: u16 property index @0, value string id @2, flags @4
+;;   36864 compounds, 16 bytes each, at most 256 (8 per selector): u16 combinator @0 (0 first, 1 descendant, 2 child,
+;;         3 adjacent, 4 general sibling), tag id @2 (0 none or *), id id @4 (0 none), class count @6 (at most 4), class ids @8
+;;   49152 header words: 3 selector entries, 4 declarations, 5 compounds, 6 distinct properties (at most 16), 8 first
+;;         declaration of the current rule, 12 input length, 14 origin of the current rule, byte 128 u64 specificity
+;;         being built; u16 property -> string id at 256
+;; A selector list is split at commas, one entry per selector, as the hosted rule loop does. Only type, *, #id and .class
+;; compounds and the four combinators are accepted; anything else (attribute, pseudo-class, namespace, escape, non-ASCII)
+;; is refused with -12, never skipped. Only the FIRST #id of a compound counts, as in core.cljk parse-simple-selector.
+;; A property repeated inside one rule is refused (-1): core.cljk keeps a rule's declarations in a map, which this encoding does not
+;; reproduce. Status: position (>= 0) or -1 malformed, -6 entries, -7 declarations, -8 compounds, -9 classes, -10 properties,
+;; -12 selector outside the subset, -13 CSS-wide keyword value, and the interning errors -4, -5.
+(defn- hd [st i] (kernel-load-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i)))
+(defn- hd! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i) v))
+(defn- sp [st] (kernel-load-u64-4k (kernel-subregion st 61440 49152 4096) 4096 128))
+(defn- sp! [st v] (kernel-store-u64-4k (kernel-subregion st 61440 49152 4096) 4096 128 v))
+(defn- pt [st k] (kernel-load-u16-4k (kernel-subregion st 61440 49152 4096) 4096 (+ 256 (* 2 k))))
+(defn- pt! [st k v] (kernel-store-u16-4k (kernel-subregion st 61440 49152 4096) 4096 (+ 256 (* 2 k)) v))
+(defn- inb [st i] (if (and (>= i 0) (< i (hd st 12))) (kernel-load-u8-16k (kernel-subregion st 61440 0 16384) 16384 i) 0))
+(defn- fits [st p n] (<= (+ p n) (hd st 12)))
+(defn- rl! [st s at v] (kernel-store-u16-4k (kernel-subregion st 61440 28672 4096) 4096 (+ (* 32 s) at) v))
+(defn- rl64! [st s v] (kernel-store-u64-4k (kernel-subregion st 61440 28672 4096) 4096 (+ (* 32 s) 16) v))
+(defn- dc [st d at] (kernel-load-u16-4k (kernel-subregion st 61440 32768 4096) 4096 (+ (* 8 d) at)))
+(defn- dc! [st d at v] (kernel-store-u16-4k (kernel-subregion st 61440 32768 4096) 4096 (+ (* 8 d) at) v))
+(defn- cp [st c at] (kernel-load-u16-4k (kernel-subregion st 61440 36864 4096) 4096 (+ (* 16 c) at)))
+(defn- cp! [st c at v] (kernel-store-u16-4k (kernel-subregion st 61440 36864 4096) 4096 (+ (* 16 c) at) v))
+
+(defn sk-reset [w length]
+  (if (>= length 61440)
+    (let [st (kernel-subregion w length 0 61440)]
+      (+ 1 (* 0 (+ (hd! st 3 0) (+ (hd! st 4 0) (+ (hd! st 5 0) (hd! st 6 0)))))))
+    0))
+
+;; ---- declarations ----
+(defn- pidx-find [st ps k n] (if (>= k n) -1 (if (= (pt st k) ps) k (pidx-find st ps (+ k 1) n))))
+(defn- pidx [st ps]
+  (let [n (hd st 6) f (pidx-find st ps 0 n)]
+    (if (>= f 0) f
+      (if (>= n 16) -10 (+ n (* 0 (+ (pt! st n ps) (hd! st 6 (+ n 1)))))))))
+;; CSS-wide keywords (case-insensitive, as css-wide-keyword): inherit initial unset revert revert-layer
+(defn- wide? [st vs]
+  (let [n (ik/ik-len st 61440 vs) a (ik/ik-word st 61440 vs 0 1)]
+    (or (and (= n 7) (or (= a 32767037346967145) (= a 30506403037277801)))
+        (or (and (= n 5) (= a 499918270069))
+            (or (and (= n 6) (= a 128034677351794))
+                (and (= n 12) (and (= a 12794408629331314) (= (ik/ik-word st 61440 vs 1 1) 491328725356))))))))
+(defn- dup? [st pi k d] (if (>= k d) 0 (if (= (dc st k 0) pi) 1 (dup? st pi (+ k 1) d))))
+(defn- decl [st q]
+  (let [pl (inb st q) vq (+ q (+ 1 pl)) vl (inb st vq) fl (inb st (+ vq (+ 1 vl)))
+        ps (ik/ik-intern st 61440 (+ q 1) pl 0)
+        vs (ik/ik-intern st 61440 (+ vq 1) vl 0)
+        d (hd st 4)]
+    (if (< ps 0) ps
+      (if (< vs 0) vs
+        (if (or (= ps 0) (or (= vs 0) (> fl 1))) -1
+          (if (= (if (wide? st vs) 1 0) 1) -13
+            (if (>= d 512) -7
+              (let [pi (pidx st ps)]
+                (if (< pi 0) pi
+                  (if (= (dup? st pi (hd st 8) d) 1) -1
+                  (+ 0 (* 0 (+ (dc! st d 0 pi) (+ (dc! st d 2 vs) (+ (dc! st d 4 fl) (hd! st 4 (+ d 1)))))))))))))))))
+(defn- d-loop [st q cnt]
+  (if (= cnt 0) q
+    (if (not (fits st q 1)) -1
+      (let [pl (inb st q) vq (+ q (+ 1 pl))]
+        (if (or (= pl 0) (not (fits st vq 1))) -1
+          (let [vl (inb st vq) fq (+ vq (+ 1 vl))]
+            (if (or (= vl 0) (not (fits st fq 1))) -1
+              (let [r (decl st q)]
+                (if (< r 0) r (d-loop st (+ fq 1) (- cnt 1)))))))))))
+
+;; ---- selectors ----
+(defn- alpha? [c] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+(defn- identst? [c] (or (alpha? c) (= c 95)))
+(defn- identrest? [c] (or (identst? c) (or (= c 45) (and (>= c 48) (<= c 57)))))
+(defn- ws? [c] (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 13) (= c 12))))))
+(defn- ident-end [st p e] (if (and (< p e) (identrest? (inb st p))) (ident-end st (+ p 1) e) p))
+(defn- skip-ws [st p e] (if (and (< p e) (ws? (inb st p))) (skip-ws st (+ p 1) e) p))
+;; after the optional type selector: #id and .class, in any order; stops at the first other byte
+(defn- simple-loop [st p e ci]
+  (if (>= p e) p
+    (let [c (inb st p)]
+      (if (or (= c 46) (= c 35))
+        (let [s (+ p 1)]
+          (if (or (>= s e) (not (identst? (inb st s)))) -12
+            (let [en (ident-end st s e) sid (ik/ik-intern st 61440 s (- en s) 0)]
+              (if (< sid 0) sid
+                (if (= sid 0) -12
+                  (if (= c 35)
+                    (if (= (cp st ci 4) 0)
+                      (simple-loop st en e (+ ci (* 0 (+ (cp! st ci 4 sid) (sp! st (+ (sp st) 4294967296))))))
+                      (simple-loop st en e ci))
+                    (let [k (cp st ci 6)]
+                      (if (>= k 4) -9
+                        (simple-loop st en e (+ ci (* 0 (+ (cp! st ci (+ 8 (* 2 k)) sid) (+ (cp! st ci 6 (+ k 1)) (sp! st (+ (sp st) 65536)))))))))))))))
+        p))))
+(defn- compound [st p e ci]
+  (let [c (inb st p)]
+    (if (= c 42) (simple-loop st (+ p 1) e ci)
+      (if (alpha? c)
+        (let [en (ident-end st p e) sid (ik/ik-intern st 61440 p (- en p) 1)]
+          (if (< sid 0) sid
+            (if (= sid 0) -12
+              (simple-loop st en e (+ ci (* 0 (+ (cp! st ci 2 sid) (sp! st (+ (sp st) 1)))))))))
+        (if (or (= c 46) (= c 35)) (simple-loop st p e ci) -12)))))
+(defn- init-comp [st ci comb]
+  (+ 1 (* 0 (+ (cp! st ci 0 comb) (+ (cp! st ci 2 0) (+ (cp! st ci 4 0) (+ (cp! st ci 6 0) (hd! st 5 (+ ci 1)))))))))
+;; one complex selector; returns the position of the terminating comma, or e
+(defn- chain [st p e comb]
+  (let [ci (hd st 5)]
+    (if (>= ci 256) -8
+      (let [z (init-comp st ci comb) q (compound st p e ci)]
+        (if (< q 0) q
+          (let [r (skip-ws st q e)]
+            (if (>= r e) r
+              (let [c (inb st r)]
+                (if (= c 44) r
+                  (let [cb (if (= c 62) 2 (if (= c 43) 3 (if (= c 126) 4 0)))]
+                    (if (> cb 0)
+                      (let [s (skip-ws st (+ r 1) e)]
+                        (if (or (>= s e) (= (inb st s) 44)) -12 (chain st s e cb)))
+                      (if (> r q) (chain st r e 1) -12))))))))))))
+(defn- entry! [st s nc cs dd]
+  (let [dst (u64-shift-right dd 10) dn (bit-and dd 1023)]
+    (+ 1 (* 0 (+ (rl! st s 0 (hd st 14)) (+ (rl! st s 2 nc) (+ (rl! st s 4 cs) (+ (rl! st s 6 dst) (+ (rl! st s 8 dn) (+ (rl64! st s (sp st)) (hd! st 3 (+ s 1))))))))))))
+(defn- slist [st p e dd]
+  (let [q (skip-ws st p e)]
+    (if (>= q e) 1
+      (if (= (inb st q) 44) (slist st (+ q 1) e dd)
+        (let [s (hd st 3)]
+          (if (>= s 128) -6
+            (let [cs (hd st 5) z (sp! st 0) r (chain st q e 0)]
+              (if (< r 0) r
+                (let [nc (- (hd st 5) cs)]
+                  (if (> nc 8) -8
+                    (let [g (entry! st s nc cs dd)] (slist st (+ r 1) e dd))))))))))))
+(defn- rule [st p]
+  (if (not (fits st p 4)) -1
+    (let [o (inb st (+ p 1)) sl (inb st (+ p 2)) sq (+ p 3) dq (+ sq sl)]
+      (if (or (> o 1) (not (fits st dq 1))) -1
+        (let [nd (inb st dq) d0 (hd st 4) z (+ (hd! st 14 o) (hd! st 8 d0)) q (d-loop st (+ dq 1) nd)]
+          (if (< q 0) q
+            (let [r (slist st sq (+ sq sl) (+ (* d0 1024) (- (hd st 4) d0)))]
+              (if (< r 0) r q))))))))
+(defn- rules [st p]
+  (if (not (fits st p 1)) -1
+    (let [b (inb st p)]
+      (if (= b 0) (+ p 1)
+        (if (= b 82)
+          (let [q (rule st p)] (if (< q 0) q (rules st q)))
+          -1)))))
+;; parse the rules starting at input offset p; the new offset (after the 0x00 end of the sheet) or a negative status
+(defn sk-sheet [w length p]
+  (if (and (>= length 61440) (and (>= p 0) (<= p 16384)))
+    (rules (kernel-subregion w length 0 61440) p)
+    -1))
