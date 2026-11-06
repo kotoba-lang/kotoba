@@ -58,9 +58,7 @@ def c_badid(t): set_ui(t, "yataverse", {"document": "Not An Id"})
 def c_const_gone(t): edit(t / SESSION / "apps/itonami.kotoba", "(defn document-title [] :string", "(defn document-name [] :string")
 
 
-def c_unrequired(t):
-    add_document(t, "yataverse", "yataverse", "Yataverse")
-    set_ui(t, "yataverse", {"document": "yataverse"})
+def c_unnamed_require(t): edit(t / SESSION / "index.kotoba", "[app-itonami :as ai]", "[app-itonami :as ai] [app-extra :as ax]")
 
 
 def c_require_dropped(t): edit(t / SESSION / "index.kotoba", " [app-itonami :as ai]", "")
@@ -75,7 +73,7 @@ CONTROLS = [
     ("ui has a key besides document", RECORDS, c_shape, "ui must be an object"),
     ("ui.document is not an id", RECORDS, c_badid, "must match"),
     ("document lacks its title constant", RECORDS, c_const_gone, "found 0"),
-    ("record names a document index.kotoba does not require", TABLE, c_unrequired, "index.kotoba requires"),
+    ("index.kotoba requires a document no record names", TABLE, c_unnamed_require, "index.kotoba requires"),
     ("index.kotoba drops a require the records name", TABLE, c_require_dropped, "index.kotoba requires"),
 ]
 
