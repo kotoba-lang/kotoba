@@ -27,9 +27,10 @@ ADR-0287 fixes the interface: UI document and events in, draw list out, through 
 `lib/kotoba.cssom/scripts/check-draw-k-native-macos.py` (native macOS Amu `e13a2054...` / `amu-full-root` `88623412...`, QEMU TCG, profile `draw`, observer
 `os/aiueos/scripts/check-native-draw-qemu.py`, entry `os/aiueos/native/draw-entry.kotoba`), receipt `measurements.json`, status `PASS_NATIVE_CSSOM_DRAW_K`.
 
-* 198 cases (`scripts/draw_k_cases.py`): 28 hand-derived draw lists (px written out from the CSS rules; the reference reproduces 20 of them from the hand-derived box table
-  before the kernel is looked at, the other 8 are refusal / bound cases with fixed statuses or lists), 7 bounds (255 ops at, 256 past, 128 elements, 8-deep x+w past 2^30,
-  16 properties), 15 component trees with block sheets plus colours, 70 seeded random documents. 1591 ops in total; draw statuses seen 0 (186), -20 (9), -21 (2), -18 (1);
+* 198 cases (`scripts/draw_k_cases.py`): 29 hand-written (28 with an explicit draw list: px written out from the CSS rules; the reference reproduces 20 of them from the
+  hand-derived box table before the kernel is looked at, the other 8 are refusals with a fixed status or lists without a hand-derived table), 6 bounds (255 ops at, 256 past,
+  128 elements with one and with five ops each, 8-deep x+w past 2^30, 16 properties), 93 component trees with block sheets plus colours, 70 seeded random documents.
+  1591 ops in total; draw statuses seen 0 (186), -20 (9), -21 (2), -18 (1);
   every role seen (740 backgrounds, 266 / 203 / 205 / 177 borders); 18 distinct colours.
 * Host side, independent of the module: its own cascade (single compound selectors, specificity, `!important`, order), colour parser and ordering (`expected`), and a decoder
   of the raw region words (`decode`: magic, slot size, reserved words, count, op codes, roles, element indices). The observer compares the kernel's draw list with the
