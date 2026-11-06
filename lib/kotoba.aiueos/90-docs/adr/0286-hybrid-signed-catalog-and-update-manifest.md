@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates; test keys except where Amendment 7 says otherwise; Amendments 3 to 7): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6). Amendment 7 pins a VERIFICATION-ONLY signer set kept on one Mac so the production path can be exercised end to end; it is not a custody set. Not implemented: any custody-separated production signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
+Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates; test keys except where Amendment 7 says otherwise; Amendments 3 to 8): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6) and an RTC probe for the real board (Amendment 8). Amendment 7 pins a VERIFICATION-ONLY signer set kept on one Mac so the production path can be exercised end to end; it is not a custody set. Not implemented: any custody-separated production signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -462,3 +462,28 @@ the three golden fixtures and refuses a one-signer header, a header signed by th
 one kind presented as another; verdicts come from the independent references under the production public keys. The existing `update2`, `catalog` and `fresh` gates' former
 "production-mode" case (a header signed by TEST keys, previously refused with 8) is now refused with 1. Negative controls are rebuilt kernels (production mode that accepts
 the TEST keys; production mode that ignores the signer count) and mutated copies of the tool; results are in the pull request.
+
+## Amendment 8 (2026-11-06, JUN-813, owner decision): the CMOS RTC is adopted as the freshness clock, subject to the 6600H probe
+
+**Decision (owner, 2026-11-06).** Amendment 6's clock choice stands and is now **adopted**: the CMOS real-time clock (ports 0x70/0x71), read by `rtc-now` in
+`native/update.kotoba`, is the clock a freshness record (`AIUEFRS1`) is judged against. The adoption is **subject to the result of a probe on the real 6600H
+board**. Amendment 6 rests on a PC architecture argument and a QEMU measurement; its own evidence lists the board as "not measured". Nothing here changes
+the verdict rules, the build floor, the one-day slack or any record layout of Amendment 6.
+
+**What was added.** A read-only probe, `rtc-probe` in `native/update.kotoba`, run once by the desktop debug entry before the QEMU-only hook, and a QEMU gate for it
+(`build-native-desktop-macos.py --profile rtc`, `check-native-rtc-qemu.py`, `rtc_probe_decode.py`). It reads the CMOS through ports 0x70/0x71 only (no fw_cfg, no disk,
+no RTC write), waits out the update-in-progress flag, requires two equal snapshots, takes a second snapshot one RTC second later, and reports through the netlog /
+debug link (KDBG 0xc400..0xc40b): registers 0x00..0x0D and 0x32 raw, the conversion with the face value read as UTC (the assumption `rtc-now` makes; whether the
+RTC is UTC or local is for the operator to read off by comparing with the Mac's UTC), the TSC ticks between the two reads, the production `rtc-now` answer, and a
+verdict word. Operator instructions: `docs/runbook-6600h-rtc-probe.md`. QEMU results and negative controls: `90-docs/evidence/rtc-probe-qemu-20261106/README.md`.
+
+**What the probe result decides.** The adoption holds on this board only if the probe shows: register D bit 7 set, including after a full power-off of at least ten
+minutes (a battery that keeps the clock); the registers decode to a valid date (BCD or binary, 12 or 24 hour, whichever register B says); the seconds register
+advances once a second; and the face value is within 14 hours of the Mac's UTC at a quarter-hour zone (UTC, or local time that the one day of slack on issued-at
+covers). The century register 0x32 being absent or implausible is not a failure (20 is assumed, correct to 2099). If register D bit 7 is clear, the clock is reset after
+a power-off, or the clock is wrong by more than a zone, the RTC is not usable on that board; the fail-safe of Amendment 6 already applies (a reading below the build floor
+or without register D bit 7 is "no usable clock", so the record is "not fresh"), and the adoption is withdrawn for that board until the battery or setup is fixed.
+
+**Status.** Source, QEMU gate and runbook: built. **The 6600H RTC facts are NOT VERIFIED**: UTC or local, century register, battery retention, binary/BCD and
+12/24-hour mode, seconds advance and TSC rate are all unmeasured until the operator runs the runbook and files the evidence. No claim in Amendments 2, 4 or 6 about the
+board's clock is strengthened by this amendment.

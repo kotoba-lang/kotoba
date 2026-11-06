@@ -176,7 +176,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-builder-layout-qemu.py", "check-builder-layout.py", "check-provision-esp.py", "make-release-image.py", "aiueos-image.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-prodsig-qemu.py", "prodsig_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-builder-layout-qemu.py", "check-builder-layout.py", "check-provision-esp.py", "make-release-image.py", "aiueos-image.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-prodsig-qemu.py", "prodsig_oracle.py", "check-native-rtc-qemu.py", "rtc_probe_decode.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -282,7 +282,7 @@ def main(args):
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
                         else "input-entry.kotoba" if args.profile == "input-state"
-                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig")
+                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "rtc")
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -361,6 +361,7 @@ def main(args):
                         else "check-native-catalog-qemu.py" if args.profile == "catalog"
                         else "check-native-fresh-qemu.py" if args.profile == "fresh"
                         else "check-native-prodsig-qemu.py" if args.profile == "prodsig"
+                        else "check-native-rtc-qemu.py" if args.profile == "rtc"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -398,6 +399,7 @@ def main(args):
                         else "native-catalog-qemu.json" if args.profile == "catalog"
                         else "native-fresh-qemu.json" if args.profile == "fresh"
                         else "native-prodsig-qemu.json" if args.profile == "prodsig"
+                        else "native-rtc-qemu.json" if args.profile == "rtc"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
@@ -428,6 +430,7 @@ def main(args):
                            else "PASS_NATIVE_CATALOG_QEMU" if args.profile == "catalog"
                            else "PASS_NATIVE_FRESH_QEMU" if args.profile == "fresh"
                            else "PASS_NATIVE_PRODSIG_QEMU" if args.profile == "prodsig"
+                           else "PASS_NATIVE_RTC_PROBE_QEMU" if args.profile == "rtc"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 18 if args.expect_stuck_entropy
@@ -443,6 +446,7 @@ def main(args):
                            else 3 if args.profile == "catalog"
                            else 7 if args.profile == "fresh"
                            else 5 if args.profile == "prodsig"
+                           else 7 if args.profile == "rtc"
                            else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -658,6 +662,14 @@ def main(args):
                     or not observed["testKeysOnly"] or observed["productionSignerSet"] or not observed["notWiredToDesktop"]
                     or observed["physicalHardware"] or not observed["clockIsQemuNotABoard"]):
                 raise ValueError("fresh verdict is incomplete")
+        elif args.profile == "rtc":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["rtc-default-host", "rtc-vm-2026-11-06", "rtc-vm-leap-day-2028", "rtc-vm-2100-03-01",
+                                                                       "rtc-vm-before-build-floor", "rtc-decoder-negative-controls", "rtc-regression"]
+                    or [row["verdict"] for row in observed["events"][:5]] != [1, 1, 1, 0, 0]
+                    or observed["decoder"] != script_pins["rtc_probe_decode.py"]
+                    or not observed["readOnly"] or not observed["clockIsQemuNotABoard"] or observed["physicalHardware"]):
+                raise ValueError("rtc verdict is incomplete")
         elif args.profile == "provision":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["provision-esp", "provision-cases-checked", "provision-equal",
@@ -893,7 +905,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "rtc", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "

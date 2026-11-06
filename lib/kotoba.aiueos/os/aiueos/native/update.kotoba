@@ -117,7 +117,7 @@
             [aiueos.imgsig-testkeys :as tk]
             [aiueos.imgsig-prodkeys :as pk]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [self-test pull report install install-report qemu-hook confirm-installed]))
+  (:export [self-test pull report install install-report qemu-hook confirm-installed rtc-probe]))
 
 (defn word [region i]
   (storage/word region i))
@@ -919,6 +919,130 @@
     (do (clear-words ctx 213 224) (put-word ctx 208 0)
         (put-word ctx 262 (if (> (+ r (* 0 d)) 0) 1 2))
         1)))
+;; ---- JUN-813 (ADR-0286 amendment 6, owner decision 2026-11-06): the RTC probe for the real board ----
+;; The debug entry runs `rtc-probe` once at boot (before qemu-hook), read only: ports 0x70/0x71, no RTC write, no disk, no fw_cfg, so the same code
+;; runs under QEMU and on a physical board. It reports twelve KDBG records, tag 0xc400 + k, and keeps each as three context words at 1500 + 3k
+;; (tag, value low, value high; word 1499 = records so far, word 1498 = "RTC1" when finished). Register snapshots live at words 1400..1414 (A),
+;; 1420..1434 (B), 1440..1454 (temporary): word at + r is CMOS register r (r = 0..13), at + 14 is register 0x32 (century).
+;;   c400 "RTC1" << 32 | 1 (version)       c401 / c403 registers 0x00..0x07 of snapshot A / B, register 0 in the low byte
+;;   c402 / c404 registers 0x08 0x09 0x0A 0x0B 0x0C 0x0D 0x32 (bytes 0..6)    c405 guest conversion, face value read as UTC: A | B << 32 (0 = invalid)
+;;   c406 / c407 TSC at A / B       c408 spins to see the update flag | spins to see the seconds change << 24 | retries A << 48 | retries B << 56
+;;   c409 `rtc-now` (the freshness clock itself): unix | status << 32       c40a verdict: flags | hypervisor << 32 | rtc-now status << 40 | flag self-check << 48 | verdict << 56
+;;   c40b 0x5254433100000000 | records
+;; Flags, low 10 bits fail the clock: 1 update flag stuck, 2 no two equal snapshots, 4 register D bit 7 clear (battery dead, power lost), 8 a field invalid
+;; (BCD nibble over 9 or out of range), 16 earlier than the build floor 2026-11-06, 32 seconds did not change, 64 change not 1..2 s, 128 register B SET bit
+;; (updates halted), 256 `rtc-now` disagrees with this probe, 512 the probe's own update-flag wait did not clear the flag. Information only: 65536 century
+;; register 0x32 is plausible (19..21), 131072 12-hour mode, 262144 binary mode, 524288 DST bit, 1048576 update flag never seen, 2097152 divider not 010.
+;; The conversion assumes the face value is UTC (as `rtc-now` does); the zone, if it is local time, is for the operator to read off (runbook-6600h-rtc-probe.md).
+(defn pr-idle [fuel]
+  (if (= (bit-and (cmos 10) 128) 0) 1
+    (if (= fuel 0) 0 (do (kernel-pause) (pr-idle (- fuel 1))))))
+(defn pr-reg [i] (if (= i 14) 50 i))
+(defn pr-snap [ctx at i]
+  (if (>= i 15) 1 (do (put-word ctx (+ at i) (cmos (pr-reg i))) (pr-snap ctx at (+ i 1)))))
+(defn pr-cmp [i] (case i 0 1 2 1 4 1 6 1 7 1 8 1 9 1 11 1 14 1 0))
+(defn pr-same [ctx a b i]
+  (if (>= i 15) 1
+    (if (and (= (pr-cmp i) 1) (not (= (word ctx (+ a i)) (word ctx (+ b i))))) 0 (pr-same ctx a b (+ i 1)))))
+;; 1: two snapshots with the update flag clear before and after agree (the first stays at `at`); 0: none did; 2: the flag never cleared
+(defn pr-stable [ctx at tries]
+  (if (= tries 0) 0
+    (if (= (pr-idle 500000) 0) 2
+      (do (pr-snap ctx at 0) (pr-snap ctx 1440 0)
+          (if (and (= (pr-same ctx at 1440 0) 1) (= (bit-and (cmos 10) 128) 0)) 1
+            (do (put-word ctx 1492 (+ (word ctx 1492) 1)) (pr-stable ctx at (- tries 1))))))))
+;; the two spins are bounded by a TSC deadline (4e9 ticks: 4 s at 1 GHz, over a second on any TSC up to 3.5 GHz), not by a count: a count that is a
+;; second on a slow port bus is a fraction of a second under TCG, and a dead RTC must not hold the boot past the watchdog. They return the spin count, 0 on timeout.
+(defn pr-find-uip [n limit]
+  (if (> (kernel-rdtsc) limit) 0 (if (= (bit-and (cmos 10) 128) 0) (pr-find-uip (+ n 1) limit) n)))
+(defn pr-change [s0 n limit]
+  (if (> (kernel-rdtsc) limit) 0
+    (if (and (= (bit-and (cmos 10) 128) 0) (not (= (cmos 0) s0))) n (pr-change s0 (+ n 1) limit))))
+;; self-check of the wait: catch the update flag set, wait, and read register A again: 1 cleared, 2 still set, 0 never seen
+(defn pr-check [ctx]
+  (let [n (pr-find-uip 1 (+ (kernel-rdtsc) 4000000000))]
+    (if (= n 0) 0
+      (let [w (pr-idle 500000)
+            a (cmos 10)]
+        (do (put-word ctx 1490 n)
+            (if (and (= w 1) (= (bit-and a 128) 0)) 1 2))))))
+(defn pr-pack [ctx at i lo acc]
+  (if (< i lo) acc (pr-pack ctx at (- i 1) lo (+ (i64-shift-left acc 8) (word ctx (+ at i))))))
+;; the layout `rtc-unix` reads: seconds, minutes, hours, day, month, year, century, register B
+(defn pr-unix [ctx at]
+  (do (put-word ctx 1460 (word ctx at)) (put-word ctx 1461 (word ctx (+ at 2))) (put-word ctx 1462 (word ctx (+ at 4)))
+      (put-word ctx 1463 (word ctx (+ at 7))) (put-word ctx 1464 (word ctx (+ at 8))) (put-word ctx 1465 (word ctx (+ at 9)))
+      (put-word ctx 1466 (word ctx (+ at 14))) (put-word ctx 1467 (word ctx (+ at 11)))
+      (rtc-unix ctx 1460)))
+(defn pr-emit [ctx k tag value]
+  (do (put-word ctx (+ 1500 (* k 3)) tag) (put-word64 ctx (+ 1501 (* k 3)) value) (put-word ctx 1499 (+ k 1))
+      (nic/log tag value)))
+(defn pr-flag [c v] (if (= c 1) v 0))
+;; the inputs sit in words 1470..1476: okA okB uA uB `rtc-now` self-check seconds-change spins
+(defn pr-fail [ctx]
+  (let [okA (word ctx 1470) okB (word ctx 1471) uA (word ctx 1472) uB (word ctx 1473)
+        now (word ctx 1474) chk (word ctx 1475) nchg (word ctx 1476)
+        rb (word ctx 1411) rd (word ctx 1413)
+        both (if (and (> uA 0) (> uB 0)) 1 0)
+        diff (- uB uA)
+        bad (if (and (= okA 1) (and (= okB 1) (or (= uA 0) (= uB 0)))) 1 0)
+        low (if (and (= okA 1) (and (> uA 0) (< uA 1793923200))) 1 0)
+        unusable (if (or (not (= okA 1)) (or (= (bit-and rd 128) 0) (or (= uA 0) (= low 1)))) 1 0)
+        disagree (if (= (if (= now 0) 1 0) unusable) 0 1)
+        far (if (and (> now 0) (and (> uA 0) (> (if (> now uA) (- now uA) (- uA now)) 3))) 1 0)]
+    (+ (pr-flag (if (= okA 2) 1 0) 1)
+       (+ (pr-flag (if (or (= okA 0) (= okB 0)) 1 0) 2)
+          (+ (pr-flag (if (= (bit-and rd 128) 0) 1 0) 4)
+             (+ (pr-flag bad 8)
+                (+ (pr-flag low 16)
+                   (+ (pr-flag (if (or (= nchg 0) (and (= both 1) (= diff 0))) 1 0) 32)
+                      (+ (pr-flag (if (and (= both 1) (or (< diff 0) (> diff 2))) 1 0) 64)
+                         (+ (pr-flag (if (= (bit-and rb 128) 128) 1 0) 128)
+                            (+ (pr-flag (if (or (= disagree 1) (= far 1)) 1 0) 256)
+                               (pr-flag (if (= chk 2) 1 0) 512))))))))))))
+(defn pr-info [ctx]
+  (let [rb (word ctx 1411) ra (word ctx 1410) rc (word ctx 1414) chk (word ctx 1475)
+        bin (bit-and (u64-shift-right rb 2) 1)
+        plausible (if (and (= (bcd-ok rc bin) 1) (and (>= (bcd rc bin) 19) (<= (bcd rc bin) 21))) 1 0)]
+    (+ (pr-flag plausible 65536)
+       (+ (pr-flag (if (= (bit-and rb 2) 0) 1 0) 131072)
+          (+ (pr-flag bin 262144)
+             (+ (pr-flag (bit-and rb 1) 524288)
+                (+ (pr-flag (if (= chk 0) 1 0) 1048576)
+                   (pr-flag (if (= (bit-and (u64-shift-right ra 4) 7) 2) 0 1) 2097152))))))))
+(defn rtc-probe [ctx]
+  (let [hv (bit-and (u64-shift-right (kernel-cpuid-ecx 1 0) 31) 1)
+        z (do (put-word ctx 1498 0) (put-word ctx 1499 0) (put-word ctx 1490 0) (put-word ctx 1492 0) 0)
+        chk (pr-check ctx)
+        okA (pr-stable ctx 1400 8)
+        tA (kernel-rdtsc)
+        retA (word ctx 1492)
+        nchg (pr-change (word ctx 1400) 1 (+ (kernel-rdtsc) 4000000000))
+        okB (pr-stable ctx 1420 8)
+        tB (kernel-rdtsc)
+        retB (- (word ctx 1492) retA)
+        uA (pr-unix ctx 1400)
+        uB (pr-unix ctx 1420)
+        now (rtc-now ctx)
+        nst (word ctx 365)
+        inp (do (put-word ctx 1470 okA) (put-word ctx 1471 okB) (put-word ctx 1472 uA) (put-word ctx 1473 uB)
+               (put-word ctx 1474 now) (put-word ctx 1475 chk) (put-word ctx 1476 nchg) 0)
+        flags (+ (pr-fail ctx) (+ (pr-info ctx) (* 0 inp)))
+        verdict (if (= (bit-and flags 1023) 0) 1 0)]
+    (do (pr-emit ctx 0 50176 5932440486886244353)
+        (pr-emit ctx 1 50177 (pr-pack ctx 1400 7 0 0))
+        (pr-emit ctx 2 50178 (pr-pack ctx 1400 14 8 0))
+        (pr-emit ctx 3 50179 (pr-pack ctx 1420 7 0 0))
+        (pr-emit ctx 4 50180 (pr-pack ctx 1420 14 8 0))
+        (pr-emit ctx 5 50181 (+ uA (i64-shift-left uB 32)))
+        (pr-emit ctx 6 50182 tA)
+        (pr-emit ctx 7 50183 tB)
+        (pr-emit ctx 8 50184 (+ (word ctx 1490) (+ (i64-shift-left nchg 24) (+ (i64-shift-left retA 48) (i64-shift-left retB 56)))))
+        (pr-emit ctx 9 50185 (+ now (i64-shift-left nst 32)))
+        (pr-emit ctx 10 50186 (+ flags (+ (i64-shift-left hv 32) (+ (i64-shift-left nst 40) (+ (i64-shift-left chk 48) (i64-shift-left verdict 56))))))
+        (pr-emit ctx 11 50187 5932440486886244364)
+        (put-word ctx 1498 1381253937)
+        (+ verdict (* 0 z)))))
 (defn qemu-hook [ctx]
   (let [b (fw-request)]
     (do (put-word ctx 211 b)
