@@ -1,0 +1,193 @@
+(ns cssom.table-k (:export [tk-run tk-sum tk-count]))
+;; Table column widths, kernel dialect: layout.cljk `table-column-widths` (automatic layout: base widths, colspan shortfall shared
+;; equally, proportional scale-down), `table-fixed-column-widths` (table-layout: fixed), the caption widening of `layout-table`
+;; and `distribute-excess` (the surplus of a wider table, `<col>`/cell-declared columns locked), as region code over a bounded
+;; column and cell table (ADR-0287, JUN-932 part 2 / JUN-920, census group G07, the table part). Whole-pixel integer arithmetic as
+;; in the source: lengths enter and leave as Q6 raw (1/64 px), are floored to whole px on entry (the `long` coercions; negative
+;; lengths are not representable), results are px << 6. Cell placement (assign-table-cells: the occupancy walk of rowspan) and the
+;; measurement of a cell's natural width belong to the caller; this module takes the placed cells.
+;;
+;; Input (page 0 of the window, u32 words, little endian; the caller copies `inlen` words in):
+;;   0 mode (0 automatic, 1 fixed)   1 content width   2 border-spacing   3 K column records (0..16)   4 C cells (0..64)
+;;   5 caption width (0 = no caption)   6 surplus target for distribute-excess (4294967295 = not applied; the fixed algorithm never applies it)   7 zero
+;;   column record k at 8 + 2 k: width from a `<col>`/`<colgroup>`, width declared by the column's cells (4294967295 = none, for either)
+;;   cell j at 8 + 2 K + 5 j: column, colspan (>= 1), natural width, declared width (4294967295 = none), 1 when the cell is in row 0
+;; Column count n: automatic = max(col + colspan) over the cells; fixed = max(K, max(col + colspan) over the row-0 cells), as layout-table.
+;; Every length word is < 2^24 (below 262144 px) or the none sentinel where one is allowed; col + colspan <= 16.
+;; tk-run returns H >= 0, the hash of the n column widths (Q6 raw; H <- (257 H + v + 1) mod 2^32 from 5381), or a negative status:
+;; -1 malformed (length, mode/flag/reserved words), -2 more than 16 column records, -3 more than 64 cells, -5 a length word >= 2^24,
+;; -6 a colspan of 0, -7 a cell reaching past column 16. tk-sum is the sum of the widths (Q6 raw), tk-count is n.
+;; Pages: 0 input; 1 scratch u32 words 0 n, 1 total, 2 free total, 3 free count, 5 last free column, 6 growth target;
+;; 16+i width (4294967295 = still undetermined, in the fixed algorithm only).
+(defn- gw [st i] (kernel-load-u32-4k (kernel-subregion st 61440 0 4096) 4096 (* 4 i)))
+(defn- gq [st i] (kernel-load-u32-4k (kernel-subregion st 61440 4096 4096) 4096 (* 4 i)))
+(defn- gq! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 4096 4096) 4096 (* 4 i) v))
+(defn- imax [a b] (if (> a b) a b))
+(defn- px [v] (u64-shift-right v 6))
+(defn- lim? [v] (< v 16777216))
+(defn- lims? [v] (or (< v 16777216) (= v 4294967295)))
+(defn- cwd [st k] (if (< k (gw st 3)) (gw st (+ 8 (* 2 k))) 4294967295))
+(defn- dwd [st k] (if (< k (gw st 3)) (gw st (+ 9 (* 2 k))) 4294967295))
+(defn- cb [st j] (+ 8 (+ (* 2 (gw st 3)) (* 5 j))))
+(defn- ccol [st j] (gw st (cb st j)))
+(defn- cspan [st j] (gw st (+ (cb st j) 1)))
+(defn- cnat [st j] (px (gw st (+ (cb st j) 2))))
+(defn- cdec [st j] (gw st (+ (cb st j) 3)))
+(defn- crow0 [st j] (gw st (+ (cb st j) 4)))
+
+;; ---- validation ----
+(defn- chk-cell [st j]
+  (let [b (cb st j) col (gw st b) sp (gw st (+ b 1))]
+    (cond (= sp 0) -6
+          (> (+ col sp) 16) -7
+          (not (and (lim? (gw st (+ b 2))) (and (lims? (gw st (+ b 3))) (< (gw st (+ b 4)) 2)))) -5
+          :else 0)))
+(defn- chk-cells [st j c]
+  (if (>= j c) 0 (let [r (chk-cell st j)] (if (< r 0) r (chk-cells st (+ j 1) c)))))
+(defn- chk-cols [st k kk]
+  (if (>= k kk) 0
+    (if (and (lims? (gw st (+ 8 (* 2 k)))) (lims? (gw st (+ 9 (* 2 k))))) (chk-cols st (+ k 1) kk) -5)))
+(defn- chk [st inlen]
+  (let [kk (gw st 3) c (gw st 4)]
+    (cond (or (< inlen 8) (> inlen 1024)) -1
+          (> kk 16) -2
+          (> c 64) -3
+          (not (= inlen (+ 8 (+ (* 2 kk) (* 5 c))))) -1
+          (not (and (< (gw st 0) 2) (= (gw st 7) 0))) -1
+          (not (and (lim? (gw st 1)) (and (lim? (gw st 2)) (and (lim? (gw st 5)) (lims? (gw st 6)))))) -5
+          :else (let [r (chk-cols st 0 kk)] (if (< r 0) r (chk-cells st 0 c))))))
+
+;; ---- column count ----
+(defn- ncols [st j c row0only acc]
+  (if (>= j c) acc
+    (let [e (+ (ccol st j) (cspan st j))
+          v (if (or (= row0only 0) (= (crow0 st j) 1)) (imax acc e) acc)]
+      (ncols st (+ j 1) c row0only v))))
+
+;; ---- automatic layout ----
+;; base width of column col: both declarations -> the larger, one -> it, none -> the widest colspan-1 natural width in the column, at least 1
+(defn- widest [st col j c acc]
+  (if (>= j c) acc
+    (let [v (if (and (= (cspan st j) 1) (= (ccol st j) col)) (imax acc (cnat st j)) acc)]
+      (widest st col (+ j 1) c v))))
+(defn- base-w [st col]
+  (let [cw (cwd st col) dw (dwd st col)]
+    (cond (and (not (= cw 4294967295)) (not (= dw 4294967295))) (imax (px cw) (px dw))
+          (not (= cw 4294967295)) (px cw)
+          (not (= dw 4294967295)) (px dw)
+          :else (widest st col 0 (gw st 4) 1))))
+(defn- init-base [st i n]
+  (if (>= i n) 1
+    (let [a (gq! st (+ 16 i) (base-w st i))] (init-base st (+ i (+ 1 (* 0 a))) n))))
+(defn- sum-w [st i e acc] (if (>= i e) acc (sum-w st (+ i 1) e (+ acc (gq st (+ 16 i))))))
+(defn- add-w [st i e add]
+  (if (>= i e) 1
+    (let [a (gq! st (+ 16 i) (+ (gq st (+ 16 i)) add))] (add-w st (+ i (+ 1 (* 0 a))) e add))))
+;; a colspan cell widens the columns it covers by the shortfall shared equally, rounded up
+(defn- span-cell [st j]
+  (let [col (ccol st j) sp (cspan st j)
+        have (+ (sum-w st col (+ col sp) 0) (* (px (gw st 2)) (- sp 1)))
+        short (- (cnat st j) have)]
+    (if (> short 0) (add-w st col (+ col sp) (quot (+ short (- sp 1)) sp)) 0)))
+(defn- spans [st j c]
+  (if (>= j c) 1
+    (let [u (if (> (cspan st j) 1) (span-cell st j) 0)] (spans st (+ j (+ 1 (* 0 u))) c))))
+(defn- scale [st i n total cwp]
+  (if (>= i n) 1
+    (let [a (gq! st (+ 16 i) (quot (* (gq st (+ 16 i)) cwp) total))] (scale st (+ i (+ 1 (* 0 a))) n total cwp))))
+(defn- auto-widths [st n]
+  (let [b (init-base st 0 n)
+        s (spans st (+ 0 (* 0 b)) (gw st 4))
+        total (sum-w st (+ 0 (* 0 s)) n 0)
+        cwp (px (gw st 1))]
+    (if (and (> total 0) (> total cwp)) (scale st 0 n total cwp) 1)))
+
+;; ---- distribute-excess ----
+(defn- locked? [st i lock] (if (= lock 1) (if (or (< (cwd st i) 4294967295) (< (dwd st i) 4294967295)) 1 0) 0))
+(defn- scan [st i n lock]
+  (if (>= i n) 1
+    (let [l (locked? st i lock) v (gq st (+ 16 i))
+          a (gq! st 1 (+ (gq st 1) v))
+          b (if (= l 0) (gq! st 2 (+ (gq st 2) v)) 0)
+          c (if (= l 0) (gq! st 3 (+ (gq st 3) 1)) 0)
+          d (if (= l 0) (gq! st 5 i) 0)]
+      (scan st (+ i (+ 1 (* 0 (+ a (+ b (+ c d)))))) n lock))))
+;; grown(i) = floor(target * w_i / base) for the columns taking part, and the rounding shortfall goes to column `at`
+(defn- grow [st i n lock tb]
+  (if (>= i n) 1
+    (let [l (locked? st i lock) v (gq st (+ 16 i))
+          g (if (= l 0) (quot (* (gq st 6) v) tb) v)
+          a (gq! st (+ 16 i) g)]
+      (grow st (+ i (+ 1 (* 0 a))) n lock tb))))
+(defn- dx [st n target lock]
+  (let [z0 (gq! st 1 0) z1 (gq! st 2 0) z2 (gq! st 3 0) z3 (gq! st 5 0)
+        sc (scan st (+ 0 (* 0 (+ z0 (+ z1 (+ z2 z3))))) n lock)
+        total (+ (gq st 1) (* 0 sc)) ft (gq st 2) fcnt (gq st 3)]
+    (if (or (= n 0) (or (<= total 0) (<= target total))) 1
+      (if (or (= fcnt 0) (<= ft 0))
+        (let [t0 (gq! st 6 target) g (grow st (+ 0 (* 0 t0)) n 0 total)
+              sh (- target (sum-w st (+ 0 (* 0 g)) n 0))]
+          (gq! st (+ 16 (- n 1)) (+ (gq st (+ 16 (- n 1))) sh)))
+        (let [t0 (gq! st 6 (- target (- total ft))) g (grow st (+ 0 (* 0 t0)) n lock ft)
+              sh (- target (sum-w st (+ 0 (* 0 g)) n 0))
+              lc (gq st 5)]
+          (gq! st (+ 16 lc) (+ (gq st (+ 16 lc)) sh)))))))
+
+;; ---- table-layout: fixed ----
+(defn- first-decl [st col j c]
+  (if (>= j c) 4294967295
+    (if (and (and (= (crow0 st j) 1) (and (= (cspan st j) 1) (= (ccol st j) col))) (not (= (cdec st j) 4294967295)))
+      (px (cdec st j))
+      (first-decl st col (+ j 1) c))))
+(defn- decl-w [st col]
+  (let [cw (cwd st col)] (if (= cw 4294967295) (first-decl st col 0 (gw st 4)) (px cw))))
+(defn- init-decl [st i n]
+  (if (>= i n) 1
+    (let [a (gq! st (+ 16 i) (decl-w st i))] (init-decl st (+ i (+ 1 (* 0 a))) n))))
+(defn- fixed-sum [st i n acc]
+  (if (>= i n) acc
+    (let [v (gq st (+ 16 i)) x (if (= v 4294967295) 0 v)] (fixed-sum st (+ i 1) n (+ acc x)))))
+(defn- count-auto [st i n acc]
+  (if (>= i n) acc
+    (let [v (gq st (+ 16 i)) x (if (= v 4294967295) 1 0)] (count-auto st (+ i 1) n (+ acc x)))))
+(defn- fill-auto [st i n each]
+  (if (>= i n) 1
+    (let [v (gq st (+ 16 i)) a (if (= v 4294967295) (gq! st (+ 16 i) each) 0)] (fill-auto st (+ i (+ 1 (* 0 a))) n each))))
+(defn- fixed-widths [st n]
+  (let [d (init-decl st 0 n)
+        avail (imax 0 (- (px (gw st 1)) (* (px (gw st 2)) (+ n 1))))
+        fx (fixed-sum st (+ 0 (* 0 d)) n 0)
+        autos (count-auto st 0 n 0)
+        each (if (> autos 0) (imax 0 (quot (- avail fx) autos)) 0)]
+    (if (> autos 0) (fill-auto st 0 n each) (dx st n avail 0))))
+
+;; ---- caption widening ----
+(defn- caption [st n]
+  (let [cols (sum-w st 0 n 0)
+        short (- (px (gw st 5)) (+ cols (* (px (gw st 2)) (+ n 1))))]
+    (if (and (> short 0) (> n 0)) (add-w st 0 n (quot (+ short (- n 1)) n)) 0)))
+
+(defn- hash-w [st i n h]
+  (if (>= i n) h (hash-w st (+ i 1) n (bit-and (+ (* h 257) (+ 1 (i64-shift-left (gq st (+ 16 i)) 6))) 4294967295))))
+(defn- pipeline [st n]
+  (let [mode (gw st 0)
+        w1 (if (= mode 0) (auto-widths st n) (fixed-widths st n))
+        cp (caption st (+ n (* 0 w1)))
+        tg (gw st 6)
+        ex (if (and (= mode 0) (< tg 4294967295)) (dx st (+ n (* 0 cp)) (px tg) 1) 0)]
+    (hash-w st (+ 0 (* 0 ex)) n 5381)))
+(defn tk-run [w length inlen]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)
+          c (chk st inlen)]
+      (if (< c 0) c
+        (let [cc (gw st 4)
+              n (if (= (gw st 0) 0) (ncols st 0 cc 0 0) (ncols st 0 cc 1 (gw st 3)))
+              z (gq! st 0 n)]
+          (pipeline st (+ n (* 0 z))))))))
+(defn tk-sum [w length]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)] (i64-shift-left (sum-w st 0 (gq st 0) 0) 6))))
+(defn tk-count [w length]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)] (gq st 0))))
