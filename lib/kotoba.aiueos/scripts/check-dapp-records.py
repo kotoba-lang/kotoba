@@ -8,6 +8,12 @@ document, the module resources/aiueos/session/apps/<id>.kotoba. A record without
 stays valid until every record carries it. `ui` may hold only `document`, whose value
 is a lowercase id ([a-z0-9-], at most 40 characters).
 
+Each named document is checked against its record (JUN-856): the module exists, its
+`document-id` and `document-title` constants equal the record's id and title, no two
+records name the same document, and no module in apps/ is named by no record.
+scripts/session-page.py check-table separately checks that index.kotoba requires them.
+scripts/check-dapp-documents-negative.py proves each of these checks refuses a mutation.
+
 usage: check-dapp-records.py [ROOT]   ROOT defaults to the lib/kotoba.aiueos this script is in.
 """
 import json
@@ -25,6 +31,8 @@ WANT = {"murakumo", "itonami", "yataverse", "aozora", "browser", "yotei", "shaka
         "settei", "itonami-apps", "updates", "torihiki"}
 
 
+APPS = ROOT / "resources" / "aiueos" / "session" / "apps"
+DOC_CONST = r'\(defn %s \[\] :string "((?:[^"\\]|\\.)*)"\)'
 DOC_ID = re.compile(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?")
 
 
@@ -67,7 +75,30 @@ if set(records) != WANT:
 if sorted(docks) != list(range(1, len(docks) + 1)):
     fail("dock ids must be 1..N without gaps")
 
+named = {}
+for rec in records.values():
+    if "ui" in rec:
+        doc = rec["ui"]["document"]
+        if doc in named:
+            fail(f"records {named[doc]} and {rec['id']} both name document {doc}")
+        named[doc] = rec["id"]
+for doc, rid in sorted(named.items()):
+    rec = records[rid]
+    path = APPS / (doc + ".kotoba")
+    if not path.is_file():
+        fail(f"{rid}: document {doc} does not exist ({path.relative_to(ROOT)})")
+    text = path.read_text(encoding="utf-8")
+    for const, want in (("document-id", rec["id"]), ("document-title", rec["title"])):
+        found = re.findall(DOC_CONST % const, text)
+        if len(found) != 1:
+            fail(f"{doc}.kotoba: want exactly one (defn {const} [] :string \"...\"), found {len(found)}")
+        if found[0] != want:
+            fail(f"{doc}.kotoba: {const} is {found[0]!r}, record {rid} says {want!r}")
+for path in sorted(APPS.glob("*.kotoba")) if APPS.is_dir() else []:
+    if path.stem not in named:
+        fail(f"document {path.name} is named by no record")
+
 policy = json.loads((ROOT / "distributions" / "awai" / "update-policy.json").read_text(encoding="utf-8"))
 if policy.get("consent") != "each-operation" or policy.get("default") not in {m["id"] for m in policy["modes"]}:
     fail("update-policy: consent/default")
-print(f"AIUEOS_DAPP_RECORDS_OK apps={len(records)} docks=1..{len(docks)} update-modes={len(policy['modes'])}")
+print(f"AIUEOS_DAPP_RECORDS_OK apps={len(records)} docks=1..{len(docks)} update-modes={len(policy['modes'])} documents={len(named)}")
