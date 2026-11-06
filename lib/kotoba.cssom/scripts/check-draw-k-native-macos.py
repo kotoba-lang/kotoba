@@ -48,7 +48,7 @@ import layout_k_cases as L  # noqa: E402
 SRC, LIB, AIUEOS = G.SRC, G.LIB, G.AIUEOS
 MOD = SRC / "draw_k.kotoba"
 MODS = {s: SRC / (s + ".kotoba") for s in ["draw_k"] + LG.STEMS + ["intern_k", "selector_k", "match_k", "cascade_k"]}
-EXPECTED_MODULES = 62
+EXPECTED_MODULES = 63        # 62 + native/update links aiueos.imgsig-prodkeys (JUN-813 amendment 7), as the builder's count for every graph with update.kotoba
 
 # one line per behaviour; each anchor must occur exactly once in draw_k.kotoba
 MUTANTS = [
