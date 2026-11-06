@@ -90,3 +90,12 @@ The cssom census (kotoba#1252, JUN-134/135) found two things that change how thi
 
 **Owner confirmation still wanted, not blocking.** (a) The rounding rule at exact ties: the f64 oracle is inexact there (29% of 50 px gives 14 where exact arithmetic gives 14.5; 1114 of 1,233,197 integer-percent x basis pairs differ and all differences are exact .5 ties). The Q6 spec will be exact arithmetic with a stated rounding rule and the oracle disagreements will be reported, not copied; Blink's behaviour at ties was not measured. (b) Whether an interim placement inside the kernel image is acceptable if it fits, given decision 1.
 
+### Amendment 2, measured addendum (2026-11-06, JUN-920, kotoba#1255)
+
+The first fixed-point slice (Q6 lengths, percent, block-width, margin-collapse, block-style; scalar i64 modules, gate `PASS_NATIVE_CSSOM_BLOCK_Q6`, reproduced by the orchestrator) gives the first measured cost of a scalar rewrite:
+
+- The arithmetic core without the parser is 143 code lines and **22,837 text bytes on kernel-v1, about 160 bytes per code line** (length 5,642; block_width 9,753; margin_collapse 2,344; block_style 20,009 including the first two). On `user-v1` it is refused: E7104 (4,096-byte text page, 5.6 times over) for a 0-argument entry, E7102 detail 56 for a 2-argument entry.
+- **Indication, not a forecast.** The original closure is about 14.8k code lines. At 160 bytes per line a scalar rewrite of that size would be about 2.4 MB, about three times the ~0.82 MB margin of the kernel-v3 image. Unless the rewrite is much denser than this slice (the slice is arithmetic-heavy; layout code with more control flow may be denser or sparser), the interim placement "inside the kernel image if it fits" of this amendment is unlikely to hold, and the renderer is a separate object, loaded outside the kernel text cap, behind the interface of this ADR. The measurement is repeated on each slice (JUN-920 and its successors) and the placement is decided on the total, not on this extrapolation.
+- Tie rule used by the slice: exact arithmetic, round half up (`floor(x + 1/2)`), digits past the sixth truncated. The hosted f64 oracle disagrees only at exact .5 ties (846, 1,114 and 7,391 pairs in the three dense sweeps; none away from ties). The owner is asked to confirm the rule; Blink's behaviour at ties was not measured.
+- Host runtime note: it traps (SIGTRAP) on i64 overflow and on f64 to i64 of a huge value, contrary to the census's "wraps silently"; the slice's modules guard against it.
+
