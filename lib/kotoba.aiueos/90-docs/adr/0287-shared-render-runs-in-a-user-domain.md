@@ -99,3 +99,11 @@ The first fixed-point slice (Q6 lengths, percent, block-width, margin-collapse, 
 - Tie rule used by the slice: exact arithmetic, round half up (`floor(x + 1/2)`), digits past the sixth truncated. The hosted f64 oracle disagrees only at exact .5 ties (846, 1,114 and 7,391 pairs in the three dense sweeps; none away from ties). The owner is asked to confirm the rule; Blink's behaviour at ties was not measured.
 - Host runtime note: it traps (SIGTRAP) on i64 overflow and on f64 to i64 of a huge value, contrary to the census's "wraps silently"; the slice's modules guard against it.
 
+### Amendment 2, owner confirmation (2026-11-06)
+
+The owner answered the open points of this amendment with "proceed with the recommended options":
+
+- **Tie rule: confirmed.** Q6 arithmetic is exact with round half up (`floor(x + 1/2)`); decimal digits past the sixth are truncated. The hosted f64 oracle's disagreements at exact ties are reported, not copied. Blink's behaviour at ties is still unmeasured.
+- **Placement: confirmed as recommended.** The renderer is written in the kernel dialect behind the document-in / draw-list-out interface; whether it lives in the kernel image or in a separate object is decided on the measured total (about 160 bytes per code line so far), and the CPL3 domain remains the destination (JUN-919).
+- **Flex rounding.** The flex slice (JUN-920 slice 3, kotoba#1260) rounds each item on its own, as the hosted code does; a line's sizes may then differ from the free space by at most n/2 raw (n/128 px). Largest-remainder rounding, proposed by the census, is not adopted until Blink's behaviour is measured. The same slice caps a flex line at 4 items because scalar parameters leave no room for more; larger lines are refused, never truncated (JUN-932).
+
