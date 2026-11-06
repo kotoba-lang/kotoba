@@ -44,3 +44,8 @@ The two figures bracket the range: 0.76 (graph average) to 3.4-4.1 (dense code) 
 ## Method and limits
 
 Line and byte counts: `wc -l` / `wc -c` on the files above. Text size: program header parse of `KERNEL.ELF` from the stage 2/3/4 QEMU builds (Amu Mac compiler c126449b). The deltas include each stage's entry module. cssom has not been compiled in the kernel dialect, so its real ratio is unmeasured; the range above is an estimate, not a result. A measured figure needs the first slice of JUN-855 (C2).
+
+## Correction (2026-11-06)
+
+The sizes above are SOURCE bytes. The cssom census (kotoba#1252) measured that 76% of them are docstrings and comments: the closure's code is about 14.8k non-blank lines, 458 KB. Applying the two ratios of section 2 to code bytes gives about 350 KB (whole-graph ratio 0.76) to about 1.2 MB (2.6 text bytes per code byte, measured on one fixed-point solver on kernel-v1); the margin is about 0.82 MB. The statement in section 3 that the closure "does not fit under the current cap, by any estimate in the measured range" is therefore wrong: it may or may not fit. Also, four cssom modules are already canonical `.kotoba` (length, block_width, block_style, margin_collapse; they are not required by layout.cljk), contrary to "none of the cssom modules is canonical .kotoba yet". See ADR-0287 Amendment 2.
+
