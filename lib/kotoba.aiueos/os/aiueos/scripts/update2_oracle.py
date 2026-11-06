@@ -8,7 +8,13 @@ the admission rule come from imgsig_oracle (public TEST keys; RFC 8032 integer E
 verdict here is computed independently of the kernel: header structure, then the counted signers (imgsig_oracle.verdict), then the
 manifest's size and version, then the SHA-256 of the image bytes that follow.
 
-Result codes of update.kotoba: 21 stream broke (mode 2 only; the entries completed before the break still count), 15 image verified, 1 fewer than two distinct valid signers, 2 bad magic, 3 count/layout or size,
+JUN-813 stage 5c (ADR-0286 amendment 4): the guest reads a per-channel version FLOOR from its update journal (OSMETA.BIN, provisioned by
+the gate with floor FLOOR = 4). An admitted header whose version is not strictly above it is refused with 9 before any image byte is taken, and an
+unreadable journal is 10 (fail closed). The floor rule is applied here independently: it comes after the signers and the version >= 1 / size
+checks and before the image digest. Cases with AIUEIMG1 headers (the 128-byte header, one Ed25519 signature under the RFC 8032 test-1 key, padded
+with zeros to 16384 bytes so the case file keeps its shape) cover the other format.
+
+Result codes of update.kotoba: 9 version not above the floor, 10 version floor unreadable, 21 stream broke (mode 2 only; the entries completed before the break still count), 15 image verified, 1 fewer than two distinct valid signers, 2 bad magic, 3 count/layout or size,
 4 version below 1, 5 manifest reserved bytes not zero, 7 digest differs, 8 no production signer set pinned.
 """
 import hashlib
@@ -17,6 +23,7 @@ import struct
 import imgsig_oracle as o
 
 IMG_LEN = 5000
+FLOOR = 4  # the floor the gate provisions into OSMETA.BIN (update.kotoba hook request 4)
 
 
 def image():
@@ -40,8 +47,10 @@ def entry_counts(hdr, i):
             and o.ed_valid(kid, hdr[:64], e[8:72]) and o.ml_valid(kid, hdr[:64], e[72:3381])), kid
 
 
-def expected(hdr, mode, img):
+def expected(hdr, mode, img, floor=FLOOR):
     """(result, mask) the kernel must report for this case."""
+    if hdr[:8] == b"AIUEIMG1":
+        return expected_v1(hdr, mode, img, floor)
     v, mask = o.verdict(hdr)
     if v in (2, 5, 3):
         return v, 0
@@ -63,7 +72,27 @@ def expected(hdr, mode, img):
         return 3, mask
     if version < 1:
         return 4, mask
+    if version <= floor:
+        return 9, mask
     return (15 if hashlib.sha256(img).digest() == hdr[32:64] and len(img) == size else 7), mask
+
+
+def v1_header(version):
+    """An AIUEIMG1 header (manifest 64 + Ed25519 signature 64 under the RFC 8032 test-1 seed), padded to the case file's 16384 bytes."""
+    man = manifest(version=version, magic=b"AIUEIMG1")
+    return (man + o.ed_sign(o.ED_SEEDS[0], man)[1]).ljust(o.HDR, b"\0")
+
+
+def expected_v1(hdr, mode, img, floor):
+    """AIUEIMG1: signature (1), magic (2), reserved (5), size (3), version >= 1 (4), then the floor (9), then the digest. Counted mask is 0."""
+    version, size = struct.unpack_from("<QQ", hdr, 8)
+    if not (1 <= size <= 33554432):
+        return 3, 0
+    if version < 1:
+        return 4, 0
+    if version <= floor:
+        return 9, 0
+    return (15 if hashlib.sha256(img).digest() == hdr[32:64] and len(img) == size else 7), 0
 
 
 def cases():
@@ -77,6 +106,8 @@ def cases():
     big = manifest(size=40 << 20)
     sgb = {s: o.sign_entry(s, big) for s in range(2)}
     bad_ctx = o.sign_entry(0, man, b"AIUEIMG1")
+    man6, man4, man3 = manifest(version=6), manifest(version=4), manifest(version=3)
+    sg6, sg4, sg3 = ({s: o.sign_entry(s, m) for s in range(2)} for m in (man6, man4, man3))
     rows = [
         ("two-of-three-0-1", 0, o.header(man, [e(0), e(1)]), img),
         ("two-of-three-2-0", 0, o.header(man, [e(2), e(0)]), img),
@@ -108,6 +139,13 @@ def cases():
         ("id-65536", 0, o.header(man, [o.entry(65536, *sg[0]), e(1)]), img),
         ("id-16777216", 0, o.header(man, [o.entry(0x01000000, *sg[0]), e(1)]), img),
         ("wrong-context", 0, o.header(man, [o.entry(0, sg[0][0], bad_ctx[1]), e(1)]), img),
+        # JUN-813 stage 5c: the version floor (FLOOR = 4). Version 5 above is every case above; these are the boundary and AIUEIMG1.
+        ("floor-above", 0, o.header(man6, [o.entry(s, *sg6[s]) for s in range(2)]), img),
+        ("floor-equal", 0, o.header(man4, [o.entry(s, *sg4[s]) for s in range(2)]), img),
+        ("floor-below", 0, o.header(man3, [o.entry(s, *sg3[s]) for s in range(2)]), img),
+        ("v1-above-floor", 0, v1_header(5), img),
+        ("v1-equal-floor", 0, v1_header(FLOOR), img),
+        ("v1-below-floor", 0, v1_header(FLOOR - 1), img),
         # last: the stream breaks after entries 0 and 1 were verified; the storage driver must still work afterwards (JUN-813 finding B)
         ("stream-broken-after-verify", 2, o.header(man, [e(0), e(1), e(2)]), img),
     ]

@@ -88,12 +88,13 @@
             [aiueos.native.rtl8168-debug :as nic]
             [aiueos.native.nvme :as nvme]
             [aiueos.native.esp :as esp]
+            [aiueos.native.update-journal :as journal]
             [aiueos.ed25519 :refer [aiueos-ed25519-verify]]
             [aiueos.mldsa-verify :refer [mv-mu mv-verify]]
             [aiueos.imgsig :refer [ims-step ims-final ims-bit]]
             [aiueos.imgsig-testkeys :refer [ims-ed-word ims-ml-word]]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [self-test pull report install install-report qemu-hook]))
+  (:export [self-test pull report install install-report qemu-hook confirm-installed]))
 
 (defn word [region i]
   (storage/word region i))
@@ -436,12 +437,37 @@
         ;; the stream broke after some entries may have been verified: the verifier left the NVMe/ESP state overwritten
         (do (restore-storage ctx) (fail ctx 21))
         (do (restore-storage ctx) (h2-admit ctx))))))
+;; ---- JUN-813 stage 5c (ADR-0286 amendment 4): the hash-checked per-channel version floor ----
+;; The floor lives in the update journal (native/update_journal.kotoba, OSMETA.BIN: crash-ordered double slot, SHA-256 checked, NOT
+;; signed). `floor-load` re-runs the NVMe driver and the ESP walk (a verifier may have overwritten their words), mounts OSMETA.BIN
+;; read-only and loads the journal; it FAILS CLOSED: a missing, unreadable, corrupt, hash-mismatching or never-initialised journal is
+;; result 10, never floor 0. Words 256/257 floor, 258 load result (1 ok, 0 failed), 259 advance (0 not tried, 1 advanced, 2 failed),
+;; 260/261 floor after the advance, 262 the QEMU provisioning hook's result. The journal writes its public fields to words 212..223,
+;; which are this file's header words, so they are cleared after the floor is taken (the verifier sets its own words afterwards).
+(defn clear-words [ctx i end]
+  (if (>= i end) 1 (do (put-word ctx i 0) (clear-words ctx (+ i 1) end))))
+(defn floor-load [ctx]
+  (do (put-word ctx 258 0) (put-word ctx 259 0) (put-word ctx 262 0)
+      (if (and (= (nvme/probe ctx) 15) (= (esp/run ctx) 15) (> (journal/mount 0) 0) (> (journal/load) 0))
+        (let [lo (journal/field 6) hi (journal/field 7)]
+          (do (clear-words ctx 213 224)
+              (put-word ctx 256 lo) (put-word ctx 257 hi) (put-word ctx 258 1)
+              1))
+        (do (clear-words ctx 213 224) 0))))
+;; The manifest is signed and its version is known (181/182): it must be strictly above the floor. No image byte has been taken.
+(defn floor-ok [ctx]
+  (> (word64 ctx 181) (word64 ctx 256)))
+(defn floor-check [ctx]
+  (if (floor-ok ctx) 14 (fail ctx 9)))
 ;; Fetch the first 128 bytes and dispatch on the magic's last byte: "2" AIUEIMG2, anything else the AIUEIMG1 path.
+;; The floor is read first (result 10 when it cannot be) and compared once the header is admitted (result 9).
 (defn admit [ctx src test]
-  (do (put-word ctx 212 128) (put-word ctx 228 0)
-      (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
-        (if (= (pg 7) 50) (begin2 ctx src test)
-          (if (= (begin ctx test) 14) 14 (word ctx 180))))))
+  (if (= (floor-load ctx) 0) (fail ctx 10)
+    (do (put-word ctx 212 128) (put-word ctx 228 0)
+        (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+          (let [r (if (= (pg 7) 50) (begin2 ctx src test)
+                    (if (= (begin ctx test) 14) 14 (word ctx 180)))]
+            (if (= r 14) (floor-check ctx) r))))))
 
 (defn chunks [ctx at]
   (let [size (word ctx 183)]
@@ -495,6 +521,45 @@
                          (= (same-words ctx 680 190 0) 1))
                   (ifail ctx 15)
                   (ifail ctx 47)))))))))
+;; ---- JUN-813 stage 5c: advance the floor after a committed install ----
+;; Order: the floor is advanced AFTER the install is committed (BOOTX64.EFI swapped and re-hashed), never before. A crash between the two
+;; leaves the new image installed with the old floor: one repeat install of the same version is admitted, nothing is bricked. Advancing
+;; first would turn every failed install into a refused retry. The journal state after an advance is "prepared" (phase 1, floor =
+;; candidate = the installed version); nothing confirms it yet (no boot-health evidence exists), so an install that finds an earlier
+;; unconfirmed prepare first abandons it through the journal's own trial and rollback transitions (phase 3, floor kept).
+(defn put-digest-bytes [i]
+  (if (>= i 8) 1
+    (let [w (word (kernel-browser-context) (+ 190 i))]
+      (do (put-pg (* i 4) (bit-and (u64-shift-right w 24) 255))
+          (put-pg (+ (* i 4) 1) (bit-and (u64-shift-right w 16) 255))
+          (put-pg (+ (* i 4) 2) (bit-and (u64-shift-right w 8) 255))
+          (put-pg (+ (* i 4) 3) (bit-and w 255))
+          (put-digest-bytes (+ i 1))))))
+(defn abandon-pending [phase]
+  (if (= phase 1) (if (> (journal/trial) 0) (if (> (journal/rollback) 0) 1 0) 0)
+    (if (= phase 2) (if (> (journal/rollback) 0) 1 0) 1)))
+(defn advance [ctx]
+  (let [version (word64 ctx 181)
+        d (put-digest-bytes 0)]
+    (if (and (> (journal/mount 0) 0) (> (journal/load) 0)
+             (= (abandon-pending (journal/field 4)) (+ 1 (* 0 d)))
+             (> (journal/prepare version (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) 0))
+      (do (put-word ctx 260 (journal/field 6)) (put-word ctx 261 (journal/field 7)) (put-word ctx 259 1) 1)
+      (do (put-word ctx 259 2) 0))))
+;; The journal's `confirm` needs boot-health evidence that does not exist yet (nothing boots the installed image and reports back), so nothing calls
+;; this: it is the single place the follow-up will, and it also gives the compiler the extent of confirm's digest region. It is not
+;; reachable from any remote command, hook or boot path.
+(defn confirm-installed []
+  (let [ctx (kernel-browser-context) d (put-digest-bytes 0)]
+    (if (and (> (journal/mount 0) 0) (> (journal/load) 0))
+      (+ (journal/confirm (word64 ctx 181) (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) (* 0 d))
+      -1)))
+;; r is commit's result: only a fully committed install (15) advances the floor; if the advance itself fails the image is installed
+;; but the floor is not (50), which the operator must see.
+(defn after-commit [ctx r]
+  (if (= r 15)
+    (if (= (advance ctx) 1) (ifail ctx 15) (ifail ctx 50))
+    r))
 (defn install [ctx]
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0)
       (put-word ctx 186 0) (put-word ctx 187 0)
@@ -502,7 +567,7 @@
         (if (not (= (admit ctx 0 0) 14)) (ifail ctx (word ctx 180))
           (let [r (ready ctx)]
             (if (> r 0) (ifail ctx r)
-              (do (start-stream ctx) (chunks ctx 0) (commit ctx))))))))
+              (do (start-stream ctx) (chunks ctx 0) (after-commit ctx (commit ctx)))))))))
 (defn self-install [ctx flip]
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0)
       (put-header 0 -1)
@@ -560,7 +625,7 @@
           (put-word ctx 180 0)
           count))))
 ;; Install case 0 of the file through the same admit / ready / stream / commit as the network install.
-(defn install2 [ctx]
+(defn install2 [ctx adv]
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 229 0) (put-word ctx 230 0)
       (if (= (fw-open 1) 0) (ifail ctx 21)
         (do (fw-byte)
@@ -569,11 +634,23 @@
                 (do (fw-skip (- 16384 (word ctx 229)))
                     (let [r (ready ctx)]
                       (if (> r 0) (ifail ctx r)
-                        (do (start-stream ctx) (feed2 ctx 0) (commit ctx)))))))))))
+                        (do (start-stream ctx) (feed2 ctx 0)
+                               (if (= adv 1) (after-commit ctx (commit ctx)) (commit ctx))))))))))))
+;; Hook request "4": provision OSMETA.BIN (never done at boot or by the network path): floor 4, active 4, a fixed digest. QEMU only.
+(defn fill-digest [i] (if (>= i 32) 1 (do (put-pg i (+ 165 i)) (fill-digest (+ i 1)))))
+(defn provision [ctx]
+  (let [m (journal/mount 1)
+        d (fill-digest 0)
+        r (if (> m 0) (journal/initialize 4 4 0 (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) m)]
+    (do (clear-words ctx 213 224) (put-word ctx 208 0)
+        (put-word ctx 262 (if (> (+ r (* 0 d)) 0) 1 2))
+        1)))
 (defn qemu-hook [ctx]
   (let [b (fw-request)]
     (do (put-word ctx 211 b)
         (if (= b 49) (self-install ctx -1)
           (if (= b 50) (self-install ctx 4097)
-            (if (= b 51) (install2 ctx)
-              (do (self-test2 ctx) 0)))))))
+            (if (= b 51) (install2 ctx 1)
+              (if (= b 52) (provision ctx)
+                (if (= b 53) (install2 ctx 0)
+                  (do (self-test2 ctx) 0)))))))))
