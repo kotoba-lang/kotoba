@@ -58,6 +58,13 @@ def c_badid(t): set_ui(t, "yataverse", {"document": "Not An Id"})
 def c_const_gone(t): edit(t / SESSION / "apps/itonami.kotoba", "(defn document-title [] :string", "(defn document-name [] :string")
 
 
+def c_local_consent(t):
+    p = t / "distributions/awai/dapps/updates.json"
+    r = json.loads(p.read_text(encoding="utf-8"))
+    r["localOperations"][0]["consent"] = "once"
+    p.write_text(json.dumps(r, indent=2) + "\n", encoding="utf-8")
+
+
 def c_unnamed_require(t): edit(t / SESSION / "index.kotoba", "[app-itonami :as ai]", "[app-itonami :as ai] [app-extra :as ax]")
 
 
@@ -73,6 +80,7 @@ CONTROLS = [
     ("ui has a key besides document", RECORDS, c_shape, "ui must be an object"),
     ("ui.document is not an id", RECORDS, c_badid, "must match"),
     ("document lacks its title constant", RECORDS, c_const_gone, "found 0"),
+    ("a local operation's consent is not each-operation", RECORDS, c_local_consent, "install-update consent must be each-operation"),
     ("index.kotoba requires a document no record names", TABLE, c_unnamed_require, "index.kotoba requires"),
     ("index.kotoba drops a require the records name", TABLE, c_require_dropped, "index.kotoba requires"),
 ]

@@ -53,7 +53,9 @@ for path in sorted(DAPPS.glob("*.json")):
         fail(f"{path.name}: id {rec['id']}")
     if rec["dns"] != "never" or rec["offline"] != "local-core":
         fail(f"{path.name}: a dapp never resolves a name and runs offline")
-    for o in rec["remoteOperations"]:
+    # localOperations (JUN-813, additive): operations that need approval but send nothing over the network
+    # (the Updates install). Same keys, same consent rule as remoteOperations.
+    for o in rec["remoteOperations"] + rec.get("localOperations", []):
         for key in OP_REQUIRED:
             if key not in o:
                 fail(f"{path.name}: operation lacks {key}")
