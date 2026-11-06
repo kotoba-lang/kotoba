@@ -8,7 +8,7 @@ path as the network pull: the first 128 bytes, then 1 KiB pieces, each entry's E
 entry's last byte lands, then (only for an admitted header) the 5000-byte image hashed against the manifest.
   update2-cases       30 cases, no install request: three signers, two of three (0+1, 2+0), one signer, an ML-DSA half bad, an Ed25519 half
                       bad, a tampered image byte (digest), a tampered manifest, a duplicate id, an unknown id, the same valid header
-                      under the production signer set (no keys pinned: refused), bad magic, count 0, nonzero reserved, version 0, an
+                      under the production signer set (JUN-813 amendment 7: signed by TEST keys, so no slot counts: result 1), bad magic, count 0, nonzero reserved, version 0, an
                       oversize image; review hardening: nonzero entry reserved/padding bytes (first and last), nonzero layout bytes 68
                       and 127, count 5, count 4 (a duplicate fourth entry, and a fourth entry that is the second counted signer), key ids
                       256, 65536 and 2^24, a signature made under context AIUEIMG1; last, a case whose header stream breaks (mode 2)

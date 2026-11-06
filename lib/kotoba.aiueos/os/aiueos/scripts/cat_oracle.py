@@ -19,7 +19,7 @@ aiueos.cid-v1-admit: 01, codec (55, 70 or 71), 12, 20, then a 32-byte digest.
 Result codes of update.kotoba: 15 catalog verified; 16 the body hash matches but an entry is refused (flags: 1 dock id outside 19..82, 2
 duplicate dock id, 4 reserved bytes not zero, 8 bad title, 16 bad CID, 32 size outside 1..2^25); 7 body hash differs; 1 fewer than two
 distinct valid signers; 2 bad magic; 3 signature count/layout, or entry count/length; 4 version below 1; 5 manifest reserved not zero;
-8 no production signer set pinned.
+8 retired (no production signer set pinned until ADR-0286 amendment 7).
 """
 import hashlib
 import struct
@@ -70,12 +70,11 @@ def two_of_three(man, slots=(0, 1), ctx=CTX):
 
 
 # ---- the independent verdict -------------------------------------------------------------------------------------------------------
-def ml_valid(slot, man, sig):
-    pk = o.keys()[slot][2]
-    return ref.verify_mu(pk, ref.mu_of(pk, o.mprime(man, CTX)), sig)
+def ml_valid(slot, man, sig, ks="test"):
+    return o.ml_valid(slot, man, sig, ks, CTX)
 
 
-def counted(hdr):
+def counted(hdr, ks="test"):
     """Mask of the pinned slots whose entry counts: pinned id not seen, zero reserved/padding, Ed25519 and ML-DSA-65 valid."""
     man, seen, mask = hdr[:64], set(), 0
     for i in range(struct.unpack_from("<I", hdr, 64)[0]):
@@ -83,7 +82,7 @@ def counted(hdr):
         kid = struct.unpack_from("<I", e, 0)[0]
         if kid >= o.N_SLOTS or kid in seen or e[4:8] != bytes(4) or e[3381:] != bytes(11):
             continue
-        if o.ed_valid(kid, man, e[8:72]) and ml_valid(kid, man, e[72:3381]):
+        if o.ed_valid(kid, man, e[8:72], ks) and ml_valid(kid, man, e[72:3381], ks):
             seen.add(kid); mask |= 1 << kid
     return mask
 
@@ -122,9 +121,7 @@ def verdict(hdr, body, mode):
     sigs = struct.unpack_from("<I", hdr, 64)[0]
     if not 1 <= sigs <= 4 or hdr[68:128] != bytes(60):
         return 3, 0, 0
-    if mode == 1:
-        return 8, 0, 0
-    mask = counted(hdr)
+    mask = counted(hdr, "prod" if mode == 1 else "test")   # mode 1: the production signer set's PUBLIC keys (amendment 7)
     if bin(mask).count("1") < 2:
         return 1, mask, 0
     version, length, count = struct.unpack_from("<QQI", hdr, 8)
@@ -175,7 +172,7 @@ def cases():
     img_man = manifest(good, magic=IMG_CTX)
     add("image-magic-signed-as-image", (o.header(img_man, two_of_three(img_man, (0, 1), IMG_CTX)), good), (2, 0, 0))
     add("image-magic-signed-as-catalog", (o.header(img_man, two_of_three(img_man)), good), (2, 0, 0))
-    add("production-mode", hdr_for(good), (8, 0, 0), mode=1)
+    add("production-mode", hdr_for(good), (1, 0, 0), mode=1)
     # manifest and header structure
     add("manifest-tamper", (o.header(o.flip(man, 40), two_of_three(man)), good), (1, 0, 0))
     add("manifest-reserved", (o.header(o.flip(man, 28), two_of_three(man)), good), (5, 0, 0))

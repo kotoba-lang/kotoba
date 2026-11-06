@@ -15,7 +15,7 @@ checks and before the image digest. Cases with AIUEIMG1 headers (the 128-byte he
 with zeros to 16384 bytes so the case file keeps its shape) cover the other format.
 
 Result codes of update.kotoba: 9 version not above the floor, 10 version floor unreadable, 21 stream broke (mode 2 only; the entries completed before the break still count), 15 image verified, 1 fewer than two distinct valid signers, 2 bad magic, 3 count/layout or size,
-4 version below 1, 5 manifest reserved bytes not zero, 7 digest differs, 8 no production signer set pinned.
+4 version below 1, 5 manifest reserved bytes not zero, 7 digest differs, 8 retired (no production signer set pinned until amendment 7).
 """
 import hashlib
 import struct
@@ -39,19 +39,19 @@ def manifest(version=5, size=IMG_LEN, img=None, **kw):
 CUT = 7200  # mode 2: the stream breaks before the piece that would pass this byte; pieces end on 1 KiB lines
 
 
-def entry_counts(hdr, i):
+def entry_counts(hdr, i, ks="test"):
     """Independent check of entry i of a header: does it count (pinned id, zero reserved/padding, both signatures valid)?"""
     e = hdr[128 + i * o.ENTRY:128 + (i + 1) * o.ENTRY]
     kid = struct.unpack_from("<I", e, 0)[0]
     return (kid < o.N_SLOTS and e[4:8] == bytes(4) and e[3381:] == bytes(11)
-            and o.ed_valid(kid, hdr[:64], e[8:72]) and o.ml_valid(kid, hdr[:64], e[72:3381])), kid
+            and o.ed_valid(kid, hdr[:64], e[8:72], ks) and o.ml_valid(kid, hdr[:64], e[72:3381], ks)), kid
 
 
 def expected(hdr, mode, img, floor=FLOOR):
     """(result, mask) the kernel must report for this case."""
     if hdr[:8] == b"AIUEIMG1":
         return expected_v1(hdr, mode, img, floor)
-    v, mask = o.verdict(hdr)
+    v, mask = o.verdict(hdr, "prod" if mode == 1 else "test")   # mode 1: the production signer set's PUBLIC keys (amendment 7)
     if v in (2, 5, 3):
         return v, 0
     if mode == 2:
@@ -63,8 +63,6 @@ def expected(hdr, mode, img, floor=FLOOR):
                 if ok and kid not in seen:
                     seen.add(kid); mask2 |= 1 << kid
         return 21, mask2
-    if mode == 1:
-        return 8, 0
     if v == 4:
         return 1, mask
     version, size = struct.unpack_from("<QQ", hdr, 8)

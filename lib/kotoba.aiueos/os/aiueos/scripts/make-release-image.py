@@ -4,12 +4,21 @@
 import argparse
 import binascii
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import struct
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+# JUN-942: the journal writer and the placement rules for \EFI\ITONAMI\OSMETA.BIN live in aiueos-provision-esp.py (kotoba#1264) and
+# are used from there, never copied: this builder lays out the directory and the loader copy, the provisioner places the journal.
+_spec = importlib.util.spec_from_file_location("aiueos_provision_esp", HERE / "aiueos-provision-esp.py")
+PROVISION = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(PROVISION)
 
 SECTOR = 512
 DISK_SECTORS = 131072  # 64 MiB
@@ -104,6 +113,12 @@ def dirent(name, attr, cluster, size=0):
 
 
 def make_fat32(efi, kernel, initramfs):
+    """The primary ESP. JUN-942: besides the removable-media path EFI/BOOT/BOOTX64.EFI (the firmware's boot entry and universal fallback)
+    it carries EFI/ITONAMI/BOOTX64.EFI, the native updater's home: a SEPARATE copy of the same loader bytes in its own clusters (the
+    updater swaps that entry's clusters, which must never alias EFI/BOOT's). OSMETA.BIN is not written here; provision_update_layout
+    places it afterwards through aiueos-provision-esp.py, which needs the GPT. Clusters stay 512 bytes: the 20480-byte journal needs
+    a 4096-aligned contiguous run, which the provisioner finds in the free area behind the files (at most 7 clusters, 3.5 KiB, skipped
+    for alignment), so neither a larger cluster nor padding is needed."""
     reserved, fats = 32, 2
     # Solve fat_sectors >= ceil((data_clusters + 2) * 4 / sector_size)
     # directly; a fixed-point iteration can oscillate between adjacent values.
@@ -155,22 +170,26 @@ def make_fat32(efi, kernel, initramfs):
         return first
 
     # Allocate directories first so their stable cluster numbers can be referenced.
-    root_cluster, efi_cluster, boot_cluster, aiueos_cluster = 2, 3, 4, 5
-    for cluster in range(2, 6):
+    root_cluster, efi_cluster, boot_cluster, aiueos_cluster, itonami_cluster = 2, 3, 4, 5, 6
+    for cluster in range(2, 7):
         fat[cluster] = 0x0FFFFFFF
-    next_cluster = 6
+    next_cluster = 7
     efi_bytes, kernel_bytes = Path(efi).read_bytes(), Path(kernel).read_bytes()
     initramfs_bytes = Path(initramfs).read_bytes()
     efi_file_cluster = allocate(efi_bytes)
+    itonami_file_cluster = allocate(efi_bytes)
     kernel_file_cluster = allocate(kernel_bytes)
     initramfs_file_cluster = allocate(initramfs_bytes)
 
     directories = {
         root_cluster: dirent("EFI", 0x10, efi_cluster),
         efi_cluster: dirent(".", 0x10, efi_cluster) + dirent("..", 0x10, root_cluster) +
-                     dirent("BOOT", 0x10, boot_cluster) + dirent("AIUEOS", 0x10, aiueos_cluster),
+                     dirent("BOOT", 0x10, boot_cluster) + dirent("AIUEOS", 0x10, aiueos_cluster) +
+                     dirent("ITONAMI", 0x10, itonami_cluster),
         boot_cluster: dirent(".", 0x10, boot_cluster) + dirent("..", 0x10, efi_cluster) +
                       dirent("BOOTX64.EFI", 0x20, efi_file_cluster, len(efi_bytes)),
+        itonami_cluster: dirent(".", 0x10, itonami_cluster) + dirent("..", 0x10, efi_cluster) +
+                         dirent("BOOTX64.EFI", 0x20, itonami_file_cluster, len(efi_bytes)),
         aiueos_cluster: dirent(".", 0x10, aiueos_cluster) + dirent("..", 0x10, efi_cluster) +
                         dirent("KERNEL.ELF", 0x20, kernel_file_cluster, len(kernel_bytes)) +
                         dirent("INITRD.IMG", 0x20, initramfs_file_cluster, len(initramfs_bytes)),
@@ -505,7 +524,26 @@ def gpt_header(current, backup, entries_lba, entries_crc):
     return header
 
 
-def build_image(output, efi, kernel, initramfs):
+def provision_update_layout(output, disk, version):
+    """Write `disk` beside `output` and place \\EFI\\ITONAMI\\OSMETA.BIN on its primary ESP with aiueos-provision-esp.py's own
+    journal writer and placement (floor = active = version, active-image digest = the SHA-256 of \\EFI\\ITONAMI\\BOOTX64.EFI). The
+    file reaches `output` only when the provisioner accepted it; when the journal cannot be placed (no 4096-aligned contiguous run of
+    free clusters, no free directory slot in BOOTX64.EFI's block) nothing is left behind and the build refuses."""
+    partial = Path(str(output) + ".partial")
+    partial.write_bytes(disk)
+    try:
+        info = PROVISION.provision(str(partial), version, replace=False, block=SECTOR)
+        os.replace(partial, output)
+    except PROVISION.Refused as error:
+        partial.unlink(missing_ok=True)
+        raise SystemExit("REFUSED: cannot place \\EFI\\ITONAMI\\OSMETA.BIN on the primary ESP: %s" % error)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return info
+
+
+def build_image(output, efi, kernel, initramfs, version):
     esp = make_fat32(efi, kernel, initramfs)
     recovery = make_fat16(efi, kernel, initramfs, recovery_marker=True)
     disk = bytearray(DISK_SECTORS * SECTOR)
@@ -535,7 +573,7 @@ def build_image(output, efi, kernel, initramfs):
     disk[-SECTOR:] = gpt_header(DISK_SECTORS - 1, 1, GPT_BACKUP_ENTRIES, entries_crc)
     disk[ESP_FIRST * SECTOR:(ESP_LAST + 1) * SECTOR] = esp
     disk[RECOVERY_FIRST * SECTOR:(RECOVERY_LAST + 1) * SECTOR] = recovery
-    Path(output).write_bytes(disk)
+    return provision_update_layout(output, bytes(disk), version)
 
 
 UNSET = object()
@@ -544,7 +582,7 @@ UNSET = object()
 def verify_image(path, expected_efi=None, expected_kernel=None,
                  expected_initramfs=None,
                  recovery_efi=UNSET, recovery_kernel=UNSET,
-                 recovery_initramfs=UNSET):
+                 recovery_initramfs=UNSET, expected_version=None):
     """Verify the release image. The recovery partition is compared against
     the primary expectations unless distinct recovery artifacts are given
     (an applied update leaves the previous version there); passing None
@@ -598,6 +636,48 @@ def verify_image(path, expected_efi=None, expected_kernel=None,
         raise ValueError("BOOTX64.EFI content mismatch")
     if expected_kernel and embedded_kernel != Path(expected_kernel).read_bytes():
         raise ValueError("KERNEL.ELF content mismatch")
+    verify_update_layout(disk, embedded_efi, expected_version)
+
+
+def verify_update_layout(disk, boot_loader, expected_version=None):
+    """JUN-942: \\EFI\\ITONAMI\\BOOTX64.EFI is a separate copy of EFI/BOOT/BOOTX64.EFI and \\EFI\\ITONAMI\\OSMETA.BIN is the journal
+    aiueos-provision-esp.py writes for floor = active = N and that loader's digest, contiguous, 4096-aligned, inside the ESP and
+    disjoint from every other file. Returns (version, OSMETA.BIN bytes, byte offset on the disk). An image from before JUN-942 fails."""
+    try:
+        esp = PROVISION.Esp(PROVISION.Disk(io.BytesIO(disk)), SECTOR)
+        rows, _ = esp.entries(esp.root)
+        efi = esp.find(rows, PROVISION.DIRS[0])
+        rows, _ = esp.entries(esp.first(efi[1]))
+        boot_dir, own_dir = esp.find(rows, b"BOOT       "), esp.find(rows, PROVISION.DIRS[1])
+        if own_dir is None:
+            raise ValueError("missing \\EFI\\ITONAMI (an image from before the native update layout)")
+        boot_rows, _ = esp.entries(esp.first(boot_dir[1]))
+        own_rows, _ = esp.entries(esp.first(own_dir[1]))
+        boot = esp.find(boot_rows, PROVISION.BOOT)
+        own = esp.find(own_rows, PROVISION.BOOT)
+        meta = esp.find(own_rows, PROVISION.META)
+        if boot is None or own is None or meta is None:
+            raise ValueError("missing EFI/BOOT/BOOTX64.EFI, EFI/ITONAMI/BOOTX64.EFI or EFI/ITONAMI/OSMETA.BIN")
+        if esp.read_file(boot[1]) != boot_loader or esp.read_file(own[1]) != boot_loader:
+            raise ValueError("EFI/ITONAMI/BOOTX64.EFI differs from EFI/BOOT/BOOTX64.EFI")
+        boot_chain, own_chain = esp.chain(esp.first(boot[1])), esp.chain(esp.first(own[1]))
+        meta_chain = esp.chain(esp.first(meta[1]))
+        if set(boot_chain) & set(own_chain):
+            raise ValueError("EFI/ITONAMI/BOOTX64.EFI shares clusters with EFI/BOOT/BOOTX64.EFI")
+        if (struct.unpack_from("<I", meta[1], 28)[0] != PROVISION.SIZE or meta[1][11] & 31
+                or meta_chain != list(range(meta_chain[0], meta_chain[0] + len(meta_chain)))
+                or esp.off(meta_chain[0]) % 4096 or esp.off(meta_chain[0]) + PROVISION.SIZE > esp.end
+                or set(meta_chain) & (set(boot_chain) | set(own_chain))):
+            raise ValueError("OSMETA.BIN is not a contiguous, 4096-aligned, disjoint 20480-byte file inside the ESP")
+        journal = esp.read_file(meta[1])
+        floor, active = PROVISION.journal_state(journal)
+        if floor != active or (expected_version is not None and floor != expected_version):
+            raise ValueError("OSMETA.BIN floor/active %d/%d, expected %s" % (floor, active, expected_version))
+        if journal != PROVISION.journal_bytes(floor, hashlib.sha256(boot_loader).digest()):
+            raise ValueError("OSMETA.BIN is not the journal for EFI/ITONAMI/BOOTX64.EFI's digest")
+        return floor, journal, esp.off(meta_chain[0])
+    except PROVISION.Refused as error:
+        raise ValueError("update layout: %s" % error)
 
 
 def read_primary_artifacts(disk):
@@ -641,7 +721,7 @@ def read_primary_artifacts(disk):
     return read_file(efi_cluster, efi_size), read_file(kernel_cluster, kernel_size)
 
 
-def apply_update(image, efi, kernel, initramfs, output, receipt_path):
+def apply_update(image, efi, kernel, initramfs, output, receipt_path, version):
     """Write a new loader/kernel pair into the primary ESP only. The recovery
     partition keeps the previous known-good pair, so a failed update rolls
     back through the existing firmware/loader fallback paths."""
@@ -650,9 +730,9 @@ def apply_update(image, efi, kernel, initramfs, output, receipt_path):
     recovery_before = bytes(disk[RECOVERY_FIRST * SECTOR:(RECOVERY_LAST + 1) * SECTOR])
     previous_efi, previous_kernel = read_primary_artifacts(bytes(disk))
     disk[ESP_FIRST * SECTOR:(ESP_LAST + 1) * SECTOR] = make_fat32(efi, kernel, initramfs)
-    Path(output).write_bytes(disk)
+    provisioned = provision_update_layout(output, bytes(disk), version)
     verify_image(output, efi, kernel, initramfs,
-                 recovery_efi=None, recovery_kernel=None, recovery_initramfs=None)
+                 recovery_efi=None, recovery_kernel=None, recovery_initramfs=None, expected_version=version)
     updated = Path(output).read_bytes()
     if updated[RECOVERY_FIRST * SECTOR:(RECOVERY_LAST + 1) * SECTOR] != recovery_before:
         raise ValueError("update touched the recovery partition")
@@ -673,10 +753,21 @@ def apply_update(image, efi, kernel, initramfs, output, receipt_path):
         },
         "recovery": {"unchanged": True,
                      "sha256": hashlib.sha256(recovery_before).hexdigest()},
+        "update": update_receipt(provisioned),
     }
     Path(receipt_path).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n",
                                   encoding="utf-8")
     print(output)
+
+
+def update_receipt(provisioned):
+    """The native-update layout as the provisioner reported it (aiueos-provision-esp.py)."""
+    return {"version": provisioned["floor"],
+            "EFI/ITONAMI/BOOTX64.EFI": {"sha256": provisioned["activeImageSha256"]},
+            "EFI/ITONAMI/OSMETA.BIN": {"bytes": provisioned["size"], "sha256": provisioned["sha256"],
+                                       "floor": provisioned["floor"], "active": provisioned["active"],
+                                       "first_cluster": provisioned["firstCluster"],
+                                       "disk_offset": provisioned["diskOffset"]}}
 
 
 def corrupt_image(image, output, target):
@@ -731,12 +822,17 @@ def main():
     build.add_argument("--data")
     build.add_argument("--iso")
     build.add_argument("--output", required=True); build.add_argument("--receipt", required=True)
+    build.add_argument("--version", type=PROVISION.version_arg, required=True,
+                       help="REQUIRED, no default: the version this image will be signed as (aiueos-image.py sign --version N); "
+                            "OSMETA.BIN is written with floor = active = N")
     build.add_argument("--distribution-json",
                        help="aiueos.distribution.v1 descriptor to bind into the receipt")
     verify = sub.add_parser("verify")
     verify.add_argument("--image"); verify.add_argument("--iso")
     verify.add_argument("--efi"); verify.add_argument("--kernel")
     verify.add_argument("--initramfs")
+    verify.add_argument("--version", type=PROVISION.version_arg,
+                        help="also require OSMETA.BIN's floor = active to equal N")
     verify.add_argument("--recovery-efi"); verify.add_argument("--recovery-kernel")
     verify.add_argument("--recovery-initramfs")
     update = sub.add_parser("apply-update")
@@ -744,6 +840,8 @@ def main():
     update.add_argument("--efi", required=True); update.add_argument("--kernel", required=True)
     update.add_argument("--initramfs", required=True)
     update.add_argument("--output", required=True); update.add_argument("--receipt", required=True)
+    update.add_argument("--version", type=PROVISION.version_arg, required=True,
+                        help="REQUIRED, no default: the version the updated image will be signed as (floor = active = N)")
     corrupt = sub.add_parser("corrupt")
     corrupt.add_argument("--image", required=True)
     corrupt.add_argument("--output", required=True)
@@ -755,7 +853,7 @@ def main():
         corrupt_image(args.image, args.output, args.target)
         return
     if args.command == "apply-update":
-        apply_update(args.image, args.efi, args.kernel, args.initramfs, args.output, args.receipt)
+        apply_update(args.image, args.efi, args.kernel, args.initramfs, args.output, args.receipt, args.version)
         return
     if args.command == "verify":
         if not args.image and not args.iso:
@@ -766,14 +864,14 @@ def main():
                 recovery_expectations = {"recovery_efi": args.recovery_efi,
                                          "recovery_kernel": args.recovery_kernel,
                                          "recovery_initramfs": args.recovery_initramfs}
-            verify_image(args.image, args.efi, args.kernel, args.initramfs, **recovery_expectations)
+            verify_image(args.image, args.efi, args.kernel, args.initramfs, expected_version=args.version, **recovery_expectations)
             print("AIUEOS_RELEASE_IMAGE_OK")
         if args.iso:
             verify_iso(args.iso, args.efi, args.kernel, args.initramfs)
             print("AIUEOS_RELEASE_ISO_OK")
         return
-    build_image(args.output, args.efi, args.kernel, args.initramfs)
-    verify_image(args.output, args.efi, args.kernel, args.initramfs)
+    provisioned = build_image(args.output, args.efi, args.kernel, args.initramfs, args.version)
+    verify_image(args.output, args.efi, args.kernel, args.initramfs, expected_version=args.version)
     if args.iso:
         build_iso(args.iso, args.efi, args.kernel, args.initramfs)
         verify_iso(args.iso, args.efi, args.kernel, args.initramfs)
@@ -795,6 +893,7 @@ def main():
                                       "sha256": sha256(args.initramfs)},
         },
     }
+    receipt["update"] = update_receipt(provisioned)
     if args.data:
         receipt["artifacts"]["AIUEOS-DATA.IMG"] = {
             "bytes": Path(args.data).stat().st_size, "sha256": sha256(args.data)}
