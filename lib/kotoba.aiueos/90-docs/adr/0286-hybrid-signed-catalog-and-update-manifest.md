@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Nothing in this ADR is implemented except the region-based ML-DSA-65 verifier (kotoba#1231-#1234); no key exists and no origin is registered. Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
+Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates, test keys only; Amendments 3 to 6): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6). Not implemented: any production key or signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -313,3 +313,91 @@ rebuilt with one rule removed, each failing the catalog gate on exactly the case
 the duplicate-dock-id check dropped, the body-hash check dropped. Kernel text: 2501888 to 2515840 bytes (+13952; estimated margin
 588704 to 574752), the same for the debug and the default desktop kernels because `chunk-done` is shared. **Not verified:** a physical board; the network pull of a catalog (no
 RTL8168 in QEMU); anything about a consumer, because none exists.
+
+## Amendment 6 (2026-11-06, JUN-813 freshness): the clock, the `AIUEFRS1` record, and what it stops
+
+Amendment 2 decided a signed "latest" record (version, issued-at, valid-until, 30 days) and left open the clock it is judged against. The
+investigation is in `90-docs/evidence/freshness-time-source-20261106/README.md` (every claim labelled measured or read). Its result, in one
+paragraph: the native kernel has **no wall clock at all today** (the TSC is calibrated against the PIT and counts from boot, nothing reads
+the CMOS RTC, nothing speaks a time protocol, nothing checks a certificate date). The only wall clock a PC offers is the CMOS RTC
+(ports 0x70/0x71), which is battery-backed, survives reboot, and is set by whoever controls the firmware, the hypervisor or code running on the
+machine, never by the network. That is a clock the device can trust **as far as the stated threat needs** (a source withholding or replaying
+old records, at a granularity of days) and no further. It is read by `native/update.kotoba` (`rtc-now`) and used only for this decision.
+
+**Record layout.** Object `AIUEFRS1`: the `AIUEIMG2` signature block of Amendment 2 byte for byte (16384 bytes: 64-byte manifest, signature count
+`u32` at 64, bytes 68..127 zero, up to four 3392-byte entries; the tail is ignored and unauthenticated, Amendment 3). It has **no body**.
+
+| Offset | Size | Manifest field (the 64 signed bytes) |
+| -- | -- | -- |
+| 0 | 8 | `"AIUEFRS1"` |
+| 8 | 8 | latest version, `u64` LE, 1..2^63-1: the highest `AIUEIMG2` version the signers publish on the channel |
+| 16 | 8 | issued-at, `u64` LE, UTC seconds since 1970-01-01, 1..2^63-1 |
+| 24 | 8 | valid-until, `u64` LE, UTC seconds, above issued-at, below 2^63 |
+| 32 | 4 | channel, `u32` LE, 1 = the update image channel (the only one today); any other value is refused |
+| 36 | 28 | reserved, zero |
+
+The signed message is fixed at 64 bytes in the kernel (`copy-manifest`, the Ed25519 message length), so the record cannot also carry the
+SHA-256 of the latest image's manifest; the version number is the whole claim, and the image itself is separately admitted. ML-DSA-65 signs
+`M' = 0 || 8 || "AIUEFRS1" || manifest`, context `"AIUEFRS1"`; Ed25519 signs the 64 manifest bytes (so the magic keeps an Ed25519 signature made for
+another kind from verifying here, and the context keeps the ML-DSA half apart in the other direction). The kernel selects the kind by the call
+(bit 2 of `admit`'s test argument: 5 = TEST keys, 4 = production set, which is not pinned), never by the magic. Same pinned slots, same 2-of-3
+rule, same skip-never-count rule.
+
+**Admission order and codes** (word 180): `2` magic (an image or catalog magic included), `5` manifest bytes 36..63 not zero, `3` signature
+count / layout bytes 68..127, `8` no production signer set, then the per-entry signatures, `1` fewer than two distinct valid signers, `3` the
+structure (issued-at below 1 or at or above 2^63, valid-until not above issued-at or at or above 2^63, **lifetime above 30 days = 2592000 s**,
+channel not 1), `4` version below 1 (or at or above 2^63), `15` verified. A record that is verified is then judged against the clock.
+
+**Which clock, and the verdict** (word 273, set only when the result is 15). `now` is the RTC read by `rtc-now`: update-in-progress flag awaited,
+two snapshots that agree, register D bit 7 (the RTC kept power) set, BCD or binary and 12 or 24 hour as register B says, the century register 0x32
+used when it holds BCD 19..21 and otherwise 20 assumed, every field range-checked (day against the month and leap year), and the result refused
+(status word 365 = 1, 2, 3 or 5) when it is **earlier than the build floor 2026-11-06T00:00:00Z** compiled into the kernel (the usual dead-RTC
+resets, 1970, 1980 and 2000, are all earlier). Verdict: `1` fresh (`issued-at <= now + 86400` and `now <= valid-until`); `2` expired; `3` the clock is
+more than a day behind issued-at (the clock is wrong, or was set back: the record cannot be judged); `4` no usable clock. The one day of
+slack on issued-at, and the lack of any on valid-until, cover an RTC kept in local time (up to 14 hours either way: a record then expires up to 14 hours
+early or late, which a 30-day window absorbs). Verdicts 2, 3 and 4 are all "not fresh".
+
+**What each state does** (the update manager's `check` is not built; this is the rule it must follow, and word 273 is its input):
+
+| Record | `check` | Install | Version floor |
+| -- | -- | -- | -- |
+| fresh (1), version above the installed one | "update to V available", with issued-at | unchanged: only the image's own admission and the floor decide | unchanged |
+| fresh (1), version not above | "up to date as of issued-at" | unchanged | unchanged |
+| expired, behind or no clock (2, 3, 4) | "**not fresh**: cannot tell whether a newer version exists"; a signed version above the installed one is still shown as "at least V exists" (a signed record is a true lower bound however old) | unchanged: a verified newer image installs | unchanged |
+| missing, or refused (any result but 15) | exactly the same "not fresh" line; a refused record contributes no data | unchanged | unchanged |
+
+A record never authorizes an install and never moves the floor; only a committed install advances it (Amendment 4). Nothing about freshness
+blocks an offline device, as Amendment 2 required.
+
+**Monotonic rule (decided, not built).** Rule: a record is accepted for display only if its issued-at is not below the issued-at of the last record
+this device accepted, and the trusted lower bound of the clock is `max(build floor, last accepted issued-at)` (a record's issued-at is the signers'
+own time, so it is a lower bound on the present that no clock attacker can lower). This stops an attacker who is serving an older, still unexpired
+record (R1, v5, valid to day 30) after the device has seen a newer one (R2, v6, issued day 10): without the rule R1 is "fresh" until day 30 and hides v6.
+It needs persisted state, and `OSMETA.BIN`'s journal can hold it: its record has 16 bytes at 48..63 that `valid` requires to be zero today (and
+352 at 128..479), the record schema word is 1, and the SHA-256 at 480 already covers them. Missing: schema 2 with `valid` accepting bytes 48..63
+(last issued-at `u64`, last version `u64`), a journal operation that updates them with the journal's own crash-ordered `publish`, the change in
+`aiueos-provision-esp.py`, and the journal's gates for the new schema. A kernel that predates schema 2 would read the new record as invalid and
+refuse every update (fail closed). Until that lands the exposure of a replayed record is its remaining validity, at most 30 days.
+
+**What this stops, and what it does not.**
+
+| Who | Can they make a stale record look fresh? | Why |
+| -- | -- | -- |
+| A mirror, peer or on-path attacker (the Amendment 1 threat) | **No** | They can serve only bytes. They cannot set the RTC, and the kernel reads no time from the network. They can still withhold; the device then reports "not fresh" once the last record it has expires |
+| Anyone who replays an old record | Only for its remaining validity (at most 30 days); with the monotonic rule, not after the device has seen a newer one | Signed records cannot be forged or extended (the tamper cases in the gate) |
+| A disk-write attacker | Not by writing the disk alone | The RTC is not on the disk. Replacing `BOOTX64.EFI` gives them code that can set the RTC, but then they own the machine and the freshness of a record is the least of it (Amendment 4) |
+| Someone with the firmware setup screen or physical access | **Yes**: set the RTC back inside the old record's window | The RTC is whatever the firmware says. The build floor and the persisted lower bound narrow it, they do not close it |
+| A dead RTC battery | Fails safe: the reading falls below the build floor, so "no usable clock" and "not fresh" | |
+| A hypervisor or the VM host | **Yes**, completely | It supplies the RTC (measured under QEMU: the guest reads exactly what `-rtc` says) |
+| Any attacker, for the *signers'* clock | n/a | The signers' issued-at is trusted as signed |
+
+Not used as clocks, and why: an NTP/SNTP reply, a TLS or HTTP `Date` (unauthenticated or served by the very source being checked: the
+withholding attacker controls it, so it is strictly worse than the RTC against the stated threat); the TSC (it counts from boot and says nothing
+about the date); a signed time statement carried in the record (it is a lower bound only: it can prove time has passed, never that none has).
+
+**Built and gated.** `update.kotoba` admits `AIUEFRS1` as a third kind with the existing signature-block machinery, reads the RTC, and keeps the verdict
+in words 273..280; QEMU hooks `opt/aiueos/fresh` (cases) and `opt/aiueos/clock` (RTC probe and decoder rows) only; not wired to the desktop, no
+`check`, nothing persisted, no production signer set. Gate `fresh` (`check-native-fresh-qemu.py`, `fresh_oracle.py`). Results, mutants and what was
+not verified are in the evidence README and the pull request.
+
+**Documentation that disagreed with the code (corrected in this change).** The Status paragraph above said "Design only, nothing here is implemented" although `native/update.kotoba` implements stages 5a to 6; and `distributions/awai/update-policy.json` said the ML-DSA-65 verifier was open work and that versions "must rise (>= 1)". Both now state the real state (comments and text only).
