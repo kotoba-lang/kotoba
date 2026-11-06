@@ -75,3 +75,18 @@ The owner left the choice to the recommended option. What was measured (evidence
 **Cost, stated plainly.** JUN-854 counted 58 float sites in cssom (`double`, `Math/`) and 4 in dom-gpu; each needs a scale and a bound, and parity with the f64 hosted oracle becomes "within the bound", not "equal". Layout results that depend on exact float behaviour (percent and calc rounding) need cases.
 **Reopen when** the compiler gains `f64` for the user targets and the context switch saves FP state; this ADR then gets a further amendment.
 
+## Amendment 2 (2026-11-06, owner delegation: recommended options): the user targets cannot host a renderer yet
+
+The cssom census (kotoba#1252, JUN-134/135) found two things that change how this ADR is realized, not where it is headed.
+
+**1. The size premise was overstated.** The render-closure evidence (kotoba#1235) sized the closure by source bytes (1.78 MB). 76% of those bytes are docstrings and comments; the closure's code is about 14.8k non-blank lines, 458 KB. At the whole-graph ratio (0.76 text bytes per code byte) that is about 350 KB, inside the ~0.82 MB margin the 3 MiB cap leaves; at 2.6 text bytes per code byte (one fixed-point solver measured on kernel-v1) it is about 1.2 MB, outside it. So the closure may or may not fit in the kernel image, and the figures bound a different program than the one that will exist, because the port is a rewrite into scalar code.
+
+**2. The user targets cannot host it (measured; two probes re-run by the orchestrator).** With the pinned compiler, `x86_64-aiueos-user-v1` to `user-v5` emit one 4096-byte text page (E7104) and refuse strings (E7101 detail 16), records and vector parameters (E7102), floats (E7101 detail 9/33/36), `/`, `rem`, `mod` (E2101) and functions with 6 or more parameters; there is no store primitive (`kernel-store-u32` is E2101), only `kernel-load-u32` on the 64-byte request from v2. A 34-line fixed-point block-width solver needs 5874 bytes on user-v1 (E7104) and compiles on kernel-v1 at 6226 text bytes. The cap is therefore not the first blocker for a CPL3 renderer; the target's capabilities are (JUN-919).
+
+**Decision (recommended option; the destination in decision 1 stands).**
+- The renderer stays a separate module group behind the interface of this ADR (document and events in, draw list out; shared regions). Until the user targets gain what JUN-919 lists (a text segment above 4 KiB, a store primitive on a region the process owns, bounded strings and records), its modules are written in the kernel dialect and measured with the kernel targets (JUN-920).
+- Where those modules run in the interim is decided by measurement, not by this ADR: if the measured text of the whole renderer fits the kernel-v3 margin it may live in the kernel image as an interim placement behind the same interface; if not, it is a separate privileged object. Moving it to a CPL3 domain stays the goal and costs only the interface already fixed here.
+- First slice: JUN-920 (Q6 lengths, percent, block-width, margin-collapse, block-style) as scalar-i64 modules with a native oracle gate.
+
+**Owner confirmation still wanted, not blocking.** (a) The rounding rule at exact ties: the f64 oracle is inexact there (29% of 50 px gives 14 where exact arithmetic gives 14.5; 1114 of 1,233,197 integer-percent x basis pairs differ and all differences are exact .5 ties). The Q6 spec will be exact arithmetic with a stated rounding rule and the oracle disagreements will be reported, not copied; Blink's behaviour at ties was not measured. (b) Whether an interim placement inside the kernel image is acceptable if it fits, given decision 1.
+
