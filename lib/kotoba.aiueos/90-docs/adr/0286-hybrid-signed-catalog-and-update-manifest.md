@@ -228,3 +228,88 @@ each fail this gate (see the pull request). **Not verified:** the network pull i
 power loss between the install and the advance (the crash case is simulated by the hook stopping before the advance, the guest is not
 killed between the writes); an adversary who rewrites `OSMETA.BIN`; real-board provisioning; a floor per channel (one floor is kept,
 the update image channel is the only channel today).
+
+## Amendment 5 (2026-11-06, JUN-813 stage 6): the `AIUECAT1` byte layout and its kernel-side admission
+
+Decision 5 named the catalog object but fixed no bytes. This amendment fixes them, using Amendment 2's signature block unchanged, and records
+the choices the text could not settle (marked **chosen**: the safest option, not an owner decision). It is implemented as a QEMU-only
+admission in `native/update.kotoba` and is **not** wired into the desktop's app list.
+
+**Container.** An `AIUECAT1` object is, in order: a 16384-byte header, then the body. The header is the `AIUEIMG2` signature block of
+Amendment 2 byte for byte: the 64-byte manifest at 0, the signature count `u32` at 64 (1..4), bytes 68..127 zero, up to four 3392-byte
+entries from 128 (key id `u32`, 4 zero bytes, Ed25519 signature 64, ML-DSA-65 signature 3309, 11 zero bytes), the rest of the 16384 bytes
+ignored and unauthenticated (Amendment 3). The body starts at byte 16384, immediately after the header and not after the last entry, and
+is `128 * count` bytes long (at most 8192).
+
+**Manifest (64 bytes, the bytes both signatures cover).**
+
+| Offset | Size | Field |
+| -- | -- | -- |
+| 0 | 8 | `"AIUECAT1"` |
+| 8 | 8 | version, `u64` LE, at least 1 |
+| 16 | 8 | body length, `u64` LE, must equal `128 * count` |
+| 24 | 4 | catalog entry count, `u32` LE, 1..64 |
+| 28 | 4 | reserved, zero |
+| 32 | 32 | SHA-256 of the body |
+
+This differs from the `AIUEIMG2` manifest only where the image has "size" and "reserved" (bytes 16..31): the catalog's length is redundant
+with its count on purpose (a signed length that disagrees with the signed count is refused, `3`), and the count sits in the signed bytes.
+The signature count at byte 64 is the signature block's, not the catalog's; the two are different fields.
+
+**Signed message and domain separation.** Ed25519 signs the 64 manifest bytes (as `AIUEIMG2`). ML-DSA-65 signs
+`M' = 0 || 8 || "AIUECAT1" || manifest`, context `"AIUECAT1"`. The magic is part of the manifest, so an Ed25519 signature over an image
+manifest cannot be replayed as a catalog manifest (the magic differs, so the bytes differ), and the ML-DSA context separates the other
+direction: a catalog signed under `"AIUEIMG2"` is refused as a catalog because the ML-DSA half fails, and one signed under `"AIUECAT1"` is
+refused as an image for the same reason. The kernel selects the kind by the call (the catalog entry point), never by the magic alone, and
+rejects a header whose magic is the other kind (`2`). The same pinned signer slots, the 2-of-3 rule and the skip-never-count rule of
+Amendments 2 and 3 apply unchanged.
+
+**Body entry (128 bytes).**
+
+| Offset | Size | Field | Rule |
+| -- | -- | -- | -- |
+| 0 | 4 | dock id, `u32` LE | 19..82 (**chosen**), no two entries equal |
+| 4 | 32 | title | 1..31 printable ASCII bytes (`0x20..0x7e`), then a NUL, then only zero bytes |
+| 36 | 36 | manifest CID | binary CIDv1 envelope |
+| 72 | 36 | bundle CID | binary CIDv1 envelope |
+| 108 | 4 | bundle size, `u32` LE | 1..33554432 (**chosen**) |
+| 112 | 16 | reserved | all zero |
+
+- **Dock id range 19..82 (chosen).** The text says installable apps start at 19 and a catalog holds 1..64 entries; it names no upper bound.
+  19..82 is the only bound that lets a full 64-entry catalog exist and makes duplicate detection a 64-bit mask in two context words. A
+  consumer (not in this stage) may narrow it further; widening it needs a larger mask.
+- **Title.** Empty, unterminated, non-ASCII, control characters (including `0x7f`) and bytes after the first NUL are all refused.
+- **CID envelope.** The four prefix bytes the way `aiueos.cid-v1-admit` reads them (reasons 2..5: version 1, codec 0x55, 0x70 or 0x71,
+  multihash 0x12, length 0x20); any 36-byte string that is not that, including a textual CID, is refused. This is a structural check
+  only: the digest is compared with a block when the manifest or the bundle is downloaded (`aiueos-cid-v1-admit` itself needs the
+  block, which a catalog does not carry). The prefix test is written again in `update.kotoba` rather than called, because the module's one
+  entry point hashes a block and changing it would change the pinned `cid-v1-admit.o`.
+- **Bundle size bound 1..2^25 (chosen).** The same 32 MiB limit the image path already applies; zero and larger are refused.
+
+**Admission order and result codes** (word 180; shared with the image path where the code is the same): `2` magic (or the other kind's
+magic), `5` manifest reserved bytes, `3` signature count / layout bytes 68..127, `8` no production signer set pinned (test mode only
+has one; the check is before any signature work), then the per-entry signatures as each entry's last byte lands, `1` fewer than two
+distinct valid signers, `3` entry count outside 1..64 or length not `128 * count`, `4` version 0; only then is the body taken. The body
+is streamed through the image path unchanged (chunks that end on a 1 KiB line, SHA-256 against the manifest) and each 128-byte entry is
+checked in the page as its chunk lands; `7` is the body hash differing, `16` the hash matches but an entry is refused, `15` verified. `7`
+wins over `16`: an entry of a body whose hash is wrong is not looked at as evidence. Entry flags (word 270, OR over all entries, no early
+exit): 1 dock id outside the range, 2 duplicate dock id, 4 reserved bytes, 8 title, 16 CID, 32 size.
+
+**Memory and words.** The header uses exactly the memory of the `AIUEIMG2` path (ML-DSA arena = owned window 4, Ed25519 buffers, SHA state);
+the body adds nothing: it lands in the same one-page buffer as an image block and is gone when the next chunk lands. Added state: word 231
+(kind: 1 catalog), 270 flags, 271/272 the seen-dock-id mask (bit `id - 19`); the QEMU hook records case k at word 300 + k as
+`result | counted mask << 8 | flags << 16`.
+
+**What this stage does not do.** The catalog's version is checked for `>= 1` only: the hash-checked floor of Amendment 4 is the **image**
+channel's, and a catalog needs its own channel record (open). Nothing reads a fetched catalog into the app list; the desktop still uses the
+packed catalog only (JUN-811). `fetch-catalog` and `download-app` are not built. No production signer set is pinned (a production-mode
+catalog is refused with `8`). The CIDs are checked for shape, not against any bytes. An entry for a dock id that the packed default also
+defines (ids 1..18 are refused, so a fetched catalog cannot shadow them) is the only conflict rule: how a consumer treats a fetched id that
+is not yet installed is the consumer's.
+
+**Verified (QEMU/TCG, test keys, `-nic none`):** the `catalog` gate (44 cases, every verdict equal to the independent oracle's), and the `update2` (now 39 cases, two of them
+AIUECAT1-context signatures presented as images, refused), `imgsig`, `nvme` and default `desktop` regressions. Negative controls (kernels
+rebuilt with one rule removed, each failing the catalog gate on exactly the cases that rule decides): the image context accepted for catalogs,
+the duplicate-dock-id check dropped, the body-hash check dropped. Kernel text: 2501888 to 2515840 bytes (+13952; estimated margin
+588704 to 574752), the same for the debug and the default desktop kernels because `chunk-done` is shared. **Not verified:** a physical board; the network pull of a catalog (no
+RTL8168 in QEMU); anything about a consumer, because none exists.
