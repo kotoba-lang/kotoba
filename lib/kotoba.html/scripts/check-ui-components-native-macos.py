@@ -50,7 +50,7 @@ def hosted_equivalence():
     out = {}
     for cls in ('desktop-app', 'dock-app'):
         want = expected_literal(test, cls)
-        have = re.search(r'<a class="' + cls + r'" [^>]*data-app="browser"[^>]*>.*?</a>', page, re.S).group(0)
+        have = re.search(r'<a(?=[^>]*\sclass="' + cls + r'")(?=[^>]*\sdata-app="browser")[^>]*>.*?</a>', page, re.S).group(0)
         flat = lambda s: re.sub(r'>\s+<', '><', s)
         if attrs(re.match(r'<a[^>]*>', flat(want)).group(0)) != attrs(re.match(r'<a[^>]*>', have).group(0)):
             raise ValueError('start tag differs from the hosted page: ' + cls)
