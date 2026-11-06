@@ -69,16 +69,10 @@ The guest (the real `update.kotoba`, `opt/aiueos/clock` hook) read the CMOS in f
 
 ## Regressions (full builder runs on the final source)
 
-Each ran the real builder profile on the final source, one QEMU boot sequence per gate, `-nic none`:
-
-* `fresh`: `PASS_NATIVE_FRESH_QEMU` (7 events; the receipt here is from this run).
-* `catalog`: `PASS_NATIVE_CATALOG_QEMU`.
-* `imgsig`: `PASS_NATIVE_IMGSIG_QEMU`.
-* `update2`: `PASS_NATIVE_UPDATE2_QEMU` (the case list gains `fresh-context-both`) and `nvme`: `PASS_NATIVE_NVME_READ_QEMU`. Both **failed once** in the builder run
-  ("the desktop must still draw after the update path ran" / "after the probe") while three builds and gates shared the host, and **passed** when the same built
-  artifacts were gated alone (`check-native-update2-qemu.py`, `check-native-nvme-qemu.py` run directly). I read that as host-load timing of the 2 s key/frame wait, not as a
-  regression: but I did not prove it against a baseline build of the parent commit, so it stays a stated uncertainty.
-* Earlier `fresh` run (before the last edits to comments, pins and the update2 case): the same 42 cases and 170 rows.
+Re-run on the tree merged with main and with #1274 (style, layout, flex, grid), one or two builds at a time, each through the real builder profile: `fresh`
+`PASS_NATIVE_FRESH_QEMU` (module count measured from `kernel/build-state.json`: 51; the receipt here is from this run), `imgsig` `PASS_NATIVE_IMGSIG_QEMU`, `update2`
+`PASS_NATIVE_UPDATE2_QEMU` (the case list gains `fresh-context-both`), `catalog` `PASS_NATIVE_CATALOG_QEMU`, `nvme` `PASS_NATIVE_NVME_READ_QEMU`. No "desktop must still draw" failure
+occurred on the merged tree. On the pre-merge tree update2 and nvme had failed once each with that message while three builds shared the host, and passed when gated alone.
 
 ## Not verified
 
