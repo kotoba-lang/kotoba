@@ -418,6 +418,17 @@ fi
 if [ -n "${AIUEOS_QUALIFICATION_FORCE_KERNEL_HANG_CODE:-}" ]; then
   kernel_hang_test_cflags="-DAIUEOS_QUALIFICATION_FORCE_KERNEL_HANG_CODE=${AIUEOS_QUALIFICATION_FORCE_KERNEL_HANG_CODE}"
 fi
+# JUN-855 (evidence only): AIUEOS_FP_PROBE=measure|poison|fxsave builds the x87/SSE state probe into
+# process.c / scheduler.c / entry.S; empty (the default) compiles none of it.
+# See 90-docs/evidence/jun-855-fp-state-preemption-20261106/README.md.
+fp_probe_cflags=
+case "${AIUEOS_FP_PROBE:-}" in
+  '') ;;
+  measure) fp_probe_cflags="-DAIUEOS_FP_PROBE" ;;
+  poison) fp_probe_cflags="-DAIUEOS_FP_PROBE -DAIUEOS_FP_PROBE_POISON" ;;
+  fxsave) fp_probe_cflags="-DAIUEOS_FP_PROBE -DAIUEOS_FP_PROBE_FXSAVE" ;;
+  *) echo "error: AIUEOS_FP_PROBE must be measure, poison or fxsave" >&2; exit 1 ;;
+esac
 kotoba_ime_object=${AIUEOS_KOTOBA_IME_OBJECT:-"$aiueos/kotoba/ime-romaji.o"}
 kotoba_wm_object=${AIUEOS_KOTOBA_WM_OBJECT:-"$aiueos/kotoba/wm-hit.o"}
 kotoba_scanout_object=${AIUEOS_KOTOBA_SCANOUT_OBJECT:-"$aiueos/kotoba/scanout-bind.o"}
@@ -1296,7 +1307,7 @@ zig cc -target x86_64-freestanding-none -std=c11 $kernel_main_opt \
   $physical_job_qualification_cflags \
   $kernel_hang_test_cflags \
   -c -o "$kernel_object" "$aiueos/kernel/main.c"
-zig cc -target x86_64-freestanding-none \
+zig cc -target x86_64-freestanding-none $fp_probe_cflags \
   -c -o "$kernel_entry_object" "$aiueos/kernel/entry.S"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone -I "$out" \
@@ -1550,7 +1561,7 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_tls13_object" "$aiueos/kernel/tls13.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
-  $input_smoke_cflags \
+  $input_smoke_cflags $fp_probe_cflags \
   -c -o "$kernel_scheduler_object" "$aiueos/kernel/scheduler.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
@@ -1558,7 +1569,7 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_syscall_object" "$aiueos/kernel/syscall.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
-  $input_smoke_cflags \
+  $input_smoke_cflags $fp_probe_cflags \
   -c -o "$kernel_process_object" "$aiueos/kernel/process.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
