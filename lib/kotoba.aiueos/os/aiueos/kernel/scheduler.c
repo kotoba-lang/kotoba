@@ -540,31 +540,7 @@ int aiueos_scheduler_restore_service_registry(uint64_t state0, uint64_t state1) 
 int aiueos_scheduler_persistent_restore_evidence_ready(void) {
   return (int)persistent_restore_evidence;
 }
-#ifdef AIUEOS_FP_PROBE_FXSAVE
-/* JUN-855 experiment only: one 512-byte FXSAVE image per scheduler slot, kept outside tasks[]
-   because that table's layout is an ABI of the Kotoba dispatch object. aiueos_fx_isr_scratch is
-   what entry.S fxsave64s into / fxrstor64s from around the call below. */
-uint8_t aiueos_fx_isr_scratch[512] __attribute__((aligned(16)));
-static uint8_t fx_area[AIUEOS_TASK_SLOT_COUNT][512] __attribute__((aligned(16)));
-static uint8_t fx_valid[AIUEOS_TASK_SLOT_COUNT];
-static void fx_copy(uint8_t *to,const uint8_t *from) {
-  for (unsigned i=0;i<512;i++) to[i]=from[i];
-}
-static void fx_save_outgoing(unsigned slot) { fx_copy(fx_area[slot],aiueos_fx_isr_scratch); fx_valid[slot]=1; }
-static void fx_load_incoming(unsigned slot) {
-  if (!fx_valid[slot]) {  /* first dispatch: the architectural reset image, FCW 0x037f, MXCSR 0x1f80 */
-    for (unsigned i=0;i<512;i++) fx_area[slot][i]=0;
-    fx_area[slot][0]=0x7f; fx_area[slot][1]=0x03;
-    fx_area[slot][24]=0x80; fx_area[slot][25]=0x1f;
-    fx_valid[slot]=1;
-  }
-  fx_copy(aiueos_fx_isr_scratch,fx_area[slot]);
-}
-#endif
 uint64_t *aiueos_scheduler_on_timer(uint64_t *interrupted_stack) {
-#ifdef AIUEOS_FP_PROBE_FXSAVE
-  fx_save_outgoing(current_task);
-#endif
 #ifdef AIUEOS_PLC_RT_SMOKE
   if (rt_mode) return rt_on_timer(interrupted_stack);
 #endif
@@ -604,9 +580,6 @@ uint64_t *aiueos_scheduler_on_timer(uint64_t *interrupted_stack) {
     tasks[current_task].active=0; user_tasks_reaped++;
   }
   if (recipe&AIUEOS_DISPATCH_CURRENT) current_task=next;
-#ifdef AIUEOS_FP_PROBE_FXSAVE
-  fx_load_incoming(current_task);
-#endif
   if (recipe&AIUEOS_DISPATCH_SWITCH_COUNT) aiueos_scheduler_context_switches++;
   if (recipe&AIUEOS_DISPATCH_USER_DOMAIN) {
     aiueos_current_user_domain = current_task ? tasks[current_task].domain : 0;

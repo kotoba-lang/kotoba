@@ -197,8 +197,13 @@ scratch, coverage of every CPL0 entry that can reach SSE-using C, and setting CR
 
 ## 7. Files
 
-* `kernel/process.c`, `kernel/scheduler.c`, `kernel/entry.S`, `scripts/build-uefi.sh`: probe, poison and fxsave
-  hooks, all behind `AIUEOS_FP_PROBE=measure|poison|fxsave` (`-DAIUEOS_FP_PROBE[_POISON|_FXSAVE]`); off by default.
+* `probe/aiueos-fp-probe.patch`: the probe, poison and fxsave hooks for `kernel/process.c`, `kernel/scheduler.c`,
+  `kernel/entry.S` and `scripts/build-uefi.sh` (all behind `AIUEOS_FP_PROBE=measure|poison|fxsave`, off by default). They are
+  kept as a patch, not applied to the tree, so the C kernel sources on main are unchanged. To reproduce: from the repository root,
+  `git apply lib/kotoba.aiueos/90-docs/evidence/jun-855-fp-state-preemption-20261106/probe/aiueos-fp-probe.patch` (it applies to
+  main at ffedd600c; `git apply --check` was run), build with `AIUEOS_FP_PROBE=measure scripts/build-uefi.sh` as in section 4,
+  then judge the serial log with `check-fp-state-probe.py`. The patch was produced from the working tree the measurements in
+  sections 3-4 were taken on.
 * `scripts/check-fp-state-probe.py`, `scripts/test_check_fp_state_probe.py`: gate and its negative controls.
 * `serial/*.txt`: the `AIUEOS_FP_PROBE`, `AIUEOS_RING3_OK` and `AIUEOS_SCHEDULER_OK` lines of the four runs
   (CR removed). `compiler/`: sources, driver and output of section 1.

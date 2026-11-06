@@ -22,18 +22,7 @@ struct user_result {
   uint64_t transferred_valid, completed, scheduled_runs;
   uint64_t foreign_page;
   char message[8];
-#ifdef AIUEOS_FP_PROBE
-  /* JUN-855: filled by aiueos_fp_probe_loop (CPL3); offsets 152.. are used by its assembly. */
-  uint64_t fp_checks, fp_xmm_events, fp_x87_events, fp_mxcsr_events, fp_gaps, fp_syscalls;
-  uint64_t fp_bad_xmm0_lo, fp_bad_xmm0_hi, fp_bad_xmm7_lo, fp_bad_st0, fp_bad_cw, fp_bad_mxcsr;
-#endif
 };
-#ifdef AIUEOS_FP_PROBE
-_Static_assert(offsetof(struct user_result,scheduled_runs)==128,"fp probe asm offset");
-_Static_assert(offsetof(struct user_result,fp_checks)==152,"fp probe asm offset");
-_Static_assert(offsetof(struct user_result,fp_syscalls)==192,"fp probe asm offset");
-_Static_assert(offsetof(struct user_result,fp_bad_mxcsr)==240,"fp probe asm offset");
-#endif
 
 extern uint64_t aiueos_gdt_tss[2]; extern int64_t kotoba_aiueos_tss_descriptor_build(int64_t base, int64_t limit, int64_t out, int64_t out_length);
 extern uint8_t aiueos_kernel_stack_top[];
@@ -156,60 +145,6 @@ static const uint8_t hello_app_id[16]="app/hello";
 static const uint8_t worker_app_id[16]="app/worker";
 static const uint8_t missing_app_id[16]="app/missing";
 int aiueos_process_result(void);
-
-#ifdef AIUEOS_FP_PROBE
-extern volatile uint64_t aiueos_user_scheduler_switches, aiueos_scheduler_context_switches;
-static uint64_t fp_probe_wakes, fp_probe_base, fp_probe_based;
-static void p108_dec64(uint64_t value) {
-  char digits[20]; unsigned count = 0;
-  if (!value) { p108_byte((uint8_t)'0'); return; }
-  while (value) { digits[count++] = (char)('0' + (value % 10)); value /= 10; }
-  while (count) p108_byte((uint8_t)digits[--count]);
-}
-static void p108_hex64(uint64_t value) {
-  p108_str("0x");
-  for (int shift=60;shift>=0;shift-=4) p108_byte((uint8_t)"0123456789abcdef"[(value>>shift)&15U]);
-}
-/* Keep the wait loop in aiueos_process_enter alive until both probes have run and the scheduler has
-   switched user tasks 400 more times (bounded at 20000 wakeups). Without this the loop ends within a
-   few timer ticks and the probes are asked to exit before they have been preempted at all. */
-static int fp_probe_pending(void) {
-  volatile struct user_result *a=kernel_results[0],*b=kernel_results[1];
-  if (!a || !b || ++fp_probe_wakes>20000) return 0;
-  if (!a->fp_checks || !b->fp_checks) return 1;
-  if (!fp_probe_based) { fp_probe_based=1; fp_probe_base=aiueos_user_scheduler_switches; }
-  return aiueos_user_scheduler_switches-fp_probe_base<400;
-}
-static void fp_probe_report(void) {
-  const char *mode="measure"
-#if defined(AIUEOS_FP_PROBE_POISON)
-    "+poison"
-#endif
-#if defined(AIUEOS_FP_PROBE_FXSAVE)
-    "+fxsave"
-#endif
-    ;
-  p108_str("AIUEOS_FP_PROBE mode="); p108_str(mode);
-  for (unsigned i=0;i<2;i++) {
-    volatile struct user_result *r=kernel_results[i];
-    p108_str(" p"); p108_dec(i); p108_str("{domain="); p108_dec64(r->domain);
-    p108_str(" checks="); p108_dec64(r->fp_checks);
-    p108_str(" xmm_events="); p108_dec64(r->fp_xmm_events);
-    p108_str(" x87_events="); p108_dec64(r->fp_x87_events);
-    p108_str(" mxcsr_events="); p108_dec64(r->fp_mxcsr_events);
-    p108_str(" bad_xmm0_lo="); p108_hex64(r->fp_bad_xmm0_lo);
-    p108_str(" bad_st0="); p108_hex64(r->fp_bad_st0);
-    p108_str(" bad_cw="); p108_hex64(r->fp_bad_cw);
-    p108_str(" bad_mxcsr="); p108_hex64(r->fp_bad_mxcsr);
-    p108_str(" tsc_gaps="); p108_dec64(r->fp_gaps);
-    p108_str(" syscalls="); p108_dec64(r->fp_syscalls); p108_str("}");
-  }
-  p108_str(" user_switches_during="); p108_dec64(aiueos_user_scheduler_switches-fp_probe_base);
-  p108_str(" user_switches_total="); p108_dec64(aiueos_user_scheduler_switches);
-  p108_str(" context_switches_total="); p108_dec64(aiueos_scheduler_context_switches);
-  p108_str("\r\n");
-}
-#endif
 void aiueos_process_set_kernel_stack(uint64_t top) {
   tss.rsp0=top; aiueos_syscall_kernel_stack_top=top;
 }
@@ -259,140 +194,6 @@ static inline uint64_t call(uint64_t n, uint64_t h, const void *p, uint64_t l) {
   return a;
 }
 
-
-#ifdef AIUEOS_FP_PROBE
-/* JUN-855 floating-point state probe (evidence only, not part of any default build).
-   Runs at CPL3 in .user.text. rdi=result page, rsi=xmm pattern, rdx=bits of a double for x87 st0,
-   rcx=x87 control word, r8=MXCSR. aiueos_fp_probe_loop loads xmm0 = {pat, ~pat}, xmm7 = xmm0, st0 = the
-   double, CW and MXCSR, then forever re-reads all of them. Each check that finds a disagreement counts ONE
-   event for its class, records the value it saw, and reloads the expected state, so a counter is a number of
-   clobbering events and not a number of loop iterations spent in a wrong state.
-     152 checks   160 xmm_events   168 x87_events (st0 value or control word)   176 mxcsr_events
-     184 tsc_gaps (TSC jump > 200000)   192 syscalls (one SYSCALL ABI query per 1024 iterations)
-     200/208 last bad xmm0 low/high   216 last bad xmm7 low   224 last bad st0 bits   232 last bad CW   240 last bad MXCSR
-   128 scheduled_runs is incremented as the C loop it replaces did. State lives in callee-saved registers:
-   r14=pat r15=~pat rbp=double bits r12=cw r13=mxcsr rbx=last TSC. */
-__asm__(
-".section .user.text,\"ax\",@progbits\n"
-".global aiueos_fp_probe_loop\n"
-".type aiueos_fp_probe_loop,@function\n"
-"aiueos_fp_probe_loop:\n"
-"  sub $48,%rsp\n"
-"  mov %rsi,%r14\n"
-"  mov %rsi,%r15\n"
-"  not %r15\n"
-"  mov %rdx,%rbp\n"
-"  mov %rcx,%r12\n"
-"  mov %r8,%r13\n"
-"  call fp_set_state\n"
-"  rdtsc\n"
-"  shl $32,%rdx\n"
-"  or %rdx,%rax\n"
-"  mov %rax,%rbx\n"
-"1:\n"
-"  xor %r8d,%r8d\n"
-"  xor %r9d,%r9d\n"
-"  xor %r10d,%r10d\n"
-"  movq %xmm0,%rax\n"
-"  cmp %r14,%rax\n"
-"  je 2f\n"
-"  mov %rax,200(%rdi)\n"
-"  inc %r8d\n"
-"2:\n"
-"  movhlps %xmm0,%xmm2\n"
-"  movq %xmm2,%rax\n"
-"  cmp %r15,%rax\n"
-"  je 3f\n"
-"  mov %rax,208(%rdi)\n"
-"  inc %r8d\n"
-"3:\n"
-"  movq %xmm7,%rax\n"
-"  cmp %r14,%rax\n"
-"  je 4f\n"
-"  mov %rax,216(%rdi)\n"
-"  inc %r8d\n"
-"4:\n"
-"  fstl 16(%rsp)\n"
-"  mov 16(%rsp),%rax\n"
-"  cmp %rbp,%rax\n"
-"  je 5f\n"
-"  mov %rax,224(%rdi)\n"
-"  inc %r9d\n"
-"5:\n"
-"  fnstcw 24(%rsp)\n"
-"  movzwl 24(%rsp),%eax\n"
-"  cmp %r12d,%eax\n"
-"  je 6f\n"
-"  mov %rax,232(%rdi)\n"
-"  inc %r9d\n"
-"6:\n"
-"  stmxcsr 28(%rsp)\n"
-"  mov 28(%rsp),%eax\n"
-"  cmp %r13d,%eax\n"
-"  je 7f\n"
-"  mov %rax,240(%rdi)\n"
-"  inc %r10d\n"
-"7:\n"
-"  test %r8d,%r8d\n"
-"  jz 8f\n"
-"  incq 160(%rdi)\n"
-"8:\n"
-"  test %r9d,%r9d\n"
-"  jz 9f\n"
-"  incq 168(%rdi)\n"
-"9:\n"
-"  test %r10d,%r10d\n"
-"  jz 10f\n"
-"  incq 176(%rdi)\n"
-"10:\n"
-"  or %r9d,%r10d\n"
-"  or %r8d,%r10d\n"
-"  jz 11f\n"
-"  call fp_set_state\n"
-"11:\n"
-"  rdtsc\n"
-"  shl $32,%rdx\n"
-"  or %rdx,%rax\n"
-"  mov %rax,%rcx\n"
-"  sub %rbx,%rax\n"
-"  mov %rcx,%rbx\n"
-"  cmp $200000,%rax\n"
-"  jb 12f\n"
-"  incq 184(%rdi)\n"
-"12:\n"
-"  incq 128(%rdi)\n"
-"  incq 152(%rdi)\n"
-"  mov 152(%rdi),%rax\n"
-"  test $1023,%eax\n"
-"  jnz 1b\n"
-"  push %rdi\n"
-"  xor %eax,%eax\n"
-"  xor %edi,%edi\n"
-"  xor %esi,%esi\n"
-"  xor %edx,%edx\n"
-"  syscall\n"
-"  pop %rdi\n"
-"  incq 192(%rdi)\n"
-"  jmp 1b\n"
-"fp_set_state:\n"
-"  movq %r14,%xmm0\n"
-"  movq %r15,%xmm1\n"
-"  punpcklqdq %xmm1,%xmm0\n"
-"  movdqa %xmm0,%xmm7\n"
-"  mov %rbp,-8(%rsp)\n"
-"  fninit\n"
-"  fldl -8(%rsp)\n"
-"  mov %r12w,-16(%rsp)\n"
-"  fldcw -16(%rsp)\n"
-"  mov %r13d,-20(%rsp)\n"
-"  ldmxcsr -20(%rsp)\n"
-"  ret\n"
-".size aiueos_fp_probe_loop,.-aiueos_fp_probe_loop\n"
-".previous\n"
-);
-extern void aiueos_fp_probe_loop(struct user_result *r,uint64_t pattern,uint64_t dbits,uint64_t cw,uint64_t mxcsr)
-  __attribute__((noreturn));
-#endif
 __attribute__((section(".user.text"), noreturn))
 static void user_run(struct user_result *r, const void *foreign_page) {
   r->abi = call(ABI,0,0,0);
@@ -412,15 +213,6 @@ static void user_run(struct user_result *r, const void *foreign_page) {
     r->transferred_valid=call(LOG,r->claimed,r->message,5);
   }
   r->completed = 1;
-#ifdef AIUEOS_FP_PROBE
-  {
-    uint64_t d=r->domain;
-    aiueos_fp_probe_loop(r,0xC0DE000000000000ULL|(d<<40)|0xA5A5A5A5ULL,
-      d==2 ? 0x4004000000000000ULL : 0x400C000000000000ULL,   /* 2.5 and 3.5 */
-      d==2 ? 0x037fU : 0x027fU,                                 /* x87 CW: 64-bit and 53-bit precision */
-      d==2 ? 0x3f80U : 0x5f80U);                                /* MXCSR: round down and round up */
-  }
-#endif
   for (;;) { r->scheduled_runs++; __asm__ volatile("pause"); }
 }
 __attribute__((section(".user.text"), noreturn))
@@ -682,11 +474,7 @@ void aiueos_process_enter(void) {
     while (!aiueos_process_result() || !aiueos_user_scheduler_evidence_ready() ||
            *kotoba_result!=42 || *worker_result!=42 ||
            !aiueos_kotoba_service_ipc_evidence_ready() ||
-           !aiueos_user_object_write_evidence_ready()
-#ifdef AIUEOS_FP_PROBE
-           || fp_probe_pending()
-#endif
-           ) {
+           !aiueos_user_object_write_evidence_ready()) {
       int flushed;
       __asm__ volatile("cli");
       flushed = aiueos_user_object_flush_pending();
@@ -715,9 +503,6 @@ void aiueos_process_enter(void) {
       __asm__ volatile("sti; hlt");
     }
   }
-#ifdef AIUEOS_FP_PROBE
-  fp_probe_report();
-#endif
   aiueos_scheduler_request_user_exit(2); aiueos_scheduler_request_user_exit(3);
   aiueos_scheduler_request_user_exit(4);
   aiueos_scheduler_request_user_exit(5);

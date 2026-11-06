@@ -4,7 +4,6 @@
 .extern aiueos_kernel_main
 .extern aiueos_exception_dispatch
 .extern aiueos_scheduler_on_timer
-.extern aiueos_fx_isr_scratch
 .extern aiueos_syscall_dispatch
 .global aiueos_syscall_from_user
 .global aiueos_saved_kernel_rsp
@@ -156,17 +155,6 @@ aiueos_isr_apic_timer:
   push %r13
   push %r14
   push %r15
-#ifdef AIUEOS_FP_PROBE_FXSAVE
-  /* JUN-855 experiment: capture the interrupted task's x87/SSE image before any C runs.
-     aiueos_scheduler_on_timer moves it to the per-task area and leaves the incoming
-     task's image here. */
-  fxsave64 aiueos_fx_isr_scratch(%rip)
-#endif
-#ifdef AIUEOS_FP_PROBE_POISON
-  /* JUN-855 negative control: behave like a kernel path that uses SSE/x87 without saving it. */
-  pxor %xmm0, %xmm0
-  fninit
-#endif
   incq aiueos_apic_timer_ticks(%rip)
   mov aiueos_apic_mmio_base(%rip), %rax
   movl $0, 0xb0(%rax)
@@ -174,9 +162,6 @@ aiueos_isr_apic_timer:
   and $-16, %rsp
   call aiueos_scheduler_on_timer
   mov %rax, %rsp
-#ifdef AIUEOS_FP_PROBE_FXSAVE
-  fxrstor64 aiueos_fx_isr_scratch(%rip)
-#endif
   pop %r15
   pop %r14
   pop %r13
