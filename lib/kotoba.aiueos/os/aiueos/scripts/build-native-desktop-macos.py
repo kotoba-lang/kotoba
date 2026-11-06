@@ -176,7 +176,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -276,6 +276,7 @@ def main(args):
                         else "style-entry.kotoba" if args.profile == "style"
                         else "layout-entry.kotoba" if args.profile == "layout"
                         else "flex-entry.kotoba" if args.profile == "flex"
+                        else "grid-entry.kotoba" if args.profile == "grid"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
@@ -293,7 +294,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != ({"style": 55, "layout": 61, "flex": 54}.get(args.profile, 51))
+                or kernel_state["sourceModuleCount"] != ({"style": 55, "layout": 61, "flex": 54, "grid": 53}.get(args.profile, 51))
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -341,6 +342,7 @@ def main(args):
                         else "check-native-style-qemu.py" if args.profile == "style"
                         else "check-native-layout-qemu.py" if args.profile == "layout"
                         else "check-native-flex-qemu.py" if args.profile == "flex"
+                        else "check-native-grid-qemu.py" if args.profile == "grid"
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
@@ -374,6 +376,7 @@ def main(args):
                         else "native-style-qemu.json" if args.profile == "style"
                         else "native-layout-qemu.json" if args.profile == "layout"
                         else "native-flex-qemu.json" if args.profile == "flex"
+                        else "native-grid-qemu.json" if args.profile == "grid"
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
@@ -400,6 +403,7 @@ def main(args):
                            else "PASS_NATIVE_STYLE_K_QEMU" if args.profile == "style"
                            else "PASS_NATIVE_LAYOUT_K_QEMU" if args.profile == "layout"
                            else "PASS_NATIVE_FLEX_K_QEMU" if args.profile == "flex"
+                           else "PASS_NATIVE_GRID_K_QEMU" if args.profile == "grid"
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
@@ -423,7 +427,7 @@ def main(args):
                            else 12 if args.profile == "update2"
                            else 8 if args.profile == "provision"
                            else 3 if args.profile == "catalog"
-                           else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "gf25519", "keyseal") else 24)
+                           else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -522,6 +526,9 @@ def main(args):
                     or observed["events"][1]["cases"] != observed["events"][1]["matches"]
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("flex verdict is incomplete")
+        elif args.profile == "grid":
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "grid-cases"]
+                raise ValueError("grid verdict is incomplete")
         elif args.profile == "gf25519":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "gf25519"]
@@ -736,6 +743,7 @@ def main(args):
                             else "MACOS_NATIVE_STYLE_K_QEMU_CANDIDATE" if args.profile == "style"
                             else "MACOS_NATIVE_LAYOUT_K_QEMU_CANDIDATE" if args.profile == "layout"
                             else "MACOS_NATIVE_FLEX_K_QEMU_CANDIDATE" if args.profile == "flex"
+                            else "MACOS_NATIVE_GRID_K_QEMU_CANDIDATE" if args.profile == "grid"
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
@@ -783,6 +791,8 @@ def main(args):
                                     if args.profile == "layout"
                                     else "Mac native CSSOM flex lines of up to sixteen items (grow, scaled shrink, clamp, freeze, justify-content, auto margins as kernel region code) against the host exact grid on QEMU"
                                     if args.profile == "flex"
+                                    else "Mac native CSSOM grid track sizing and table column widths (layout.cljk track-sizes, distribute-fr, distribute-equally-with-caps, table-column-widths, distribute-excess as kernel region code) against the host references on QEMU"
+                                    if args.profile == "grid"
                                     else "Mac native GF(2^255-19) arithmetic self-test on QEMU"
                                     if args.profile == "gf25519"
                                     else "Mac native Ed25519 public keys from RFC 8032 seeds on QEMU"
@@ -822,7 +832,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "update2", "provision", "catalog", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "catalog", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "
