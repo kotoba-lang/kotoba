@@ -160,10 +160,10 @@ def check_table():
         if set(rows) != set(recs):
             fail("%s has rows %s, records have %s" % (fn, sorted(rows), sorted(recs)))
     want_req = sorted("app-" + d for d in documents())
-    ns = re.match(r"\(ns index \(:require (.*?)\)\)\n", text)
+    ns = re.match(r"\(ns index \(:require (.*?)\)\)\n", text, re.S)
     if not ns:
         fail("index.kotoba does not start with (ns index (:require ...))")
-    got_req = sorted(re.findall(r"\[(app-[a-z0-9-]+) :as [a-z]+\]", ns.group(1)))
+    got_req = sorted(re.findall(r"\[(app-[a-z0-9-]+) :as [a-z0-9]+\]", ns.group(1)))
     if got_req != want_req:
         fail("index.kotoba requires %s, the records' ui.document name %s" % (got_req, want_req))
     print("AIUEOS_SESSION_TABLE_OK apps=%d documents=%d" % (count, len(want_req)))
