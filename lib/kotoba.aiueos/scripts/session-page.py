@@ -13,6 +13,7 @@ or `amu` on PATH. Host-side only: it compiles nothing but the one source and boo
 nothing. `amu run` prints main's value ("0") after the page; it is stripped only when
 the output ends exactly with "</html>\\n0\\n".
 """
+import hashlib
 import json
 import os
 import pathlib
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SESSION = ROOT / "resources" / "aiueos" / "session"
@@ -46,8 +48,25 @@ def amu():
     fail("Amu not found (set AMU_HOME or put amu on PATH); the page cannot be built or checked", 2)
 
 
+HTML_LIB = ROOT.parent / "kotoba.html" / "kotoba"
+MODULES = {"index": SRC, "html-core": HTML_LIB / "html_core.kotoba", "html-hiccup": HTML_LIB / "html_hiccup.kotoba",
+           "ui-components": HTML_LIB / "ui_components.kotoba"}
+
+
+def source_lock(path):
+    """KSL2 source lock over the page and the shared html libraries it requires (JUN-856)."""
+    mods = {n: p.resolve(strict=True) for n, p in MODULES.items()}
+    text = "KSL2\nentry %s\n" % mods["index"]
+    text += "".join("module %s %s\n" % (n, p) for n, p in sorted(mods.items()))
+    text += "".join("file %s %s\n" % (hashlib.sha256(p.read_bytes()).hexdigest(), p) for p in sorted(mods.values()))
+    path.write_text(text, encoding="utf-8")
+
+
 def render():
-    r = subprocess.run([amu(), "run", str(SRC)], capture_output=True, timeout=300)
+    with tempfile.TemporaryDirectory() as tmp:
+        lock = pathlib.Path(tmp) / "page.ksl"
+        source_lock(lock)
+        r = subprocess.run([amu(), "run", str(SRC), "--source-lock", str(lock)], capture_output=True, timeout=300)
     if r.returncode != 0:
         fail("amu run exited %d: %s" % (r.returncode, r.stderr.decode("utf-8", "replace")[:300]))
     out = r.stdout
