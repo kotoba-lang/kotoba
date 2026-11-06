@@ -162,3 +162,61 @@ Two review findings that change no behaviour. They state what the implementation
    let one key (and no ML-DSA signature) install an image, bypassing the two-of-three rule and the post-quantum floor. The
    change that pins the production set must therefore remove the `AIUEIMG1` branch of `admit` (and the single-key pin) in the
    same commit; a release that has both is not acceptable.
+
+## Amendment 4 (2026-11-06, owner decision, JUN-813 stage 5c): an interim hash-checked version floor
+
+**Decision (owner, recorded).** Ship rollback refusal now with a hash-checked per-channel version floor kept in the existing update
+journal (`native/update_journal.kotoba`, file `OSMETA.BIN`, AWAI-122). Decision 4's "signed by the device key" (ADR-0284's append-only
+chain) is **not** met by this and stays the goal. It is follow-up work behind ADR-0284: that chain does not exist yet, and the device
+key cannot sign on the unattended update path (it is consent-bound, ADR-0277). Decision 4 is therefore partly implemented, not closed.
+
+**The threat this answers, and its limit.** Rollback protection answers *replay of an old but validly signed image arriving over the
+network* (a mirror, a peer or an on-path attacker serving version 3 to a device at version 5; the signature is still good). The floor
+refuses it. An attacker who can **write the disk** can replace `BOOTX64.EFI` directly, without touching the floor, so a device signature
+over the floor would not stop that attacker either: signing the floor protects the floor, not the image the firmware boots. What the
+journal's SHA-256 gives is protection against **corruption and accidental edits** (a torn write, a flipped bit, a half-written
+record), not against an adversary. What a hash-checked floor does **not** give: protection against someone who can rewrite
+`OSMETA.BIN` consistently (a valid record with a lower floor and its correct hash); they can lower the floor and then replay. The
+hash is not a MAC and the file is not sealed.
+
+**What was built.**
+
+1. `admit` (both `AIUEIMG1` and `AIUEIMG2`; the self-test and the `self-install` hooks do not go through it) first loads the journal
+   (re-probes NVMe and the ESP, mounts `OSMETA.BIN` read-only, `load`: marker, head, both slots and the SHA-256 of the published
+   record all checked). Only then does it fetch the 128 header bytes. After the header is admitted (signatures counted, size and
+   version valid) the manifest version must be **strictly above** the floor. No image byte has been taken at that point.
+2. **New result codes (word 180, and 208 for installs).** `9`: the version is not above the floor (equal is refused). `10`: the floor
+   cannot be read: `OSMETA.BIN` is missing, unreadable, corrupt, fails its hash or schema, or was never initialised. A journal that
+   cannot be read **fails closed**: the update is refused. It is never taken as floor 0. `50` (word 208 only): the image was installed
+   and committed but the journal could not be advanced; the operator must see this, because the same version can then be installed
+   again. Words 256..262 are the observation words (floor read, load result, advance result, floor after, provisioning hook).
+3. **Crash order: install, then advance.** After the install is committed (`BOOTX64.EFI` swapped and hashed back to the manifest digest)
+   the floor advances through the journal's own crash-ordered `prepare`: the new floor is `version`. If the machine stops between the
+   two, the new image is installed with the old floor: **one repeat install of the same version is admitted, and nothing is bricked.**
+   Advancing first would turn every install that fails halfway (digest mismatch, write failure, power loss) into a device that refuses
+   its own retry. A verify-only boot, a refused header and a failed install never advance the floor.
+4. **Journal phases.** An advance leaves the journal "prepared" (phase 1, floor = candidate = the installed version). Nothing confirms
+   it: confirming needs boot-health evidence (the first good boot of the new image) and no such evidence exists. A later install that
+   finds an earlier unconfirmed prepare abandons it through the journal's own `trial` then `rollback` transitions (phase 3, floor
+   kept) before preparing the new version. `confirm-installed` exists as the one future call site and has no caller.
+5. **Provisioning: fail closed, do not create.** The ESP of the `update2` and `nvme` gate fixtures, and of every installed board, has no
+   `OSMETA.BIN`; nothing at boot or on the network path creates it (the journal's rule "no boot formatting"). The smallest correct
+   choice is to refuse: creating the file on the update path would initialise the floor from an image nobody has trusted yet, which is
+   floor 0 by another name for the first replay. So a board with no `OSMETA.BIN` **refuses every network update with 10** until a
+   deliberate, separate provisioning step creates it with a floor the owner chose. That step does not exist for real boards yet (open
+   follow-up). The QEMU gate provisions through a hypervisor-only fw_cfg hook (request `4`: floor 4, active 4) that no physical board
+   has.
+
+**Consequence the owner must know.** Merging this makes the existing network `install` path refuse on every currently installed
+board until it has an `OSMETA.BIN`. That is the intended fail-closed behaviour, and it also means a board cannot be updated over the
+network until the provisioning step is built.
+
+**Verified (QEMU/TCG, test keys, `-nic none`):** the `update2` gate (hook-provisioned floor 4, independent oracle): floor boundary
+(above, equal, below) for `AIUEIMG2` and `AIUEIMG1`; install advances the floor 4 to 5 and a second install of version 5 is refused; a
+newer version advances it again; an install that stops before the advance leaves the floor at 4, a repeat is admitted once and then
+refused; a tampered image and a one-signer header never advance it; a corrupt and an absent `OSMETA.BIN` give 10 with nothing
+written. Negative controls: rebuilt kernels without the floor check, without the advance, and with a corrupt journal read as floor 0
+each fail this gate (see the pull request). **Not verified:** the network pull itself (no RTL8168 in QEMU); physical hardware;
+power loss between the install and the advance (the crash case is simulated by the hook stopping before the advance, the guest is not
+killed between the writes); an adversary who rewrites `OSMETA.BIN`; real-board provisioning; a floor per channel (one floor is kept,
+the update image channel is the only channel today).

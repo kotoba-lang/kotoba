@@ -288,7 +288,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 50
+                or kernel_state["sourceModuleCount"] != 51
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -400,7 +400,7 @@ def main(args):
                            else 11 if args.profile == "dapps"
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
-                           else 4 if args.profile == "update2"
+                           else 12 if args.profile == "update2"
                            else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -533,15 +533,20 @@ def main(args):
                 raise ValueError("nvme verdict is incomplete")
         elif args.profile == "update2":
             if (observed["font"] != font_state["padded"]
-                    or [row["name"] for row in observed["events"]] != ["update2-cases", "update2-install", "update2-tampered", "update2-one-signer"]
-                    or observed["events"][0]["matches"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "one-signer", "ml-half-bad",
+                    or [row["name"] for row in observed["events"]] != ["update2-provision", "update2-cases", "update2-install", "update2-replay", "update2-newer",
+                                                                                     "update2-crash-before-advance", "update2-crash-repeat", "update2-crash-refused",
+                                                                                     "update2-tampered", "update2-one-signer", "update2-journal-corrupt", "update2-journal-absent"]
+                    or observed["events"][1]["matches"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "one-signer", "ml-half-bad",
                                                             "ed-half-bad", "tampered-image", "tampered-manifest", "duplicate-id", "unknown-id",
                                                             "production-mode", "bad-magic", "count-zero", "manifest-reserved", "version-zero",
                                                             "size-too-big", "entry-reserved-4", "entry-reserved-7", "pad-nonzero-first",
                                                             "pad-nonzero-last", "layout-68", "layout-127", "count-five", "count-four-dup",
                                                             "count-four-last-counts", "id-256", "id-65536", "id-16777216", "wrong-context",
-                                                            "stream-broken-after-verify"]
-                    or [row["install"] for row in observed["events"][1:]] != [15, 7, 1]
+                                                            "floor-above", "floor-equal", "floor-below", "v1-above-floor", "v1-equal-floor",
+                                                            "v1-below-floor", "stream-broken-after-verify"]
+                    or [row["install"] for row in observed["events"][2:]] != [15, 9, 15, 15, 15, 9, 7, 1, 10, 10]
+                    or [row.get("floorAfter") for row in observed["events"][2:]] != [5, None, 6, None, 5, None, None, None, None, None]
+                    or not observed.get("versionFloorHashCheckedNotSigned")
                     or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
                 raise ValueError("update2 verdict is incomplete")
         elif args.profile == "keyseal":
