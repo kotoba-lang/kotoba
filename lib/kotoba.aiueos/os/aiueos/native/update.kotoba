@@ -25,8 +25,8 @@
   ;; manifest byte changed (signature) and refuse it with one image byte changed
   ;; (digest), all through the same chunk path the network uses.
   ;;
-  ;; Classical Ed25519 only, and no rollback protection beyond version >= 1:
-  ;; the kernel has no ML-DSA verifier yet and keeps no installed version.
+  ;; AIUEIMG1 is classical Ed25519 only, and there is no rollback protection beyond
+  ;; version >= 1 for either format: the kernel keeps no installed version.
   ;;
   ;; State: context words 180 result (0 none, 1 signature refused, 2 magic,
   ;; 3 size, 4 version, 5 reserved not zero, 6 chunk out of order, 7 digest
@@ -58,11 +58,40 @@
   ;; fixture with one image byte changed ("2"). It never installs network data,
   ;; and a physical board has no fw_cfg. The verifier uses context bytes
   ;; 2048..3071 and 4096..8191, SHA-256 bytes 3072..3647 (as native/esp).
+  ;;
+  ;; JUN-813 stage 5b (ADR-0286 amendment 2): AIUEIMG2. The header is 16384 bytes: the 64-byte manifest (as AIUEIMG1, magic
+  ;; "AIUEIMG2"), the entry count u32 at 64 (1..4, bytes 68..127 zero), then up to four 3392-byte entries from byte 128 (key id
+  ;; u32, 4 zero bytes, Ed25519 signature 64, ML-DSA-65 signature 3309, 11 zero bytes); the image follows the header. It does not fit
+  ;; the 4096-byte page, so it arrives in the same chunks as the image (the first 128 bytes, then 1024-byte pieces that never
+  ;; cross a 1 KiB line) and each byte is consumed as it lands: the manifest into the verifier buffers, the signatures into
+  ;; their buffers, and when an entry's last byte lands both of its signatures are verified (aiueos.ed25519 and
+  ;; aiueos.mldsa-verify) and counted with aiueos.imgsig (N = 3 pinned slots, M = 2 distinct valid signers). Only after the header
+  ;; is admitted are the manifest's size and version checked and the image hashed against its SHA-256.
+  ;; `admit` dispatches on header byte 7 ("2" AIUEIMG2, otherwise the AIUEIMG1 path above is unchanged and still takes
+  ;; its own checks): AIUEIMG1 stays admissible here until AIUEIMG2 has a production signer set (ADR-0286 retires it only when
+  ;; AIUEIMG2 ships), so the self-test above still runs.
+  ;; Pinned signers: test=1 uses the TEST keys of aiueos.imgsig-testkeys (self-test and QEMU hook only: their seeds are public);
+  ;; test=0, the network paths, has NO production signer set pinned yet (key custody is an owner decision, ADR-0286 amendment 1)
+  ;; and refuses an AIUEIMG2 image with result 8 after the structural checks, before any signature work.
+  ;; Memory: the ML-DSA arena is owned window 4 (20480 bytes: signature at 8192, key at 12288), which the NVMe driver and the ESP
+  ;; walk also use (queues, data page). Verifying an entry therefore overwrites them; `restore-storage` re-runs nvme/probe and
+  ;; esp/run after any header that ran ML-DSA, before the SHA state is initialised (esp hashes with the same scratch). The Ed25519
+  ;; verifier keeps its buffers (context bytes 2048..3071 and 4096..8191; key 2048, signature 2080, manifest 2144), the SHA
+  ;; state stays 3072..3647. AIUEIMG2 state words: 212 header length (128 or 16384), 216 count, 218 mask of counted slots, 220 key
+  ;; id of the entry in progress, 221 its reserved bytes, 222 its padding, 223 flags (1 size out of range, 2 version below 1),
+  ;; 224 size, 225/226 version, 227 header end, 228 ML-DSA ran, 229 stream bytes consumed from the QEMU file, 233 storage walk after
+  ;; the cases, 234 marker "UP02", 235 case count, 236.. per case k < 20: result | counted mask << 8. New result codes:
+  ;; 8 no production signer set pinned; 1 is also "fewer than two distinct valid signers" for AIUEIMG2.
+  ;; QEMU hook: fw_cfg file opt/aiueos/update2 (hypervisor only): [count][per case: mode (0 test keys, 1 production), 16384 header
+  ;; bytes, 5000 image bytes]; with no install request every case is run to its verdict, with install request "3" case 0 is installed.
   (:require [aiueos.native.storage-state :as storage]
             [aiueos.native.rtl8168-debug :as nic]
             [aiueos.native.nvme :as nvme]
             [aiueos.native.esp :as esp]
             [aiueos.ed25519 :refer [aiueos-ed25519-verify]]
+            [aiueos.mldsa-verify :refer [mv-mu mv-verify]]
+            [aiueos.imgsig :refer [ims-step ims-final ims-bit]]
+            [aiueos.imgsig-testkeys :refer [ims-ed-word ims-ml-word]]
             [aiueos.lib.sha256-stream :as sha])
   (:export [self-test pull report install install-report qemu-hook]))
 
@@ -255,18 +284,172 @@
           (if (= (wait (word64 ctx 172) offset len dst (+ (kernel-rdtsc) 1073741824)) 1) 1
             (fetch ctx offset len dst (+ tries 1)))
           (fetch ctx offset len dst (+ tries 1))))))
+;; ---- fw_cfg byte stream (QEMU only): the gate hook and the AIUEIMG2 cases ----
+(defn fw-byte [] (kernel-in-u8 1297))
+(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
+(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
+;; which 0 "opt/aiueos/install", 1 "opt/aiueos/update2" (18 bytes and a NUL)
+(defn fw-name-byte [which i]
+  (if (< i 11) (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 0)
+    (if (= which 0) (case i 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0)
+                    (case i 11 117 12 112 13 100 14 97 15 116 16 101 17 50 0))))
+(defn fw-name [which i ok]
+  (if (>= i 56) ok
+    (let [b (fw-byte)]
+      (fw-name which (+ i 1) (if (and (= ok 1) (or (>= i 19) (= b (fw-name-byte which i)))) 1 0)))))
+(defn fw-find [left which]
+  (if (<= left 0) 0
+    (let [size (fw-be 4 0)
+          sel (fw-be 2 0)
+          skip (fw-skip 2)
+          hit (fw-name which 0 1)]
+      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1) which)))))
+(defn fw-signature [i]
+  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
+;; 1 when the hypervisor's fw_cfg file `which` is selected (its first byte is next), else 0.
+(defn fw-open [which]
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
+    (do (kernel-out-u16 1296 0)
+        (if (= (fw-signature 0) 0) 0
+          (do (kernel-out-u16 1296 25)
+              (let [sel (fw-find (least (fw-be 4 0) 256) which)]
+                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) 1))))))))
+(defn fw-request [] (if (= (fw-open 0) 1) (fw-byte) 0))
+(defn fw-fill [dst n i]
+  (if (>= i n) 1 (do (put-pg (+ dst i) (fw-byte)) (fw-fill dst n (+ i 1)))))
+
+;; ---- JUN-813 stage 5b: AIUEIMG2, a 16 KiB multi-signer header consumed as it streams ----
+(defn sb! [i v] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 8192 4096) 4096 i v))
+(defn pw! [w v] (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 12288 4096) 4096 (* 4 w) v))
+(defn nz [b] (if (= b 0) 0 1))
+(defn magic2-byte [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 50 0))
+(defn magic2-bad [i acc]
+  (if (>= i 8) acc (magic2-bad (+ i 1) (bit-or acc (nz (bit-xor (pg i) (magic2-byte i)))))))
+(defn zeros-nz [from to acc]
+  (if (>= from to) acc (zeros-nz (+ from 1) to (bit-or acc (nz (pg from))))))
+;; M' = 0 || 8 || "AIUEIMG2" || manifest: the 10-byte prefix at S 3392, the manifest after it
+(defn mp-prefix-byte [i] (case i 1 8 2 65 3 73 4 85 5 69 6 73 7 77 8 71 9 50 0))
+(defn mp-prefix [i] (if (>= i 10) 1 (do (sb! (+ 3392 i) (mp-prefix-byte i)) (mp-prefix (+ i 1)))))
+(defn copy-manifest [ctx i]
+  (if (>= i 64) 1 (do (put-byte ctx (+ 2144 i) (pg i)) (sb! (+ 3402 i) (pg i)) (copy-manifest ctx (+ i 1)))))
+
+;; Overwritten by an entry's verification: the Ed25519 verifier's buffer covers the NVMe/ESP words 600..699 and the ML-DSA arena
+;; is the NVMe queues and the ESP data page. Run the driver again (word 228 says a verifier ran).
+(defn restore-storage [ctx]
+  (if (= (word ctx 228) 0) 0
+    (do (nvme/probe ctx) (esp/run ctx) (put-word ctx 228 0))))
+(defn pinned-signers [test] (if (= test 1) 3 0))
+
+;; Page bytes 0..127 hold the manifest, the count and the zero bytes. 14 when the structure is sound and the
+;; entries follow, else a refusal code (2 magic, 5 reserved, 3 count or layout, 8 no signer set).
+(defn h2-start [ctx test]
+  (let [badm (magic2-bad 0 0)
+        rsv (zeros-nz 24 32 0)
+        cnt (pg-le 64 4 0)
+        lay (zeros-nz 68 128 0)
+        size (pg-le 16 8 0)
+        version (pg-le 8 8 0)]
+    (if (not (= badm 0)) (fail ctx 2)
+      (if (not (= rsv 0)) (fail ctx 5)
+        (if (or (or (< cnt 1) (> cnt 4)) (not (= lay 0))) (fail ctx 3)
+          (if (= (pinned-signers test) 0) (fail ctx 8)
+            (do (put-word ctx 212 16384)
+                (put-word ctx 216 cnt)
+                (put-word ctx 218 0)
+                (put-word ctx 227 (+ 128 (* cnt 3392)))
+                (put-word ctx 223 (+ (if (or (<= size 0) (> size 33554432)) 1 0) (if (< version 1) 2 0)))
+                (put-word ctx 224 (if (or (<= size 0) (> size 33554432)) 0 size))
+                (put-word64 ctx 225 (if (< version 1) 0 version))
+                (copy-manifest ctx 0)
+                (mp-prefix 0)
+                (save-digest ctx 0)
+                (fail ctx 14))))))))
+
+(defn load-ed-key [ctx id w]
+  (if (>= w 8) 1 (do (put-word ctx (+ 512 w) (ims-ed-word id w)) (load-ed-key ctx id (+ w 1)))))
+(defn load-ml-key [id w]
+  (if (>= w 488) 1 (do (pw! w (ims-ml-word id w)) (load-ml-key id (+ w 1)))))
+;; The entry's last byte has landed: key id (220), reserved (221), padding (222) must be a pinned slot not yet
+;; counted with zero reserved/padding bytes; then Ed25519, and only if it verified, ML-DSA-65.
+(defn verify-entry [ctx]
+  (let [id (word ctx 220) seen (word ctx 218)]
+    (if (or (>= id 3) (or (not (= (word ctx 221) 0)) (or (not (= (word ctx 222) 0))
+                                                         (not (= (bit-and seen (ims-bit id)) 0)))))
+      0
+      (let [flag (put-word ctx 228 1)
+            k (load-ed-key ctx id 0)
+            ed (aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 64
+                                      (kernel-subregion ctx 8192 4096 4096))
+            ml (if (= (+ ed (* 0 (+ k flag))) 1)
+                 (let [kk (load-ml-key id 0)
+                       u (mv-mu (kernel-owned-window 4 20480) 20480 74)
+                       v (mv-verify (kernel-owned-window 4 20480) 20480)]
+                   (+ v (* 0 (+ kk u))))
+                 0)]
+        (put-word ctx 218 (ims-step seen id ed ml))))))
+
+;; Header byte h (>= 128), value b. Entry ei = (h - 128) / 3392, offset e within it.
+(defn h2-byte [ctx h b]
+  (let [j (- h 128)
+        ei (quot j 3392)
+        e (- j (* ei 3392))]
+    (if (>= ei (word ctx 216)) 0
+      (do (if (< e 4) (put-word ctx 220 (if (= e 0) b (+ (word ctx 220) (* b (case e 1 256 2 65536 16777216))))) 0)
+          (if (and (>= e 4) (< e 8)) (put-word ctx 221 (if (= e 4) b (bit-or (word ctx 221) b))) 0)
+          (if (and (>= e 8) (< e 72)) (put-byte ctx (+ 2072 e) b) 0)
+          (if (and (>= e 72) (< e 3381)) (sb! (- e 72) b) 0)
+          (if (>= e 3381) (put-word ctx 222 (if (= e 3381) (nz b) (bit-or (word ctx 222) (nz b)))) 0)
+          (if (= e 3391) (verify-entry ctx) 0)
+          1))))
+(defn h2-consume [ctx h i n]
+  (if (>= i n) 1
+    (do (h2-byte ctx (+ h i) (pg (bit-and (+ h i) 4095)))
+        (h2-consume ctx h (+ i 1) n))))
+
+;; src 0 the network (stream offset `off`), src 1 the QEMU file. n <= 1024 bytes land at page byte dst.
+(defn get-chunk [ctx src off n dst]
+  (if (= src 1)
+    (do (put-word ctx 229 (+ (word ctx 229) n)) (fw-fill dst n 0))
+    (fetch ctx off n dst 0)))
+;; Header bytes h .. end in pieces that end at a 1 KiB line, so none crosses the page end.
+(defn h2-loop [ctx src h end]
+  (if (>= h end) 1
+    (let [n (least (- 1024 (bit-and h 1023)) (- end h))]
+      (if (= (get-chunk ctx src h n (bit-and h 4095)) 0) 0
+        (do (h2-consume ctx h 0 n) (h2-loop ctx src (+ h n) end))))))
+(defn h2-admit [ctx]
+  (if (not (= (ims-final (word ctx 218)) 1)) (fail ctx 1)
+    (if (= (bit-and (word ctx 223) 1) 1) (fail ctx 3)
+      (if (= (bit-and (word ctx 223) 2) 2) (fail ctx 4)
+        (do (put-word64 ctx 181 (+ (word ctx 225) (* (word ctx 226) 4294967296)))
+            (put-word ctx 183 (word ctx 224))
+            (put-word ctx 184 0)
+            (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+            (fail ctx 14))))))
+;; The first 128 header bytes are in the page. 14 when the header is admitted and the image is next.
+(defn begin2 [ctx src test]
+  (let [s (h2-start ctx test)]
+    (if (not (= s 14)) s
+      (if (= (h2-loop ctx src 128 (word ctx 227)) 0) (fail ctx 21)
+        (do (restore-storage ctx) (h2-admit ctx))))))
+;; Fetch the first 128 bytes and dispatch on the magic's last byte: "2" AIUEIMG2, anything else the AIUEIMG1 path.
+(defn admit [ctx src test]
+  (do (put-word ctx 212 128) (put-word ctx 228 0)
+      (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+        (if (= (pg 7) 50) (begin2 ctx src test)
+          (if (= (begin ctx test) 14) 14 (word ctx 180))))))
+
 (defn chunks [ctx at]
   (let [size (word ctx 183)]
     (if (or (>= at size) (not (= (word ctx 180) 14))) (word ctx 180)
       (let [n (least 1024 (- size at))]
-        (if (= (fetch ctx (+ 128 at) n (bit-and at 4095) 0) 0) (fail ctx 21)
+        (if (= (fetch ctx (+ (word ctx 212) at) n (bit-and at 4095) 0) 0) (fail ctx 21)
           (do (chunk-done ctx n) (chunks ctx (+ at n))))))))
 ;; The boot nonce is remote-cmd's (context words 172/173).
 (defn pull [ctx]
   (do (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0) (put-word ctx 186 0) (put-word ctx 187 0)
       (if (= (nic/link-info) 0) (fail ctx 20)
-        (if (= (fetch ctx 0 128 0 0) 0) (fail ctx 21)
-          (if (= (begin ctx 0) 14) (chunks ctx 0) (word ctx 180))))))
+        (if (= (admit ctx 0 0) 14) (chunks ctx 0) (word ctx 180)))))
 
 ;; KDBG 0xc120 result | repeats << 16, 0xc121 version, 0xc122 size | taken << 32,
 ;; 0xc123 failed offset, 0xc124..0xc127 the computed SHA-256 (8 bytes each).
@@ -312,11 +495,10 @@
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0)
       (put-word ctx 186 0) (put-word ctx 187 0)
       (if (= (nic/link-info) 0) (ifail ctx 20)
-        (if (= (fetch ctx 0 128 0 0) 0) (ifail ctx 21)
-          (if (not (= (begin ctx 0) 14)) (ifail ctx (word ctx 180))
-            (let [r (ready ctx)]
-              (if (> r 0) (ifail ctx r)
-                (do (start-stream ctx) (chunks ctx 0) (commit ctx)))))))))
+        (if (not (= (admit ctx 0 0) 14)) (ifail ctx (word ctx 180))
+          (let [r (ready ctx)]
+            (if (> r 0) (ifail ctx r)
+              (do (start-stream ctx) (chunks ctx 0) (commit ctx))))))))
 (defn self-install [ctx flip]
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0)
       (put-header 0 -1)
@@ -340,33 +522,50 @@
       (word ctx 208)))
 
 ;; ---- QEMU gate hook (fw_cfg) ----
-(defn fw-byte [] (kernel-in-u8 1297))
-(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
-(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
-;; "opt/aiueos/install" and its NUL
-(defn fw-name-byte [i] (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0))
-(defn fw-name [i ok]
-  (if (>= i 56) ok
-    (let [b (fw-byte)]
-      (fw-name (+ i 1) (if (and (= ok 1) (or (>= i 19) (= b (fw-name-byte i)))) 1 0)))))
-(defn fw-find [left]
-  (if (<= left 0) 0
-    (let [size (fw-be 4 0)
-          sel (fw-be 2 0)
-          skip (fw-skip 2)
-          hit (fw-name 0 1)]
-      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1))))))
-(defn fw-signature [i]
-  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
-(defn fw-request []
-  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
-    (do (kernel-out-u16 1296 0)
-        (if (= (fw-signature 0) 0) 0
-          (do (kernel-out-u16 1296 25)
-              (let [sel (fw-find (least (fw-be 4 0) 256))]
-                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) (fw-byte)))))))))
+;; AIUEIMG2 cases from opt/aiueos/update2: [count][per case: mode, 16384 header bytes, 5000 image bytes]. The image of an
+;; admitted case flows through chunk-done (digest check); a refused case's stream is skipped to keep the file aligned.
+(defn feed2 [ctx at]
+  (if (or (>= at (word ctx 183)) (not (= (word ctx 180) 14))) (word ctx 180)
+    (let [n (least 1024 (- (word ctx 183) at))]
+      (do (get-chunk ctx 1 0 n (bit-and at 4095))
+          (chunk-done ctx n)
+          (feed2 ctx (+ at n))))))
+(defn run-case2 [ctx k]
+  (let [mode (fw-byte)]
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0)
+        (let [a (admit ctx 1 (if (= mode 0) 1 0))
+              hn (- 16384 (word ctx 229))
+              hs (fw-skip hn)
+              r (if (= a 14) (feed2 ctx 0) (word ctx 180))
+              is (fw-skip (- 21384 (+ hn (word ctx 229))))]
+          (do (put-word ctx (+ 236 k) (+ r (* 256 (word ctx 218))))
+              (+ 1 (* 0 (+ hs is))))))))
+(defn cases2 [ctx k n]
+  (if (>= k n) 1 (do (run-case2 ctx k) (cases2 ctx (+ k 1) n))))
+(defn self-test2 [ctx]
+  (if (= (fw-open 1) 0) 0
+    (let [count (fw-byte)]
+      (do (cases2 ctx 0 (least count 20))
+          (put-word ctx 233 (esp/run ctx))
+          (put-word ctx 235 count)
+          (put-word ctx 234 1431318578)
+          (put-word ctx 180 0)
+          count))))
+;; Install case 0 of the file through the same admit / ready / stream / commit as the network install.
+(defn install2 [ctx]
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 229 0)
+      (if (= (fw-open 1) 0) (ifail ctx 21)
+        (do (fw-byte)
+            (let [mode (fw-byte)]
+              (if (not (= (admit ctx 1 (if (= mode 0) 1 0)) 14)) (ifail ctx (word ctx 180))
+                (do (fw-skip (- 16384 (word ctx 229)))
+                    (let [r (ready ctx)]
+                      (if (> r 0) (ifail ctx r)
+                        (do (start-stream ctx) (feed2 ctx 0) (commit ctx)))))))))))
 (defn qemu-hook [ctx]
   (let [b (fw-request)]
     (do (put-word ctx 211 b)
         (if (= b 49) (self-install ctx -1)
-          (if (= b 50) (self-install ctx 4097) 0)))))
+          (if (= b 50) (self-install ctx 4097)
+            (if (= b 51) (install2 ctx)
+              (do (self-test2 ctx) 0)))))))

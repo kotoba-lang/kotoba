@@ -174,7 +174,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -276,7 +276,7 @@ def main(args):
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
                         else "input-entry.kotoba" if args.profile == "input-state"
-                        else "desktop-debug-entry.kotoba" if args.profile == "nvme"
+                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2")
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -288,7 +288,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (50 if args.profile == "imgsig" else 48 if args.profile == "mldsa-verify" else 46 if args.profile == "mldsa-sample" else 45 if args.profile in ("keccak", "mldsa-ntt") else 44)
+                or kernel_state["sourceModuleCount"] != 50
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -340,6 +340,7 @@ def main(args):
                         else "check-native-dapps-qemu.py" if args.profile == "dapps"
                         else "check-native-input-state-qemu.py" if args.profile == "input-state"
                         else "check-native-nvme-qemu.py" if args.profile == "nvme"
+                        else "check-native-update2-qemu.py" if args.profile == "update2"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -367,6 +368,7 @@ def main(args):
                         else "native-dapps-qemu.json" if args.profile == "dapps"
                         else "native-input-state-qemu.json" if args.profile == "input-state"
                         else "native-nvme-qemu.json" if args.profile == "nvme"
+                        else "native-update2-qemu.json" if args.profile == "update2"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
@@ -387,6 +389,7 @@ def main(args):
                            else "PASS_NATIVE_DAPPS_QEMU" if args.profile == "dapps"
                            else "PASS_NATIVE_USB_HID_NVME_STATE_QEMU" if args.profile == "input-state"
                            else "PASS_NATIVE_NVME_READ_QEMU" if args.profile == "nvme"
+                           else "PASS_NATIVE_UPDATE2_QEMU" if args.profile == "update2"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 18 if args.expect_stuck_entropy
@@ -397,6 +400,7 @@ def main(args):
                            else 11 if args.profile == "dapps"
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
+                           else 4 if args.profile == "update2"
                            else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -524,6 +528,16 @@ def main(args):
                     or not observed["events"][5].get("noNewClusters")
                     or not observed["writesOnlyThroughInstallHook"] or observed["physicalHardware"]):
                 raise ValueError("nvme verdict is incomplete")
+        elif args.profile == "update2":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["update2-cases", "update2-install", "update2-tampered", "update2-one-signer"]
+                    or observed["events"][0]["matches"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "one-signer", "ml-half-bad",
+                                                            "ed-half-bad", "tampered-image", "tampered-manifest", "duplicate-id", "unknown-id",
+                                                            "production-mode", "bad-magic", "count-zero", "manifest-reserved", "version-zero",
+                                                            "size-too-big"]
+                    or [row["install"] for row in observed["events"][1:]] != [15, 7, 1]
+                    or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
+                raise ValueError("update2 verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
@@ -730,7 +744,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "update2", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "
