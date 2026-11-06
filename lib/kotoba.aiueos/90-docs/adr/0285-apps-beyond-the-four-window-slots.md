@@ -203,3 +203,19 @@ Run against the previous four-app media it fails at the first slot-map assertion
 asserts the draw list stays within 259 ops with no overflow after every observed state. Measured: 253 ops with four
 windows open and a full 8-button page 0, 254 at most over the whole run, so the headroom is 5 ops. A later window or
 launcher feature that adds ops must re-measure; the gate fails when the list overflows.
+
+## Amendment 5 2026-11-06 — a consumer of the admitted AIUECAT1 catalog does not fit the surface (JUN-811 / JUN-812)
+
+Asked to list at most the first N admitted entries (dock id and title) after the built-in apps, I stopped before changing code, as the
+task required when the headroom does not allow it. Numbers (source reading and arithmetic only; nothing was built or run, see
+`90-docs/evidence/jun-811-catalog-consumer-20261106/README.md`):
+
+- No surface word is free. The op list's 5 ops of headroom (259 capacity, 254 peak) are 30 words; a verified title is 8 words, so
+  the table holds N = 3 entries with zero ops of headroom left (N = 2 leaves 2).
+- A launcher page of eight installed apps with 9+ glyph titles costs about 216 + 48 = 264 ops against 259: the list overflows (-5).
+  Clipping installed labels to 8 glyphs gives 256, which leaves nothing once the table is carved out of the op list.
+- Paging itself is unchanged (more pages); but `app-count` would stop being a constant, and the register check (-9) uses
+  `pow2(app-count)`, which cannot hold 64+ apps.
+
+Open for the owner: clip installed labels (8 glyphs) and keep the table outside the surface (needs a second region at the label call,
+which has the maximum 5 arguments), or accept N = 2 with no op headroom. No kernel code, no gate and no pin changed.
