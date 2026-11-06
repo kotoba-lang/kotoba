@@ -176,7 +176,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-prodsig-qemu.py", "prodsig_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-builder-layout-qemu.py", "check-builder-layout.py", "check-provision-esp.py", "make-release-image.py", "aiueos-image.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-prodsig-qemu.py", "prodsig_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -282,7 +282,7 @@ def main(args):
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
                         else "input-entry.kotoba" if args.profile == "input-state"
-                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "catalog", "fresh", "prodsig")
+                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig")
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -357,6 +357,7 @@ def main(args):
                         else "check-native-nvme-qemu.py" if args.profile == "nvme"
                         else "check-native-update2-qemu.py" if args.profile == "update2"
                         else "check-native-provision-esp-qemu.py" if args.profile == "provision"
+                        else "check-native-builder-layout-qemu.py" if args.profile == "builder-layout"
                         else "check-native-catalog-qemu.py" if args.profile == "catalog"
                         else "check-native-fresh-qemu.py" if args.profile == "fresh"
                         else "check-native-prodsig-qemu.py" if args.profile == "prodsig"
@@ -393,6 +394,7 @@ def main(args):
                         else "native-nvme-qemu.json" if args.profile == "nvme"
                         else "native-update2-qemu.json" if args.profile == "update2"
                         else "native-provision-esp-qemu.json" if args.profile == "provision"
+                        else "native-builder-layout-qemu.json" if args.profile == "builder-layout"
                         else "native-catalog-qemu.json" if args.profile == "catalog"
                         else "native-fresh-qemu.json" if args.profile == "fresh"
                         else "native-prodsig-qemu.json" if args.profile == "prodsig"
@@ -422,6 +424,7 @@ def main(args):
                            else "PASS_NATIVE_NVME_READ_QEMU" if args.profile == "nvme"
                            else "PASS_NATIVE_UPDATE2_QEMU" if args.profile == "update2"
                            else "PASS_NATIVE_PROVISION_ESP_QEMU" if args.profile == "provision"
+                           else "PASS_NATIVE_BUILDER_LAYOUT_QEMU" if args.profile == "builder-layout"
                            else "PASS_NATIVE_CATALOG_QEMU" if args.profile == "catalog"
                            else "PASS_NATIVE_FRESH_QEMU" if args.profile == "fresh"
                            else "PASS_NATIVE_PRODSIG_QEMU" if args.profile == "prodsig"
@@ -436,7 +439,7 @@ def main(args):
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
                            else 12 if args.profile == "update2"
-                           else 8 if args.profile == "provision"
+                           else 8 if args.profile in ("provision", "builder-layout")
                            else 3 if args.profile == "catalog"
                            else 7 if args.profile == "fresh"
                            else 5 if args.profile == "prodsig"
@@ -663,6 +666,15 @@ def main(args):
                     or [row.get("floorAfter") for row in observed["events"][2:]] != [None, 6, None, None, None, 4]
                     or observed["provisioningHookUsed"] or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
                 raise ValueError("provision verdict is incomplete")
+        elif args.profile == "builder-layout":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["builder-esp", "builder-cases-checked", "builder-equal",
+                                                                       "builder-above", "neg-absent", "neg-wrong-hash", "neg-floor-high", "neg-floor-low"]
+                    or [row["install"] for row in observed["events"][2:]] != [9, 15, 10, 10, 9, 15]
+                    or [row.get("floorAfter") for row in observed["events"][2:]] != [None, 5, None, None, None, 4]
+                    or not observed["eachInstallKeptEfiBoot"] or observed["firmwareBootOfLayout"]
+                    or observed["provisioningHookUsed"] or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
+                raise ValueError("builder-layout verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
@@ -881,7 +893,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "catalog", "fresh", "prodsig", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "
