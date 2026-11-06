@@ -1,0 +1,105 @@
+(ns cssom.uidoc-k
+  (:export [ud-run ud-word]))
+;; Render integration, pass 0, kernel dialect: the compact UI DOCUMENT in a region becomes the style slice's wire stream (ADR-0287 "UI document and
+;; events in, draw list out"; JUN-856). Runs BEFORE fk-run in the same owned window of 61440 bytes. PROPOSAL, not an accepted encoding: ADR-0287 still
+;; lists the region layouts open; the layout is documented in 90-docs/evidence/cssom-uidoc-slice-20261107/README.md.
+;; Input region (a stand-in for the read-only UI-document region of ADR-0287): the two free pages 13 and 14 of the window (53248..61439, 8192 bytes,
+;; the draw-list pages, which dk-run overwrites after this stage has consumed the document). Output: the wire stream at 0..16383, exactly the bytes
+;; scripts/style_k_cases.py `encode` makes (sheet, 0x00, elements, 0x00) and fk-run / ck-run read.
+;; UI document v0, little endian:
+;;   0   "UID1" (85 73 68 49)   4 u16 S sheet bytes   6 u16 N strings (<= 255)   8 u16 G string-table bytes   10 u16 T tree bytes
+;;   12  sheet: S bytes, the rule records of the wire sheet WITHOUT its 0x00 terminator (selector_k reads and validates them)
+;;   12+S string table: N entries, u8 length (1..255) then the bytes; entry i is 1-based; tags, ids and class lists are entries
+;;   12+S+G tree, T bytes, ops:  0x00 close the current element
+;;       0x80 | f open an element, f = 1 has id, 2 has class list; operands u8 tag, then u8 id if f&1, then u8 class if f&2 (string entries)
+;;       0x40 u16 len   a text node placeholder of len bytes: it emits nothing (text is not part of the style stream), it is counted
+;;   The sections must add up: 12 + S + G + T = the document length handed in (<= 8192). The tree is one balanced element tree; text only inside it.
+;; ud-run returns the length of the wire stream (>= 2) or a negative status: -30 header (window, length, magic, section sums, N > 255), -31 string
+;; table not exactly G bytes of non-empty entries, -32 unknown op or operands past the tree, -33 string index 0 or past N, -34 the wire stream
+;; would pass 16384 bytes, -35 unbalanced tree or text outside an element. ud-word i reads a header word of the last run: 0 string-table offset,
+;; 1 N, 2 text nodes, 3 text bytes, 4 tree offset, 5 tree end, 6 S (header page words 72..78, free in every other module).
+;; Not modelled, so not claimed: the style attribute, any attribute but id and class, text content, the hidden attribute (the host encoder emits the
+;; opened window), entities, comments.
+(defn- hd [st i] (kernel-load-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i)))
+(defn- hd! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i) v))
+(defn- ib [st o]
+  (if (or (< o 0) (>= o 8192)) 0
+    (if (< o 4096)
+      (kernel-load-u8-4k (kernel-subregion st 61440 53248 4096) 4096 o)
+      (kernel-load-u8-4k (kernel-subregion st 61440 57344 4096) 4096 (- o 4096)))))
+(defn- ob! [st o v] (kernel-store-u8-16k (kernel-subregion st 61440 0 16384) 16384 o v))
+(defn- u16 [st o] (+ (ib st o) (* 256 (ib st (+ o 1)))))
+;; copy n bytes of the document to the stream
+(defn- cp [st from to n]
+  (if (<= n 0) 1
+    (cp st (+ from 1) (+ to 1) (- n (+ 1 (* 0 (ob! st to (ib st from))))))))
+;; the end offset of k more string entries from pos, or -1 on an empty entry
+(defn- tbl-end [st pos k]
+  (if (= k 0) pos
+    (let [n (ib st pos)]
+      (if (= n 0) -1 (tbl-end st (+ pos (+ 1 n)) (- k 1))))))
+;; document offset of the length byte of entry idx (1-based), -1 outside 1..N
+(defn- walk [st pos k] (if (= k 1) pos (walk st (+ pos (+ 1 (ib st pos))) (- k 1))))
+(defn- sp-of [st idx]
+  (if (or (< idx 1) (> idx (hd st 73))) -1 (walk st (hd st 72) idx)))
+(defn- slen [st sp] (if (< sp 0) 0 (ib st sp)))
+;; length byte then the bytes of the entry at sp (a 0 byte when sp < 0); returns the next stream offset
+(defn- put-str [st sp dst]
+  (if (< sp 0) (+ dst (+ 1 (* 0 (ob! st dst 0))))
+    (let [n (ib st sp) z (ob! st dst n) c (cp st (+ sp 1) (+ dst 1) n)]
+      (+ dst (+ 1 (+ n (* 0 (+ z c))))))))
+;; one element: 'E' tag id class (each length-prefixed); the new stream offset or -34
+(defn- open-el [st tp ip kp dst]
+  (let [n (+ 4 (+ (slen st tp) (+ (slen st ip) (slen st kp))))]
+    (if (> (+ dst n) 16383) -34
+      (let [z (ob! st dst 69) d1 (put-str st tp (+ dst 1)) d2 (put-str st ip d1) d3 (put-str st kp d2)]
+        (+ d3 (* 0 z))))))
+(defn- open-dst [st pos dst]
+  (let [f (- (ib st pos) 128) hi (bit-and f 1) hk (u64-shift-right f 1)]
+    (if (> (+ pos (+ 2 (+ hi hk))) (hd st 77)) -32
+      (let [tp (sp-of st (ib st (+ pos 1)))
+            ip (if (= hi 1) (sp-of st (ib st (+ pos 2))) -1)
+            kp (if (= hk 1) (sp-of st (ib st (+ pos (+ 2 hi)))) -1)]
+        (if (or (< tp 0) (or (and (= hi 1) (< ip 0)) (and (= hk 1) (< kp 0)))) -33
+          (open-el st tp ip kp dst))))))
+(defn- text-dst [st pos dst depth]
+  (if (= depth 0) -35
+    (if (> (+ pos 3) (hd st 77)) -32
+      (let [n (u16 st (+ pos 1))
+            z (+ (hd! st 74 (+ (hd st 74) 1)) (hd! st 75 (+ (hd st 75) n)))]
+        (+ dst (* 0 z))))))
+(defn- close-dst [st pos dst depth]
+  (if (= depth 0) -35
+    (if (> (+ dst 1) 16383) -34
+      (+ dst (+ 1 (* 0 (ob! st dst 47)))))))
+;; one op: the new stream offset or a negative status
+(defn- step [st b pos dst depth]
+  (if (= b 0) (close-dst st pos dst depth)
+    (if (= b 64) (text-dst st pos dst depth)
+      (if (and (>= b 128) (<= b 131)) (open-dst st pos dst) -32))))
+(defn- adv [b] (if (= b 64) 3 (if (and (>= b 128) (<= b 131)) (+ 2 (+ (bit-and b 1) (bit-and (u64-shift-right b 1) 1))) 1)))
+(defn- dep [b depth] (if (= b 0) (- depth 1) (if (and (>= b 128) (<= b 131)) (+ depth 1) depth)))
+(defn- tree [st pos dst depth]
+  (if (>= pos (hd st 77))
+    (if (= depth 0) (+ dst (+ 1 (* 0 (ob! st dst 0)))) -35)
+    (let [b (ib st pos) r (step st b pos dst depth)]
+      (if (< r 0) r (tree st (+ pos (adv b)) r (dep b depth))))))
+(defn- magic? [st] (and (= (ib st 0) 85) (and (= (ib st 1) 73) (and (= (ib st 2) 68) (= (ib st 3) 49)))))
+(defn- body [st s n g t]
+  (let [gs (+ 12 s) ts (+ gs g)]
+    (if (not (= (tbl-end st gs n) ts)) -31
+      (let [z (+ (hd! st 72 gs) (+ (hd! st 73 n) (+ (hd! st 74 0) (+ (hd! st 75 0) (+ (hd! st 76 ts) (+ (hd! st 77 (+ ts t)) (hd! st 78 s)))))))
+            c (cp st 12 0 s)
+            e (ob! st s 0)]
+        (tree st ts (+ s (+ 1 (* 0 (+ z (+ c e))))) 0)))))
+(defn ud-run [w length dlen]
+  (if (< length 61440) -30
+    (if (or (< dlen 12) (> dlen 8192)) -30
+      (let [st (kernel-subregion w length 0 61440)
+            s (u16 st 4) n (u16 st 6) g (u16 st 8) t (u16 st 10)]
+        (if (or (not (magic? st)) (or (> n 255) (not (= (+ 12 (+ s (+ g t))) dlen)))) -30
+          (body st s n g t))))))
+(defn ud-word [w length i]
+  (if (and (>= length 61440) (and (>= i 0) (< i 7)))
+    (hd (kernel-subregion w length 0 61440) (+ 72 i))
+    0))
