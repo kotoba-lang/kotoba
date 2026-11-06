@@ -26,7 +26,8 @@ Per-unit identifiers are not recorded.
 | Boot | A/B (slot `_a`), Treble, bootloader locked, verified boot green, bootloader `deepspace-17.4-16119390` |
 | Displays | inner 2076x2152, outer 1080x2364, both 120 Hz |
 | GPU | PowerVR (from `ro.hardware.egl`); model unverified |
-| Storage | UFS LUNs `sda`..`sdd`; the UFS class is inferred from the SCSI block devices |
+| Storage | UFS (`google-ufshcd` platform driver), LUNs `sda`..`sdd` |
+| Security | SELinux enforcing; page size 4096 |
 
 The partition list (`abl`, `bl31`, `tzsw`, `gsa_*`, `pvmfw`, `boot`, `init_boot`,
 `dtbo`, `super`, `modem`, ...) points to Google's Android bootloader with
@@ -48,19 +49,33 @@ unverified.
 
 ## Wi-Fi and Bluetooth
 
-Wi-Fi: interfaces `wlan0`, `wlan1`; features include STA, P2P, hotspot, Aware,
-RTT, Passpoint, PNO, and STA+STA and STA+AP concurrency. The unit was associated
-at 802.11ax; that is one connection and not a statement of the radio's limit.
-The chip, its bus and its firmware were **not** identified: an unprivileged shell
-cannot read `device/uevent`. Wi-Fi 7 is not claimed.
+Both radios are Broadcom (measured, 2026-11-06).
 
-Bluetooth: classic and LE, channel sounding, A2DP offload, and a wide LE Audio
-and HID profile set. The controller and its transport were **not** identified.
+**Wi-Fi.** `ro.wifi.model` is `bcm4390` (`ro.wifi.manufacturer` is `broadcom`). Android
+runs Broadcom's DHD driver (`dhd_wonder_dev`, driver 103.511.77.27) with firmware
+27.10.1121.57.26. Interfaces are `wlan0` and `wlan1`; features include STA, P2P,
+hotspot, Aware, RTT, Passpoint, PNO, and STA+STA and STA+AP concurrency. The unit was
+associated at 802.11ax; that is one connection and not a statement of the radio's limit.
+Wi-Fi 7 is not claimed. **Not identified:** the bus (a `pci` bus exists, but the device
+is not visible to an unprivileged shell) and the firmware file names.
 
-These gaps cannot be closed from an unrooted, locked device. The public Android
-kernel and Pixel module sources, or a rooted debug build, are the next sources.
-Whether the Tensor G5 sources are published at the same completeness as earlier
-generations is unverified.
+**Bluetooth.** The controller reports manufacturer id 15 (Broadcom), LMP 6.0 (0x0e),
+subversion 0x4208, and the vendor config uses chip id 123. The transport is **UART**
+(`/dev/ttySAC16`, overlaid by `/dev/ttyS1`) driven by the `hci_bcm` driver, with a
+`BT_REG_ON` power pin and a 100 ms delay after a reset. Firmware is `BCM.hcd` from
+`vendor/firmware/brcm/`, loaded as an accumulated buffer with 50 ms and 250 ms delays.
+The file itself is not readable from an unprivileged shell, so its digest is unverified.
+Audio offload goes to the AOC. Whether Bluetooth is on the same die as the BCM4390 is
+unverified; both being Broadcom is not proof.
+
+Bluetooth over a UART is much the smaller job: HCI over a serial port needs a UART
+driver and the firmware download sequence. Wi-Fi needs the bus, the firmware, and a
+large host-side stack. This is why Bluetooth comes before Wi-Fi in the order below.
+
+Public sources: a web search did not find a Pixel 10 Wi-Fi or Bluetooth driver tree
+on android.googlesource.com, only an unrelated Wi-Fi tracking module. Press coverage
+reports upstream Linux 7.4 gaining basic Tensor G5 and Pixel 10 boot support.
+Neither was checked against the kernel source, so treat both as leads.
 
 ## Driver design
 
@@ -83,7 +98,8 @@ in QEMU and real PCI; this device has neither, so the bus layer is new work.
 | 0 | boot path, serial or fastboot console, GIC, generic timer | nothing else can be observed without it | AArch64 kernel reaches a console on the device |
 | 1 | UFS, outer display, outer touch (`synaptics_tcm_touch`), power key | smallest set that shows and accepts input | tap coordinates printed on the outer display |
 | 2 | inner display, inner touch (`fst2`), hinge-angle sensor, posture change | the fold is what is specific to this device | window moves between displays on fold and unfold |
-| 3 | Wi-Fi, Bluetooth | firmware loading, regulatory data and a security boundary; hardest | scan, then join a WPA2/WPA3 network, then HCI inquiry |
+| 3a | Bluetooth (Broadcom over UART) | serial HCI plus a firmware download; smallest radio job | HCI reset, firmware load, LE scan |
+| 3b | Wi-Fi (BCM4390) | needs the bus, firmware, regulatory data and a security boundary; hardest | scan, then join a WPA2/WPA3 network |
 | deferred | cellular, camera, GPU, NFC, UWB, GNSS, fingerprint, haptics, TPU | none is needed to prove the OS | |
 
 Step 0 is the dependency of everything. The README's own gaps stand first:
@@ -91,7 +107,7 @@ the AArch64 kernel has no scheduler, userspace or syscall path yet.
 
 ### Wi-Fi and Bluetooth specifics
 
-- **Firmware:** both radios need vendor firmware. aiueos must treat a firmware
+- **Firmware:** both radios need vendor firmware (`BCM.hcd` for Bluetooth; Wi-Fi files unknown). aiueos must treat a firmware
   blob as an external artifact: pinned source, digest verified before use, and
   a missing digest recorded as "unverified". It must not load an unpinned blob.
 - **Consent:** joining a network or pairing a device is a capability decision for
@@ -123,8 +139,9 @@ device pass.
 
 ## Open items
 
-- Identify the Wi-Fi chip, Bluetooth controller, panel controllers and GPU model.
+- Wi-Fi bus and firmware files, the Bluetooth part number, the panel controllers and the GPU model.
 - Whether the bootloader can be unlocked (`oem_unlock_allowed` was not readable) and what
   that costs: unlocking wipes user data, so it needs an explicit owner decision.
 - A boot path for the AArch64 loader, which assumes UEFI, on a non-UEFI bootloader.
-- Whether the public sources for Tensor G5 cover the touch, Wi-Fi and Bluetooth drivers.
+- Whether public sources cover the touch, Wi-Fi and Bluetooth drivers. The Broadcom firmware is
+  redistributable only on terms we have not read; check them before pinning any digest.
