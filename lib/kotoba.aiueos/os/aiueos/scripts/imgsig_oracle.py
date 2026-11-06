@@ -202,12 +202,25 @@ def u32le(b):
     return [struct.unpack_from("<I", b, i)[0] for i in range(0, len(b), 4)]
 
 
+def pack_pairs(words):
+    """Little endian u32 words packed two to a signed 64-bit literal (low word in bits 0..31); an odd count pads with 0."""
+    out = []
+    for j in range(0, len(words), 2):
+        v = words[j] | ((words[j + 1] if j + 1 < len(words) else 0) << 32)
+        out.append(v - (1 << 64) if v >= (1 << 63) else v)
+    return out
+
+
 def emit_keys_module_from(ks, ns, comments):
-    """Generated Kotoba module of pinned public keys (words, little endian) for ks = [(_, ed_pk, ml_pk, _)] in namespace ns."""
+    """Generated Kotoba module of pinned public keys for ks = [(_, ed_pk, ml_pk, _)] in namespace ns. Each key is a case of 64-bit
+    literals holding two little endian u32 words (a case arm costs about 100 bytes of kernel text, so packing halves the module);
+    the accessors return the u32 word, 0 outside the key (as the one-word-per-arm form did)."""
     L = ["(ns %s (:export [ims-ed-word ims-ml-word]))" % ns] + [";; " + c for c in comments]
     for i, (_s, edpk, mlpk, _sk) in enumerate(ks):
-        L.append("(defn- ed%d [w] (case w %s 0))" % (i, " ".join("%d %d" % (j, v) for j, v in enumerate(u32le(edpk)))))
-        L.append("(defn- ml%d [w] (case w %s 0))" % (i, " ".join("%d %d" % (j, v) for j, v in enumerate(u32le(mlpk)))))
+        for name, pk in (("ed", edpk), ("ml", mlpk)):
+            n = len(pk) // 4
+            L.append("(defn- %s%d-pair [h] (case h %s 0))" % (name, i, " ".join("%d %d" % (j, v) for j, v in enumerate(pack_pairs(u32le(pk))))))
+            L.append("(defn- %s%d [w] (if (or (< w 0) (>= w %d)) 0 (let [p (%s%d-pair (quot w 2))] (if (= (bit-and w 1) 0) (bit-and p 4294967295) (bit-and (u64-shift-right p 32) 4294967295)))))" % (name, i, n, name, i))
     L.append("(defn ims-ed-word [id w] (case id 0 (ed0 w) 1 (ed1 w) 2 (ed2 w) 0))")
     L.append("(defn ims-ml-word [id w] (case id 0 (ml0 w) 1 (ml1 w) 2 (ml2 w) 0))")
     return "\n".join(L) + "\n"

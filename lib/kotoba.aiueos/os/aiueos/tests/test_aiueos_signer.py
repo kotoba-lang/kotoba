@@ -301,11 +301,16 @@ class PinnedPublicData(unittest.TestCase):
         self.assertEqual((OS / "kotoba/aiueos/imgsig_prodkeys.kotoba").read_text(), text)
         p = subprocess.run([sys.executable, TOOL, "emit-pinned", "--from", str(o.PROD_PUBKEYS)], capture_output=True, text=True)
         self.assertEqual((p.returncode, p.stdout), (0, text))
-        # the words in the module are the public keys, little endian (ims-ed-word / ims-ml-word)
+        # the words in the module are the public keys, little endian, two u32 words to a signed 64-bit case literal (low word first)
+        def pairs(key):
+            out = []
+            for j in range(0, len(key), 8):
+                v = struct.unpack_from("<Q", key, j)[0]
+                out.append(v - (1 << 64) if v >= (1 << 63) else v)
+            return out
         for slot, (ed, ml) in enumerate(pubs):
-            words = [struct.unpack_from("<I", ed, 4 * w)[0] for w in range(8)]
-            self.assertIn("(defn- ed%d [w] (case w %s 0))" % (slot, " ".join("%d %d" % (w, v) for w, v in enumerate(words))), text)
-            self.assertIn(" ".join("%d %d" % (w, struct.unpack_from("<I", ml, 4 * w)[0]) for w in range(488)), text)
+            self.assertIn("(defn- ed%d-pair [h] (case h %s 0))" % (slot, " ".join("%d %d" % (h, v) for h, v in enumerate(pairs(ed)))), text)
+            self.assertIn("(defn- ml%d-pair [h] (case h %s 0))" % (slot, " ".join("%d %d" % (h, v) for h, v in enumerate(pairs(ml)))), text)
 
     def test_the_test_keys_module_is_unchanged_by_the_refactor(self):
         self.assertEqual((OS / "kotoba/aiueos/imgsig_testkeys.kotoba").read_text(), o.emit_keys_module())

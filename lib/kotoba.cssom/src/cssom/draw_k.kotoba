@@ -1,0 +1,122 @@
+(ns cssom.draw-k (:require [cssom.intern-k :as ik])
+  (:export [dk-run dk-word]))
+;; Render integration, pass 4, kernel dialect: the laid-out box table of flow-k becomes a DRAW LIST in a shared region (ADR-0287 decision
+;; "shared regions, not per-operation syscalls"; JUN-805). Runs after fk-run in the same owned window of 61440 bytes. It reads the box
+;; table (0..16383, record in box_k.kotoba, absolute x / y and border-box size in Q6 after flow-k), the node table, the computed values
+;; (40960) and the property table (header @256) and writes the draw-list region.
+;; Draw-list region: the two free pages 13 and 14 (53248..61439) of the window, 8192 bytes, as a stand-in for the region the kernel will
+;; map read-write into the renderer domain and read-only into the compositor. Slots of 32 bytes, slot 0 is the header, slots 1..255 are
+;; ops; u32 word i of slot s at 53248 + 32 s + 4 i (a Q6 raw is two's complement).
+;;   header  0 magic 829836356 ("DLv1" little endian)   1 op count   2 status (0, or the positive refusal code of the run)
+;;           3 element count   4 document height (Q6)   5 slot size (32)   6, 7 reserved (0)
+;;   op      0 code (1 fill-rect)   1 x   2 y   3 w   4 h   (Q6 raw, border-box coordinates of the page)   5 colour r<<24|g<<16|b<<8|a
+;;           6 element index   7 role (0 background, 1 border top, 2 border right, 3 border bottom, 4 border left)
+;; Paint order is CSS 2.1 Appendix E step 4 for in-flow non-positioned blocks, in tree order (= element order): per box, the background
+;; (border box, background-clip: border-box) and then the four borders top, right, bottom, left (top / bottom full width, left / right
+;; between them, no mitres). Only a box of kind 1 paints. A rectangle with width or height <= 0 is not emitted.
+;; Colour sources (the only two paint properties of this slice): `background-color` and `border-color` (one colour for the four sides),
+;; value `#rgb` or `#rrggbb` (any case) or `transparent`; absent = no paint (a border without `border-color` paints nothing: currentcolor
+;; and border-style are not modelled, box_k refuses border-style). Any other value is refused with -20.
+;; dk-run returns the op count (>= 0) or a negative status: -1 window too small, -18 a coordinate outside +-2^30 Q6 raw, -20 a colour
+;; value outside the grammar (header word 33 holds the element + 1), -21 more than 255 ops.
+;; Not modelled, so not claimed: text, images, gradients, opacity, border-style / radius, clipping and scrolling, positioned and
+;; floated boxes, stacking contexts, alpha in hex (#rgba), named colours and rgb() / hsl() functions.
+(defn- hd [st i] (kernel-load-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i)))
+(defn- hd! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 49152 4096) 4096 (* 4 i) v))
+(defn- h16 [st at] (kernel-load-u16-4k (kernel-subregion st 61440 49152 4096) 4096 at))
+(defn- cv [st n k] (kernel-load-u16-4k (kernel-subregion st 61440 40960 4096) 4096 (+ (* 32 n) (* 2 k))))
+(defn- sx [x] (if (>= x 2147483648) (- x 4294967296) x))
+(defn- bx [st n i] (sx (kernel-load-u32-16k (kernel-subregion st 61440 0 16384) 16384 (+ (* 128 n) (* 4 i)))))
+(defn- big? [x] (or (> x 1073741824) (< x -1073741824)))
+;; ---- the draw-list region ----
+(defn- dw! [st s i v]
+  (let [o (+ (* 32 (bit-and s 127)) (* 4 i)) vv (bit-and v 4294967295)]
+    (if (< s 128)
+      (kernel-store-u32-4k (kernel-subregion st 61440 53248 4096) 4096 o vv)
+      (kernel-store-u32-4k (kernel-subregion st 61440 57344 4096) 4096 o vv))))
+(defn- dw [st s i]
+  (let [o (+ (* 32 (bit-and s 127)) (* 4 i))]
+    (if (< s 128)
+      (kernel-load-u32-4k (kernel-subregion st 61440 53248 4096) 4096 o)
+      (kernel-load-u32-4k (kernel-subregion st 61440 57344 4096) 4096 o))))
+(defn- head-init [st nn]
+  (+ (dw! st 0 0 829836356) (+ (dw! st 0 1 0) (+ (dw! st 0 2 0) (+ (dw! st 0 3 nn) (+ (dw! st 0 4 0) (+ (dw! st 0 5 32) (+ (dw! st 0 6 0) (dw! st 0 7 0)))))))))
+;; one rectangle: 1 emitted, 0 skipped (empty), -18 range, -21 full. The caller sets colour and role with `col!` on the op just written.
+(defn- rect! [st x y w h]
+  (if (or (<= w 0) (<= h 0)) 0
+    (if (or (big? x) (or (big? y) (or (big? (+ x w)) (big? (+ y h))))) -18
+      (let [c (dw st 0 1)]
+        (if (>= c 255) -21
+          (let [s (+ c 1)
+                z (+ (dw! st s 0 1) (+ (dw! st s 1 x) (+ (dw! st s 2 y) (+ (dw! st s 3 w) (dw! st s 4 h)))))]
+            (+ 1 (* 0 (+ z (dw! st 0 1 s))))))))))
+(defn- col! [st color n role]
+  (let [s (dw st 0 1)]
+    (+ 1 (* 0 (+ (dw! st s 5 color) (+ (dw! st s 6 n) (dw! st s 7 role)))))))
+;; rectangle then its colour and role
+(defn- put [st n color role r]
+  (if (= r 1) (col! st color n role) r))
+;; ---- colour values ----
+(defn- hx [c] (if (and (>= c 48) (<= c 57)) (- c 48) (if (and (>= c 65) (<= c 70)) (- c 55) (if (and (>= c 97) (<= c 102)) (- c 87) -1))))
+(defn- chan [st id i step]
+  (let [a (hx (ik/ik-byte st 61440 id i))]
+    (if (= step 1) (if (< a 0) -1 (* 17 a))
+      (let [b (hx (ik/ik-byte st 61440 id (+ i 1)))] (if (or (< a 0) (< b 0)) -1 (+ (* 16 a) b))))))
+(defn- rgb [st id i step]
+  (let [r (chan st id i step) g (chan st id (+ i step) step) b (chan st id (+ i (* 2 step)) step)]
+    (if (or (< r 0) (or (< g 0) (< b 0))) -1 (+ (+ (* r 16777216) (* g 65536)) (+ (* b 256) 255)))))
+(defn- word-is [st id n w0 w1] (and (= (ik/ik-len st 61440 id) n) (and (= (ik/ik-word st 61440 id 0 1) w0) (= (ik/ik-word st 61440 id 1 1) w1))))
+;; the colour of a value id: 0..4294967295 opaque colour, -2 transparent, -1 outside the grammar
+(defn- color-of [st id]
+  (let [n (ik/ik-len st 61440 id)]
+    (if (word-is st id 11 27426713816363636 1953391986) -2
+      (if (not (= (ik/ik-byte st 61440 id 0) 35)) -1
+        (if (= n 4) (rgb st id 1 1) (if (= n 7) (rgb st id 1 2) -1))))))
+;; the colour of property slot pi (index + 1, 0 absent) of element n: as color-of, -2 when absent
+(defn- prop-color [st n pi]
+  (if (= pi 0) -2
+    (let [v (cv st n (- pi 1))] (if (= v 0) -2 (color-of st v)))))
+;; ---- the two property names, once per run ----
+;; name of paint property 0 background-color, 1 border-color: byte length and the 7-byte little-endian words (0 past the end)
+(defn- nm [x :i64] :i64 (case x 0 16 1 31369510923755874 2 30521769238752885 3 29295 4 12 5 12792153754464098 6 491495649123 0))
+(defn- name-eq [st id which]
+  (and (= (ik/ik-len st 61440 id) (nm (* 4 which)))
+       (and (= (ik/ik-word st 61440 id 0 0) (nm (+ (* 4 which) 1)))
+            (and (= (ik/ik-word st 61440 id 1 0) (nm (+ (* 4 which) 2)))
+                 (= (ik/ik-word st 61440 id 2 0) (nm (+ (* 4 which) 3)))))))
+(defn- pidx [st k np which]
+  (if (>= k np) -1 (if (name-eq st (h16 st (+ 256 (* 2 k))) which) k (pidx st (+ k 1) np which))))
+;; ---- one box ----
+(defn- borders [st n cc r0]
+  (let [x (bx st n 1) y (bx st n 2) w (bx st n 3) h (bx st n 4)
+        bt (bx st n 17) br (bx st n 18) bb (bx st n 19) bl (bx st n 20)
+        a (put st n cc 1 (rect! st x y w bt))
+        b (if (< a 0) a (put st n cc 2 (rect! st (- (+ x w) br) (+ y bt) br (- h (+ bt bb)))))
+        c (if (< b 0) b (put st n cc 3 (rect! st x (- (+ y h) bb) w bb)))
+        d (if (< c 0) c (put st n cc 4 (rect! st x (+ y bt) bl (- h (+ bt bb)))))]
+    (+ r0 (if (< d 0) d 0))))
+(defn- paint [st n nn pp]
+  (let [cb (prop-color st n (bit-and pp 255))
+        cc (prop-color st n (u64-shift-right pp 8))]
+    (if (or (= cb -1) (= cc -1)) (+ -20 (* 0 (hd! st 33 (+ n 1))))
+      (let [a (if (>= cb 0) (put st n cb 0 (rect! st (bx st n 1) (bx st n 2) (bx st n 3) (bx st n 4))) 0)]
+        (if (< a 0) a
+          (if (>= cc 0) (borders st n cc 0) 0))))))
+(defn- nodes-loop [st n nn pp]
+  (if (>= n nn) 0
+    (let [r (if (= (bx st n 0) 1) (paint st n nn pp) 0)]
+      (if (< r 0) r (nodes-loop st (+ n 1) nn pp)))))
+(defn- code-of [r] (if (< r 0) (- 0 r) 0))
+(defn dk-run [w length]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)
+          nn (hd st 2) np (hd st 6)
+          z (head-init st nn)
+          pp (+ (+ 1 (pidx st 0 np 0)) (* 256 (+ 1 (pidx st 0 np 1))))
+          r (nodes-loop st 0 nn (+ pp (* 0 z)))
+          z2 (+ (dw! st 0 2 (code-of r)) (dw! st 0 4 (hd st 37)))]
+      (if (< r 0) (+ r (* 0 z2)) (+ (dw st 0 1) (* 0 z2))))))
+(defn dk-word [w length s i]
+  (if (and (>= length 61440) (and (>= s 0) (and (< s 256) (and (>= i 0) (< i 8)))))
+    (dw (kernel-subregion w length 0 61440) s i)
+    0))
