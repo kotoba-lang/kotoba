@@ -4,8 +4,8 @@ Date: 2026-11-06
 
 ## Status
 
-Proposed (JUN-854, JUN-810). Owner decision 2026-11-06: render outside the kernel image ("描画をカーネル外に出す"). The decision is
-taken; the interface below is a proposal to be accepted, and nothing here is implemented.
+Accepted 2026-11-06 (owner: render outside the kernel image, "描画をカーネル外に出す"; the open questions below were answered
+"おすすめで決定" with the recommended options, listed under Decisions on the open questions). Nothing here is implemented.
 
 ## Context
 
@@ -45,13 +45,18 @@ measured the size (evidence: `90-docs/evidence/render-closure-size-20261105/READ
   fixed point is part of that work and is not decided.
 - The 4-window draw budget (ADR-0285) still bounds what the kernel draws; the renderer must fit its output in it.
 
-## Not decided here
+## Decisions on the open questions (owner: recommended options, 2026-11-06)
 
-- The domain boundary: shared memory region(s) for document, events and draw list versus syscalls, and who maps them.
-- How the renderer object is loaded (embedded in the boot image, or a signed object under ADR-0286) and how it is updated.
-- Whether one renderer domain serves all windows or one domain per app (isolation versus memory).
-- f64 versus fixed point in the user domain.
+- **Boundary: shared regions, not per-operation syscalls.** The kernel maps three regions into the renderer domain: the UI document (read-only to the renderer), an input event ring (read-only), and the draw-list region (read-write to the renderer, read-only to the compositor). Syscalls are used only to signal "frame ready" and to yield. Per-op syscalls would cost a ring crossing for each of up to 259 ops per frame.
+- **Loading: embedded first, signed later.** The renderer object is embedded in the boot image, so it is covered by the existing image signature. Once ADR-0286's multi-signer scheme ships, it is updated as a signed system object under the same rule. It is never fetched unsigned.
+- **One renderer domain, per-window arenas.** One domain serves all windows with a separate arena per window, and the kernel restarts the domain if it faults while the compositor keeps drawing the last frame. Per-app domains give stronger isolation against a hostile document, but multiply the renderer's memory by the window count; revisit once the memory of the renderer is measured.
+- **Floats: f64 in the user domain, conditional.** `cssom` uses doubles in 58 places and the hosted oracle is f64, so fixed point would add a parity risk. This holds only if the kernel saves and restores floating-point state on a CPL3 process switch; checking that (and fixing it if absent) is the first task of JUN-855. If it cannot be done, fixed point is the fallback and this line is reopened.
+
+## Still open
+
 - Measured size and speed of cssom in the user target (needs the first slice of JUN-855).
+- Whether the kernel preserves floating-point state across a CPL3 process switch (read-only check first).
+- The exact byte layout of the three regions and the event/draw-list encodings.
 
 ## Not verified
 
