@@ -2,12 +2,20 @@
 """Check distributions/awai/dapps/*.json (itonami.dapp.v1) and update-policy.json.
 
 Host-side check only: it reads JSON and refuses; it compiles and boots nothing.
+
+Optional `ui` object (JUN-856, additive): {"document": "<id>"} names the record's UI
+document, the module resources/aiueos/session/apps/<id>.kotoba. A record without `ui`
+stays valid until every record carries it. `ui` may hold only `document`, whose value
+is a lowercase id ([a-z0-9-], at most 40 characters).
+
+usage: check-dapp-records.py [ROOT]   ROOT defaults to the lib/kotoba.aiueos this script is in.
 """
 import json
 import pathlib
+import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
 DAPPS = ROOT / "distributions" / "awai" / "dapps"
 REQUIRED = ("id", "dock", "title", "install", "entry", "core", "localCore",
             "localState", "dns", "offline", "remoteOperations", "adr")
@@ -15,6 +23,9 @@ OP_REQUIRED = ("operation", "service", "endpoint", "data", "consent", "state")
 WANT = {"murakumo", "itonami", "yataverse", "aozora", "browser", "yotei", "shakai",
         "saifu", "bunsho", "hyokeisan", "zuhyo", "tokei", "wifi", "bluetooth",
         "settei", "itonami-apps", "updates", "torihiki"}
+
+
+DOC_ID = re.compile(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?")
 
 
 def fail(msg):
@@ -40,6 +51,12 @@ for path in sorted(DAPPS.glob("*.json")):
                 fail(f"{path.name}: operation lacks {key}")
         if o["consent"] != "each-operation":
             fail(f"{path.name}: {o['operation']} consent must be each-operation")
+    if "ui" in rec:
+        ui = rec["ui"]
+        if not isinstance(ui, dict) or set(ui) != {"document"}:
+            fail(f"{path.name}: ui must be an object with exactly the key document")
+        if not isinstance(ui["document"], str) or not DOC_ID.fullmatch(ui["document"]):
+            fail(f"{path.name}: ui.document must match [a-z0-9-]{{1,40}}")
     records[rec["id"]] = rec
 
 docks = [r["dock"] for r in records.values()]
