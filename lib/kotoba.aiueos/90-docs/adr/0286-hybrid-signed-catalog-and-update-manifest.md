@@ -203,13 +203,21 @@ hash is not a MAC and the file is not sealed.
    `OSMETA.BIN`; nothing at boot or on the network path creates it (the journal's rule "no boot formatting"). The smallest correct
    choice is to refuse: creating the file on the update path would initialise the floor from an image nobody has trusted yet, which is
    floor 0 by another name for the first replay. So a board with no `OSMETA.BIN` **refuses every network update with 10** until a
-   deliberate, separate provisioning step creates it with a floor the owner chose. That step does not exist for real boards yet (open
-   follow-up). The QEMU gate provisions through a hypervisor-only fw_cfg hook (request `4`: floor 4, active 4) that no physical board
-   has.
+   deliberate, separate provisioning step creates it with a floor the owner chose. That step is
+   `os/aiueos/scripts/aiueos-provision-esp.py DISK --version N` (JUN-813 follow-up): it writes `\EFI\ITONAMI\OSMETA.BIN` with the
+   journal's exact format (floor = active = N, confirmed, generation 1, active-image digest = SHA-256 of that ESP's `BOOTX64.EFI`) into
+   an existing `\EFI\ITONAMI\`, with the placement `record-file` demands, and refuses (nothing written) a missing `--version`,
+   a missing directory, an existing `OSMETA.BIN` without `--replace`, or a file that cannot be placed. The QEMU `provision` gate
+   boots a disk the command made, with no hook. The earlier `update2` gate still provisions through a hypervisor-only fw_cfg hook
+   (request `4`: floor 4, active 4) that no physical board has.
 
-**Consequence the owner must know.** Merging this makes the existing network `install` path refuse on every currently installed
-board until it has an `OSMETA.BIN`. That is the intended fail-closed behaviour, and it also means a board cannot be updated over the
-network until the provisioning step is built.
+**Consequence the owner must know.** Merging this makes the existing network `install` path refuse (result 10) on every currently
+installed board until it has an `OSMETA.BIN`. That is the intended fail-closed behaviour. Boards already deployed (and any board
+imaged before this change) stay refused until the operator runs `aiueos-provision-esp.py DISK --version N` against the ESP (the
+version of the image the board runs now); the choice of N is the owner's, and a too-low N re-admits older images. The image
+builders (`make-release-image.py`, `make-install-usb-image.py`) do not create `\EFI\ITONAMI\` at all, so a board freshly imaged
+by them has neither the native loader path nor an `OSMETA.BIN`; building that directory into new images is a separate, open gap and
+this change does not close it.
 
 **Verified (QEMU/TCG, test keys, `-nic none`):** the `update2` gate (hook-provisioned floor 4, independent oracle): floor boundary
 (above, equal, below) for `AIUEIMG2` and `AIUEIMG1`; install advances the floor 4 to 5 and a second install of version 5 is refused; a
