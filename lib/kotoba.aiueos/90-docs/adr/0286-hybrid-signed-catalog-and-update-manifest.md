@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Proposed (JUN-812, JUN-813). Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
+Proposed (JUN-812, JUN-813). Amendment 1 (2026-11-06, owner): key custody and distribution are decentralized; see the end. Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -74,3 +74,49 @@ From FIPS 204 ML-DSA-65 (k=6, l=5, q=8380417; public key 1952 B, signature 3309 
   hardware token), their key ids, and the rotation rule. The seeds must never enter this repository.
 - Acceptance of the `AIUEIMG2` layout and of retiring `AIUEIMG1`.
 - Whether a publisher catalog (third-party) may exist beside the distribution catalog (ADR-0284 keeps publisher trust a user choice).
+
+## Amendment 1 (2026-11-06, owner): decentralized key custody and distribution
+
+The owner decided that the signing keys and the distribution origin are decentralized ("署名鍵の保管と配信元は、分散型で").
+This is a direction, not a finished design. What follows is what the direction implies for the text above, read from this
+ADR and the sizes measured in it. Parameters the owner has not given are listed as open and are not chosen here.
+
+**Key custody: several independent signers, not one key.**
+
+- A catalog or image is accepted only when at least M distinct signers out of N pinned signers have both of their signatures
+  valid (Ed25519 and ML-DSA-65, decision 1 stays per signer). No single holder can publish.
+- There is no standardized threshold ML-DSA, so this is a list of ordinary signatures, not threshold cryptography. The cost
+  is linear: M verifications, N pinned keys.
+- The `AIUEIMG2` layout of decision 2 does not hold more than one signer: Ed25519 (64 B) plus ML-DSA-65 (3309 B) is 3373 B per
+  signer, and the 4096-byte header already carries 128 B of fields. The header has to become a signature block of M entries
+  (key id, both signatures) after the fixed fields. `AIUECAT1` changes the same way. The layout is therefore not accepted
+  as written in decision 2.
+- Pinned keys (decision 3) grow to N pairs: N x (32 B + 1952 B). At the ~40 KB of text per ML-DSA key estimated above, N = 5
+  is order of 200 KB of kernel text, which the margin (about 0.82 MB after amu#1840) can hold; the number is to be measured.
+- Rotation (decision 3) generalizes: a new signer set is accepted when the current set signs it with its own threshold M.
+  The same rule covers removing a signer.
+- Seeds still never enter this repository, and no signer's key is held by the same custodian as another's.
+
+**Distribution: content addressed, the origin is not a trust root.**
+
+- Integrity comes from the signed manifest and the content identifier of each object, which decision 5 already requires
+  (`aiueos.cid-v1-admit` before use). Where the bytes came from therefore does not decide whether they are accepted: any
+  mirror or peer may serve them, and a wrong object is refused by the kernel, not by the origin.
+- This replaces "register one origin" with a set of interchangeable, untrusted sources. It does not remove the Kotoba rule that
+  each fetch is an operation the user approves for a declared service and endpoint, nor the static CSP derived from the
+  declared origins (the shared contract in the workspace AGENTS.md): every source class still has to be declared. A
+  peer-to-peer transport needs its own declared service and approval; this ADR does not define one.
+- An untrusted source can withhold. Rollback protection (decision 4) stops an old image being installed, but it does not stop a
+  source from hiding a new one. A signed freshness statement (a short-lived signed "latest version" record with an expiry)
+  would let a device notice. That is a proposal to be decided, not part of this amendment.
+
+**Order of work (replaces step 5 only):** the multi-signer block layout is designed and accepted first; the region-based
+ML-DSA-65 verifier (steps 2, already merged as stages 1-4) is unchanged because it verifies one signature at a time.
+
+**Open owner parameters:** the number of signers N and the threshold M; who the signers are and where each key lives; which
+content-addressed network or networks are used (and their declared service origins); the signer-set rotation procedure; whether
+a freshness statement is required; the layout of the signature block.
+
+Not verified: no signature block, multi-signer verification or mirror fetch exists; the size figures are estimates from the
+numbers above.
+
