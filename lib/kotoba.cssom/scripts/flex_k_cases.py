@@ -428,8 +428,33 @@ def random_cases(count, seed=9320):
     return out
 
 
+def small_cases(count, seed=9321):
+    """Lines of one to four items, the range flex_q6 is defined on: a clamp on many items and the nets of the slice-3 differential
+    grid (q6_flex_vs_f64 net-of)."""
+    rnd = random.Random(seed)
+    out = []
+    bases = [0, 1, 63, 64, 65, 640, 3200, 6400, 9600, 19200, 64000, 262143, 12800]
+    facs = [0, 1, 2500, 5000, 10000, 10000, 15000, 20000, 30000, 33333, 65535]
+    mins = [0, 0, 0, 0, 1, 1280, 3200, 6400, 9600, 12800, 19200, 262143]
+    maxs = [None, None, None, 0, 640, 1920, 3200, 6400, 9600, 12800]
+    nets = [0, 1, 12800, 19200, 38400, 76800, 262143, -1000, 524287, -524288, 6400, 25600, 9600]
+    for k in range(count):
+        n = rnd.randint(1, 4)
+        items = [(rnd.choice(bases) if rnd.random() < 0.85 else rnd.randint(0, BASE_MAX), rnd.choice(mins), rnd.choice(maxs), rnd.choice(facs))
+                 for _ in range(n)]
+        net = rnd.choice(nets) if rnd.random() < 0.7 else rnd.randint(NET_LO, NET_HI) if rnd.random() < 0.2 else rnd.randint(0, 20000)
+        c = case("small-%04d-n%d" % (k, n), items, net, group="small")
+        if rnd.random() < 0.3:
+            st, sz = sizes_exact(items, net)
+            c["mode"], c["safe"] = rnd.randint(0, 5), rnd.randint(0, 1)
+            c["container"] = max(0, (sum(sz) if st == 0 else 0) + rnd.randint(-1000, 12000))
+            c["gap"] = rnd.choice((0, 64, 1, 640))
+        out.append(c)
+    return out
+
+
 def all_cases(random_count=520):
-    cases = hand_cases() + capacity_cases() + bound_cases() + cascade_cases() + tie_cases() + place_cases() + random_cases(random_count)
+    cases = hand_cases() + capacity_cases() + bound_cases() + cascade_cases() + tie_cases() + place_cases() + random_cases(random_count) + small_cases(140)
     names = [c["name"] for c in cases]
     assert len(names) == len(set(names)), "duplicate case names"
     return cases

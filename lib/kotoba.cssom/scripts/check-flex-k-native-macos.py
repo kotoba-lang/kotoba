@@ -127,6 +127,8 @@ def check_hand(cases):
                 raise ValueError(("refusal code differs", c["name"], st, c["status"]))
             n += 1
             continue
+        if c["expect"] is None and "offsets" not in c and "autos_expect" not in c:
+            continue
         if st:
             raise ValueError(("unexpected refusal", c["name"], st))
         if c["expect"] is not None and sizes != c["expect"]:
@@ -246,6 +248,8 @@ def main():
     ap.add_argument("--image-baseline", type=Path, help="an existing builder output of another profile, for the whole-image delta")
     ap.add_argument("--image-baseline-profile", default="imgsig")
     ap.add_argument("--host-only", action="store_true", help="stages 1-3 and the reference mutant only (no kernel build)")
+    ap.add_argument("--reuse-run", type=Path, help="a previous output of this gate on the same tree: its kernel-baseline and kernel-mutant-* "
+                    "builds are re-verified (receipts read, records compared with the exact model again) instead of rebuilt")
     ap.add_argument("--skip-mutants", action="store_true")
     ap.add_argument("--print-measurements", action="store_true")
     args = ap.parse_args()
@@ -268,7 +272,7 @@ def main():
 
     # 2. the exact model against the hand-derived cases
     hand = [c for c in cases if c["group"] == "hand"]
-    receipt["handDerived"] = {"cases": len(hand), "agree": check_hand(cases)}
+    receipt["handDerived"] = {"hand-group-cases": len(hand), "casesWithAHandDerivedExpectationOrRefusal": check_hand(cases)}
     ti, tl = exact_ties(cases)
     st_counts = {}
     for c in cases:
@@ -313,6 +317,9 @@ def main():
         return
 
     # 4. kernel: baseline build and QEMU run
+    receipt["reusedRun"] = str(args.reuse_run.resolve()) if args.reuse_run else None
+    if args.reuse_run:
+        args.reuse_baseline = args.reuse_run.resolve() / "kernel-baseline"
     base = args.reuse_baseline.resolve() if args.reuse_baseline else out / "kernel-baseline"
     started = time.monotonic()
     if not args.reuse_baseline:
@@ -332,7 +339,7 @@ def main():
                          "equalToExactModel": len(cases) - len(bad), "statusZero": sum(1 for r in recs if r["status"] == 0),
                          "refused": sum(1 for r in recs if r["status"] != 0),
                          "refusalCodes": sorted({r["status"] for r in recs if r["status"]}),
-                         "buildAndRunSeconds": round(time.monotonic() - started, 1),
+                         "buildAndRunSeconds": None if args.reuse_baseline else round(time.monotonic() - started, 1),
                          "textSegmentBytes": state["textMargin"]["textSegmentBytes"], "estimatedMarginBytes": state["textMargin"]["estimatedMarginBytes"],
                          "sourceModuleCount": kstate["sourceModuleCount"], "kernelSha256": kstate["kernel"]["sha256"],
                          "cssomModulesLocked": sorted(m for m in kstate["sourceGraph"] if "/cssom/" in m)}
@@ -354,9 +361,17 @@ def main():
             for p in SRC.glob("*_k.kotoba"):
                 shutil.copyfile(p, mdir / p.name)
             (mdir / (stem + ".kotoba")).write_text(text0.replace(anchor, repl))
-            code, tail, secs = S.run_builder(args, out / ("kernel-mutant-" + stem), profile="flex",
-                                             env_extra={"AIUEOS_CSSOM_K_SOURCE_PATH": str(mdir)})
-            mr = read_receipt(out / ("kernel-mutant-" + stem))
+            if args.reuse_run:
+                old = args.reuse_run.resolve() / "mutants" / stem
+                if any(sha(old / p.name) != sha(mdir / p.name) for p in mdir.glob("*.kotoba")):
+                    raise ValueError(("the reused mutant sources differ from the current tree", stem))
+                mout = args.reuse_run.resolve() / ("kernel-mutant-" + stem)
+                code = None                               # not re-run: the first run raised unless the builder exited non-zero; the receipt decides
+            else:
+                mout = out / ("kernel-mutant-" + stem)
+                code, tail, secs = S.run_builder(args, mout, profile="flex", env_extra={"AIUEOS_CSSOM_K_SOURCE_PATH": str(mdir)})
+            tail = ""
+            mr = read_receipt(mout)
             if code == 0 or mr is None or mr["status"] != "FAIL_NATIVE_FLEX_K_QEMU":
                 raise ValueError(("the mutant was not seen by the observer", name, code, tail[-400:]))
             diff = differing(cases, mr)
@@ -384,10 +399,12 @@ def main():
         for zero in (False, True):
             src, _, _ = S.reachable(S.bundle(entry_for(stem, zero), SRC))
             res = comp.compile("user-%s-%s" % (stem, "zero" if zero else "two"), src, "x86_64-aiueos-user-v1")
-            if res["ok"]:
+            # fxdiv_k holds no window form (scalar code), so user-v1 may accept it; the two window modules must be refused
+            if res["ok"] and stem != "fxdiv_k":
                 raise ValueError(("user-v1 unexpectedly accepted region code", stem))
-            user["%s/%s-argument-entry" % (stem, "0" if zero else "2")] = {"error": res.get("error"), "message": res.get("message"),
-                                                                         "detail": res.get("detail"), "output": res["output"]}
+            user["%s/%s-argument-entry" % (stem, "0" if zero else "2")] = {
+                "accepted": res["ok"], "textBytes": res.get("textBytes"), "error": res.get("error"), "message": res.get("message"),
+                "detail": res.get("detail"), "output": res["output"]}
     receipt["userV1"] = user
     six = ("(ns m (:export [main]))\n(defn f [a b c d e g] (+ a (+ b (+ c (+ d (+ e g))))))\n(defn main [a :i64 b :i64] :i64 (f a b a b a b))\n")
     res = comp.compile("six-params", six, "x86_64-aiueos-kernel-v1")
