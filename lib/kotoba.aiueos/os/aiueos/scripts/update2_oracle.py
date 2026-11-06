@@ -2,12 +2,13 @@
 """Host oracle for the AIUEIMG2 path of native/update.kotoba (JUN-813 stage 5b, ADR-0286 amendment 2).
 
 Builds the fw_cfg file opt/aiueos/update2 the QEMU gate hands to the guest: [count][per case: mode (0 = pinned TEST keys, 1 =
-production signer set), 16384 header bytes, 5000 image bytes], and the verdict the kernel must reach for each case. Keys, signing and
+production signer set, 2 = TEST keys with the header stream broken before the piece that would pass byte 7200), 16384 header
+bytes, 5000 image bytes], and the verdict the kernel must reach for each case. Keys, signing and
 the admission rule come from imgsig_oracle (public TEST keys; RFC 8032 integer Ed25519 and the ACVP-checked ML-DSA-65 reference). The
 verdict here is computed independently of the kernel: header structure, then the counted signers (imgsig_oracle.verdict), then the
 manifest's size and version, then the SHA-256 of the image bytes that follow.
 
-Result codes of update.kotoba: 15 image verified, 1 fewer than two distinct valid signers, 2 bad magic, 3 count/layout or size,
+Result codes of update.kotoba: 21 stream broke (mode 2 only; the entries completed before the break still count), 15 image verified, 1 fewer than two distinct valid signers, 2 bad magic, 3 count/layout or size,
 4 version below 1, 5 manifest reserved bytes not zero, 7 digest differs, 8 no production signer set pinned.
 """
 import hashlib
@@ -28,11 +29,31 @@ def manifest(version=5, size=IMG_LEN, img=None, **kw):
     return m[:32] + hashlib.sha256(image() if img is None else img).digest()
 
 
+CUT = 7200  # mode 2: the stream breaks before the piece that would pass this byte; pieces end on 1 KiB lines
+
+
+def entry_counts(hdr, i):
+    """Independent check of entry i of a header: does it count (pinned id, zero reserved/padding, both signatures valid)?"""
+    e = hdr[128 + i * o.ENTRY:128 + (i + 1) * o.ENTRY]
+    kid = struct.unpack_from("<I", e, 0)[0]
+    return (kid < o.N_SLOTS and e[4:8] == bytes(4) and e[3381:] == bytes(11)
+            and o.ed_valid(kid, hdr[:64], e[8:72]) and o.ml_valid(kid, hdr[:64], e[72:3381])), kid
+
+
 def expected(hdr, mode, img):
     """(result, mask) the kernel must report for this case."""
     v, mask = o.verdict(hdr)
     if v in (2, 5, 3):
         return v, 0
+    if mode == 2:
+        # entries whose last byte lies below the last whole piece consumed before the break
+        consumed, mask2, seen = (CUT // 1024) * 1024, 0, set()
+        for i in range(struct.unpack_from("<I", hdr, 64)[0]):
+            if 128 + (i + 1) * o.ENTRY <= consumed:
+                ok, kid = entry_counts(hdr, i)
+                if ok and kid not in seen:
+                    seen.add(kid); mask2 |= 1 << kid
+        return 21, mask2
     if mode == 1:
         return 8, 0
     if v == 4:
@@ -55,6 +76,7 @@ def cases():
     sg0 = {s: o.sign_entry(s, man0) for s in range(2)}
     big = manifest(size=40 << 20)
     sgb = {s: o.sign_entry(s, big) for s in range(2)}
+    bad_ctx = o.sign_entry(0, man, b"AIUEIMG1")
     rows = [
         ("two-of-three-0-1", 0, o.header(man, [e(0), e(1)]), img),
         ("two-of-three-2-0", 0, o.header(man, [e(2), e(0)]), img),
@@ -72,6 +94,22 @@ def cases():
         ("manifest-reserved", 0, o.header(o.flip(man, 24), [e(0), e(1)]), img),
         ("version-zero", 0, o.header(man0, [o.entry(s, *sg0[s]) for s in range(2)]), img),
         ("size-too-big", 0, o.header(big, [o.entry(s, *sgb[s]) for s in range(2)]), img),
+        # review hardening (JUN-813): every must-be-zero byte group, counts 4 and 5, key ids with a high byte, the wrong context
+        ("entry-reserved-4", 0, o.header(man, [o.entry(0, *sg[0], reserved=b"\1\0\0\0"), e(1)]), img),
+        ("entry-reserved-7", 0, o.header(man, [o.entry(0, *sg[0], reserved=b"\0\0\0\x80"), e(1)]), img),
+        ("pad-nonzero-first", 0, o.header(man, [o.entry(0, *sg[0], pad=b"\1" + bytes(10)), e(1)]), img),
+        ("pad-nonzero-last", 0, o.header(man, [o.entry(0, *sg[0], pad=bytes(10) + b"\x80"), e(1)]), img),
+        ("layout-68", 0, o.header(man, [e(0), e(1)], layout=(68, 1)), img),
+        ("layout-127", 0, o.header(man, [e(0), e(1)], layout=(127, 0x80)), img),
+        ("count-five", 0, o.header(man, [e(0), e(1)], count=5), img),
+        ("count-four-dup", 0, o.header(man, [e(0), e(1), e(2), e(1)]), img),
+        ("count-four-last-counts", 0, o.header(man, [e(0), o.entry(7, *sg[1]), e(0), e(1)]), img),
+        ("id-256", 0, o.header(man, [o.entry(256, *sg[0]), e(1)]), img),
+        ("id-65536", 0, o.header(man, [o.entry(65536, *sg[0]), e(1)]), img),
+        ("id-16777216", 0, o.header(man, [o.entry(0x01000000, *sg[0]), e(1)]), img),
+        ("wrong-context", 0, o.header(man, [o.entry(0, sg[0][0], bad_ctx[1]), e(1)]), img),
+        # last: the stream breaks after entries 0 and 1 were verified; the storage driver must still work afterwards (JUN-813 finding B)
+        ("stream-broken-after-verify", 2, o.header(man, [e(0), e(1), e(2)]), img),
     ]
     out = []
     for name, mode, hdr, im in rows:

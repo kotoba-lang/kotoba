@@ -143,3 +143,22 @@ fixtures signed by published *test* keys (the fixtures prove the path, not a key
 custodians and the gateway hosts are separate, later and owner-supplied. Kernel text for three pinned ML-DSA keys is to be
 measured, estimated at order 120 KB.
 
+
+## Amendment 3 (2026-11-06): header tail and AIUEIMG1 retirement, from review of stages 5a and 5b
+
+Two review findings that change no behaviour. They state what the implementation does and what must hold before production.
+
+1. **Header bytes after the last entry are ignored and unauthenticated.** Amendment 2 says the rest of the 16384-byte header is
+   zero. Neither kernel path reads or checks bytes `128 + count * 3392 .. 16383`: the stage 5a self-test discards them, and the
+   network pull (stage 5b) never fetches them, the image starting at byte 16384 of the stream only after the entries. The
+   signatures cover the 64-byte manifest, not the header, so these bytes cannot affect admission and nobody has signed them. A
+   producer should still write zeros, and a consumer must treat the tail as padding, never as data. The bytes that *are*
+   checked are: magic, manifest reserved bytes 24..31, count 1..4, layout bytes 68..127, and per entry the key id (all four
+   bytes), reserved bytes 4..7 and padding bytes 3381..3391; an entry with a non-pinned id or any nonzero reserved/padding
+   byte is skipped, never counted (stage 5a hardening makes the 5a kernel match the stage 5b path and the host oracle here).
+2. **`AIUEIMG1` MUST be retired in the same change that pins a production signer set.** The kernel keeps accepting `AIUEIMG1`
+   (one Ed25519 signature, one pinned key) while no production `AIUEIMG2` signer set exists, so that the existing update path
+   and its self-test still work. Once production keys for the multi-signer rule are pinned, leaving `AIUEIMG1` admissible would
+   let one key (and no ML-DSA signature) install an image, bypassing the two-of-three rule and the post-quantum floor. The
+   change that pins the production set must therefore remove the `AIUEIMG1` branch of `admit` (and the single-key pin) in the
+   same commit; a release that has both is not acceptable.

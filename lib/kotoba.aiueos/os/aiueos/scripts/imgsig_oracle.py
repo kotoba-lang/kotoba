@@ -81,9 +81,9 @@ def sign_entry(slot, man, ctx=CTX):
     return ed, ml
 
 
-def entry(kid, ed, ml, reserved=bytes(4)):
-    assert len(ed) == 64 and len(ml) == 3309
-    return (struct.pack("<I", kid) + reserved + ed + ml).ljust(ENTRY, b"\0")
+def entry(kid, ed, ml, reserved=bytes(4), pad=bytes(11)):
+    assert len(ed) == 64 and len(ml) == 3309 and len(reserved) == 4 and len(pad) == 11
+    return struct.pack("<I", kid) + reserved + ed + ml + pad
 
 
 def flip(b, at, mask=1):
@@ -91,9 +91,13 @@ def flip(b, at, mask=1):
     return bytes(x)
 
 
-def header(man, entries, count=None):
+def header(man, entries, count=None, layout=None):
+    """layout: optional (offset, byte) written into the must-be-zero bytes 68..127."""
     body = man + struct.pack("<I", len(entries) if count is None else count)
-    body = body.ljust(128, b"\0") + b"".join(entries)
+    body = body.ljust(128, b"\0")
+    if layout is not None:
+        body = flip(body, layout[0], layout[1])
+    body += b"".join(entries)
     assert len(body) <= HDR
     return body.ljust(HDR, b"\0")
 
@@ -148,6 +152,18 @@ def cases():
         ("count-zero", header(man, [e(0), e(1)], count=0), 3),
         ("count-five", header(man, [e(0), e(1)], count=5), 3),
         ("manifest-reserved", header(flip(man, 24), [e(0), e(1)]), 5),
+        # review hardening (JUN-813): every must-be-zero byte group, the largest header, and key ids with a high byte set
+        ("pad-nonzero-first", header(man, [entry(0, *sg[0], pad=b"\1" + bytes(10)), e(1)]), 4),
+        ("pad-nonzero-last", header(man, [entry(0, *sg[0], pad=bytes(10) + b"\x80"), e(1)]), 4),
+        ("entry-reserved-4", header(man, [entry(0, *sg[0], reserved=b"\1\0\0\0"), e(1)]), 4),
+        ("entry-reserved-7", header(man, [entry(0, *sg[0], reserved=b"\0\0\0\x80"), e(1)]), 4),
+        ("layout-68", header(man, [e(0), e(1)], layout=(68, 1)), 3),
+        ("layout-127", header(man, [e(0), e(1)], layout=(127, 0x80)), 3),
+        ("count-four-dup", header(man, [e(0), e(1), e(2), e(1)]), 1),
+        ("count-four-last-counts", header(man, [e(0), entry(7, *sg[1]), e(0), e(1)]), 1),
+        ("id-256", header(man, [entry(256, *sg[0]), e(1)]), 4),
+        ("id-65536", header(man, [entry(65536, *sg[0]), e(1)]), 4),
+        ("id-16777216", header(man, [entry(0x01000000, *sg[0]), e(1)]), 4),
     ]
     out = []
     for name, h, want in rows:
