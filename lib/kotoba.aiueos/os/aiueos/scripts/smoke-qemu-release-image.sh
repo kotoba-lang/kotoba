@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# JUN-942: the release builder requires the image's version N and has no default. This smoke builds throwaway images, so the harness
+# (not the builder) picks N = 1 unless the caller sets AIUEOS_IMAGE_VERSION; the update-flow image below is built as N + 1.
+AIUEOS_IMAGE_VERSION=${AIUEOS_IMAGE_VERSION:-1}
+export AIUEOS_IMAGE_VERSION
+
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 aiueos="$repo/os/aiueos"
 out=${AIUEOS_OUT:-"$repo/build/aiueos"}
@@ -138,13 +143,15 @@ python3 "$aiueos/scripts/make-release-image.py" build \
   --efi "$out/update-previous-bootx64.efi" \
   --kernel "$out/update-previous-kernel.elf" \
   --initramfs "$out/update-previous-initrd.img" \
-  --output "$out/update-base.img" --receipt "$out/update-base-receipt.json" >/dev/null
+  --output "$out/update-base.img" --receipt "$out/update-base-receipt.json" \
+  --version "$AIUEOS_IMAGE_VERSION" >/dev/null
 python3 "$aiueos/scripts/make-release-image.py" apply-update \
   --image "$out/update-base.img" \
   --efi "$out/esp/EFI/BOOT/BOOTX64.EFI" \
   --kernel "$out/esp/EFI/AIUEOS/KERNEL.ELF" \
   --initramfs "$out/esp/EFI/AIUEOS/INITRD.IMG" \
-  --output "$out/update-applied.img" --receipt "$out/update-receipt.json" >/dev/null
+  --output "$out/update-applied.img" --receipt "$out/update-receipt.json" \
+  --version "$((AIUEOS_IMAGE_VERSION + 1))" >/dev/null
 python3 "$aiueos/scripts/make-release-image.py" verify \
   --image "$out/update-applied.img" \
   --efi "$out/esp/EFI/BOOT/BOOTX64.EFI" \
@@ -152,7 +159,8 @@ python3 "$aiueos/scripts/make-release-image.py" verify \
   --initramfs "$out/esp/EFI/AIUEOS/INITRD.IMG" \
   --recovery-efi "$out/update-previous-bootx64.efi" \
   --recovery-kernel "$out/update-previous-kernel.elf" \
-  --recovery-initramfs "$out/update-previous-initrd.img" >/dev/null
+  --recovery-initramfs "$out/update-previous-initrd.img" \
+  --version "$((AIUEOS_IMAGE_VERSION + 1))" >/dev/null
 cp "$out/aiueos-x86_64-data.img" "$out/virtio-blk-smoke.img"
 AIUEOS_DISK_IMAGE="$out/update-applied.img" \
   AIUEOS_PRESERVE_BLK_IMAGE=1 \
