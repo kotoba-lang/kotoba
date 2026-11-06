@@ -527,7 +527,10 @@ def main(args):
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("flex verdict is incomplete")
         elif args.profile == "grid":
+            if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "grid-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("grid verdict is incomplete")
         elif args.profile == "gf25519":
             if (observed["font"] != font_state["padded"]
