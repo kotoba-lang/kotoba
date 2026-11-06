@@ -107,6 +107,7 @@ def cases():
     sgb = {s: o.sign_entry(s, big) for s in range(2)}
     bad_ctx = o.sign_entry(0, man, b"AIUEIMG1")
     cat_sg = {s: o.sign_entry(s, man, b"AIUECAT1") for s in range(2)}
+    frs_sg = {s: o.sign_entry(s, man, b"AIUEFRS1") for s in range(2)}
     man6, man4, man3 = manifest(version=6), manifest(version=4), manifest(version=3)
     sg6, sg4, sg3 = ({s: o.sign_entry(s, m) for s in range(2)} for m in (man6, man4, man3))
     rows = [
@@ -150,6 +151,8 @@ def cases():
         # JUN-813 stage 6: signatures made for another object type (ML-DSA context "AIUECAT1", the catalog's) must not admit an image
         ("catalog-context-both", 0, o.header(man, [o.entry(s, *cat_sg[s]) for s in range(2)]), img),
         ("catalog-context-one", 0, o.header(man, [o.entry(0, sg[0][0], cat_sg[0][1]), e(1)]), img),
+        # JUN-813 amendment 6: signatures made for a freshness record (ML-DSA context "AIUEFRS1") must not admit an image
+        ("fresh-context-both", 0, o.header(man, [o.entry(s, *frs_sg[s]) for s in range(2)]), img),
         # last: the stream breaks after entries 0 and 1 were verified; the storage driver must still work afterwards (JUN-813 finding B)
         ("stream-broken-after-verify", 2, o.header(man, [e(0), e(1), e(2)]), img),
     ]

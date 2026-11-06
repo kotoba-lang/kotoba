@@ -174,7 +174,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
@@ -276,7 +276,7 @@ def main(args):
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
                         else "input-entry.kotoba" if args.profile == "input-state"
-                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "catalog")
+                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "catalog", "fresh")
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -343,6 +343,7 @@ def main(args):
                         else "check-native-update2-qemu.py" if args.profile == "update2"
                         else "check-native-provision-esp-qemu.py" if args.profile == "provision"
                         else "check-native-catalog-qemu.py" if args.profile == "catalog"
+                        else "check-native-fresh-qemu.py" if args.profile == "fresh"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -373,6 +374,7 @@ def main(args):
                         else "native-update2-qemu.json" if args.profile == "update2"
                         else "native-provision-esp-qemu.json" if args.profile == "provision"
                         else "native-catalog-qemu.json" if args.profile == "catalog"
+                        else "native-fresh-qemu.json" if args.profile == "fresh"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
@@ -396,6 +398,7 @@ def main(args):
                            else "PASS_NATIVE_UPDATE2_QEMU" if args.profile == "update2"
                            else "PASS_NATIVE_PROVISION_ESP_QEMU" if args.profile == "provision"
                            else "PASS_NATIVE_CATALOG_QEMU" if args.profile == "catalog"
+                           else "PASS_NATIVE_FRESH_QEMU" if args.profile == "fresh"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 18 if args.expect_stuck_entropy
@@ -409,6 +412,7 @@ def main(args):
                            else 12 if args.profile == "update2"
                            else 8 if args.profile == "provision"
                            else 3 if args.profile == "catalog"
+                           else 7 if args.profile == "fresh"
                            else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -551,7 +555,7 @@ def main(args):
                                                             "pad-nonzero-last", "layout-68", "layout-127", "count-five", "count-four-dup",
                                                             "count-four-last-counts", "id-256", "id-65536", "id-16777216", "wrong-context",
                                                             "floor-above", "floor-equal", "floor-below", "v1-above-floor", "v1-equal-floor",
-                                                            "v1-below-floor", "catalog-context-both", "catalog-context-one", "stream-broken-after-verify"]
+                                                            "v1-below-floor", "catalog-context-both", "catalog-context-one", "fresh-context-both", "stream-broken-after-verify"]
                     or [row["install"] for row in observed["events"][2:]] != [15, 9, 15, 15, 15, 9, 7, 1, 10, 10]
                     or [row.get("floorAfter") for row in observed["events"][2:]] != [5, None, 6, None, 5, None, None, None, None, None]
                     or not observed.get("versionFloorHashCheckedNotSigned")
@@ -567,6 +571,24 @@ def main(args):
                     or not observed["testKeysOnly"] or observed["productionSignerSet"] or not observed["notWiredToDesktop"]
                     or observed["physicalHardware"]):
                 raise ValueError("catalog verdict is incomplete")
+        elif args.profile == "fresh":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["fresh-clock-probes", "fresh-clock-decoder", "fresh-cases",
+                                                                       "fresh-cases-clock-ahead", "fresh-cases-no-clock",
+                                                                       "fresh-storage-restored", "fresh-regression"]
+                    or len(observed["events"][0]["probes"]) != 5
+                    or len(observed["events"][2]["matches"]) != observed["events"][2]["cases"]
+                    or len(observed["events"][3]["matches"]) != observed["events"][3]["cases"]
+                    or len(observed["events"][4]["matches"]) != observed["events"][4]["cases"]
+                    or sorted(observed["events"][2]["admittedStates"]) != sorted(["two-of-three-0-1", "two-of-three-2-0", "three-signers",
+                                                                                 "expired-one-hour-ago-30-day-lifetime", "expired-two-months-ago",
+                                                                                 "fresh-three-hours-left", "issued-23-hours-ahead-within-skew",
+                                                                                 "issued-two-days-ahead-clock-behind", "lifetime-exactly-30-days",
+                                                                                 "version-one", "version-max-signed"])
+                    or not observed["events"][5]["diskUnchanged"] or not observed["events"][6]["desktopStillDraws"]
+                    or not observed["testKeysOnly"] or observed["productionSignerSet"] or not observed["notWiredToDesktop"]
+                    or observed["physicalHardware"] or not observed["clockIsQemuNotABoard"]):
+                raise ValueError("fresh verdict is incomplete")
         elif args.profile == "provision":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["provision-esp", "provision-cases-checked", "provision-equal",
@@ -781,7 +803,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "update2", "provision", "catalog", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "update2", "provision", "catalog", "fresh", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "
