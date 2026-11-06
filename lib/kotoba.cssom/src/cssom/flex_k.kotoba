@@ -1,0 +1,119 @@
+(ns cssom.flex-k (:require [cssom.fxdiv-k :as xd]) (:export [fx-run fx-size fx-header fx-count]))
+;; JUN-932 (JUN-920 follow-up), flex lines of up to SIXTEEN items, kernel dialect (ADR-0287). The semantics are those of
+;; flex_q6.kotoba (and of layout.cljk resolve-flexible-lengths, CSS Flexbox 9.7): grow, or shrink scaled by the base size;
+;; min/max clamp; freeze-and-redistribute; the freeze test on the EXACT proposal (never on its rounded value); one half-up
+;; rounding of the exact share for an item that is not frozen; a flex factor of zero (a weight of zero) is a frozen item.
+;; What changes is the representation. flex_q6 keeps a line in five scalar words (310 bits, so four items). Here the line sits
+;; in an owned window, as the style slice holds its tables (cssom.intern-k and friends); nothing is truncated: a line of more
+;; than sixteen items is refused (status -1), not cut.
+;;
+;; WINDOW. One owned window of 24576 bytes (kernel-owned-window 0 24576), cut with inline kernel-subregion at constant offsets:
+;;   0      input line (16 KiB)         16384  item table (32 B x 16)         20480  header words
+;; Input line, little-endian u32 words:  [0] n items (1..16; any u32 is read so that n > 16 is refused, not trusted)  [1] net
+;;   (two's complement, Q6 raw: the container's main size minus the gaps)  [2] justify-content mode | safe << 3
+;;   [3] container (Q6)  [4] gap (Q6)  [5] auto-margin leads (bit j: item j)  [6] auto-margin trails  [7] 0
+;;   then item j at byte 32 + 16 j: base, min, max (4294967295 = none), factor (D4: flex-grow 1.5 = 15000).
+;; The words [2]..[6] belong to flexplace_k.kotoba and the gate's entry; the solver reads [0], [1] and the items only.
+;; Ranges (those of flex_q6 item-word / line-word, so the two agree wherever flex_q6 is defined): base 0..262143, min 0..262143,
+;; max none or 0..262142, factor 0..65535, net -524288..524287.
+;; Item record (32 B): cur @0 (the base, then the frozen size), min @4, max @8, ev @12 (2 * size + changed), weight u64 @16,
+;; factor @24. Header page: word 1 = net + 524288, word 3 = the pass counter.
+;;
+;; PASSES (as flex_q6, state in the records instead of in rewritten words). grow? = net > sum(base), decided once from the
+;; ORIGINAL sizes. weight = factor when growing, factor * base when shrinking. A pass: W = sum of weights, R = net - sum(cur);
+;; an item with a positive weight proposes v = max(0, cur + R * weight / W) (exact: floor F and remainder f / W, see fxdiv_k),
+;; a frozen item (weight 0) proposes its size. clamp(v) = min(max, max(min, v)). Changed (f > 0): F < min or F >= max; (f = 0):
+;; clamp(v) != v. A pass that changes nothing answers the sizes (unchanged items: the proposal rounded half up; changed
+;; items never get here); otherwise every changed item is frozen at its clamped size (cur := size, weight := 0) and the next
+;; pass runs. W = 0 answers the sizes as they are (the source returns the bases when every weight is not positive).
+;; Each pass freezes at least one more item or answers, so at most n + 1 passes run; a pass counter of 18 is a guard that
+;; cannot be reached (status -6). The source's own guard (n) never fires either (see the analysis in the evidence README).
+;;
+;; fx-run answers n (1..16) or a negative status: -1 more than 16 items, -2 no item, -3 an item field out of range, -4 net out
+;; of range, -5 |R| >= 2^23 (cannot happen inside the ranges), -6 the pass guard, -7 the window is too short.
+;; fx-size answers the final size of item i in Q6 raw (-1 for an item that is not there).
+(defn- inw [st at] (kernel-load-u32-16k (kernel-subregion st 24576 0 16384) 16384 at))
+(defn- it [st i at] (kernel-load-u32-4k (kernel-subregion st 24576 16384 4096) 4096 (+ (* 32 i) at)))
+(defn- it! [st i at v] (kernel-store-u32-4k (kernel-subregion st 24576 16384 4096) 4096 (+ (* 32 i) at) v))
+(defn- wt [st i] (kernel-load-u64-4k (kernel-subregion st 24576 16384 4096) 4096 (+ (* 32 i) 16)))
+(defn- wt! [st i v] (kernel-store-u64-4k (kernel-subregion st 24576 16384 4096) 4096 (+ (* 32 i) 16) v))
+(defn- hd [st k] (kernel-load-u32-4k (kernel-subregion st 24576 20480 4096) 4096 (* 4 k)))
+(defn- hd! [st k v] (kernel-store-u32-4k (kernel-subregion st 24576 20480 4096) 4096 (* 4 k) v))
+(defn- absv [x] (if (< x 0) (- 0 x) x))
+
+;; ---- load and validate item i; the sum of the bases or the negative status ----
+(defn- put-item [st i b mn at]
+  (let [a (it! st i 0 b) c (it! st i 4 mn) d (it! st i 8 (inw st (+ at 8))) e (it! st i 24 (inw st (+ at 12))) g (it! st i 12 0)]
+    (+ 1 (* 0 (+ a (+ c (+ d (+ e g))))))))
+(defn- load-loop [st i n sb]
+  (if (>= i n) sb
+    (let [at (+ 32 (* 16 i)) b (inw st at) mn (inw st (+ at 4)) mx (inw st (+ at 8)) f (inw st (+ at 12))]
+      (if (and (<= b 262143) (and (<= mn 262143) (and (or (= mx 4294967295) (<= mx 262142)) (<= f 65535))))
+        (load-loop st (+ i 1) n (+ sb (+ b (* 0 (put-item st i b mn at)))))
+        -3))))
+;; weight of every item: the factor when growing, factor * base when shrinking (at most 65535 * 262143 < 2^34)
+(defn- weights [st i n grow]
+  (if (>= i n) 1
+    (let [b (it st i 0) f (it st i 24) w (if (= grow 1) f (* f b)) a (wt! st i w)]
+      (weights st (+ i 1) n (+ grow (* 0 a))))))
+(defn- sum-wt [st i n acc] (if (>= i n) acc (sum-wt st (+ i 1) n (+ acc (wt st i)))))
+(defn- sum-cur [st i n acc] (if (>= i n) acc (sum-cur st (+ i 1) n (+ acc (it st i 0)))))
+
+;; ---- one pass ----
+(defn- clampv [st i v]
+  (let [v1 (if (> (it st i 4) v) (it st i 4) v) mx (it st i 8)]
+    (if (= mx 4294967295) v1 (if (< mx v1) mx v1))))
+;; ev of item i: 2 * size + changed (see the header). The exact proposal is cur + F + f / W, max(0, .) first.
+(defn- ev [st i r tw]
+  (let [w (wt st i) b (it st i 0)]
+    (if (= w 0)
+      (let [c (clampv st i b)] (+ (* 2 c) (if (= c b) 0 1)))
+      (let [d (xd/xd-pack r w tw) v0 (+ b (xd/xd-floor d)) neg (< v0 0)
+            v (if neg 0 v0) f (if neg 0 (xd/xd-rem d))
+            c (clampv st i v) mx (it st i 8)
+            ch (if (> f 0) (if (or (< v (it st i 4)) (and (not= mx 4294967295) (>= v mx))) 1 0) (if (= c v) 0 1))]
+        (+ (* 2 (if (= ch 1) c (+ v (if (>= (* 2 f) tw) 1 0)))) ch)))))
+(defn- eval-loop [st i n r tw]
+  (if (>= i n) 1 (eval-loop st (+ i (+ 1 (* 0 (it! st i 12 (ev st i r tw))))) n r tw)))
+(defn- chg-loop [st i n acc] (if (>= i n) acc (chg-loop st (+ i 1) n (+ acc (bit-and (it st i 12) 1)))))
+(defn- apply-one [st i]
+  (let [e (it st i 12)]
+    (if (= (bit-and e 1) 1)
+      (+ 1 (* 0 (+ (it! st i 0 (u64-shift-right e 1)) (wt! st i 0))))
+      0)))
+(defn- apply-loop [st i n] (if (>= i n) 1 (apply-loop st (+ i (+ 1 (* 0 (apply-one st i)))) n)))
+(defn- plain-loop [st i n] (if (>= i n) 1 (plain-loop st (+ i (+ 1 (* 0 (it! st i 12 (* 2 (it st i 0)))))) n)))
+(defn- pass [st n]
+  (let [tw (sum-wt st 0 n 0)
+        r (- (- (hd st 1) 524288) (sum-cur st 0 n 0))
+        p (hd st 3)]
+    (if (= tw 0)
+      (+ n (* 0 (plain-loop st 0 n)))
+      (if (>= (absv r) 8388608) -5
+        (if (>= p 18) -6
+          (let [e (eval-loop st 0 n r tw)]
+            (if (= (chg-loop st 0 n 0) 0)
+              (+ n (* 0 e))
+              (pass st (+ n (* 0 (+ (apply-loop st 0 n) (hd! st 3 (+ p 1)))))))))))))
+
+(defn fx-run [w length]
+  (if (< length 24576) -7
+    (let [st (kernel-subregion w length 0 24576)
+          n (inw st 0) nv (inw st 4)
+          net (if (>= nv 2147483648) (- nv 4294967296) nv)]
+      (if (> n 16) -1
+        (if (= n 0) -2
+          (if (or (< net -524288) (> net 524287)) -4
+            (let [sb (load-loop st 0 n 0)]
+              (if (< sb 0) sb
+                (let [grow (if (> net sb) 1 0) a (hd! st 1 (+ net 524288)) b (hd! st 3 0)
+                      c (weights st 0 n grow)]
+                  (pass st (+ n (* 0 (+ a (+ b c)))))))))))))) 
+(defn fx-size [w length i]
+  (if (and (>= length 24576) (and (>= i 0) (< i 16)))
+    (u64-shift-right (it (kernel-subregion w length 0 24576) i 12) 1)
+    -1))
+(defn fx-header [w length k]
+  (if (and (>= length 24576) (and (>= k 0) (< k 8))) (inw (kernel-subregion w length 0 24576) (* 4 k)) 0))
+(defn fx-count [w length]
+  (if (>= length 24576) (inw (kernel-subregion w length 0 24576) 0) 0))

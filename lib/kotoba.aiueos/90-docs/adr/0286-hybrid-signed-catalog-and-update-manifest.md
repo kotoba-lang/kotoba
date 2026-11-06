@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Nothing in this ADR is implemented except the region-based ML-DSA-65 verifier (kotoba#1231-#1234); no key exists and no origin is registered. Design only: nothing here is implemented and no row is claimed. It fills what ADR-0283 and
+Accepted 2026-11-06 (owner: "おすすめで決定", the recommended options for every question this ADR left open, listed in Amendment 2). Amendment 1 (owner, 2026-11-06) made key custody and distribution decentralized. Implemented (QEMU gates, test keys only; Amendments 3 to 6): the region-based ML-DSA-65 verifier (kotoba#1231-#1234), the AIUEIMG2 multi-signer admission (stages 5a, 5b), the hash-checked version floor (stage 5c, Amendment 4), the AIUECAT1 catalog admission (stage 6, Amendment 5) and the AIUEFRS1 freshness admission with an RTC clock (Amendment 6). Not implemented: any production key or signer set, any origin, a consumer of the catalog or the freshness record, the signed device-key floor. No row is claimed beyond the gates named in each amendment. It fills what ADR-0283 and
 ADR-0284 left open for the catalog and update artifacts, and it asks the owner for the decisions in the last section. It
 registers no origin, creates no key and changes no kernel. The installed-state schema is ADR-0284 and is not repeated.
 
@@ -400,7 +400,4 @@ in words 273..280; QEMU hooks `opt/aiueos/fresh` (cases) and `opt/aiueos/clock` 
 `check`, nothing persisted, no production signer set. Gate `fresh` (`check-native-fresh-qemu.py`, `fresh_oracle.py`). Results, mutants and what was
 not verified are in the evidence README and the pull request.
 
-**Documentation that disagrees with the code (found while reading; not edited here).** This ADR's Status paragraph still says "nothing in this ADR
-is implemented except the region-based ML-DSA-65 verifier" and "Design only"; `native/update.kotoba` implements stages 5a to 6 (Amendments 2 to 5).
-`distributions/awai/update-policy.json` still says "ML-DSA-65 verifier is open work" (line 18) and "versions must rise (>= 1)" (line 20); the code
-refuses a version not above the hash-checked floor and verifies ML-DSA-65 (for `AIUEIMG2`).
+**Documentation that disagreed with the code (corrected in this change).** The Status paragraph above said "Design only, nothing here is implemented" although `native/update.kotoba` implements stages 5a to 6; and `distributions/awai/update-policy.json` said the ML-DSA-65 verifier was open work and that versions "must rise (>= 1)". Both now state the real state (comments and text only).

@@ -1,0 +1,212 @@
+(ns cssom.grid-k (:export [gk-run gk-sum gk-count]))
+;; Grid track sizing, kernel dialect: layout.cljk `track-sizes` (with distribute-equally-with-caps, distribute-fr, fixed-contribution,
+;; fr-weight), `grid-track-intrinsics` (single-track items only) and `span-width`, as region code over a bounded track table
+;; (ADR-0287, JUN-932 part 2 / JUN-920, census group G07, the grid part). The hosted code is whole-pixel integer arithmetic
+;; (parse-int, quot, long); only the fr weights are doubles. This port keeps that: lengths enter and leave as Q6 raw (1/64 px) and
+;; every length is floored to whole px on entry (the `long` coercions of the source; negative lengths are refused), results are
+;; px << 6. An fr weight enters as D4 raw (1/10000; 1.5fr = 15000), exact integer arithmetic, floor(remaining * w / W).
+;;
+;; Input (page 0 of the window, u32 words, little endian; the caller copies `inlen` words in):
+;;   0 n tracks (1..16)   1 gap   2 definite total T (4294967295 = nil, the container has no definite size)   3 stretch-auto? (0/1)
+;;   4 m items (0..32)   5 derive (1: the per-track intrinsics are derived from the items, 0: taken from the track words)   6 zero   7 zero
+;;   track i at 8 + 6 i: type, a, b, intrinsic min, intrinsic max, zero
+;;       type 0 fixed (a size)   1 fr (a weight D4)   2 minmax(min, fixed max) (a min, b max)   3 minmax(min, Nfr) (a min, b weight D4)   4 auto
+;;   item j at 8 + 6 n + 4 j: column start, column end (exclusive), min-content, max-content (margins included by the caller)
+;; Every length and weight word is < 2^24 (a length: below 262144 px). inlen = 8 + 6 n + 4 m.
+;; gk-run returns H >= 0, the hash of the output vector (n track sizes, then the m span widths, each as Q6 raw):
+;; H <- (257 H + v + 1) mod 2^32 from 5381, or a negative status: -1 malformed (length, reserved/flag words), -2 tracks outside
+;; 1..16, -3 more than 32 items, -4 unknown track type, -5 a length or weight word >= 2^24, -6 an item range outside [0, n) or empty.
+;; Nothing is truncated: past a bound the case is refused. gk-sum is the sum of the track sizes (Q6 raw), gk-count is n + m.
+;; Scope cut kept from the source: an item spanning more than one track contributes to no intrinsic (grid-track-intrinsics).
+;; Pages: 0 input; 1 scratch u32 words 0 share, 1 capped, 2 unspent, 3 sum, 4 W, 5 last weighted track, 6 hasfr, 7 remaining;
+;; 16+i current size, 32+i intrinsic min, 48+i intrinsic max, 80+i output size, 96+j span width; u8 live flag at byte 1024 + i.
+(defn- gw [st i] (kernel-load-u32-4k (kernel-subregion st 61440 0 4096) 4096 (* 4 i)))
+(defn- gq [st i] (kernel-load-u32-4k (kernel-subregion st 61440 4096 4096) 4096 (* 4 i)))
+(defn- gq! [st i v] (kernel-store-u32-4k (kernel-subregion st 61440 4096 4096) 4096 (* 4 i) v))
+(defn- lv [st i] (kernel-load-u8-4k (kernel-subregion st 61440 4096 4096) 4096 (+ 1024 i)))
+(defn- lv! [st i v] (kernel-store-u8-4k (kernel-subregion st 61440 4096 4096) 4096 (+ 1024 i) v))
+(defn- imax [a b] (if (> a b) a b))
+(defn- px [v] (u64-shift-right v 6))
+(defn- lim? [v] (< v 16777216))
+(defn- tt [st i] (gw st (+ 8 (* 6 i))))
+(defn- ta [st i] (gw st (+ 9 (* 6 i))))
+(defn- tb [st i] (gw st (+ 10 (* 6 i))))
+(defn- tm [st i] (gw st (+ 11 (* 6 i))))
+(defn- tx [st i] (gw st (+ 12 (* 6 i))))
+(defn- isa [st i] (if (= (tt st i) 4) 1 0))
+(defn- ib [st n j] (+ 8 (+ (* 6 n) (* 4 j))))
+
+;; ---- validation ----
+(defn- chk-track [st i]
+  (let [t (tt st i)]
+    (cond (> t 4) -4
+          (not (and (lim? (ta st i)) (and (lim? (tb st i)) (and (lim? (tm st i)) (lim? (tx st i)))))) -5
+          :else 0)))
+(defn- chk-tracks [st i n]
+  (if (>= i n) 0 (let [c (chk-track st i)] (if (< c 0) c (chk-tracks st (+ i 1) n)))))
+(defn- chk-item [st n j]
+  (let [b (ib st n j) cs (gw st b) ce (gw st (+ b 1))]
+    (cond (not (and (< cs ce) (<= ce n))) -6
+          (not (and (lim? (gw st (+ b 2))) (lim? (gw st (+ b 3))))) -5
+          :else 0)))
+(defn- chk-items [st n j m]
+  (if (>= j m) 0 (let [c (chk-item st n j)] (if (< c 0) c (chk-items st n (+ j 1) m)))))
+(defn- chk [st inlen]
+  (let [n (gw st 0) m (gw st 4) t (gw st 2)]
+    (cond (or (< inlen 8) (> inlen 1024)) -1
+          (or (< n 1) (> n 16)) -2
+          (> m 32) -3
+          (not (= inlen (+ 8 (+ (* 6 n) (* 4 m))))) -1
+          (not (and (< (gw st 3) 2) (and (< (gw st 5) 2) (and (= (gw st 6) 0) (= (gw st 7) 0))))) -1
+          (not (lim? (gw st 1))) -5
+          (not (or (lim? t) (= t 4294967295))) -5
+          :else (let [c (chk-tracks st 0 n)] (if (< c 0) c (chk-items st n 0 m))))))
+
+;; ---- intrinsics: from the track words, or the widest single-track item per track; then max >= min as intrinsic-max does ----
+(defn- init-i [st i n d]
+  (if (>= i n) 1
+    (let [lo (if (= d 1) 0 (px (tm st i))) hi (if (= d 1) 0 (px (tx st i)))
+          a (gq! st (+ 32 i) lo) b (gq! st (+ 48 i) hi)]
+      (init-i st (+ i (+ 1 (* 0 (+ a b)))) n d))))
+(defn- fold-items [st n j m]
+  (if (>= j m) 1
+    (let [b (ib st n j) cs (gw st b) ce (gw st (+ b 1))
+          u (if (= (- ce cs) 1)
+              (+ (gq! st (+ 32 cs) (imax (gq st (+ 32 cs)) (px (gw st (+ b 2)))))
+                 (gq! st (+ 48 cs) (imax (gq st (+ 48 cs)) (px (gw st (+ b 3))))))
+              0)]
+      (fold-items st n (+ j (+ 1 (* 0 u))) m))))
+(defn- fin-i [st i n]
+  (if (>= i n) 1
+    (let [z (gq! st (+ 48 i) (imax (gq st (+ 32 i)) (gq st (+ 48 i))))] (fin-i st (+ i (+ 1 (* 0 z))) n))))
+
+;; ---- per-track contributions ----
+(defn- fc [st i]
+  (let [t (tt st i)]
+    (cond (= t 0) (px (ta st i))
+          (= t 2) (imax (px (ta st i)) (px (tb st i)))
+          (= t 3) (px (ta st i))
+          :else 0)))
+(defn- base [st i] (if (= (tt st i) 4) (gq st (+ 32 i)) (fc st i)))
+;; fr weight D4 of a track, -1 when the track takes no part in fr distribution (fr-weight returns nil)
+(defn- fw [st i]
+  (let [t (tt st i)] (cond (= t 1) (ta st i) (= t 3) (tb st i) :else -1)))
+(defn- init-cur [st i n]
+  (if (>= i n) 1
+    (let [a (gq! st (+ 16 i) (base st i)) b (lv! st i (isa st i))]
+      (init-cur st (+ i (+ 1 (* 0 (+ a b)))) n))))
+(defn- mark-live [st i n]
+  (if (>= i n) 1
+    (let [b (lv! st i (isa st i))] (mark-live st (+ i (+ 1 (* 0 b))) n))))
+(defn- cnt-auto [st i n acc] (if (>= i n) acc (cnt-auto st (+ i 1) n (+ acc (isa st i)))))
+(defn- has-fr [st i n] (if (>= i n) 0 (if (>= (fw st i) 0) 1 (has-fr st (+ i 1) n))))
+(defn- sum-cur [st i n acc] (if (>= i n) acc (sum-cur st (+ i 1) n (+ acc (gq st (+ 16 i))))))
+(defn- live-cnt [st i n acc] (if (>= i n) acc (live-cnt st (+ i 1) n (+ acc (lv st i)))))
+
+;; ---- distribute-equally-with-caps ----
+;; one equal-share pass over the live entries: an entry reaching its cap freezes there and returns the excess (q[2] unspent)
+(defn- pass1 [st i]
+  (let [cur (gq st (+ 16 i)) want (+ cur (gq st 0)) cap (gq st (+ 48 i))]
+    (if (and (= (gq st 1) 1) (>= want cap))
+      (let [fin (imax cur cap)
+            a (gq! st (+ 16 i) fin) b (lv! st i 0) c (gq! st 2 (+ (gq st 2) (- want fin)))]
+        (+ a (+ b c)))
+      (gq! st (+ 16 i) want))))
+(defn- pass [st i n]
+  (if (>= i n) 1
+    (let [u (if (= (lv st i) 1) (pass1 st i) 0)] (pass st (+ i (+ 1 (* 0 u))) n))))
+;; fewer px than live entries: one px each, in order, skipping an entry whose cap it would pass
+(defn- hand [st i n free]
+  (if (or (>= i n) (<= free 0)) 1
+    (if (= (lv st i) 1)
+      (let [want (+ (gq st (+ 16 i)) 1)]
+        (if (or (= (gq st 1) 0) (<= want (gq st (+ 48 i))))
+          (hand st (+ i (+ 1 (* 0 (gq! st (+ 16 i) want)))) n (- free 1))
+          (hand st (+ i 1) n free)))
+      (hand st (+ i 1) n free))))
+(defn- dewc [st n free capped]
+  (let [cnt (live-cnt st 0 n 0)]
+    (if (or (<= free 0) (= cnt 0)) 1
+      (let [share (quot free cnt)]
+        (if (<= share 0)
+          (let [z (gq! st 1 capped)] (hand st (+ 0 (* 0 z)) n free))
+          (let [a (gq! st 0 share) b (gq! st 1 capped) c (gq! st 2 0)
+                d (pass st (+ 0 (* 0 (+ a (+ b c)))) n)]
+            (dewc st n (+ (- free (* share cnt)) (+ (gq st 2) (* 0 d))) capped)))))))
+
+;; ---- the auto stage and the fr stage ----
+(defn- fixed-total [st i n acc]
+  (if (>= i n) acc
+    (let [v (if (= (tt st i) 4) (gq st (+ 16 i)) (fc st i))] (fixed-total st (+ i 1) n (+ acc v)))))
+(defn- w-sum [st i n acc] (if (>= i n) acc (w-sum st (+ i 1) n (+ acc (imax 0 (fw st i))))))
+(defn- w-last [st i n acc] (if (>= i n) acc (let [a (if (>= (fw st i) 0) i acc)] (w-last st (+ i 1) n a))))
+;; pass A: output i := its fr share floor(remaining * w / W) (0 for a track without a weight), the shares summed into q[3]
+(defn- shares [st i n]
+  (if (>= i n) 1
+    (let [wi (fw st i)
+          sh (if (and (>= wi 0) (and (> (gq st 7) 0) (> (gq st 4) 0))) (quot (* (gq st 7) wi) (gq st 4)) 0)
+          a (gq! st (+ 80 i) sh) b (gq! st 3 (+ (gq st 3) sh))]
+      (shares st (+ i (+ 1 (* 0 (+ a b)))) n))))
+;; pass B: the final size of track i
+(defn- finals [st i n]
+  (if (>= i n) 1
+    (let [t (tt st i)
+          v (cond (= t 4) (gq st (+ 16 i))
+                  (= t 1) (gq st (+ 80 i))
+                  (= t 3) (+ (px (ta st i)) (gq st (+ 80 i)))
+                  :else (fc st i))
+          a (gq! st (+ 80 i) v)]
+      (finals st (+ i (+ 1 (* 0 a))) n))))
+(defn- sum-out [st i n acc] (if (>= i n) acc (sum-out st (+ i 1) n (+ acc (gq st (+ 80 i))))))
+(defn- span-sum [st k ce acc] (if (>= k ce) acc (span-sum st (+ k 1) ce (+ acc (gq st (+ 80 k))))))
+(defn- spans [st n j m gap]
+  (if (>= j m) 1
+    (let [b (ib st n j) cs (gw st b) ce (gw st (+ b 1))
+          a (gq! st (+ 96 j) (+ (span-sum st cs ce 0) (* gap (- (- ce cs) 1))))]
+      (spans st n (+ j (+ 1 (* 0 a))) m gap))))
+(defn- hash-out [st i n h]
+  (if (>= i n) h (hash-out st (+ i 1) n (bit-and (+ (* h 257) (+ 1 (i64-shift-left (gq st (+ 80 i)) 6))) 4294967295))))
+(defn- hash-spans [st j m h]
+  (if (>= j m) h (hash-spans st (+ j 1) m (bit-and (+ (* h 257) (+ 1 (i64-shift-left (gq st (+ 96 j)) 6))) 4294967295))))
+
+(defn- auto-stage [st n tpx gapt]
+  (let [hf (has-fr st 0 n) sb (sum-cur st 0 n 0)
+        a1 (dewc st n (- (- tpx sb) gapt) 1)
+        sg (sum-cur st 0 n (* 0 a1))]
+    (if (and (= (gw st 3) 1) (= hf 0))
+      (let [m1 (mark-live st 0 n)] (dewc st n (- (- tpx sg) gapt) (+ 0 (* 0 m1))))
+      1)))
+(defn- fr-stage [st n rmn]
+  (let [z1 (gq! st 7 rmn) z2 (gq! st 4 (w-sum st 0 n 0)) z3 (gq! st 3 0)
+        s1 (shares st (+ 0 (* 0 (+ z1 (+ z2 z3)))) n)
+        wl (w-last st 0 n (- 0 1))
+        left (- (+ rmn (* 0 s1)) (gq st 3))
+        z4 (if (and (and (> rmn 0) (> (gq st 4) 0)) (and (> left 0) (>= wl 0))) (gq! st (+ 80 wl) (+ (gq st (+ 80 wl)) left)) 0)]
+    (finals st (+ 0 (* 0 z4)) n)))
+(defn- size-tracks [st n t gap]
+  (let [dfn (not (= t 4294967295)) tpx (px t) gapt (* gap (- n 1))
+        a (if (and dfn (> (cnt-auto st 0 n 0) 0)) (auto-stage st n tpx gapt) 0)
+        ft (fixed-total st 0 n (* 0 a))
+        rmn (if dfn (imax 0 (- (- tpx ft) gapt)) 0)]
+    (fr-stage st n rmn)))
+
+(defn gk-run [w length inlen]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)
+          c (chk st inlen)]
+      (if (< c 0) c
+        (let [n (gw st 0) m (gw st 4)
+              i1 (init-i st 0 n (gw st 5))
+              i2 (if (= (gw st 5) 1) (fold-items st n (+ 0 (* 0 i1)) m) 0)
+              i3 (fin-i st (+ 0 (* 0 (+ i1 i2))) n)
+              i4 (init-cur st (+ 0 (* 0 i3)) n)
+              r (size-tracks st n (gw st 2) (+ (px (gw st 1)) (* 0 i4)))
+              sp (spans st n 0 m (px (gw st 1)))
+              h (hash-out st (+ 0 (* 0 (+ r sp))) n 5381)]
+          (hash-spans st 0 m h))))))
+(defn gk-sum [w length]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)] (i64-shift-left (sum-out st 0 (gw st 0) 0) 6))))
+(defn gk-count [w length]
+  (if (< length 61440) -1
+    (let [st (kernel-subregion w length 0 61440)] (+ (gw st 0) (gw st 4)))))

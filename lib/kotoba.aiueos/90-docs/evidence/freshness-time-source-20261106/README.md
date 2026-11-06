@@ -84,5 +84,5 @@ Each ran the real builder profile on the final source, one QEMU boot sequence pe
 
 A physical board (RTC value, mode, battery, century register); an RTC in binary or 12-hour mode on a real clock; RTC persistence across a reboot (QEMU re-reads `-rtc` on each launch);
 a clock changed while the guest runs; any consumer (`check`, the desktop, the updates dapp are not built); production signer set; the persisted monotonic state (Amendment 6, designed only);
-power loss. Documents that disagree with the code: ADR-0286 Status paragraph ("Design only", "nothing here is implemented") and `distributions/awai/update-policy.json` lines 18 and 20
+power loss. Documents that disagreed with the code and were corrected in the same change: ADR-0286 Status paragraph ("Design only", "nothing here is implemented") and `distributions/awai/update-policy.json` lines 18 and 20
 (see Amendment 6).

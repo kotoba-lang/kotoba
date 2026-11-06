@@ -1,0 +1,380 @@
+(ns cssom.layout-ref
+  (:require [cssom.style-ref :as sr] [cssom.length :as flen] [cssom.block-style :as bst] [cssom.margin-collapse :as mcf])
+  (:export [run-case]))
+;; Host-native f64 reference of the layout slice (JUN-920, ADR-0287): normal block flow, written independently of the region modules
+;; (box-k, flow-k) from layout.cljk layout-block / layout-children-block and from CSS 2.1 8.3.1, 10.3.3, 10.4, 10.6.3. It uses the
+;; cascade of the style reference (style_ref.kotoba run-status / run-props / run-values, itself independent of the kernel), strings, f64
+;; and recursion; the kernel dialect has none of the three beyond i64. Arithmetic of the horizontal equation and of margin collapsing is
+;; the canonical f64 modules (cssom.block-style, cssom.block-width, cssom.length, cssom.margin-collapse), the oracles of the Q6 modules.
+;;
+;; Input document: {:sheet .. :doc .. :vw <viewport width, Q6 raw> :knn <elements the kernel reports> :kernel [22 words per element,
+;; Q6 raw, the kernel's box table]}. Output of run-case:
+;;   a negative number: the status the reference refuses with (the gate compares it with the kernel's status);
+;;   a non-negative number: both ran; D + 2^32 * T + 2^44 * U where D is the largest |kernel - reference| in thousandths of a Q6 unit over
+;;   every compared field (4294967295 when the kinds or the element count differ), T the number of fields whose reference value is an
+;;   exact .5 of a Q6 unit (a tie of the round-half-up rule) and U the number of those where the kernel did not round half up.
+;; Statuses are those of box-k / flow-k: -14 display or inline-level tag, -15 refused property, -16 grammar, -17 range or sign,
+;; -18 result beyond +-2^30 Q6 raw, plus the sheet's -1, -12, -13. The order of the checks is the kernel's (per element in document order:
+;; display, refused properties, box-sizing, the 16 lengths in slot order, vertical lengths, the three horizontal solves, height).
+;; Not modelled (as in the kernel): UA tag margins, min-height / max-height, border-style (refused), shorthands (refused), text.
+(defn- at [d :document i :i64] :document (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+(defn- txt [d :document] :string (option-value-of [:option :string] (document-string-value d) ""))
+(defn- num [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) 0))
+(defn- fld [d :document k :keyword] :document (option-or (document-get d k) (document-null)))
+(defn- cnt [d :document] :i64 (document-count d))
+(defn- ch [s :string i :i64] :i64 (if (< i (string-length s)) (string-code-point-at s i) -1))
+(defn- pk [x :f64] :document (document-i64 (f64-to-bits x)))
+(defn- uk [d :document] :f64 (f64-from-bits (num d)))
+(defn- absf [x :f64] :f64 (if (f64-lt x 0.0) (f64-sub 0.0 x) x))
+(defn- fl [x :f64] :i64 (let [t (f64-to-i64-truncating x)] (if (f64-lt x (i64-to-f64-rounded t)) (- t 1) t)))
+(defn- rhu [x :f64] :i64 (fl (f64-add x 0.5)))
+(defn- big? [x :f64] :bool (f64-gt (absf x) 16777216.0))
+(defn- zero? [x :f64] :bool (f64-lt (absf x) 0.001953125))
+(defn- near? [a :f64 b :f64] :bool (f64-lt (absf (f64-sub a b)) 0.001953125))
+
+;; ---- document: a typed list of rows [tag parent subtree-size value of property 0 .. np-1, then cw ml mr valid (bits) after aug], property names P, env E = [np vw-px nn] ----
+(defn- size [n :document] :i64
+  (let [kids (at n 3)] (loop [i 0 t 1] (if (>= i (cnt kids)) t (recur (+ i 1) (+ t (size (at kids i))))))))
+(defn- walk [n :document idx :i64 parent :i64 out [:list :document]] [:list :document]
+  (let [out1 (typed-list-conj [:list :document] out (document-vector (at n 0) (document-i64 parent) (document-i64 (size n))))
+        kids (at n 3)]
+    (loop [i 0 next (+ idx 1) o out1]
+      (if (>= i (cnt kids)) o
+        (recur (+ i 1) (+ next (size (at kids i))) (walk (at kids i) next idx o))))))
+(defn- with-styles [base [:list :document] vals [:list :string] np :i64 nn :i64] [:list :document]
+  (loop [n 0 out (typed-list-new [:list :document])]
+    (if (>= n nn) out
+      (let [b (typed-list-nth [:list :document] base n)
+            r (loop [k 0 d (document-vector (at b 0) (at b 1) (at b 2))]
+                (if (>= k np) d (recur (+ k 1) (document-vector-conj d (document-string (typed-list-nth [:list :string] vals (+ (* n np) k)))))))]
+        (recur (+ n 1) (typed-list-conj [:list :document] out r))))))
+(defn- row [N [:list :document] n :i64] :document (typed-list-nth [:list :document] N n))
+(defn- par [N [:list :document] n :i64] :i64 (num (at (row N n) 1)))
+(defn- tagof [N [:list :document] n :i64] :string (txt (at (row N n) 0)))
+(defn- np-of [E :document] :i64 (num (at E 0)))
+(defn- nn-of [E :document] :i64 (num (at E 2)))
+(defn- vw-of [E :document] :f64 (f64-div (i64-to-f64-rounded (num (at E 1))) 64.0))
+(defn- pidx [P [:list :string] E :document name :string] :i64
+  (loop [k 0] (if (>= k (np-of E)) -1 (if (string=? (typed-list-nth [:list :string] P k) name) k (recur (+ k 1))))))
+(defn- sty [N [:list :document] P [:list :string] E :document n :i64 name :string] :string
+  (let [k (pidx P E name)] (if (< k 0) "" (txt (at (row N n) (+ 3 k))))))
+
+;; ---- numbers: [+-]? (digits [. digits?] | . digits) (px | %)? , or the keywords auto / none ----
+(defn- dg? [c :i64] :bool (and (>= c 48) (<= c 57)))
+;; the integer part: end * 2^40 + value, or -1 when the value reaches 2^24 before a further digit (a number of more than 8 digits)
+(defn- int-part [s :string i :i64 acc :i64] :i64
+  (if (dg? (ch s i))
+    (if (>= acc 16777216) -1 (int-part s (+ i 1) (+ (* acc 10) (- (ch s i) 48))))
+    (+ (* i 1099511627776) acc)))
+(defn- frac-end [s :string i :i64] :i64 (if (dg? (ch s i)) (frac-end s (+ i 1)) i))
+(defn- frac-val [s :string i :i64 e :i64 acc :f64 scale :f64] :f64
+  (if (>= i e) acc (frac-val s (+ i 1) e (f64-add acc (f64-mul (i64-to-f64-rounded (- (ch s i) 48)) scale)) (f64-div scale 10.0))))
+;; [unit value-bits] with unit 0 unitless, 1 px, 2 percent, -1 outside the grammar
+(defn- scan [s :string] :document
+  (let [sg (if (or (= (ch s 0) 45) (= (ch s 0) 43)) 1 0)
+        ip (int-part s sg 0)]
+    (if (< ip 0) (document-vector (document-i64 -1) (pk 0.0))
+      (let [j (quot ip 1099511627776)
+            acc (bit-and ip 1099511627775)
+            dot (= (ch s j) 46)
+            k (if dot (frac-end s (+ j 1)) j)
+            has-int (> j sg)
+            has-frac (and dot (> k (+ j 1)))
+            rest (string-fold-case (string-substring s k (string-length s)))
+            unit (cond (string=? rest "") 0 (string=? rest "%") 2 (string=? rest "px") 1 :else -1)
+            fv (if dot (frac-val s (+ j 1) k 0.0 0.1) 0.0)
+            mag (f64-add (i64-to-f64-rounded acc) fv)
+            v (if (= (ch s 0) 45) (f64-sub 0.0 mag) mag)]
+        (if (or (< unit 0) (not (or has-int has-frac))) (document-vector (document-i64 -1) (pk 0.0))
+          (document-vector (document-i64 unit) (pk v)))))))
+;; slot s (1 width, 2 height, 3 min-width, 4 max-width, 6..9 margin t r b l, 10..13 padding t r b l, 14..17 border t r b l width)
+(defn- sname [s :i64] :string
+  (cond (= s 1) "width" (= s 2) "height" (= s 3) "min-width" (= s 4) "max-width"
+        (= s 6) "margin-top" (= s 7) "margin-right" (= s 8) "margin-bottom" (= s 9) "margin-left"
+        (= s 10) "padding-top" (= s 11) "padding-right" (= s 12) "padding-bottom" (= s 13) "padding-left"
+        (= s 14) "border-top-width" (= s 15) "border-right-width" (= s 16) "border-bottom-width" :else "border-left-width"))
+;; the allowed units as a bit mask over 1 px, 2 percent, 3 auto, 4 none
+(defn- smask [s :i64] :i64
+  (cond (or (= s 1) (= s 2)) 14 (= s 3) 6 (= s 4) 22 (and (>= s 6) (<= s 9)) 14 (and (>= s 10) (<= s 13)) 6 :else 2))
+(defn- sdef [s :i64] :i64 (cond (or (= s 1) (= s 2)) 3 (= s 4) 4 :else 1))
+(defn- bit? [m :i64 u :i64] :bool (= (bit-and (u64-shift-right m u) 1) 1))
+;; the unit of slot s of node n (1..4), or the status -16 / -17
+(defn- lu [N [:list :document] P [:list :string] E :document n :i64 s :i64] :i64
+  (let [v (sty N P E n (sname s))]
+    (if (= (string-length v) 0) (sdef s)
+      (let [f (string-fold-case v)]
+        (cond (string=? f "auto") (if (bit? (smask s) 3) 3 -16)
+              (string=? f "none") (if (bit? (smask s) 4) 4 -16)
+              :else (let [sc (scan v) u0 (num (at sc 0)) u (if (= u0 0) 1 u0) x (uk (at sc 1))]
+                      (cond (< u0 0) -16
+                            (not (bit? (smask s) u)) -16
+                            (= u 2) (if (> (absf-i (rhu (f64-mul x 100.0))) 65535) -17 2)
+                            :else (let [r (rhu (f64-mul x 64.0))] (if (or (< r -134217728) (> r 134217727)) -17 1)))))))))
+(defn- absf-i [x :i64] :i64 (if (< x 0) (- 0 x) x))
+;; the value of slot s: pixels for px, the percentage for percent, 0 for auto / none / absent
+(defn- lv [N [:list :document] P [:list :string] E :document n :i64 s :i64] :f64
+  (let [v (sty N P E n (sname s))]
+    (if (= (string-length v) 0) 0.0
+      (let [f (string-fold-case v)]
+        (if (or (string=? f "auto") (string=? f "none")) 0.0 (uk (at (scan v) 1)))))))
+(defn- slots-status [N [:list :document] P [:list :string] E :document n :i64 s :i64] :i64
+  (if (> s 17) 0
+    (if (= s 5) (slots-status N P E n 6)
+      (let [u (lu N P E n s)] (if (< u 0) u (slots-status N P E n (+ s 1)))))))
+
+;; ---- display and the refused names ----
+(defn- member? [w :string set :string] :bool (string-contains? set (string-concat "|" (string-concat w "|"))))
+(def inline-tags "|a|abbr|b|bdi|bdo|br|cite|code|data|del|dfn|em|i|ins|kbd|label|mark|meter|output|progress|q|ruby|rt|rp|s|samp|small|span|strong|sub|sup|time|u|var|wbr|")
+(def hidden-tags "|head|title|script|style|meta|link|template|")
+(def refused-names "margin|padding|border|border-width|border-style|border-top|border-right|border-bottom|border-left|border-top-style|border-right-style|border-bottom-style|border-left-style|float|clear|position|overflow|overflow-x|overflow-y|aspect-ratio|columns|column-count|column-width|writing-mode|direction|min-height|max-height")
+;; 0 no box, 1 block, 3 flow-root, -14
+(defn- kind-of [N [:list :document] P [:list :string] E :document n :i64] :i64
+  (let [d (sty N P E n "display") f (string-fold-case d) tg (string-fold-case (tagof N n))]
+    (if (= (string-length d) 0)
+      (cond (string-contains? hidden-tags (string-concat "|" (string-concat tg "|"))) 0
+            (string-contains? inline-tags (string-concat "|" (string-concat tg "|"))) -14
+            :else 1)
+      (cond (string=? f "none") 0 (string=? f "block") 1 (string=? f "flow-root") 3 :else -14))))
+(defn- hidden? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (loop [a (par N n)] (if (< a 0) false (if (= (kind-of N P E a) 0) true (recur (par N a))))))
+(defn- refused-prop? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (loop [k 0]
+    (if (>= k (np-of E)) false
+      (let [name (typed-list-nth [:list :string] P k)]
+        (if (and (string-contains? (string-concat "|" (string-concat refused-names "|")) (string-concat "|" (string-concat name "|")))
+                 (> (string-length (txt (at (row N n) (+ 3 k)))) 0))
+          true (recur (+ k 1)))))))
+;; 0 content-box, 1 border-box, -16
+(defn- sizing [N [:list :document] P [:list :string] E :document n :i64] :i64
+  (let [f (string-fold-case (sty N P E n "box-sizing"))]
+    (cond (string=? f "") 0 (string=? f "border-box") 1 (string=? f "content-box") 0 :else -16)))
+
+;; ---- used values of a box (px, f64) ----
+(defn- uni [u :i64] :keyword (cond (= u 1) :length/px (= u 2) :length/percent (= u 3) :length/auto :else :length/none))
+(defn- lin [N [:list :document] P [:list :string] E :document n :i64 s :i64] [:ref :css.length/input]
+  (record [:ref :css.length/input] (uni (lu N P E n s)) (lv N P E n s)))
+(defn- cb-of [N [:list :document] P [:list :string] E :document n :i64] :f64
+  (let [p (par N n)] (if (< p 0) (vw-of E) (cw-of N P E p))))
+(defn- bpx [N [:list :document] P [:list :string] E :document n :i64 s :i64] :f64 (lv N P E n s))
+(defn- solve-with [N [:list :document] P [:list :string] E :document n :i64 cb :f64] [:ref :css.block/result]
+  (bst/solve (record [:ref :css.block/style] cb (lin N P E n 1) (lin N P E n 3) (lin N P E n 4)
+                     (lin N P E n 9) (lin N P E n 7) (lin N P E n 13) (lin N P E n 11)
+                     (bpx N P E n 17) (bpx N P E n 15) (= (sizing N P E n) 1) false)))
+;; the horizontal solve of every box, once, in document order: rows get [cw ml mr valid] (bits) appended
+(defn- aug [N0 [:list :document] P [:list :string] E :document] [:list :document]
+  (loop [n 0 out (typed-list-new [:list :document])]
+    (if (>= n (nn-of E)) out
+      (let [p (par N0 n)
+            cb (if (< p 0) (vw-of E) (uk (at (typed-list-nth [:list :document] out p) (+ 3 (np-of E)))))
+            r (solve-with N0 P E n cb)
+            d (document-vector-conj (document-vector-conj (document-vector-conj (document-vector-conj (row N0 n)
+                (pk (record-get [:ref :css.block/result] r :content))) (pk (record-get [:ref :css.block/result] r :margin-left)))
+                (pk (record-get [:ref :css.block/result] r :margin-right)))
+                (document-i64 (if (record-get [:ref :css.block/result] r :valid) 1 0)))]
+        (recur (+ n 1) (typed-list-conj [:list :document] out d))))))
+(defn- cw-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (uk (at (row N n) (+ 3 (np-of E)))))
+(defn- valid-of [N [:list :document] P [:list :string] E :document n :i64] :bool (= (num (at (row N n) (+ 6 (np-of E)))) 1))
+(defn- vlen [N [:list :document] P [:list :string] E :document n :i64 s :i64] :f64
+  (let [u (lu N P E n s) x (lv N P E n s)]
+    (cond (= u 3) 0.0 (= u 2) (f64-mul x (f64-mul (cb-of N P E n) 0.01)) :else x)))
+(defn- ml-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (uk (at (row N n) (+ 4 (np-of E)))))
+(defn- mr-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (uk (at (row N n) (+ 5 (np-of E)))))
+(defn- pt-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 10))
+(defn- pr-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 11))
+(defn- pb-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 12))
+(defn- pl-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 13))
+(defn- mt-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 6))
+(defn- mb-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (vlen N P E n 8))
+(defn- bt-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (lv N P E n 14 ))
+(defn- br-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (lv N P E n 15))
+(defn- bb-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (lv N P E n 16))
+(defn- bl-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (lv N P E n 17))
+(defn- it-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (f64-add (pt-of N P E n) (bt-of N P E n)))
+(defn- ib-of [N [:list :document] P [:list :string] E :document n :i64] :f64 (f64-add (pb-of N P E n) (bb-of N P E n)))
+(defn- flow-root? [N [:list :document] P [:list :string] E :document n :i64] :bool (= (kind-of N P E n) 3))
+;; the border-box height from `height`: has-eh? and eh. A percentage needs a parent whose content height is definite.
+(defn- has-eh? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (let [u (lu N P E n 2)]
+    (cond (= u 1) true
+          (= u 2) (and (>= (par N n) 0) (has-dch? N P E (par N n)))
+          :else false)))
+(defn- eh-of [N [:list :document] P [:list :string] E :document n :i64] :f64
+  (let [u (lu N P E n 2) x (lv N P E n 2)
+        raw (if (= u 1) x (f64-mul x (f64-mul (dch-of N P E (par N n)) 0.01)))
+        ext (f64-add (f64-add (pt-of N P E n) (pb-of N P E n)) (f64-add (bt-of N P E n) (bb-of N P E n)))]
+    (if (= (sizing N P E n) 1) raw (f64-add raw ext))))
+(defn- has-dch? [N [:list :document] P [:list :string] E :document n :i64] :bool (has-eh? N P E n))
+(defn- dch-of [N [:list :document] P [:list :string] E :document n :i64] :f64
+  (let [v (f64-sub (eh-of N P E n) (f64-add (it-of N P E n) (ib-of N P E n)))] (if (f64-lt v 0.0) 0.0 v)))
+;; whether a top / bottom margin may collapse with the first / last child (layout-block fc-free?, collapse-top?, collapse-bottom?)
+(defn- fc-free? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (and (not (flow-root? N P E n)) (zero? (f64-add (bt-of N P E n) (bb-of N P E n)))))
+(defn- ctop? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (and (fc-free? N P E n) (zero? (it-of N P E n))))
+(defn- cbot? [N [:list :document] P [:list :string] E :document n :i64] :bool
+  (and (fc-free? N P E n) (and (zero? (ib-of N P E n)) (not (has-eh? N P E n)))))
+
+;; ---- margin collapsing: the largest positive plus the most negative (the canonical module) ----
+(defn- cm2 [a :f64 b :f64] :f64
+  (option-value-of [:option :f64] (mcf/finish (mcf/add (mcf/add (mcf/empty-state) a) b)) 0.0))
+(defn- cm3 [a :f64 b :f64 c :f64] :f64
+  (option-value-of [:option :f64] (mcf/finish (mcf/add (mcf/add (mcf/add (mcf/empty-state) a) b) c)) 0.0))
+
+;; ---- the flow of the in-flow children of p (layout-children-block), stopping at child `stop` (-1: after all) ----
+;; result [ht pm om first rel] (bits); rel is the offset of `stop` from the content top of p
+(defn- run-kids [N [:list :document] P [:list :string] E :document LT [:list :document] p :i64 stop :i64] :document
+  (let [ctop (ctop? N P E p) end (+ p (num (at (row N p) 2)))]
+    (loop [c (+ p 1) ht 0.0 pm 0.0 om 0.0 fst true]
+      (if (>= c end) (document-vector (pk ht) (pk pm) (pk om) (document-bool fst) (pk 0.0))
+        (let [nx (+ c (num (at (row N c) 2)))]
+          (if (<= (kind-of N P E c) 0) (recur nx ht pm om fst)
+            (let [lc (lay-of LT E c)
+                  hc (uk (at lc 0)) cct (uk (at lc 1)) ccb (uk (at lc 2))
+                  mts (cm2 (mt-of N P E c) cct)
+                  mbs (cm2 (mb-of N P E c) ccb)
+                  gap (if fst (if ctop 0.0 mts) (cm2 pm mts))]
+              (if (= c stop) (document-vector (pk ht) (pk pm) (pk om) (document-bool fst) (pk (f64-add ht gap)))
+                (let [selfc (and (zero? hc) (and (zero? (f64-add (bt-of N P E c) (bb-of N P E c)))
+                                                 (and (zero? (f64-add (pt-of N P E c) (pb-of N P E c))) (not (flow-root? N P E c)))))
+                      esc (and selfc (and fst ctop))
+                      ht2 (if selfc ht (f64-add ht (f64-add gap hc)))
+                      pm2 (if selfc (if esc pm (cm3 pm mts mbs)) mbs)
+                      om2 (if esc (cm3 om mts mbs) (if (and fst ctop) mts om))
+                      fst2 (if esc fst false)]
+                  (if (or (big? ht2) (big? (f64-add ht gap)))
+                    (document-vector (pk 1.0e30) (pk 0.0) (pk 0.0) (document-bool false) (pk 0.0))
+                    (recur nx ht2 pm2 om2 fst2)))))))))))
+;; [border-box height, margin collapsed out of the top, margin collapsed out of the bottom] (bits) of the box p
+(defn- lay-calc [N [:list :document] P [:list :string] E :document LT [:list :document] p :i64] :document
+  (let [k (run-kids N P E LT p -1)
+        ht (uk (at k 0)) pm (uk (at k 1)) om (uk (at k 2))
+        cbot (cbot? N P E p)
+        it (it-of N P E p) ib (ib-of N P E p)
+        hc (let [v (f64-add ht (if cbot 0.0 pm))] (if (f64-lt v 0.0) 0.0 v))
+        sum (f64-add hc (f64-add it ib))
+        nh (if (has-eh? N P E p) (eh-of N P E p) sum)
+        omb (if cbot pm 0.0)]
+    (if (or (big? nh) (big? sum)) (document-vector (pk 1.0e30) (pk 0.0) (pk 0.0))
+      (document-vector (pk nh) (pk om) (pk (if (near? nh sum) omb 0.0))))))
+(defn- lay-of [LT [:list :document] E :document p :i64] :document (typed-list-nth [:list :document] LT (- (- (nn-of E) 1) p)))
+;; the table of lay-calc for every element, last element first (an element's children are all behind it, so already in the table)
+(defn- build-lt [N [:list :document] P [:list :string] E :document] [:list :document]
+  (loop [p (- (nn-of E) 1) out (typed-list-new [:list :document])]
+    (if (< p 0) out
+      (recur (- p 1) (typed-list-conj [:list :document] out
+                       (if (<= (kind-of N P E p) 0) (document-vector (pk 0.0) (pk 0.0) (pk 0.0)) (lay-calc N P E out p)))))))
+(defn- rel-of [N [:list :document] P [:list :string] E :document LT [:list :document] n :i64] :f64
+  (let [p (par N n)]
+    (if (< p 0) (cm2 (mt-of N P E n) (uk (at (lay-of LT E n) 1)))
+      (uk (at (run-kids N P E LT p n) 4)))))
+(defn- abs-x [N [:list :document] P [:list :string] E :document n :i64] :f64
+  (let [p (par N n)]
+    (if (< p 0) (ml-of N P E n)
+      (f64-add (abs-x N P E p) (f64-add (bl-of N P E p) (f64-add (pl-of N P E p) (ml-of N P E n)))))))
+(defn- abs-y [N [:list :document] P [:list :string] E :document LT [:list :document] n :i64] :f64
+  (let [p (par N n)]
+    (if (< p 0) (rel-of N P E LT n)
+      (f64-add (abs-y N P E LT p) (f64-add (bt-of N P E p) (f64-add (pt-of N P E p) (rel-of N P E LT n)))))))
+(defn- doc-height [N [:list :document] P [:list :string] E :document LT [:list :document]] :f64
+  (if (<= (kind-of N P E 0) 0) 0.0
+    (let [l (lay-of LT E 0)]
+      (f64-add (f64-add (cm2 (mt-of N P E 0) (uk (at l 1))) (uk (at l 0))) (cm2 (mb-of N P E 0) (uk (at l 2)))))))
+
+;; ---- status of a document (the checks of box-k, in its order) ----
+(defn- v-bad? [N [:list :document] P [:list :string] E :document n :i64 s :i64 neg :bool] :bool
+  (let [u (lu N P E n s) x (lv N P E n s)]
+    (cond (= u 3) false
+          (and (not neg) (f64-lt x 0.0)) true
+          :else (> (absf-i (rhu (f64-mul (vlen N P E n s) 64.0))) 1073741824))))
+(defn- check-n [N [:list :document] P [:list :string] E :document n :i64] :i64
+  (if (refused-prop? N P E n) -15
+    (let [sz (sizing N P E n)]
+      (if (< sz 0) sz
+        (let [ss (slots-status N P E n 1)]
+          (if (< ss 0) ss
+            (if (or (v-bad? N P E n 10 false) (or (v-bad? N P E n 12 false) (or (v-bad? N P E n 6 true) (v-bad? N P E n 8 true))))
+              -17
+              (if (or (f64-lt (bt-of N P E n) 0.0) (or (f64-lt (br-of N P E n) 0.0) (or (f64-lt (bb-of N P E n) 0.0) (f64-lt (bl-of N P E n) 0.0))))
+                -17
+                (if (not (valid-of N P E n)) -17
+                  (let [u (lu N P E n 2) x (lv N P E n 2)
+                        ext (f64-add (f64-add (pt-of N P E n) (pb-of N P E n)) (f64-add (bt-of N P E n) (bb-of N P E n)))
+                        hx (f64-add (f64-add (pl-of N P E n) (pr-of N P E n)) (f64-add (bl-of N P E n) (br-of N P E n)))
+                        c (cw-of N P E n)]
+                    (cond (and (has-eh? N P E n) (f64-lt (if (= u 1) x (f64-mul x (f64-mul (dch-of N P E (par N n)) 0.01))) 0.0)) -17
+                          (and (has-eh? N P E n) (big? (eh-of N P E n))) -18
+                          (big? (f64-add c hx)) -18
+                          :else 0)))))))))))
+(defn- all-status [N [:list :document] P [:list :string] E :document n :i64] :i64
+  (if (>= n (nn-of E)) 0
+    (if (hidden? N P E n) (all-status N P E (+ n 1))
+      (let [dk (kind-of N P E n)]
+        (cond (< dk 0) dk
+              (= dk 0) (all-status N P E (+ n 1))
+              :else (let [r (check-n N P E n)] (if (< r 0) r (all-status N P E (+ n 1)))))))))
+
+;; ---- comparison with the kernel's box table ----
+(defn- fval [N [:list :document] P [:list :string] E :document LT [:list :document] n :i64 w :i64] :f64
+  (cond (= w 1) (abs-x N P E n) (= w 2) (abs-y N P E LT n)
+        (= w 3) (f64-add (cw-of N P E n) (f64-add (f64-add (pl-of N P E n) (pr-of N P E n)) (f64-add (bl-of N P E n) (br-of N P E n))))
+        (= w 4) (uk (at (lay-of LT E n) 0))
+        (= w 5) (cw-of N P E n)
+        (= w 6) (let [v (f64-sub (uk (at (lay-of LT E n) 0)) (f64-add (it-of N P E n) (ib-of N P E n)))] (if (f64-lt v 0.0) 0.0 v))
+        (= w 7) (ml-of N P E n) (= w 8) (mr-of N P E n) (= w 9) (mt-of N P E n) (= w 10) (mb-of N P E n)
+        (= w 11) (uk (at (lay-of LT E n) 1)) (= w 12) (uk (at (lay-of LT E n) 2))
+        (= w 13) (pt-of N P E n) (= w 14) (pr-of N P E n) (= w 15) (pb-of N P E n) (= w 16) (pl-of N P E n)
+        (= w 17) (bt-of N P E n) (= w 18) (br-of N P E n) (= w 19) (bb-of N P E n) (= w 20) (bl-of N P E n)
+        :else (rel-of N P E LT n)))
+(defn- expect-kind [N [:list :document] P [:list :string] E :document n :i64] :i64
+  (if (hidden? N P E n) 2 (if (= (kind-of N P E n) 0) 0 1)))
+;; geometry beyond the Q6 range: -18 else 0 (every box, every field)
+(defn- range-status [N [:list :document] P [:list :string] E :document LT [:list :document] n :i64 w :i64] :i64
+  (if (>= n (nn-of E)) 0
+    (if (> w 21) (range-status N P E LT (+ n 1) 1)
+      (if (= (expect-kind N P E n) 1)
+        (if (big? (fval N P E LT n w)) -18 (range-status N P E LT n (+ w 1)))
+        (range-status N P E LT (+ n 1) 1)))))
+;; packed [maxdev-thousandths ties disagreements] over every field of every element; kv = the kernel's words
+(defn- cmp-fields [N [:list :document] P [:list :string] E :document LT [:list :document] kv :document fm :document n :i64 w :i64 dev :i64 ties :i64 dis :i64] :document
+  (if (>= n (nn-of E)) (document-vector (document-i64 dev) (document-i64 ties) (document-i64 dis))
+    (if (> w 21) (cmp-fields N P E LT kv fm (+ n 1) 1 dev ties dis)
+      (if (not (= (expect-kind N P E n) 1)) (cmp-fields N P E LT kv fm (+ n 1) 1 dev ties dis)
+       (if (= (bit-and (u64-shift-right (num (at fm n)) w) 1) 0) (cmp-fields N P E LT kv fm n (+ w 1) dev ties dis)
+        (let [q (f64-mul (fval N P E LT n w) 64.0)
+              k (num (at kv (+ (* 22 n) w)))
+              kf (i64-to-f64-rounded k)
+              d (absf (f64-sub kf q))
+              dm (f64-to-i64-truncating (f64-add (f64-mul d 1000.0) 0.999))
+              fq (fl q)
+              tie (f64-lt (absf (f64-sub (f64-sub q (i64-to-f64-rounded fq)) 0.5)) 0.000001)]
+          (cmp-fields N P E LT kv fm n (+ w 1) (if (> dm dev) dm dev) (if tie (+ ties 1) ties)
+                      (if (and tie (not (= k (+ fq 1)))) (+ dis 1) dis))))))))
+(defn- kinds-agree? [N [:list :document] P [:list :string] E :document kv :document n :i64] :bool
+  (if (>= n (nn-of E)) true
+    (if (not (= (num (at kv (* 22 n))) (expect-kind N P E n))) false (kinds-agree? N P E kv (+ n 1)))))
+
+(defn run-case [c :document] :i64
+  (let [st (sr/run-status c)]
+    (if (< st 0) st
+      (let [doc (fld c :doc)
+            nn (size doc)
+            np (sr/run-prop-count c)
+            N0 (with-styles (walk doc 0 -1 (typed-list-new [:list :document])) (sr/run-values c) np nn)
+            P (sr/run-props c)
+            E (document-vector (document-i64 np) (document-i64 (num (fld c :vw))) (document-i64 nn))
+            N (aug N0 P E)
+            s1 (all-status N P E 0)]
+        (if (< s1 0) s1
+          (let [LT (build-lt N P E)
+                s2 (range-status N P E LT 0 1)
+                dh (doc-height N P E LT)]
+            (if (or (< s2 0) (big? dh)) -18
+              (let [kv (fld c :kernel)
+                    ok (and (= (cnt kv) (* 22 nn)) (and (= (num (fld c :knn)) nn) (kinds-agree? N P E kv 0)))]
+                (if (not ok) 4294967295
+                  (let [r (cmp-fields N P E LT kv (fld c :fmasks) 0 1 0 0 0)
+                        ddh (if (= (bit-and (u64-shift-right (num (fld c :fmask)) 22) 1) 1) (f64-to-i64-truncating (f64-add (f64-mul (absf (f64-sub (i64-to-f64-rounded (num (fld c :kdh))) (f64-mul dh 64.0))) 1000.0) 0.999)) 0)
+                        dev0 (num (at r 0))
+                        dev (if (> ddh dev0) ddh dev0)
+                        dc (if (> dev 4294967294) 4294967294 dev)]
+                    (+ dc (+ (* 4294967296 (num (at r 1))) (* 17592186044416 (num (at r 2)))))))))))))))
