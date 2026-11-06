@@ -88,6 +88,14 @@
   ;; 8 no production signer set pinned; 1 is also "fewer than two distinct valid signers" for AIUEIMG2.
   ;; QEMU hook: fw_cfg file opt/aiueos/update2 (hypervisor only): [count][per case: mode (0 test keys, 1 production, 2 test keys with the stream broken before byte 7200), 16384 header
   ;; bytes, 5000 image bytes]; with no install request every case is run to its verdict, with install request "3" case 0 is installed.
+  ;; JUN-813 stage 6 (ADR-0286 amendment 5): AIUECAT1, the signed catalog. The header is the AIUEIMG2 signature block unchanged (the same
+  ;; `h2-start` / `h2-loop` / `verify-entry` run on it); the manifest's magic is "AIUECAT1", bytes 16..27 are the body length (128 * count) and
+  ;; the entry count (1..64), 28..31 are reserved, and the ML-DSA context is "AIUECAT1". The kind is chosen by the caller (bit 1 of
+  ;; `admit`'s test argument: 3 = catalog with the TEST keys, 2 = catalog with the production set, which is not pinned), never from the magic.
+  ;; The body (128 * count bytes) follows the header at byte 16384 and flows through `chunk-done` like an image (SHA-256 against the manifest);
+  ;; each 128-byte entry is checked in the page as its chunk lands (`cat-scan`). Result 16: the hash matches but an entry is refused (flags in
+  ;; word 270). A catalog takes no version floor and is not read by anything: QEMU hook opt/aiueos/cat1 only (hypervisor only, `self-test3`).
+  ;; Words: 231 kind (1 while a catalog is admitted), 270 entry flags, 271/272 seen dock ids, 300 + k the QEMU case results.
   (:require [aiueos.native.storage-state :as storage]
             [aiueos.native.rtl8168-debug :as nic]
             [aiueos.native.nvme :as nvme]
@@ -188,7 +196,50 @@
         (if (< r 56)
           (do (put-length ctx (* size 8) 0) (pad-block ctx))
           (do (pad-block ctx) (zero-pad ctx 0) (put-length ctx (* size 8) 0) (pad-block ctx)))
-        (if (= (same-digest ctx 0) 1) (fail ctx 15) (fail ctx 7)))))
+        (if (= (same-digest ctx 0) 1)
+          (if (and (= (word ctx 231) 1) (not (= (word ctx 270) 0))) (fail ctx 16) (fail ctx 15))
+          (fail ctx 7)))))
+
+;; ---- JUN-813 stage 6 (ADR-0286 amendment 5): the entries of an AIUECAT1 body, checked as each chunk lands ----
+;; Word 231 = 1 while a catalog is being admitted. A body entry is 128 bytes at page byte p: dock id u32 at 0 (19..82, no repeat), title 4..35,
+;; manifest CID 36..71, bundle CID 72..107, size u32 at 108 (1..2^25), reserved 112..127 (zero). Word 270 ORs the refusal flags of all entries
+;; (1 dock id, 2 duplicate, 4 reserved, 8 title, 16 CID, 32 size); words 271/272 are the seen dock ids (bit id - 19).
+(defn cat-nz [from to acc]
+  (if (>= from to) acc (cat-nz (+ from 1) to (bit-or acc (if (= (pg from) 0) 0 1)))))
+(defn cat-in [x lo hi] (if (and (>= x lo) (<= x hi)) 1 0))
+;; 1 when the 32-byte title at p + 4 is not 1..31 printable ASCII, a NUL, then only zeros
+(defn cat-title [p i nul bad]
+  (if (>= i 32) (bit-or bad (if (= nul 0) 1 0))
+    (let [b (pg (+ (+ p 4) i))]
+      (if (= nul 0)
+        (if (= b 0) (cat-title p (+ i 1) 1 (if (= i 0) 1 bad))
+          (cat-title p (+ i 1) 0 (if (or (< b 32) (> b 126)) 1 bad)))
+        (cat-title p (+ i 1) 1 (if (= b 0) bad 1))))))
+(defn cat-codec [c] (if (= c 85) 1 (if (= c 112) 1 (if (= c 113) 1 0))))
+;; 1 when the 36 bytes at q are not the CIDv1 envelope of aiueos.cid-v1-admit (01, codec 55 / 70 / 71, 12, 20)
+(defn cat-cid-bad [q]
+  (if (and (= (pg q) 1) (and (= (cat-codec (pg (+ q 1))) 1) (and (= (pg (+ q 2)) 18) (= (pg (+ q 3)) 32)))) 0 1))
+;; 1 when dock id bit b was already seen, else 0 and it is marked
+(defn cat-seen [ctx b]
+  (let [w (if (< b 32) 271 272)
+        bit (i64-shift-left 1 (bit-and b 31))
+        cur (word ctx w)]
+    (if (= (bit-and cur bit) 0) (do (put-word ctx w (bit-or cur bit)) 0) 1)))
+(defn cat-entry [ctx p]
+  (let [d (pg-le p 4 0)
+        inr (cat-in d 19 82)
+        dup (if (= inr 1) (cat-seen ctx (- d 19)) 0)
+        sz (pg-le (+ p 108) 4 0)
+        f (+ (- 1 inr)
+             (+ (* 2 dup)
+                (+ (* 4 (cat-nz (+ p 112) (+ p 128) 0))
+                   (+ (* 8 (cat-title p 0 0 0))
+                      (+ (* 16 (bit-or (cat-cid-bad (+ p 36)) (cat-cid-bad (+ p 72))))
+                         (* 32 (- 1 (cat-in sz 1 33554432))))))))]
+    (put-word ctx 270 (bit-or (word ctx 270) f))))
+(defn cat-scan [ctx base len j]
+  (if (>= (* j 128) len) 1
+    (do (cat-entry ctx (+ base (* j 128))) (cat-scan ctx base len (+ j 1)))))
 
 ;; In write mode (word 209 = 1) the first n page bytes go to the staging file:
 ;; 0 done or not in write mode, -1 failed.
@@ -206,6 +257,7 @@
               (and (< len 1024) (not (= now size))))
         (fail ctx 6)
         (do (put-word ctx 184 now)
+            (if (= (word ctx 231) 1) (cat-scan ctx (bit-and got 4095) len 0) 0)
             (if (< (if (= (bit-and now 4095) 0) (stage-out ctx 4096) 0) 0) (fail ctx 48)
               (do (if (= (bit-and now 4095) 0) (absorb ctx 64) 0)
                   (if (= now size)
@@ -239,7 +291,8 @@
           (chunk-done ctx n)
           (feed ctx (+ at n) flip)))))
 (defn self-run [ctx header-flip image-flip]
-  (do (put-header 0 header-flip)
+  (do (put-word ctx 231 0)
+      (put-header 0 header-flip)
       (if (= (begin ctx 1) 14) (feed ctx 0 image-flip) (word ctx 180))))
 (defn self-test [ctx]
   (let [off (put-word ctx 209 0)
@@ -293,11 +346,12 @@
 (defn fw-byte [] (kernel-in-u8 1297))
 (defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
 (defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
-;; which 0 "opt/aiueos/install", 1 "opt/aiueos/update2" (18 bytes and a NUL)
+;; which 0 "opt/aiueos/install", 1 "opt/aiueos/update2" (18 bytes and a NUL), 2 "opt/aiueos/cat1" (JUN-813 stage 6)
 (defn fw-name-byte [which i]
   (if (< i 11) (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 0)
     (if (= which 0) (case i 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0)
-                    (case i 11 117 12 112 13 100 14 97 15 116 16 101 17 50 0))))
+      (if (= which 1) (case i 11 117 12 112 13 100 14 97 15 116 16 101 17 50 0)
+                      (case i 11 99 12 97 13 116 14 49 0)))))
 (defn fw-name [which i ok]
   (if (>= i 56) ok
     (let [b (fw-byte)]
@@ -327,14 +381,19 @@
 (defn sb! [i v] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 8192 4096) 4096 i v))
 (defn pw! [w v] (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 12288 4096) 4096 (* 4 w) v))
 (defn nz [b] (if (= b 0) 0 1))
-(defn magic2-byte [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 50 0))
-(defn magic2-bad [i acc]
-  (if (>= i 8) acc (magic2-bad (+ i 1) (bit-or acc (nz (bit-xor (pg i) (magic2-byte i)))))))
+;; JUN-813 stage 6: cat 1 selects the catalog object ("AIUECAT1"), 0 the image ("AIUEIMG2"); the kind is `(cat? test)`, bit 1 of the caller's test
+;; argument (bit 0: pinned TEST keys), never read from the magic.
+(defn cat? [t] (bit-and (u64-shift-right t 1) 1))
+(defn pick [c a b] (if (= c 1) a b))
+(defn magic2-byte [cat i] (case i 0 65 1 73 2 85 3 69 4 (pick cat 67 73) 5 (pick cat 65 77) 6 (pick cat 84 71) 7 (pick cat 49 50) 0))
+(defn magic2-bad [cat i acc]
+  (if (>= i 8) acc (magic2-bad cat (+ i 1) (bit-or acc (nz (bit-xor (pg i) (magic2-byte cat i)))))))
 (defn zeros-nz [from to acc]
   (if (>= from to) acc (zeros-nz (+ from 1) to (bit-or acc (nz (pg from))))))
 ;; M' = 0 || 8 || "AIUEIMG2" || manifest: the 10-byte prefix at S 3392, the manifest after it
-(defn mp-prefix-byte [i] (case i 1 8 2 65 3 73 4 85 5 69 6 73 7 77 8 71 9 50 0))
-(defn mp-prefix [i] (if (>= i 10) 1 (do (sb! (+ 3392 i) (mp-prefix-byte i)) (mp-prefix (+ i 1)))))
+;; the ML-DSA context: "AIUEIMG2" for an image, "AIUECAT1" for a catalog
+(defn mp-prefix-byte [cat i] (case i 1 8 2 65 3 73 4 85 5 69 6 (pick cat 67 73) 7 (pick cat 65 77) 8 (pick cat 84 71) 9 (pick cat 49 50) 0))
+(defn mp-prefix [cat i] (if (>= i 10) 1 (do (sb! (+ 3392 i) (mp-prefix-byte cat i)) (mp-prefix cat (+ i 1)))))
 (defn copy-manifest [ctx i]
   (if (>= i 64) 1 (do (put-byte ctx (+ 2144 i) (pg i)) (sb! (+ 3402 i) (pg i)) (copy-manifest ctx (+ i 1)))))
 
@@ -343,17 +402,22 @@
 (defn restore-storage [ctx]
   (if (= (word ctx 228) 0) 0
     (do (nvme/probe ctx) (esp/run ctx) (put-word ctx 228 0))))
-(defn pinned-signers [test] (if (= test 1) 3 0))
+(defn pinned-signers [test] (if (= (bit-and test 1) 1) 3 0))
 
 ;; Page bytes 0..127 hold the manifest, the count and the zero bytes. 14 when the structure is sound and the
 ;; entries follow, else a refusal code (2 magic, 5 reserved, 3 count or layout, 8 no signer set).
 (defn h2-start [ctx test]
-  (let [badm (magic2-bad 0 0)
-        rsv (zeros-nz 24 32 0)
+  (let [cat (cat? test)
+        badm (magic2-bad cat 0 0)
+        rsv (if (= cat 1) (zeros-nz 28 32 0) (zeros-nz 24 32 0))
         cnt (pg-le 64 4 0)
         lay (zeros-nz 68 128 0)
         size (pg-le 16 8 0)
-        version (pg-le 8 8 0)]
+        version (pg-le 8 8 0)
+        ccount (pg-le 24 4 0)
+        ;; the manifest's length is sound: an image 1..32 MiB, a catalog 128 * its entry count (1..64)
+        sok (if (= cat 1) (if (and (and (>= ccount 1) (<= ccount 64)) (= size (* ccount 128))) 1 0)
+                          (if (and (> size 0) (<= size 33554432)) 1 0))]
     (if (not (= badm 0)) (fail ctx 2)
       (if (not (= rsv 0)) (fail ctx 5)
         (if (or (or (< cnt 1) (> cnt 4)) (not (= lay 0))) (fail ctx 3)
@@ -362,11 +426,11 @@
                 (put-word ctx 216 cnt)
                 (put-word ctx 218 0)
                 (put-word ctx 227 (+ 128 (* cnt 3392)))
-                (put-word ctx 223 (+ (if (or (<= size 0) (> size 33554432)) 1 0) (if (< version 1) 2 0)))
-                (put-word ctx 224 (if (or (<= size 0) (> size 33554432)) 0 size))
+                (put-word ctx 223 (+ (if (= sok 1) 0 1) (if (< version 1) 2 0)))
+                (put-word ctx 224 (if (= sok 1) size 0))
                 (put-word64 ctx 225 (if (< version 1) 0 version))
                 (copy-manifest ctx 0)
-                (mp-prefix 0)
+                (mp-prefix cat 0)
                 (save-digest ctx 0)
                 (fail ctx 14))))))))
 
@@ -465,13 +529,20 @@
   (if (floor-ok ctx) 14 (fail ctx 9)))
 ;; Fetch the first 128 bytes and dispatch on the magic's last byte: "2" AIUEIMG2, anything else the AIUEIMG1 path.
 ;; The floor is read first (result 10 when it cannot be) and compared once the header is admitted (result 9).
+;; JUN-813 stage 6: a catalog (`(cat? test)`) takes no version floor: that floor is the image channel's (ADR-0286 amendment 4) and a catalog needs its own.
+(defn admit-cat [ctx src test]
+  (do (put-word ctx 212 128) (put-word ctx 228 0) (put-word ctx 231 1)
+      (put-word ctx 270 0) (put-word ctx 271 0) (put-word ctx 272 0)
+      (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+        (begin2 ctx src test))))
 (defn admit [ctx src test]
-  (if (= (floor-load ctx) 0) (fail ctx 10)
-    (do (put-word ctx 212 128) (put-word ctx 228 0)
+  (if (= (cat? test) 1) (admit-cat ctx src test)
+   (if (= (floor-load ctx) 0) (fail ctx 10)
+    (do (put-word ctx 212 128) (put-word ctx 228 0) (put-word ctx 231 0)
         (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
           (let [r (if (= (pg 7) 50) (begin2 ctx src test)
                     (if (= (begin ctx test) 14) 14 (word ctx 180)))]
-            (if (= r 14) (floor-check ctx) r))))))
+            (if (= r 14) (floor-check ctx) r)))))))
 
 (defn chunks [ctx at]
   (let [size (word ctx 183)]
@@ -573,7 +644,7 @@
             (if (> r 0) (ifail ctx r)
               (do (start-stream ctx) (chunks ctx 0) (after-commit ctx (commit ctx)))))))))
 (defn self-install [ctx flip]
-  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0)
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 231 0)
       (put-header 0 -1)
       (if (not (= (begin ctx 1) 14)) (ifail ctx (word ctx 180))
         (let [r (ready ctx)]
@@ -619,6 +690,32 @@
                 (+ 1 (* 0 (+ hs is)))))))))
 (defn cases2 [ctx k n]
   (if (>= k n) 1 (do (run-case2 ctx k) (cases2 ctx (+ k 1) n))))
+;; ---- JUN-813 stage 6: AIUECAT1 cases from opt/aiueos/cat1: [count][per case: mode (0 test keys, 1 production), 16384 header bytes,
+;; 8192 body bytes (only the manifest's length of them are streamed)]. Case k leaves at word 300 + k: result | counted mask << 8 | entry
+;; flags << 16 (flags only for result 16). Words 233 the ESP walk afterwards, 234 the marker "CAT1", 235 the count.
+(defn run-case3 [ctx k]
+  (let [mode (fw-byte)]
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 230 0)
+        (let [a (admit ctx 1 (+ 2 (test-of mode)))
+              hn (- 16384 (word ctx 229))
+              hs (fw-skip hn)
+              r (if (= a 14) (feed2 ctx 0) (word ctx 180))
+              is (fw-skip (- 24576 (+ hn (word ctx 229))))
+              v (+ r (+ (* 256 (word ctx 218)) (* 65536 (if (= r 16) (word ctx 270) 0))))]
+          (do (put-word ctx 231 0)
+              (put-word ctx (+ 300 k) v)
+              (+ 1 (* 0 (+ hs is))))))))
+(defn cases3 [ctx k n]
+  (if (>= k n) 1 (do (run-case3 ctx k) (cases3 ctx (+ k 1) n))))
+(defn self-test3 [ctx]
+  (if (= (fw-open 2) 0) 0
+    (let [count (fw-byte)]
+      (do (cases3 ctx 0 (least count 64))
+          (put-word ctx 233 (esp/run ctx))
+          (put-word ctx 235 count)
+          (put-word ctx 234 1128354865)
+          (put-word ctx 180 0)
+          count))))
 (defn self-test2 [ctx]
   (if (= (fw-open 1) 0) 0
     (let [count (fw-byte)]
@@ -657,4 +754,4 @@
             (if (= b 51) (install2 ctx 1)
               (if (= b 52) (provision ctx)
                 (if (= b 53) (install2 ctx 0)
-                  (do (self-test2 ctx) 0)))))))))
+                  (do (self-test2 ctx) (self-test3 ctx) 0)))))))))
