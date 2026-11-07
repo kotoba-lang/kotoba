@@ -59,11 +59,13 @@ reported, not forced to agree.
   `docs/oracle-cljc-dialects-20261107.md` in kotoba-lang/kotoba-lang, and
   confirm tool version, feature key and `.cljc` handling at first use.
 - Record the exact command, tool versions, inputs and outputs as dated data.
-- CI exception: JVM, nbb and Babashka may run in CI as separate oracle jobs,
-  named and reported as oracle. Native build, gates, packaging and runtime do
-  not depend on them, nothing falls back to them, and an oracle job is not a
-  required check until the owner decides. Any other CI use of them stays banned
-  (JUN-290). The other oracle languages run on a developer machine, one-off.
+- CI exception (owner decision 2026-11-07): JVM, nbb, Babashka and every other
+  `.cljc`-capable language above may run in CI as separate oracle jobs, named and
+  reported as oracle. Native build, gates, packaging and runtime do not depend on
+  them, nothing falls back to them, and an oracle job is not a required check
+  until the owner decides. Any other CI use of JVM, nbb, Babashka and GraalVM
+  stays banned (JUN-290). The oracle languages that do not read `.cljc` (C,
+  Python, Fennel) run on a developer machine, one-off.
 - CLJK stays as a reference oracle source and is treated as CLJC-equivalent
   for oracle runs: `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
   read, and an oracle is handed the source as `.cljc`. The route stays
