@@ -6,7 +6,7 @@ ADR 0026 D2 and D18). It reads Git objects only, so working-tree changes and a
 sparse checkout do not affect the result. It stays in Python so that no language
 resolution, compilation or verdict moves here.
 
-Three rewrites are needed because hosted Clojure rejects what the Kotoba reader and
+Four rewrites are needed because hosted Clojure rejects what the Kotoba reader and
 SCI accept. They apply to the output only, and the manifest counts them per file:
 
 - `:kotoba/export [a b]` becomes `:kotoba/export '[a b]`. Clojure evaluates `ns`
@@ -16,6 +16,8 @@ SCI accept. They apply to the output only, and the manifest counts them per file
 - `(catch err/ExceptionInfo e)`, and the same class in `thrown?`, becomes `(catch #?(:clj clojure.lang.ExceptionInfo
   :default :default) e)`. `kotoba.lang.error/ExceptionInfo` is a var, and a catch
   position needs a class. On a JS host this also catches other throwables.
+- A top-level `#?(:kotoba A :default (do B C))` becomes `B C`, because nbb's SCI analyzes a
+  top-level `do` as one form and C cannot see a var that B defines.
 """
 
 import argparse
@@ -30,12 +32,80 @@ import sys
 SCHEMA = "kotoba.oracle.cljc-materialization.v1"
 NS_FORM = re.compile(r"^\s*\(ns\s+(?:\^\S+\s+)*([^\s()]+)", re.MULTILINE)
 DUAL_NAME = re.compile(r"^(.*)\.(clj|cljs|cljc)\.cljk$")
-EXCLUDED_SEGMENTS = {"test", "tests", "fixtures", "examples", "docs", "scripts", "tools", "bin", "provenance"}
+# A root ending in `kotoba` is a library's native twin of its `src`, not a host source.
+EXCLUDED_SEGMENTS = {"test", "tests", "fixtures", "examples", "docs", "scripts", "tools", "bin", "provenance",
+                     "kotoba", "testdata", "conformance", "script"}
 RESOURCE_SUFFIXES = (".edn", ".json", ".js", ".mjs", ".txt")
 EXPORT_CONDITIONAL = re.compile(r":kotoba/export(\s+)#\?")
 EXPORT_VECTOR = re.compile(r":kotoba/export(\s+)\[")
 CATCH_ALIASED = re.compile(r"\((catch|thrown\?|thrown-with-msg\?)\s+[\w.-]+/ExceptionInfo(?=\s)")
+TOP_LEVEL_KOTOBA = re.compile(r"^#\?\(:kotoba\b", re.MULTILINE)
+DEFAULT_DO = re.compile(r"\s*:default\s+\(do\b")
 CATCH_DEFAULT = re.compile(r"\(catch\s+:default(?=\s)")
+
+
+def form_end(text, opening):
+    """The offset just past the balanced form that opens at `opening`."""
+    depth = 0
+    index = opening
+    in_string = False
+    while index < len(text):
+        c = text[index]
+        if in_string:
+            if c == "\\":
+                index += 1
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == ";":
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+        elif c == "\\":
+            index += 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    raise ValueError("unbalanced form")
+
+
+def unwrap_default_do(text):
+    """Turn a top-level `#?(:kotoba A :default (do B C))` into the forms `B C`.
+
+    SCI analyzes a top-level `do` as one form, so C cannot see a var that B defines. nbb then
+    refuses the namespace. The output is never read by Kotoba, so the `:kotoba` clause can go.
+    """
+    out = []
+    position = 0
+    count = 0
+    for match in TOP_LEVEL_KOTOBA.finditer(text):
+        if match.start() < position:
+            continue
+        opening = match.start() + 2
+        try:
+            end = form_end(text, opening)
+            clause = text.index(":kotoba", opening) + len(":kotoba")
+            # Skip the :kotoba clause's form, which is a balanced form or a single token.
+            start = clause + len(text[clause:]) - len(text[clause:].lstrip())
+            after = form_end(text, start) if text[start] in "([{" else start + len(text[start:].split(None, 1)[0])
+        except (ValueError, IndexError):
+            continue
+        default = DEFAULT_DO.match(text, after)
+        if not default:
+            continue
+        body_end = form_end(text, default.end() - 3)
+        if text[body_end:end].strip() != ")":
+            continue
+        out.append(text[position:match.start()])
+        out.append(text[default.end():body_end - 1])
+        position = end
+        count += 1
+    out.append(text[position:])
+    return "".join(out), count
 
 
 def rewrite(text):
@@ -44,7 +114,9 @@ def rewrite(text):
     text, vector = EXPORT_VECTOR.subn(r":kotoba/export\1'[", text)
     text, catches = CATCH_DEFAULT.subn("(catch #?(:clj Throwable :default :default)", text)
     text, aliased = CATCH_ALIASED.subn(r"(\1 #?(:clj clojure.lang.ExceptionInfo :default :default)", text)
-    return text, {"export": conditional + vector, "catch-default": catches, "catch-aliased": aliased}
+    text, unwrapped = unwrap_default_do(text)
+    return text, {"export": conditional + vector, "catch-default": catches, "catch-aliased": aliased,
+                  "default-do": unwrapped}
 
 
 def output_name(path):
@@ -100,15 +172,8 @@ def list_tree(repo, rev):
     return entries
 
 
-def materialize(repo, rev, out, libraries=(), apply_rewrites=True, include_tests=False):
-    excluded = EXCLUDED_SEGMENTS - ({"test", "tests", "fixtures"} if include_tests else set())
-    repo = Path(repo).resolve(strict=True)
-    out = Path(out).resolve()
-    if out == repo or repo in out.parents:
-        raise ValueError("the output must be outside the repository: .cljc is not committed source")
-    if out.exists() and any(out.iterdir()):
-        raise ValueError(f"the output directory is not empty: {out}")
-
+def collect(repo, rev, libraries, excluded):
+    """Read one repository's revision. Return its commit, root table and blobs."""
     commit = git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
     entries = list_tree(repo, commit)
     selected = set(libraries)
@@ -120,73 +185,98 @@ def materialize(repo, rev, out, libraries=(), apply_rewrites=True, include_tests
     blobs = read_blobs(repo, sorted({i for _, i in sources}))
 
     roots = {}
-    namespaces = {}
-    duplicates = {}
-    skipped = []
+    skipped = 0
     for path, object_id in sources:
         form = NS_FORM.search(blobs[object_id].decode("utf-8", "replace"))
         root = source_root(path, form.group(1)) if form else None
         if root is None or excluded & set(root.split("/")):
-            skipped.append(path)
+            skipped += 1
             continue
         roots.setdefault(root, []).append((path, object_id, form.group(1)))
 
     resources = {}
-    resource_rows = [(p, i) for p, i in entries if p.endswith(RESOURCE_SUFFIXES)]
-    names = [root + "/" if root else "" for root in roots]
-    for path, object_id in resource_rows:
-        for root, prefix in zip(roots, names):
-            if prefix and path.startswith(prefix):
-                resources.setdefault(root, []).append((path, object_id))
+    for path, object_id in entries:
+        if path.endswith(RESOURCE_SUFFIXES):
+            for root in roots:
+                if root and path.startswith(root + "/"):
+                    resources.setdefault(root, []).append((path, object_id))
     if resources:
         blobs.update(read_blobs(repo, sorted({i for rows in resources.values() for _, i in rows})))
+    return commit, roots, resources, blobs, skipped
 
+
+def materialize(repo, rev, out, libraries=(), apply_rewrites=True, include_tests=False, also=()):
+    """`also` names other repositories as `path` or `path@rev`, in classpath order after `repo`."""
+    excluded = EXCLUDED_SEGMENTS - ({"test", "tests", "fixtures"} if include_tests else set())
+    repo = Path(repo).resolve(strict=True)
+    out = Path(out).resolve()
+    if out == repo or repo in out.parents:
+        raise ValueError("the output must be outside the repository: .cljc is not committed source")
+    if out.exists() and any(out.iterdir()):
+        raise ValueError(f"the output directory is not empty: {out}")
+
+    inputs = [(repo, rev, libraries)]
+    for item in also:
+        path, _, other_rev = item.partition("@")
+        inputs.append((Path(path).resolve(strict=True), other_rev or "HEAD", ()))
+
+    namespaces = {}
+    duplicates = {}
     files = []
     paths = []
-    totals = {"export": 0, "catch-default": 0, "catch-aliased": 0}
-    for index, root in enumerate(sorted(roots)):
-        directory = out / "roots" / f"{index:04d}"
-        paths.append(str(directory))
-        prefix = root + "/" if root else ""
-        for path, object_id, namespace in sorted(roots[root]):
-            if namespace in namespaces:
-                duplicates.setdefault(namespace, [namespaces[namespace]]).append(path)
-            else:
-                namespaces[namespace] = path
-            raw = blobs[object_id]
-            text, counts = rewrite(raw.decode("utf-8", "surrogateescape")) if apply_rewrites else (
-                raw.decode("utf-8", "surrogateescape"), {"export": 0, "catch-default": 0})
-            data = text.encode("utf-8", "surrogateescape")
-            target = directory / output_name(path[len(prefix):])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            for key, value in counts.items():
-                totals[key] += value
-            files.append({
-                "source": path,
-                "output": str(target.relative_to(out)),
-                "namespace": namespace,
-                "source-sha256": hashlib.sha256(raw).hexdigest(),
-                "output-sha256": hashlib.sha256(data).hexdigest(),
-                "rewrites": counts,
-            })
-        for path, object_id in resources.get(root, ()):
-            target = directory / path[len(prefix):]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blobs[object_id])
+    origins = []
+    skipped = 0
+    totals = {"export": 0, "catch-default": 0, "catch-aliased": 0, "default-do": 0}
+    for repo_index, (source_repo, source_rev, selected) in enumerate(inputs):
+        commit, roots, resources, blobs, repo_skipped = collect(source_repo, source_rev, selected, excluded)
+        skipped += repo_skipped
+        origins.append({"name": source_repo.name, "commit": commit})
+        for index, root in enumerate(sorted(roots)):
+            directory = out / "roots" / f"{repo_index:02d}-{index:04d}"
+            paths.append(str(directory))
+            prefix = root + "/" if root else ""
+            for path, object_id, namespace in sorted(roots[root]):
+                label = f"{source_repo.name}:{path}"
+                if namespace in namespaces:
+                    duplicates.setdefault(namespace, [namespaces[namespace]]).append(label)
+                else:
+                    namespaces[namespace] = label
+                raw = blobs[object_id]
+                text = raw.decode("utf-8", "surrogateescape")
+                text, counts = rewrite(text) if apply_rewrites else (text, dict.fromkeys(totals, 0))
+                data = text.encode("utf-8", "surrogateescape")
+                target = directory / output_name(path[len(prefix):])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                for key, value in counts.items():
+                    totals[key] += value
+                files.append({
+                    "origin": source_repo.name,
+                    "source": path,
+                    "output": str(target.relative_to(out)),
+                    "namespace": namespace,
+                    "source-sha256": hashlib.sha256(raw).hexdigest(),
+                    "output-sha256": hashlib.sha256(data).hexdigest(),
+                    "rewrites": counts,
+                })
+            for path, object_id in resources.get(root, ()):
+                target = directory / path[len(prefix):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(blobs[object_id])
 
     (out / "classpath.txt").write_text(":".join(paths) + "\n")
     (out / "deps.edn").write_text(
         "{:paths [" + " ".join(json.dumps(p) for p in paths) + "]}\n")
     manifest = {
         "schema": SCHEMA,
-        "source-commit": commit,
-        "libraries": sorted(selected),
+        "source-commit": origins[0]["commit"],
+        "origins": origins,
+        "libraries": sorted(libraries),
         "rewrites-applied": apply_rewrites,
         "rewrites": totals,
         "roots": len(paths),
         "files": files,
-        "skipped-no-matching-ns-or-excluded": len(skipped),
+        "skipped-no-matching-ns-or-excluded": skipped,
         "duplicate-namespaces": duplicates,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
@@ -199,11 +289,13 @@ def main():
     parser.add_argument("--rev", default="HEAD")
     parser.add_argument("--out", required=True)
     parser.add_argument("--lib", action="append", default=[], help="a lib/ directory name; repeat. Default: all")
+    parser.add_argument("--also", action="append", default=[],
+                        help="another repository as PATH or PATH@REV; earlier inputs win a namespace. Repeat")
     parser.add_argument("--with-tests", action="store_true", help="also write test roots and their fixtures")
     parser.add_argument("--no-rewrite", action="store_true", help="negative control: copy the bytes unchanged")
     args = parser.parse_args()
     try:
-        manifest = materialize(args.repo, args.rev, args.out, args.lib, not args.no_rewrite, args.with_tests)
+        manifest = materialize(args.repo, args.rev, args.out, args.lib, not args.no_rewrite, args.with_tests, args.also)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2

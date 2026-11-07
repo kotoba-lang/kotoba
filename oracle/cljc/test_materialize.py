@@ -4,7 +4,6 @@
 The JVM cases need `java` and a Clojure jar in CLOJURE_CP. They skip without them.
 """
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -44,6 +43,18 @@ class Rewrite(unittest.TestCase):
     def test_aliased_exception_info_in_thrown(self):
         self.assertEqual(rewrite("(thrown? err/ExceptionInfo (f))")[0],
                          "(thrown? #?(:clj clojure.lang.ExceptionInfo :default :default) (f))")
+
+    def test_top_level_default_do_is_unwrapped(self):
+        text, counts = rewrite("#?(:kotoba nil :default (do\\n(def a 1)\\n(def b a)))\\n")
+        self.assertEqual(text, "\\n(def a 1)\\n(def b a)\\n")
+        self.assertEqual(counts["default-do"], 1)
+        text, _ = rewrite("#?(:kotoba (defn f [] (g)) :default (do (def a 1)))\\n")
+        self.assertEqual(text, " (def a 1)\\n")
+
+    def test_nested_or_other_conditionals_stay(self):
+        for source in ("(x #?(:kotoba nil :default (do 1)))", "#?(:kotoba nil :default 1)",
+                       "#?(:kotoba nil :default (do 1) :clj 2)"):
+            self.assertEqual(rewrite(source)[0], source)
 
     def test_other_keywords_are_unchanged(self):
         source = "(catch :default-thing e) :kotoba/exports [a]"
@@ -85,7 +96,7 @@ class Repository(unittest.TestCase):
         self.assertNotIn("WIP", output)
         self.assertEqual(len(manifest["source-commit"]), 40)
         self.assertEqual([row["namespace"] for row in manifest["files"]], ["demo.core"])
-        self.assertEqual(manifest["rewrites"], {"export": 1, "catch-default": 1, "catch-aliased": 0})
+        self.assertEqual(manifest["rewrites"], {"export": 1, "catch-default": 1, "catch-aliased": 0, "default-do": 0})
 
     def test_excludes_by_root_and_not_by_namespace_segment(self):
         source = self.repo / "lib" / "demo.lib" / "src" / "kotoba" / "test"
@@ -96,6 +107,20 @@ class Repository(unittest.TestCase):
                         "commit", "-qm", "y"], check=True)
         names = {row["namespace"] for row in materialize(self.repo, "HEAD", self.base / "out")["files"]}
         self.assertEqual(names, {"demo.core", "kotoba.test.generator"})
+
+    def test_also_adds_a_repository_and_the_first_input_wins(self):
+        other = self.base / "other"
+        (other / "src" / "demo").mkdir(parents=True)
+        (other / "src" / "demo" / "core.cljk").write_text("(ns demo.core)\\n")
+        (other / "src" / "demo" / "extra.cljk").write_text("(ns demo.extra)\\n")
+        for command in (["init", "-q"], ["add", "."],
+                        ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "x"]):
+            subprocess.run(["git", "-C", str(other), *command], check=True)
+        manifest = materialize(self.repo, "HEAD", self.base / "out", also=[f"{other}@HEAD"])
+        self.assertEqual([row["name"] for row in manifest["origins"]], ["repo", "other"])
+        self.assertEqual({row["namespace"] for row in manifest["files"]}, {"demo.core", "demo.extra"})
+        self.assertEqual(manifest["duplicate-namespaces"], {"demo.core": ["repo:lib/demo.lib/src/demo/core.cljk",
+                                                                          "other:src/demo/core.cljk"]})
 
     def test_refuses_output_inside_the_repository(self):
         with self.assertRaisesRegex(ValueError, "outside the repository"):
