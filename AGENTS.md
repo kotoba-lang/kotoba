@@ -64,10 +64,12 @@ reported, not forced to agree.
   not depend on them, nothing falls back to them, and an oracle job is not a
   required check until the owner decides. Any other CI use of them stays banned
   (JUN-290). The other oracle languages run on a developer machine, one-off.
-- CLJK is treated as CLJC (target contract; supersedes the 2026-11-06 "CLJC is
-  refused" wording). `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
-  read, and an oracle is handed the source as `.cljc`. Where the code
-  disagrees, the code is the state and the disagreement is reported.
+- CLJK stays as a reference oracle source and is treated as CLJC-equivalent
+  for oracle runs: `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
+  read, and an oracle is handed the source as `.cljc`. The route stays
+  `.kotoba`; native input rules are unchanged and native `.cljc` acceptance is
+  not pursued. Where the code disagrees, the code is the state and the
+  disagreement is reported.
 - Before a selfhost refactor of a cljk component, take its reference values
   first from the JVM and node (nbb) oracles.
 
