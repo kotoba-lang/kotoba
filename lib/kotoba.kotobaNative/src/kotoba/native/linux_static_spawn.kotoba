@@ -1,0 +1,547 @@
+;; Complete C3 process/spawn mechanism. Source candidate, not a runtime grant.
+;; Program/env/budget/errno/refusal policy stays in the sealed owning decisions.
+(ns kotoba.native.linux-static-spawn
+  {:kotoba/export [routine]}
+  (:require [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io]
+            [kotoba.native.linux-static-strings :as strings])
+  (:schemas
+   {:linux.static.spawn/text
+    [:record :linux.static.spawn/text
+     [[:label :keyword] [:text :string] [:length :i64] [:base :i64]]]
+    :linux.static.spawn/config
+    [:record :linux.static.spawn/config
+     [[:isa :keyword] [:data :i64] [:buf-a :i64] [:buf-b :i64] [:buf-c :i64]
+      [:names :i64] [:names-size :i64] [:io :i64] [:probe :i64]
+      [:lookup :i64] [:refused :i64]
+      [:programs [:list [:ref :linux.static.spawn/text]]]
+      [:env [:list [:ref :linux.static.spawn/text]]]
+      [:pair [:list [:ref :linux.static/instruction]]]]]
+    :linux.static.spawn/result
+    [:record :linux.static.spawn/result
+     [[:code [:list [:ref :linux.static/instruction]]] [:binding :keyword] [:error :keyword]]]}))
+
+(defn- empty-code [] [:list [:ref :linux.static/instruction]]
+  (typed-list-new [:list [:ref :linux.static/instruction]]))
+(defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out
+    (asm/instruction op aux d s b i n target (vector-alloc 0))))
+(defn- join [out [:list [:ref :linux.static/instruction]] code [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [index 0 current out]
+    (if (>= index (vector-count code)) current
+      (recur (+ index 1) (typed-list-conj [:list [:ref :linux.static/instruction]] current
+                            (typed-list-nth [:list [:ref :linux.static/instruction]] code index))))))
+(defn- tag [prefix :string suffix :string] :keyword
+  (keyword-from-string (string-concat (string-concat "ls.spawn/" prefix) (string-concat "-" suffix))))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :label :none :none :none :none :none 0 label))
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :li :none d :none :none :none n :none))
+(defn- la [out [:list [:ref :linux.static/instruction]] d :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :la :none d :none :none :none 0 label))
+(defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 :none))
+(defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :ld :none d :none :s0 :none (io/state-offset key) :none))
+(defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :st :none d :none :s0 :none (io/state-offset key) :none))
+(defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none base :none n :none))
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none base i 0 :none))
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :alu op d s :none :none 0 :none))
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :alui op d :none :none :none n :none))
+(defn- shift [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none :none :none n :none))
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 label))
+(defn- hd [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config] op :i64
+           a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+           c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/decision-fragment out (record-get [:ref :linux.static.spawn/config] cfg :data)
+    :ls.cap/h-decide (io/literal op) a b c d))
+(defn- sys [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config] call :keyword
+            a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+            c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand] e [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/syscall-fragment out (record-get [:ref :linux.static.spawn/config] cfg :isa) call a b c d e))
+(defn- close [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config] fd :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> (sys out cfg :close (io/state-field fd) (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
+      (li :t0 -1) (store :t0 fd)))
+(defn- outcome [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]
+                prefix :string stage :i64 retry :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [errno (-> out (store :t0 :x6) (li :t1 0) (imm :cmp :t0 0) (branch :ge (tag prefix "errno"))
+                  (mov :t1 :t0) (append :neg :none :t1 :none :none :none 0 :none) (mark (tag prefix "errno")))]
+    (-> (hd errno cfg 12 (io/literal 50) (io/literal stage) (io/register :t1) (io/literal 0))
+        (imm :cmp :t0 3) (branch :eq (tag prefix "proceed"))
+        (imm :cmp :t0 2) (branch :eq retry) (branch :always :ls/bad)
+        (mark (tag prefix "proceed")) (load :t0 :x6))))
+(defn- copy [out [:list [:ref :linux.static/instruction]] prefix :string dst :keyword src :keyword n :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :t0 0) (mark (tag prefix "copy")) (alu :cmp :t0 n) (branch :hs (tag prefix "copied"))
+      (byte-op :ldb :t1 src :t0) (byte-op :stb :t1 dst :t0)
+      (imm :add :t0 1) (branch :always (tag prefix "copy")) (mark (tag prefix "copied"))))
+(defn- refusal-key [index :i64] :string
+  (case index 0 "argv-budget" 1 "program-not-granted" 2 "path-lookup-denied" 3 "output-budget"
+    4 "timeout" 5 "exec-failed" 6 "isolation-unavailable" 7 "setup-failed" "invalid"))
+(defn- refusal [index :i64] :keyword (tag "refuse" (refusal-key index)))
+(defn- text-label [kind :string index :i64] :keyword (tag kind (string-from-i64 index)))
+
+;; Pass one counts non-overlapping separators and NULs without copying.
+(defn- request-shape [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [scanned (-> out (load :s1 :rp) (load :s2 :rl) (li :t0 0) (store :t0 :sp-count) (store :t0 :sp-nul)
+                    (store :s2 :sp-plen) (la :s4 :ls.spawn/arg-sep) (li :s3 0) (mark :ls.spawn/shape)
+                    (alu :cmp :s3 :s2) (branch :hs :ls.spawn/shaped)
+                    (byte-op :ldb :t0 :s1 :s3) (imm :cmp :t0 0) (branch :ne :ls.spawn/shape-nonul)
+                    (li :t0 1) (store :t0 :sp-nul) (mark :ls.spawn/shape-nonul)
+                    (mov :t0 :s2) (alu :sub :t0 :s3) (imm :cmp :t0 7) (branch :lo :ls.spawn/shape-next)
+                    (li :t0 0) (mark :ls.spawn/shape-compare) (imm :cmp :t0 7) (branch :hs :ls.spawn/shape-hit)
+                    (mov :t1 :s3) (alu :add :t1 :t0) (byte-op :ldb :t1 :s1 :t1) (byte-op :ldb :t2 :s4 :t0)
+                    (alu :cmp :t1 :t2) (branch :ne :ls.spawn/shape-next) (imm :add :t0 1) (branch :always :ls.spawn/shape-compare)
+                    (mark :ls.spawn/shape-hit) (load :t0 :sp-count) (imm :cmp :t0 0) (branch :ne :ls.spawn/shape-count)
+                    (store :s3 :sp-plen) (mark :ls.spawn/shape-count) (imm :add :t0 1) (store :t0 :sp-count)
+                    (imm :add :s3 7) (branch :always :ls.spawn/shape)
+                    (mark :ls.spawn/shape-next) (imm :add :s3 1) (branch :always :ls.spawn/shape) (mark :ls.spawn/shaped)
+                    ;; 6*count <= rl because each counted separator takes seven bytes.
+                    (load :t0 :sp-count) (mov :t1 :t0) (shift :shli :t1 1) (alu :add :t1 :t0) (shift :shli :t1 1)
+                    (alu :cmp :t1 :s2) (branch :hi :ls/bad) (mov :t2 :s2) (alu :sub :t2 :t1)
+                    (li :t0 9223372036854775807) (alu :cmp :t2 :t0) (branch :hs :ls/bad) (imm :add :t2 1) (store :t2 :x0))]
+    (-> (hd scanned cfg 33 (io/state-field :sp-count) (io/state-field :x0) (io/state-field :sp-nul) (io/state-field :sp-plen))
+        (imm :cmp :t0 -1) (branch :eq :ls/bad) (imm :cmp :t0 0) (branch :eq (refusal 0))
+        (load :t0 :x0) (imm :cmp :t0 4096) (branch :hi :ls/bad)
+        (load :t0 :sp-count) (imm :cmp :t0 500) (branch :hi :ls/bad))))
+
+;; Pass two writes complete argv strings and their terminating pointer array.
+(defn- arguments [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [a (record-get [:ref :linux.static.spawn/config] cfg :buf-a) b (record-get [:ref :linux.static.spawn/config] cfg :buf-b)]
+    (-> out (li :s3 0) (li :s4 0) (li :t0 a) (li :t1 b) (mem :st :t0 :t1 0) (li :t0 1) (store :t0 :x1)
+        (mark :ls.spawn/argv) (alu :cmp :s3 :s2) (branch :hs :ls.spawn/argv-done)
+        (mov :t0 :s2) (alu :sub :t0 :s3) (imm :cmp :t0 7) (branch :lo :ls.spawn/argv-copy)
+        (la :a1 :ls.spawn/arg-sep) (li :t0 0) (mark :ls.spawn/argv-compare)
+        (imm :cmp :t0 7) (branch :hs :ls.spawn/argv-hit)
+        (mov :t1 :s3) (alu :add :t1 :t0) (byte-op :ldb :t1 :s1 :t1) (byte-op :ldb :t2 :a1 :t0)
+        (alu :cmp :t1 :t2) (branch :ne :ls.spawn/argv-copy) (imm :add :t0 1) (branch :always :ls.spawn/argv-compare)
+        (mark :ls.spawn/argv-hit) (imm :cmp :s4 4096) (branch :hs :ls/bad)
+        (li :t1 a) (li :t0 0) (byte-op :stb :t0 :t1 :s4) (imm :add :s4 1)
+        (load :t0 :x1) (imm :cmp :t0 501) (branch :hs :ls/bad) (mov :t2 :t0) (shift :shli :t2 3)
+        (li :t1 b) (alu :add :t1 :t2) (li :t2 a) (alu :add :t2 :s4) (mem :st :t2 :t1 0)
+        (imm :add :t0 1) (store :t0 :x1) (imm :add :s3 7) (branch :always :ls.spawn/argv)
+        (mark :ls.spawn/argv-copy) (imm :cmp :s4 4096) (branch :hs :ls/bad)
+        (byte-op :ldb :t0 :s1 :s3) (li :t1 a) (byte-op :stb :t0 :t1 :s4)
+        (imm :add :s4 1) (imm :add :s3 1) (branch :always :ls.spawn/argv)
+        (mark :ls.spawn/argv-done) (imm :cmp :s4 4096) (branch :hs :ls/bad)
+        (li :t1 a) (li :t0 0) (byte-op :stb :t0 :t1 :s4)
+        (load :t0 :x1) (imm :cmp :t0 501) (branch :hi :ls/bad) (shift :shli :t0 3)
+        (li :t1 b) (alu :add :t1 :t0) (li :t0 0) (mem :st :t0 :t1 0))))
+
+(defn- compare-program [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]
+                        prefix :string label :keyword start :i64 length :i64 key :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :t2 0) (load :t0 :sp-plen) (imm :cmp :t0 length) (branch :ne (tag prefix "done"))
+      (la :a1 label) (imm :add :a1 start) (li :t0 0) (mark (tag prefix "compare"))
+      (imm :cmp :t0 length) (branch :hs (tag prefix "yes"))
+      (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :buf-a))
+      (byte-op :ldb :t1 :t1 :t0) (byte-op :ldb :t3 :a1 :t0) (alu :cmp :t1 :t3) (branch :ne (tag prefix "done"))
+      (imm :add :t0 1) (branch :always (tag prefix "compare"))
+      (mark (tag prefix "yes")) (li :t2 1) (mark (tag prefix "done")) (store :t2 key)))
+
+(defn- programs [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [constants (record-get [:ref :linux.static.spawn/config] cfg :programs)
+        slash (-> out (li :t2 0) (li :t0 0) (mark :ls.spawn/slash) (load :t3 :sp-plen)
+                  (alu :cmp :t0 :t3) (branch :hs :ls.spawn/slash-done)
+                  (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :buf-a)) (byte-op :ldb :t1 :t1 :t0)
+                  (imm :cmp :t1 47) (branch :eq :ls.spawn/slash-yes) (imm :add :t0 1) (branch :always :ls.spawn/slash)
+                  (mark :ls.spawn/slash-yes) (li :t2 1) (mark :ls.spawn/slash-done) (store :t2 :sp-slash))
+        compared
+        (loop [index 0 code slash]
+          (if (>= index (vector-count constants)) code
+            (let [constant (typed-list-nth [:list [:ref :linux.static.spawn/text]] constants index)
+                  label (record-get [:ref :linux.static.spawn/text] constant :label)
+                  length (record-get [:ref :linux.static.spawn/text] constant :length)
+                  base (record-get [:ref :linux.static.spawn/text] constant :base)
+                  prefix (string-concat "program-" (string-from-i64 index))
+                  full (compare-program code cfg (string-concat prefix "-full") label 0 length :x2)
+                  bare (compare-program full cfg (string-concat prefix "-base") label base (- length base) :x3)
+                  chosen (hd bare cfg 34 (io/state-field :sp-slash) (io/state-field :x2) (io/state-field :x3)
+                             (io/literal (record-get [:ref :linux.static.spawn/config] cfg :lookup)))]
+              (recur (+ index 1) (-> chosen (imm :cmp :t0 1) (branch :ne (tag prefix "next"))
+                                    (la :t0 label) (store :t0 :sp-prog) (branch :always :ls.spawn/have-program)
+                                    (mark (tag prefix "next")))))))
+        refused (hd compared cfg 35 (io/state-field :sp-slash)
+                  (io/literal (record-get [:ref :linux.static.spawn/config] cfg :lookup)) (io/literal 0) (io/literal 0))]
+    (-> refused (imm :cmp :t0 2) (branch :eq (refusal 2)) (branch :always (refusal 1)) (mark :ls.spawn/have-program))))
+
+(defn- compare-env [out [:list [:ref :linux.static/instruction]] constant [:ref :linux.static.spawn/text] index :i64]
+  [:list [:ref :linux.static/instruction]]
+  (let [prefix (string-concat "env-" (string-from-i64 index)) length (record-get [:ref :linux.static.spawn/text] constant :length)]
+    (-> out (li :t0 0) (la :a1 (record-get [:ref :linux.static.spawn/text] constant :label))
+        (mark (tag prefix "compare")) (imm :cmp :t0 length) (branch :hs (tag prefix "equal"))
+        ;; Stop at NUL instead of reading past a shorter inherited name.
+        (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 0) (branch :eq (tag prefix "done"))
+        (byte-op :ldb :t3 :a1 :t0) (alu :cmp :t1 :t3) (branch :ne (tag prefix "done"))
+        (imm :add :t0 1) (branch :always (tag prefix "compare")) (mark (tag prefix "equal"))
+        (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 61) (branch :ne (tag prefix "done")) (li :t2 1) (mark (tag prefix "done")))))
+
+(defn- environment [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [constants (record-get [:ref :linux.static.spawn/config] cfg :env)
+        start (-> out (li :t0 0) (store :t0 :sp-envn) (load :s4 :envp)
+                  (mark :ls.spawn/env) (mem :ld :s1 :s4 0) (imm :cmp :s1 0) (branch :eq :ls.spawn/env-done) (li :t2 0))
+        compared (loop [index 0 code start]
+                   (if (>= index (vector-count constants)) code
+                     (recur (+ index 1) (compare-env code
+                       (typed-list-nth [:list [:ref :linux.static.spawn/text]] constants index) index))))
+        admitted (hd (store compared :t2 :x2) cfg 36 (io/state-field :x2) (io/state-field :sp-envn) (io/literal 0) (io/literal 0))]
+    (-> admitted (imm :cmp :t0 1) (branch :ne :ls.spawn/env-next)
+        (load :t0 :sp-envn) (imm :cmp :t0 500) (branch :hs :ls/bad) (mov :t1 :t0) (shift :shli :t1 3)
+        (li :t2 (record-get [:ref :linux.static.spawn/config] cfg :buf-c)) (alu :add :t2 :t1) (mem :st :s1 :t2 0)
+        (imm :add :t0 1) (store :t0 :sp-envn) (mark :ls.spawn/env-next)
+        (li :t0 9223372036854775799) (alu :cmp :s4 :t0) (branch :hi :ls/bad)
+        (imm :add :s4 8) (branch :always :ls.spawn/env) (mark :ls.spawn/env-done)
+        (load :t0 :sp-envn) (shift :shli :t0 3) (li :t2 (record-get [:ref :linux.static.spawn/config] cfg :buf-c))
+        (alu :add :t2 :t0) (li :t0 0) (mem :st :t0 :t2 0))))
+
+(defn- tick [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [got (-> (sys out cfg :clock-gettime (io/literal 1)
+                    (io/literal (+ (record-get [:ref :linux.static.spawn/config] cfg :data) (io/state-offset :ts)))
+                    (io/literal 0) (io/literal 0) (io/literal 0))
+                (imm :cmp :t0 0) (branch :ne :ls/bad))]
+    (-> (hd got cfg 10 (io/literal 2) (io/state-field :ts) (io/state-field :ts-nsec) (io/literal 0))
+        (imm :cmp :t0 0) (branch :lt :ls/bad))))
+(defn- time-left [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [elapsed (-> (tick out cfg) (load :t1 :sp-start) (alu :cmp :t0 :t1) (branch :lt :ls/bad)
+                    (alu :sub :t0 :t1) (store :t0 :x5))]
+    (-> (hd elapsed cfg 39 (io/state-field :x5) (io/literal 0) (io/literal 0) (io/literal 0))
+        (imm :cmp :t0 -1) (branch :eq :ls.spawn/kill-time)
+        (imm :cmp :t0 0) (branch :lt :ls/bad) (store :t0 :x4))))
+(defn- timespec [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [first (-> (hd out cfg 41 (io/literal 0) (io/state-field :x4) (io/literal 0) (io/literal 0))
+                  (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :io)) (mem :st :t0 :t1 40))]
+    (-> (hd first cfg 41 (io/literal 1) (io/state-field :x4) (io/literal 0) (io/literal 0))
+        (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :io)) (mem :st :t0 :t1 48))))
+(defn- poll [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]
+             prefix :string fd :keyword retry :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [base (record-get [:ref :linux.static.spawn/config] cfg :io)
+        ready (-> (timespec out cfg) (load :t0 fd) (li :t1 4294967296) (alu :or :t0 :t1)
+                  (li :t1 base) (mem :st :t0 :t1 32))
+        waited (sys ready cfg :ppoll (io/literal (+ base 32)) (io/literal 1)
+                   (io/literal (+ base 40)) (io/literal 0) (io/literal 8))]
+    (-> (outcome waited cfg prefix 3 retry) (imm :cmp :t0 0) (branch :eq retry)
+        (imm :cmp :t0 1) (branch :ne :ls/bad))))
+(defn- reap [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config] prefix :string]
+  [:list [:ref :linux.static/instruction]]
+  (let [got (sys (mark out (tag prefix "reap")) cfg :wait4 (io/state-field :sp-pid)
+                (io/literal (+ (record-get [:ref :linux.static.spawn/config] cfg :io) 24))
+                (io/literal 0) (io/literal 0) (io/literal 0))]
+    (-> (outcome got cfg prefix 3 (tag prefix "reap"))
+        (load :t1 :sp-pid) (alu :cmp :t0 :t1) (branch :ne :ls/bad))))
+
+(defn- pipe-pair [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]
+                  prefix :string offset :i64 lo :keyword hi :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [base (record-get [:ref :linux.static.spawn/config] cfg :io)
+        got (sys out cfg :pipe2 (io/literal (+ base offset)) (io/literal 524288)
+                 (io/literal 0) (io/literal 0) (io/literal 0))]
+    (-> (outcome got cfg prefix 0 :ls/bad) (li :t1 base) (mem :ld :t0 :t1 offset)
+        (mov :t2 :t0) (shift :shli :t2 32) (shift :shri :t2 32) (store :t2 lo)
+        (shift :shri :t0 32) (store :t0 hi))))
+(defn- pipes-and-fork [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [base (record-get [:ref :linux.static.spawn/config] cfg :io)
+        zeroed (-> out (li :t0 0) (li :t1 base) (mem :st :t0 :t1 0) (mem :st :t0 :t1 8)
+                   (mem :st :t0 :t1 16) (mem :st :t0 :t1 24))
+        pipes (-> zeroed (pipe-pair cfg "stdin-pipe" 0 :sp-in-r :sp-in-w)
+                  (pipe-pair cfg "stdout-pipe" 8 :sp-out-r :sp-out-w)
+                  (pipe-pair cfg "status-pipe" 16 :sp-st-r :sp-st-w))
+        started (store (tick pipes cfg) :t0 :sp-start)
+        forked (sys started cfg :clone (io/literal 17) (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))]
+    (-> forked (imm :cmp :t0 0) (branch :lt :ls/bad) (branch :eq :ls.spawn/child)
+        (store :t0 :sp-pid) (branch :always :ls.spawn/parent))))
+
+(defn- child [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [input (-> (sys (mark out :ls.spawn/child) cfg :dup3 (io/state-field :sp-in-r)
+                    (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
+                  (imm :cmp :t0 0) (branch :lt (tag "child-fail" "0")))
+        output (-> (sys input cfg :dup3 (io/state-field :sp-out-w)
+                     (io/literal 1) (io/literal 0) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :lt (tag "child-fail" "0")))
+        isolated (-> (sys output cfg :close-range (io/literal 3) (io/literal 4294967295)
+                       (io/literal 4) (io/literal 0) (io/literal 0))
+                     (imm :cmp :t0 0) (branch :lt (tag "child-fail" "1")))
+        privileged (-> (sys isolated cfg :prctl (io/literal 38) (io/literal 1) (io/literal 0) (io/literal 0) (io/literal 0))
+                       (imm :cmp :t0 0) (branch :lt (tag "child-fail" "2"))
+                       (load :t0 :root-fd) (imm :cmp :t0 0) (branch :lt :ls.spawn/child-exec))
+        scoped (-> (sys privileged cfg :fchdir (io/state-field :root-fd)
+                     (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :lt (tag "child-fail" "3")) (mark :ls.spawn/child-exec))
+        executed (-> (sys scoped cfg :execve (io/state-field :sp-prog)
+                       (io/literal (record-get [:ref :linux.static.spawn/config] cfg :buf-b))
+                       (io/literal (record-get [:ref :linux.static.spawn/config] cfg :buf-c)) (io/literal 0) (io/literal 0))
+                     (branch :always (tag "child-fail" "4")))
+        failed (loop [index 0 code executed]
+                 (if (= index 5) code
+                   (recur (+ index 1) (-> code (mark (tag "child-fail" (string-from-i64 index)))
+                                         (li :t1 index) (branch :always :ls.spawn/child-report)))))
+        report (-> failed (mark :ls.spawn/child-report) (append :neg :none :t0 :none :none :none 0 :none)
+                   (shift :shli :t1 12) (alu :add :t1 :t0)
+                   (li :t2 (record-get [:ref :linux.static.spawn/config] cfg :probe)) (mem :st :t1 :t2 0)
+                   (li :s2 0) (mark :ls.spawn/report-write)
+                   (li :s3 (record-get [:ref :linux.static.spawn/config] cfg :probe)) (alu :add :s3 :s2)
+                   (li :s4 8) (alu :sub :s4 :s2))
+        wrote (outcome (sys report cfg :write (io/state-field :sp-st-w) (io/register :s3) (io/register :s4)
+                         (io/literal 0) (io/literal 0)) cfg "child-report" 3 :ls.spawn/report-write)
+        complete (-> wrote (imm :cmp :t0 0) (branch :le :ls/bad) (alu :cmp :t0 :s4) (branch :hi :ls/bad)
+                     (alu :add :s2 :t0) (imm :cmp :s2 8) (branch :lo :ls.spawn/report-write))]
+    (-> (sys complete cfg :exit-group (io/literal 127) (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
+        (append :trap :none :none :none :none :none 0 :none))))
+
+;; Poll status under the same deadline; accumulate short reads of its 8-byte word.
+(defn- exec-status [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [parent (-> (mark out :ls.spawn/parent) (close cfg :sp-in-r) (close cfg :sp-in-w)
+                   (close cfg :sp-out-w) (close cfg :sp-st-w)
+                   (li :t0 0) (store :t0 :sp-word)
+                   (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :probe)) (mem :st :t0 :t1 0)
+                   (mark :ls.spawn/status-poll) (time-left cfg))
+        ready (-> (poll parent cfg "status-poll" :sp-st-r :ls.spawn/status-poll)
+                  (load :s1 :sp-word) (imm :cmp :s1 8) (branch :hs :ls/bad)
+                  (li :s2 (record-get [:ref :linux.static.spawn/config] cfg :probe)) (alu :add :s2 :s1)
+                  (li :s3 8) (alu :sub :s3 :s1))
+        got (outcome (sys ready cfg :read (io/state-field :sp-st-r) (io/register :s2) (io/register :s3)
+                       (io/literal 0) (io/literal 0)) cfg "status-read" 3 :ls.spawn/status-poll)
+        word (-> got (imm :cmp :t0 0) (branch :eq :ls.spawn/status-eof) (alu :cmp :t0 :s3) (branch :hi :ls/bad)
+                 (alu :add :s1 :t0) (store :s1 :sp-word) (imm :cmp :s1 8) (branch :lo :ls.spawn/status-poll)
+                 (branch :always :ls.spawn/child-failed) (mark :ls.spawn/status-eof)
+                 (load :t0 :sp-word) (imm :cmp :t0 0) (branch :eq :ls.spawn/exec-ok))
+        short (-> (reap (-> word (close cfg :sp-st-r) (close cfg :sp-out-r)) cfg "short-status")
+                  (branch :always (refusal 7)) (mark :ls.spawn/child-failed))
+        failed (-> (reap (-> short (close cfg :sp-st-r) (close cfg :sp-out-r)) cfg "failed-child")
+                   (li :t1 (record-get [:ref :linux.static.spawn/config] cfg :probe)) (mem :ld :t0 :t1 0)
+                   (shift :shri :t0 12) (store :t0 :x3))
+        named (hd failed cfg 42 (io/state-field :x3) (io/literal 0) (io/literal 0) (io/literal 0))]
+    (-> named (imm :cmp :t0 1) (branch :eq (refusal 5)) (imm :cmp :t0 2) (branch :eq (refusal 6))
+        (branch :always (refusal 7)) (mark :ls.spawn/exec-ok) (close cfg :sp-st-r))))
+
+(defn- output-limit [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [capacity (record-get [:ref :linux.static.spawn/config] cfg :names-size)]
+    ;; Obtain the owning limit and require sentinel capacity before any child starts.
+    (-> (hd out cfg 37 (io/literal (- capacity 1)) (io/literal 0) (io/literal 0) (io/literal 0))
+        (imm :cmp :t0 0) (branch :lt :ls/bad) (imm :cmp :t0 (- capacity 1)) (branch :hi :ls/bad)
+        (store :t0 :sp-limit) (li :t0 0) (store :t0 :sp-total))))
+(defn- capture [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [limit (-> out (mark :ls.spawn/output-poll) (time-left cfg))
+        readable (-> (poll limit cfg "stdout-poll" :sp-out-r :ls.spawn/output-poll)
+                     (load :s1 :sp-total) (load :s3 :sp-limit) (alu :cmp :s1 :s3) (branch :hi :ls.spawn/kill-output)
+                     (li :s2 (record-get [:ref :linux.static.spawn/config] cfg :names)) (alu :add :s2 :s1)
+                     (imm :add :s3 1) (alu :sub :s3 :s1))
+        got (outcome (sys readable cfg :read (io/state-field :sp-out-r) (io/register :s2) (io/register :s3)
+                       (io/literal 0) (io/literal 0)) cfg "stdout-read" 3 :ls.spawn/output-poll)
+        eof (-> got (imm :cmp :t0 0) (branch :eq :ls.spawn/output-eof) (alu :cmp :t0 :s3) (branch :hi :ls/bad)
+                (alu :add :s1 :t0) (store :s1 :sp-total) (load :t1 :sp-limit) (alu :cmp :s1 :t1) (branch :hi :ls.spawn/kill-output)
+                (branch :always :ls.spawn/output-poll) (mark :ls.spawn/output-eof))]
+    (close eof cfg :sp-out-r)))
+
+(defn- await-exit [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [base (record-get [:ref :linux.static.spawn/config] cfg :io)
+        first (-> out (mark :ls.spawn/await) (time-left cfg))
+        got (outcome (sys first cfg :wait4 (io/state-field :sp-pid) (io/literal (+ base 24))
+                       (io/literal 1) (io/literal 0) (io/literal 0)) cfg "await" 3 :ls.spawn/await)
+        sleeping (-> got (imm :cmp :t0 0) (branch :ne :ls.spawn/reaped))
+        slice (-> (hd sleeping cfg 40 (io/state-field :x4) (io/literal 0) (io/literal 0) (io/literal 0))
+                  (imm :cmp :t0 0) (branch :lt :ls/bad) (store :t0 :x4) (timespec cfg))
+        paused (outcome (sys slice cfg :ppoll (io/literal 0) (io/literal 0) (io/literal (+ base 40))
+                          (io/literal 0) (io/literal 8)) cfg "reap-sleep" 3 :ls.spawn/await)
+        reaped (-> paused (branch :always :ls.spawn/await) (mark :ls.spawn/reaped)
+                   (load :t1 :sp-pid) (alu :cmp :t0 :t1) (branch :ne :ls/bad)
+                   (li :t1 base) (mem :ld :t0 :t1 24) (shift :shli :t0 32) (shift :shri :t0 32) (store :t0 :x3))]
+    (-> (hd reaped cfg 38 (io/state-field :x3) (io/literal 0) (io/literal 0) (io/literal 0)) (store :t0 :sp-exit))))
+
+(defn- utoa [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [end (+ (record-get [:ref :linux.static.spawn/config] cfg :data) 688)]
+    (-> out (li :s2 end) (mark :ls.spawn/exit-digit)
+        (append :udiv10 :none :t1 :t1 :t3 :none 0 :none) (imm :add :t3 48) (imm :sub :s2 1)
+        (li :t0 0) (byte-op :stb :t3 :s2 :t0) (imm :cmp :t1 0) (branch :ne :ls.spawn/exit-digit)
+        (mov :s1 :s2) (li :s2 end) (alu :sub :s2 :s1))))
+(defn- answer [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [digits (-> (utoa (-> out (load :t1 :sp-exit) (imm :cmp :t1 0) (branch :lt :ls.spawn/negative-exit)) cfg)
+                   (branch :always :ls.spawn/exit-text) (mark :ls.spawn/negative-exit)
+                   (la :s1 :ls.spawn/minus-one) (li :s2 2) (mark :ls.spawn/exit-text)
+                   (store :s1 :x1) (store :s2 :sp-dlen)
+                   (load :t0 :sp-total) (li :t1 9223372036854775786) (alu :cmp :t0 :t1) (branch :hi :ls/trap-bytes)
+                   (alu :add :t0 :s2) (imm :add :t0 1) (store :t0 :x2))
+        charged (-> (hd digits cfg 6 (io/state-field :pool-used) (io/state-field :x2) (io/state-field :bytes) (io/literal 0))
+                    (imm :cmp :t0 1) (branch :ne :ls/trap-bytes)
+                    (load :t0 :pool-used) (load :t1 :bytes) (alu :cmp :t0 :t1) (branch :hi :ls/trap-bytes)
+                    (alu :sub :t1 :t0) (load :t0 :x2) (alu :cmp :t0 :t1) (branch :hi :ls/trap-bytes)
+                    (load :s3 :pool-used) (load :t2 :pool-base) (alu :add :t2 :s3)
+                    (load :s1 :x1) (load :s2 :sp-dlen))
+        header (-> (copy charged "exit-text" :t2 :s1 :s2) (alu :add :t2 :s2)
+                   (li :t0 10) (li :t1 0) (byte-op :stb :t0 :t2 :t1) (imm :add :t2 1)
+                   (li :s1 (record-get [:ref :linux.static.spawn/config] cfg :names)) (load :s2 :sp-total))
+        text (-> (copy header "output-text" :t2 :s1 :s2) (load :s2 :x2) (mov :t0 :s3) (alu :add :t0 :s2)
+                 (store :t0 :pool-used) (mov :s4 :s3) (append :not :none :s4 :none :none :none 0 :none))]
+    (-> (join text (record-get [:ref :linux.static.spawn/config] cfg :pair))
+        (store :t0 :res) (branch :always :ls.cap/finish))))
+
+(defn- kill-and-reap [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]
+                     prefix :string label :keyword named :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [killed (sys (mark out label) cfg :kill (io/state-field :sp-pid) (io/literal 9)
+                  (io/literal 0) (io/literal 0) (io/literal 0))
+        closed (-> killed (close cfg :sp-st-r) (close cfg :sp-out-r))]
+    (branch (reap closed cfg prefix) :always named)))
+
+(defn- data-bytes [out [:list [:ref :linux.static/instruction]] label :keyword text :string nul? :bool]
+  [:list [:ref :linux.static/instruction]]
+  (let [input (string-to-utf8 text)
+        raw (loop [index 0 data (vector-alloc 0)]
+              (if (>= index (bytes-count input)) data
+                (recur (+ index 1) (vector-conj data (bytes-at input index)))))
+        bytes (if nul? (vector-conj raw 0) raw)]
+    (typed-list-conj [:list [:ref :linux.static/instruction]] (mark out label)
+      (asm/instruction :bytes :none :none :none :none :none 0 :none bytes))))
+(defn- refusal-message [index :i64] :string
+  (string-concat "KEXE_TRAP {:kind :capability :capability :process/spawn :reason :spawn/"
+    (string-concat (refusal-key index) "}\n")))
+(defn- named-refusals [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [index 0 code out]
+    (if (= index 8) code
+      (let [label (tag "message" (refusal-key index))]
+        (recur (+ index 1)
+          (-> code (mark (refusal index)) (la :p1 label) (li :p2 (bytes-count (string-to-utf8 (refusal-message index))))
+              (li :t5 (record-get [:ref :linux.static.spawn/config] cfg :refused)) (branch :always :ls/trap-exit)))))))
+(defn- text-constants [out [:list [:ref :linux.static/instruction]] texts [:list [:ref :linux.static.spawn/text]] nul? :bool]
+  [:list [:ref :linux.static/instruction]]
+  (loop [index 0 code out]
+    (if (>= index (vector-count texts)) code
+      (let [constant (typed-list-nth [:list [:ref :linux.static.spawn/text]] texts index)]
+        (recur (+ index 1) (data-bytes code (record-get [:ref :linux.static.spawn/text] constant :label)
+                             (record-get [:ref :linux.static.spawn/text] constant :text) nul?))))))
+(defn- constants [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.spawn/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [text (-> out (text-constants (record-get [:ref :linux.static.spawn/config] cfg :programs) true)
+                 (text-constants (record-get [:ref :linux.static.spawn/config] cfg :env) false)
+                 (data-bytes :ls.spawn/arg-sep "ARG_SEP" false) (data-bytes :ls.spawn/minus-one "-1" false))
+        messages (loop [index 0 code text]
+                   (if (= index 8) code
+                     (recur (+ index 1) (data-bytes code (tag "message" (refusal-key index)) (refusal-message index) false))))]
+    (append messages :align :none :none :none :none :none 16 :none)))
+
+(defn- lookup [m :document key :keyword] :document
+  (if (not= (document-kind m) :map) (document-null)
+    (loop [index 0]
+      (if (>= index (document-count m)) (document-null)
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
+              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
+          (if (document-equal? k (document-keyword key))
+            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
+(defn- item [xs :document index :i64] :document
+  (option-value-of [:option :document] (document-vector-at xs index) (document-null)))
+(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
+(defn- string-of [d :document] :string (option-value-of [:option :string] (document-string-value d) ""))
+(defn- base-index [text :string] :i64
+  (let [bytes (string-to-utf8 text)]
+    (loop [index 0 base 0]
+      (if (>= index (bytes-count bytes)) base
+        (recur (+ index 1) (if (= (bytes-at bytes index) 47) (+ index 1) base))))))
+(defn- texts [xs :document kind :string] [:list [:ref :linux.static.spawn/text]]
+  (loop [index 0 out (typed-list-new [:list [:ref :linux.static.spawn/text]])]
+    (if (>= index (document-count xs)) out
+      (let [text (string-of (item xs index))]
+        (recur (+ index 1) (typed-list-conj [:list [:ref :linux.static.spawn/text]] out
+          (record-new [:ref :linux.static.spawn/text] (text-label kind index) text
+            (bytes-count (string-to-utf8 text)) (base-index text))))))))
+(defn- text-shape? [xs :document env? :bool] :bool
+  (if (or (not= (document-kind xs) :vector) (> (document-count xs) 16)) false
+    (loop [index 0]
+      (if (>= index (document-count xs)) true
+        (let [entry (item xs index) bytes (string-to-utf8 (string-of entry)) n (bytes-count bytes)
+              valid? (and (= (document-kind entry) :string) (> n 0) (< n (if env? 256 4096))
+                          (or env? (and (= (bytes-at bytes 0) 47) (< (base-index (string-of entry)) n)))
+                          (loop [offset 0]
+                            (if (>= offset n) true
+                              (let [byte (bytes-at bytes offset)]
+                                (if (or (= byte 0) (and env? (= byte 61))) false (recur (+ offset 1)))))))]
+          (if valid? (recur (+ index 1)) false))))))
+
+(defn- region-key [index :i64] :keyword
+  (case index 0 :buf-a 1 :buf-b 2 :buf-c 3 :names 4 :spawn-io 5 :probe 6 :pool :none))
+(defn- region-size [key :keyword source-plan :document layout :document] :i64
+  (case key :buf-a 4096 :buf-b 4096 :buf-c 4096 :spawn-io 64 :probe 16
+    :names (- (i64-of (lookup layout :index)) (i64-of (lookup layout :names)))
+    :pool (i64-of (lookup source-plan :bytes)) -1))
+(defn- region? [base :i64 size :i64 begin :i64 end :i64] :bool
+  (and (>= base begin) (<= base end) (= (bit-and base 15) 0) (>= size 0) (<= size (- end base))))
+(defn- configuration-error [isa :keyword source-plan :document layout :document] :keyword
+  (let [data (i64-of (lookup layout :data)) memory (i64-of (lookup layout :memory-size))
+        spawn (lookup source-plan :spawn) refused (i64-of (lookup (lookup source-plan :exit-codes) :capability/refused))
+        names (i64-of (lookup layout :names)) index (i64-of (lookup layout :index))]
+    (cond
+      (not (or (= isa :x86_64) (= isa :aarch64))) :unknown-isa
+      (not (document-equal? (lookup source-plan :handlers?) (document-bool true))) :handlers-not-planned
+      (or (<= data 0) (not= (bit-and data 4095) 0) (< memory 4096)
+          (> memory (- 9223372036854775807 data))) :layout-input
+      (or (<= names 0) (< index names) (> index (+ data memory))) :capture-region
+      (or (< refused 0) (> refused 255)) :refusal-exit
+      (or (not= (document-kind spawn) :map) (not= (document-kind (lookup spawn :path-lookup)) :bool)
+          (not (text-shape? (lookup spawn :programs) false)) (not (text-shape? (lookup spawn :env) true))) :spawn-input
+      :else
+      (loop [index 0]
+        (if (= index 7) :ok
+          (let [key (region-key index) base (i64-of (lookup layout key)) size (region-size key source-plan layout)]
+            (if (not (region? base size (+ data 4096) (+ data memory))) :scratch-region
+              (let [separate? (loop [other 0]
+                                (if (= other index) true
+                                  (let [other-key (region-key other) other-base (i64-of (lookup layout other-key))
+                                        other-size (region-size other-key source-plan layout)]
+                                    (if (or (= size 0) (= other-size 0) (<= (+ base size) other-base)
+                                            (<= (+ other-base other-size) base)) (recur (+ other 1)) false))))]
+                (if separate? (recur (+ index 1)) :scratch-overlap)))))))))
+(defn- failure [error :keyword] [:ref :linux.static.spawn/result]
+  (record-new [:ref :linux.static.spawn/result] (empty-code) :none error))
+
+(defn routine [isa :keyword source-plan :document layout :document] [:ref :linux.static.spawn/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (let [pair (strings/pool-pair-fragment (lookup source-plan :context-abi))]
+        (if (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
+          (failure (record-get [:ref :linux.static.strings/result] pair :error))
+          (let [spawn (lookup source-plan :spawn)
+                cfg (record-new [:ref :linux.static.spawn/config] isa (i64-of (lookup layout :data))
+                      (i64-of (lookup layout :buf-a)) (i64-of (lookup layout :buf-b)) (i64-of (lookup layout :buf-c))
+                      (i64-of (lookup layout :names)) (- (i64-of (lookup layout :index)) (i64-of (lookup layout :names)))
+                      (i64-of (lookup layout :spawn-io)) (i64-of (lookup layout :probe))
+                      (if (document-equal? (lookup spawn :path-lookup) (document-bool true)) 1 0)
+                      (i64-of (lookup (lookup source-plan :exit-codes) :capability/refused))
+                      (texts (lookup spawn :programs) "program") (texts (lookup spawn :env) "env")
+                      (record-get [:ref :linux.static.strings/result] pair :code))
+                body (-> (empty-code) (append :align :none :none :none :none :none 16 :none) (mark :ls.cap/spawn)
+                         (request-shape cfg) (arguments cfg) (programs cfg) (environment cfg) (output-limit cfg) (pipes-and-fork cfg)
+                         (child cfg) (exec-status cfg) (capture cfg) (await-exit cfg) (answer cfg))
+                code (-> body (kill-and-reap cfg "timeout" :ls.spawn/kill-time (refusal 4))
+                         (kill-and-reap cfg "output" :ls.spawn/kill-output (refusal 3))
+                         (named-refusals cfg) (constants cfg))]
+            (record-new [:ref :linux.static.spawn/result] code :ls.cap/spawn :ok)))))))

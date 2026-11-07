@@ -30,7 +30,7 @@ git -C "$amu" rev-parse --show-toplevel >/dev/null || {
   echo "error: Amu source tree not found: $amu" >&2; exit 1;
 }
 kotoba_native=${AIUEOS_KOTOBA_NATIVE_ROOT:-"$(dirname -- "$amu")/kotoba-native"}
-[ -f "$kotoba_native/src/kotoba/native/elf64.cljc.cljk" ] || {
+[ -f "$kotoba_native/src/kotoba/native/elf64.cljk" ] || {
   echo "error: kotoba-native source not found: $kotoba_native/src" >&2; exit 1;
 }
 amu_commit=$(git -C "$amu" rev-parse HEAD)

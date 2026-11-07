@@ -1,0 +1,293 @@
+;; Native SHA-256 computation for the wire-3 static provider.
+;; Emits the same register IR for both ISAs; no C, FFI, kernel helper,
+;; vector-runtime call or host crypto operation occurs in the emitted code.
+;; Source candidate: not yet executed or connected to the capability gate.
+(ns kotoba.native.linux-static-sha256
+  {:kotoba/export [routine entry-label workspace-bytes digest-offset digest-bytes]}
+  (:require [kotoba.native.linux-static-assembler :as asm]))
+
+(defn entry-label [] :keyword :ls.sha256/entry)
+(defn workspace-bytes [] :i64 816)
+(defn digest-offset [] :i64 672)
+(defn digest-bytes [] :i64 64)
+
+;; Workspace: W[64] @0, H[8] @512, working[8] @576, T1/T2 @640/648,
+;; hex[64] @672, length[8] @736, block[64] @744. The final 8 bytes pad it.
+;; Runtime arguments: ctx (unused), a1=workspace, a2=input, a3=input length.
+;; Returns workspace+672 or zero for invalid/disjointness/length bounds.
+
+(defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out
+    (asm/instruction op aux d s b i n target (vector-alloc 0))))
+
+(defn- mark [out [:list [:ref :linux.static/instruction]] target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out :label :none :none :none :none :none 0 target))
+
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]]
+  (append out :li :none d :none :none :none n :none))
+
+(defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out :mov :none d s :none :none 0 :none))
+
+(defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword n :i64]
+  [:list [:ref :linux.static/instruction]]
+  (append out op :none d :none b :none n :none))
+
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out op :none d :none b i 0 :none))
+
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out :alu op d s :none :none 0 :none))
+
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]]
+  (append out :alui op d :none :none :none n :none))
+
+(defn- shift [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]]
+  (append out op :none d :none :none :none n :none))
+
+(defn- unary [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out op :none d :none :none :none 0 :none))
+
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 target))
+
+(defn- simple [out [:list [:ref :linux.static/instruction]] op :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out op :none :none :none :none :none 0 :none))
+
+(defn- mask32 [out [:list [:ref :linux.static/instruction]] d :keyword]
+  [:list [:ref :linux.static/instruction]]
+  ;; x86 AND r64,imm32 sign-extends 0xffffffff to -1; use exact shifts.
+  (shift (shift out :shli d 32) :shri d 32))
+
+(defn- rotate [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword scratch :keyword n :i64]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mov d s) (shift :shri d n) (mov scratch s)
+      (shift :shli scratch (- 32 n)) (alu :or d scratch) (mask32 d)))
+
+(defn- xor [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword scratch :keyword]
+  [:list [:ref :linux.static/instruction]]
+  ;; (d | s) & ~(d & s), with d overwritten and s preserved.
+  (-> out (mov scratch d) (alu :or scratch s) (alu :and d s)
+      (unary :not d) (alu :and d scratch)))
+
+(defn- sigma [out [:list [:ref :linux.static/instruction]] a :i64 b :i64 c :i64 rotate-c? :bool]
+  [:list [:ref :linux.static/instruction]]
+  ;; t0=u32 source; t1=result; t2/t3 scratch. a4 and s0..s4 survive.
+  (let [first (-> out (rotate :t1 :t0 :t3 a) (rotate :t2 :t0 :t3 b) (xor :t1 :t2 :t3))
+        third (if rotate-c? (rotate first :t2 :t0 :t3 c)
+                (shift (mov first :t2 :t0) :shri :t2 c))]
+    (xor third :t1 :t2 :t3)))
+
+(defn- wload [out [:list [:ref :linux.static/instruction]] d :keyword address :keyword delta :i64]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mov address :a4) (imm :add address delta)
+      (shift :shli address 3) (alu :add address :s0) (mem :ld d address 0)))
+
+(defn- preflight [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [saved (-> out (append :align :none :none :none :none :none 16 :none)
+                  (mark :ls.sha256/entry)
+                  (unary :push :s0) (unary :push :s1) (unary :push :s2)
+                  (unary :push :s3) (unary :push :s4) (simple :save-lr)
+                  (mov :s0 :a1) (mov :s1 :a2) (mov :s2 :a3))
+        bounds (-> saved (imm :cmp :s0 0) (branch :le :ls.sha256/bad)
+                   (imm :cmp :s1 0) (branch :lt :ls.sha256/bad)
+                   (imm :cmp :s2 0) (branch :lt :ls.sha256/bad)
+                   (li :t0 2305843009213693951) (alu :cmp :s2 :t0) (branch :hi :ls.sha256/bad))
+        workspace (-> bounds (mov :t0 :s0) (imm :and :t0 15) (imm :cmp :t0 0)
+                      (branch :ne :ls.sha256/bad)
+                      (li :t0 9223372036854775807) (imm :sub :t0 816)
+                      (alu :cmp :s0 :t0) (branch :hi :ls.sha256/bad))
+        input (-> workspace (li :t0 9223372036854775807) (alu :sub :t0 :s1)
+                  (alu :cmp :s2 :t0) (branch :hi :ls.sha256/bad)
+                  (imm :cmp :s2 0) (branch :eq :ls.sha256/admitted)
+                  (imm :cmp :s1 0) (branch :eq :ls.sha256/bad))]
+    (-> input (mov :t0 :s0) (imm :add :t0 816) (alu :cmp :s1 :t0)
+        (branch :hs :ls.sha256/admitted)
+        (mov :t0 :s1) (alu :add :t0 :s2) (alu :cmp :s0 :t0)
+        (branch :hs :ls.sha256/admitted) (branch :always :ls.sha256/bad)
+        (mark :ls.sha256/admitted))))
+
+(defn- initial-word [index :i64] :i64
+  (case index 0 1779033703 1 3144134277 2 1013904242 3 2773480762
+        4 1359893119 5 2600822924 6 528734635 7 1541459225 0))
+
+(defn- initialize [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [state (loop [index 0 code out]
+                (if (= index 8) code
+                  (recur (+ index 1)
+                         (mem (li code :t0 (initial-word index)) :st :t0 :s0 (+ 512 (* index 8))))))
+        bits (shift (mov state :t0 :s2) :shli :t0 3)
+        length (loop [index 0 code bits]
+                 (if (= index 8) code
+                   (recur (+ index 1)
+                     (-> code (mov :t1 :t0) (shift :shri :t1 (- 56 (* index 8)))
+                         (li :t2 (+ 736 index)) (byte-op :stb :t1 :s0 :t2)))))]
+    (-> length (mov :s4 :s2) (imm :add :s4 72) (shift :shri :s4 6)
+        (shift :shli :s4 6) (li :s3 0) (mark :ls.sha256/block))))
+
+(defn- message-block [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [choose (-> out (li :a4 0) (mark :ls.sha256/byte-loop)
+                   (mov :t1 :s3) (alu :add :t1 :a4) (alu :cmp :t1 :s2)
+                   (branch :lo :ls.sha256/byte-read) (branch :eq :ls.sha256/byte-marker)
+                   (mov :t2 :s4) (imm :sub :t2 8) (alu :cmp :t1 :t2)
+                   (branch :hs :ls.sha256/byte-length)
+                   (li :t0 0) (branch :always :ls.sha256/byte-store))
+        bytes (-> choose (mark :ls.sha256/byte-read) (byte-op :ldb :t0 :s1 :t1)
+                  (branch :always :ls.sha256/byte-store)
+                  (mark :ls.sha256/byte-marker) (li :t0 128) (branch :always :ls.sha256/byte-store)
+                  (mark :ls.sha256/byte-length) (mov :t3 :t1) (alu :sub :t3 :t2)
+                  (mov :t2 :s0) (imm :add :t2 736) (byte-op :ldb :t0 :t2 :t3))]
+    (-> bytes (mark :ls.sha256/byte-store) (mov :t1 :s0) (imm :add :t1 744)
+        (byte-op :stb :t0 :t1 :a4) (imm :add :a4 1) (imm :cmp :a4 64)
+        (branch :lo :ls.sha256/byte-loop))))
+
+(defn- prepare-words [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [first (-> out (li :a4 0) (mark :ls.sha256/prepare)
+                  (mov :t1 :s0) (imm :add :t1 744) (mov :t2 :a4) (shift :shli :t2 2)
+                  (byte-op :ldb :t0 :t1 :t2) (shift :shli :t0 24)
+                  (imm :add :t2 1) (byte-op :ldb :t3 :t1 :t2) (shift :shli :t3 16) (alu :or :t0 :t3))
+        rest (-> first (imm :add :t2 1) (byte-op :ldb :t3 :t1 :t2) (shift :shli :t3 8) (alu :or :t0 :t3)
+                 (imm :add :t2 1) (byte-op :ldb :t3 :t1 :t2) (alu :or :t0 :t3))]
+    (-> rest (mov :t3 :a4) (shift :shli :t3 3) (alu :add :t3 :s0) (mem :st :t0 :t3 0)
+        (imm :add :a4 1) (imm :cmp :a4 16) (branch :lo :ls.sha256/prepare))))
+
+(defn- extend-words [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [s0 (-> out (li :a4 16) (mark :ls.sha256/extend)
+               (wload :t0 :t2 -15) (sigma 7 18 3 false) (mov :a1 :t1))
+        s1 (-> s0 (wload :t0 :t2 -2) (sigma 17 19 10 false)
+               (mov :t0 :a1) (alu :add :t0 :t1))
+        sum (-> s1 (wload :t2 :t3 -16) (alu :add :t0 :t2)
+                (wload :t2 :t3 -7) (alu :add :t0 :t2) (mask32 :t0))]
+    (-> sum (mov :t3 :a4) (shift :shli :t3 3) (alu :add :t3 :s0) (mem :st :t0 :t3 0)
+        (imm :add :a4 1) (imm :cmp :a4 64) (branch :lo :ls.sha256/extend))))
+
+(defn- working-state [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :a4 0) (mark :ls.sha256/working-copy)
+      (mov :t1 :a4) (shift :shli :t1 3) (alu :add :t1 :s0)
+      (mem :ld :t0 :t1 512) (mem :st :t0 :t1 576)
+      (imm :add :a4 1) (imm :cmp :a4 8) (branch :lo :ls.sha256/working-copy)
+      (li :a4 0) (mark :ls.sha256/round)))
+
+(defn- round-t1 [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [sum (-> out (mem :ld :t0 :s0 608) (sigma 6 11 25 true) (mov :a1 :t1))
+        choice (-> sum (mem :ld :t1 :s0 616) (alu :and :t1 :t0)
+                   (unary :not :t0) (mem :ld :t2 :s0 624) (alu :and :t0 :t2)
+                   (xor :t1 :t0 :t3))
+        partial (-> choice (mem :ld :t0 :s0 632) (alu :add :t0 :a1) (alu :add :t0 :t1)
+                    (append :la :none :t2 :none :none :none 0 :ls.sha256/constants)
+                    (mov :t3 :a4) (shift :shli :t3 3) (alu :add :t2 :t3) (mem :ld :t2 :t2 0)
+                    (alu :add :t0 :t2))]
+    (-> partial (wload :t2 :t3 0) (alu :add :t0 :t2) (mask32 :t0) (mem :st :t0 :s0 640))))
+
+(defn- round-t2 [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [sum (-> out (mem :ld :t0 :s0 576) (sigma 2 13 22 true) (mov :a1 :t1))
+        first (-> sum (mem :ld :t2 :s0 584) (mov :t1 :t0) (alu :and :t1 :t2)
+                  (mem :ld :t3 :s0 592) (alu :and :t0 :t3) (xor :t1 :t0 :ctx))]
+    (-> first (alu :and :t2 :t3) (xor :t1 :t2 :ctx) (alu :add :t1 :a1)
+        (mask32 :t1) (mem :st :t1 :s0 648))))
+
+(defn- shift-working [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [upper (-> out (mem :ld :t0 :s0 624) (mem :st :t0 :s0 632)
+                  (mem :ld :t0 :s0 616) (mem :st :t0 :s0 624)
+                  (mem :ld :t0 :s0 608) (mem :st :t0 :s0 616)
+                  (mem :ld :t0 :s0 600) (mem :ld :t1 :s0 640)
+                  (alu :add :t0 :t1) (mask32 :t0) (mem :st :t0 :s0 608))
+        lower (-> upper (mem :ld :t0 :s0 592) (mem :st :t0 :s0 600)
+                  (mem :ld :t0 :s0 584) (mem :st :t0 :s0 592)
+                  (mem :ld :t0 :s0 576) (mem :st :t0 :s0 584)
+                  (mem :ld :t0 :s0 640) (mem :ld :t1 :s0 648)
+                  (alu :add :t0 :t1) (mask32 :t0) (mem :st :t0 :s0 576))]
+    (-> lower (imm :add :a4 1) (imm :cmp :a4 64) (branch :lo :ls.sha256/round))))
+
+(defn- accumulate [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :a4 0) (mark :ls.sha256/accumulate)
+      (mov :t2 :a4) (shift :shli :t2 3) (alu :add :t2 :s0)
+      (mem :ld :t0 :t2 512) (mem :ld :t1 :t2 576) (alu :add :t0 :t1)
+      (mask32 :t0) (mem :st :t0 :t2 512)
+      (imm :add :a4 1) (imm :cmp :a4 8) (branch :lo :ls.sha256/accumulate)
+      (imm :add :s3 64) (alu :cmp :s3 :s4) (branch :lo :ls.sha256/block)))
+
+(defn- raw-digest [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [word 0 code out]
+    (if (= word 8) code
+      (let [loaded (mem code :ld :t0 :s0 (+ 512 (* word 8)))
+            next (loop [byte 0 current loaded]
+                   (if (= byte 4) current
+                     (recur (+ byte 1)
+                            (-> current (mov :t1 :t0) (shift :shri :t1 (- 24 (* byte 8)))
+                                (li :t2 (+ 744 (* word 4) byte)) (byte-op :stb :t1 :s0 :t2)))))]
+        (recur (+ word 1) next)))))
+
+(defn- hex-digest [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [high (-> out (li :a4 0) (mark :ls.sha256/hex-loop)
+                 (mov :t1 :s0) (imm :add :t1 744) (byte-op :ldb :t0 :t1 :a4)
+                 (mov :t1 :t0) (shift :shri :t1 4) (li :t2 48) (alu :add :t2 :t1)
+                 (imm :cmp :t1 9) (branch :le :ls.sha256/hex-high) (imm :add :t2 39)
+                 (mark :ls.sha256/hex-high))
+        first (-> high (mov :ctx :a4) (shift :shli :ctx 1) (mov :a1 :s0) (imm :add :a1 672)
+                  (byte-op :stb :t2 :a1 :ctx) (imm :and :t0 15)
+                  (li :t2 48) (alu :add :t2 :t0) (imm :cmp :t0 9)
+                  (branch :le :ls.sha256/hex-low) (imm :add :t2 39) (mark :ls.sha256/hex-low))]
+    (-> first (imm :add :ctx 1) (byte-op :stb :t2 :a1 :ctx)
+        (imm :add :a4 1) (imm :cmp :a4 32) (branch :lo :ls.sha256/hex-loop)
+        (mov :t0 :s0) (imm :add :t0 672) (branch :always :ls.sha256/return))))
+
+(defn- finish [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mark :ls.sha256/bad) (li :t0 0) (mark :ls.sha256/return)
+      (simple :restore-lr) (unary :pop :s4) (unary :pop :s3)
+      (unary :pop :s2) (unary :pop :s1) (unary :pop :s0)
+      (mov :ret :t0) (simple :ret)))
+
+(defn- round-constant [index :i64] :i64
+  (case index
+    0 0x428a2f98 1 0x71374491 2 0xb5c0fbcf 3 0xe9b5dba5 4 0x3956c25b 5 0x59f111f1 6 0x923f82a4 7 0xab1c5ed5
+    8 0xd807aa98 9 0x12835b01 10 0x243185be 11 0x550c7dc3 12 0x72be5d74 13 0x80deb1fe 14 0x9bdc06a7 15 0xc19bf174
+    16 0xe49b69c1 17 0xefbe4786 18 0x0fc19dc6 19 0x240ca1cc 20 0x2de92c6f 21 0x4a7484aa 22 0x5cb0a9dc 23 0x76f988da
+    24 0x983e5152 25 0xa831c66d 26 0xb00327c8 27 0xbf597fc7 28 0xc6e00bf3 29 0xd5a79147 30 0x06ca6351 31 0x14292967
+    32 0x27b70a85 33 0x2e1b2138 34 0x4d2c6dfc 35 0x53380d13 36 0x650a7354 37 0x766a0abb 38 0x81c2c92e 39 0x92722c85
+    40 0xa2bfe8a1 41 0xa81a664b 42 0xc24b8b70 43 0xc76c51a3 44 0xd192e819 45 0xd6990624 46 0xf40e3585 47 0x106aa070
+    48 0x19a4c116 49 0x1e376c08 50 0x2748774c 51 0x34b0bcb5 52 0x391c0cb3 53 0x4ed8aa4a 54 0x5b9cca4f 55 0x682e6ff3
+    56 0x748f82ee 57 0x78a5636f 58 0x84c87814 59 0x8cc70208 60 0x90befffa 61 0xa4506ceb 62 0xbef9a3f7 63 0xc67178f2 0))
+
+(defn- constants [out [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [bytes (loop [index 0 data (vector-alloc 0)]
+                (if (= index 64) data
+                  (recur (+ index 1)
+                    (loop [byte 0 bits (round-constant index) current data]
+                      (if (= byte 8) current
+                        (recur (+ byte 1) (u64-shift-right bits 8) (vector-conj current (bit-and bits 255))))))))
+        aligned (mark (append out :align :none :none :none :none :none 16 :none) :ls.sha256/constants)]
+    (typed-list-conj [:list [:ref :linux.static/instruction]] aligned
+      (asm/instruction :bytes :none :none :none :none :none 0 :none bytes))))
+
+(defn routine [] [:list [:ref :linux.static/instruction]]
+  (let [entry (initialize (preflight (typed-list-new [:list [:ref :linux.static/instruction]])))
+        block (working-state (extend-words (prepare-words (message-block entry))))
+        rounds (accumulate (shift-working (round-t2 (round-t1 block))))]
+    (constants (finish (hex-digest (raw-digest rounds))))))

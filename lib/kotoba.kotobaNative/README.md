@@ -30,6 +30,45 @@ checkable from outside.
 
 ## Native is not an effect provider
 
+The canonical Kotoba port of the complete Linux-static register-IR assembler
+is a source candidate at `src/kotoba/native/linux_static_assembler.kotoba`.
+It includes both ISAs and all 29 existing operations. The companion
+`linux_static_plan.kotoba` ports the complete planning and region-layout
+boundary; see [its contract and dependencies](docs/linux-static-plan-port.md).
+`linux_static_sha256.kotoba` adds the private SHA-256 computation IR needed
+by the seal-verifier closure; [capability binding remains open](docs/linux-static-sha256-port.md).
+`linux_static_strings.kotoba` ports all seven existing pair/string slots,
+including handle windows, UTF-8 and allocation semantics;
+see [the runtime source contract](docs/linux-static-strings-port.md).
+`linux_static_capability.kotoba` adds the C1/C3 call gate, request/result
+handle boundary and hash-to-pool binding as a [source candidate](docs/linux-static-capability-port.md).
+Its companion `linux_static_io.kotoba` supplies the seven I/O, argument,
+environment, clock and entropy handlers plus common capability startup;
+see [the handler source contract](docs/linux-static-io-port.md).
+`linux_static_paths.kotoba` supplies scope startup, path normalization,
+dual root-spelling admission and rooted openat2/parent fragments;
+see [the path source contract](docs/linux-static-paths-port.md).
+`linux_static_browse.kotoba` supplies the complete directory-listing handler,
+including record bounds, sorting and pool ownership;
+see [the browse source contract](docs/linux-static-browse-port.md).
+`linux_static_filesystem.kotoba` supplies all sixteen fs/app-data forms,
+including range/append, metadata, rooted mutations, sync and temporary directories;
+see [the filesystem source contract](docs/linux-static-filesystem-port.md).
+`linux_static_spawn.kotoba` supplies the complete process/spawn handler,
+including sealed program/env selection, child setup, deadlines and capture;
+see [the process source contract](docs/linux-static-spawn-port.md).
+`linux_static_prelude.kotoba` composes startup, signal/trap handling, guest
+return printing and admitted slots; `linux_static_context.kotoba` builds the
+initialized context page from actual assembled bindings. See the
+[prelude and context source contract](docs/linux-static-prelude-port.md).
+`linux_static.kotoba` connects the complete sealed decision placement,
+two-pass prelude/guest composition, initialized context and owning ELF64
+framing; see [the complete image source contract](docs/linux-static-image-port.md).
+The owning [artifact pin review](docs/linux-static-artifact-pin.md) selects
+artifact main's canonical core and records the remaining root pin/lock work.
+Native admission, byte parity, reviewed owning pins and selfhost
+qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
+
 The production direction is one-way:
 
 ```text
