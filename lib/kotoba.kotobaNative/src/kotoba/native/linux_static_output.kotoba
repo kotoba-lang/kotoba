@@ -1,0 +1,251 @@
+;; Owned output staging lifecycle. Only managed FS2 creation arms this registry.
+;; Leaf native routines: no allocation, guest callback, fuel or C1 re-entry.
+(ns kotoba.native.linux-static-output
+  {:kotoba/export [routine]}
+  (:require [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io])
+  (:schemas
+   {:linux.static.output/config [:record :linux.static.output/config
+      [[:isa :keyword] [:data :i64] [:space :i64] [:path :i64] [:name :i64]]]
+    :linux.static.output/result [:record :linux.static.output/result
+      [[:code [:list [:ref :linux.static/instruction]]] [:error :keyword]]]}))
+
+(defn- empty-code [] [:list [:ref :linux.static/instruction]] (typed-list-new [:list [:ref :linux.static/instruction]]))
+(defn- ins [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out (asm/instruction op aux d s b i n target (vector-alloc 0))))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword] [:list [:ref :linux.static/instruction]]
+  (ins out :label :none :none :none :none :none 0 label))
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64] [:list [:ref :linux.static/instruction]]
+  (ins out :li :none d :none :none :none n :none))
+(defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword] [:list [:ref :linux.static/instruction]]
+  (ins out :mov :none d s :none :none 0 :none))
+(defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword n :i64] [:list [:ref :linux.static/instruction]]
+  (ins out op :none d :none b :none n :none))
+(defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword] [:list [:ref :linux.static/instruction]]
+  (mem out :ld d :s0 (io/state-offset key)))
+(defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword] [:list [:ref :linux.static/instruction]]
+  (mem out :st d :s0 (io/state-offset key)))
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword i :keyword] [:list [:ref :linux.static/instruction]]
+  (ins out op :none d :none b i 0 :none))
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword] [:list [:ref :linux.static/instruction]]
+  (ins out :alu op d s :none :none 0 :none))
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64] [:list [:ref :linux.static/instruction]]
+  (ins out :alui op d :none :none :none n :none))
+(defn- branch [out [:list [:ref :linux.static/instruction]] cond :keyword target :keyword] [:list [:ref :linux.static/instruction]]
+  (ins out (if (= cond :always) :b :bcc) cond :none :none :none :none 0 target))
+(defn- tag [prefix :string suffix :string] :keyword (keyword-from-string (string-concat "ls.output/" (string-concat prefix suffix))))
+(defn- sys [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config] call :keyword
+            a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand] c [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/syscall-fragment out (record-get [:ref :linux.static.output/config] cfg :isa) call a b c (io/literal 0) (io/literal 0)))
+(defn- begin [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config] label :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (ins :align :none :none :none :none :none 16 :none) (mark label)
+      (ins :push :none :s0 :none :none :none 0 :none) (ins :push :none :s1 :none :none :none 0 :none)
+      (ins :push :none :s2 :none :none :none 0 :none) (ins :push :none :s3 :none :none :none 0 :none)
+      (ins :push :none :s4 :none :none :none 0 :none) (ins :push :none :ctx :none :none :none 0 :none)
+      (li :s0 (record-get [:ref :linux.static.output/config] cfg :data))))
+(defn- end [out [:list [:ref :linux.static/instruction]]] [:list [:ref :linux.static/instruction]]
+  (-> out (ins :pop :none :ctx :none :none :none 0 :none) (ins :pop :none :s4 :none :none :none 0 :none)
+      (ins :pop :none :s3 :none :none :none 0 :none) (ins :pop :none :s2 :none :none :none 0 :none)
+      (ins :pop :none :s1 :none :none :none 0 :none) (ins :pop :none :s0 :none :none :none 0 :none)
+      (mov :ret :a1) (ins :ret :none :none :none :none :none 0 :none)))
+(defn- copy [out [:list [:ref :linux.static/instruction]] prefix :string dst :keyword src :keyword size :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :t0 0) (mark (tag prefix "-copy")) (alu :cmp :t0 size) (branch :hs (tag prefix "-copied"))
+      (byte-op :ldb :t1 src :t0) (byte-op :stb :t1 dst :t0) (imm :add :t0 1)
+      (branch :always (tag prefix "-copy")) (mark (tag prefix "-copied"))))
+
+;; out-space layout: full path[4096], basename[64], owned stat[256],
+;; named stat[256], generated member[64]. Remaining 384 bytes stay reserved.
+(defn- prepare [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [space (record-get [:ref :linux.static.output/config] cfg :space)
+        start (-> (begin out cfg :ls.output/prepare) (load :t0 :out-active)
+                  (imm :cmp :t0 1) (branch :hi :ls.output/prepare-invalid)
+                  (load :t0 :m-dfd) (store :t0 :out-parent)
+                  (li :t0 1) (store :t0 :out-active)
+                  (li :t0 -1) (store :t0 :out-directory) (store :t0 :out-file) (store :t0 :out-probe)
+                  (li :t0 0) (store :t0 :out-count)
+                  (li :s1 (record-get [:ref :linux.static.output/config] cfg :path)) (load :s2 :len-a)
+                  (imm :cmp :s2 1) (branch :lt :ls.output/prepare-invalid)
+                  (imm :cmp :s2 4095) (branch :hi :ls.output/prepare-invalid)
+                  (load :t0 :x1) (imm :cmp :t0 1) (branch :lt :ls.output/prepare-invalid)
+                  (imm :cmp :t0 63) (branch :hi :ls.output/prepare-invalid)
+                  (mov :t1 :s2) (imm :cmp :s2 1) (branch :eq :ls.output/prepare-length)
+                  (imm :add :t1 1) (mark :ls.output/prepare-length) (alu :add :t1 :t0)
+                  (imm :cmp :t1 4095) (branch :hi :ls.output/prepare-invalid)
+                  (li :s3 space))
+        parent (-> (copy start "prepare-parent" :s3 :s1 :s2)
+                   (imm :cmp :s2 1) (branch :eq :ls.output/prepare-root)
+                   (li :t0 47) (byte-op :stb :t0 :s3 :s2) (imm :add :s2 1)
+                   (mark :ls.output/prepare-root) (store :s2 :out-path-length)
+                   (mov :s4 :s3) (alu :add :s4 :s2)
+                   (li :s1 (record-get [:ref :linux.static.output/config] cfg :name)) (load :s2 :x1))
+        full (-> (copy parent "prepare-full" :s4 :s1 :s2) (li :t0 0) (byte-op :stb :t0 :s4 :s2)
+                 (load :t0 :out-path-length) (alu :add :t0 :s2) (store :t0 :out-path-length)
+                 (store :s2 :out-name-length) (li :s3 (+ space 4096)))]
+    (end (-> (copy full "prepare-name" :s3 :s1 :s2) (li :t0 0) (byte-op :stb :t0 :s3 :s2)
+             (li :a1 1) (branch :always :ls.output/prepare-return)
+             (mark :ls.output/prepare-invalid) (li :a1 0) (mark :ls.output/prepare-return)))))
+
+(defn- capture [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [isa (record-get [:ref :linux.static.output/config] cfg :isa)
+        flags (+ 524288 (if (= isa :x86_64) 196608 49152))
+        opened (sys (begin out cfg :ls.output/capture) cfg :openat (io/state-field :out-parent)
+                 (io/literal (+ (record-get [:ref :linux.static.output/config] cfg :space) 4096)) (io/literal flags))]
+    (end (-> opened (mov :a1 :t0) (imm :cmp :t0 0) (branch :lt :ls.output/capture-done)
+             (store :t0 :out-directory) (li :t0 3) (store :t0 :out-active) (li :a1 1)
+             (mark :ls.output/capture-done)))))
+
+;; Generate canonical <index>.tmp NUL in the fixed 64-byte private buffer.
+;; Input t1>=0; result s1 pointer, s2 byte length. No callbacks or allocations.
+(defn- member-name [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config] prefix :string]
+  [:list [:ref :linux.static/instruction]]
+  (let [end (+ (record-get [:ref :linux.static.output/config] cfg :space) 4735)
+        suffix (-> out (li :s1 (- end 4)) (li :t0 0) (li :t2 46) (byte-op :stb :t2 :s1 :t0)
+                   (li :t0 1) (li :t2 116) (byte-op :stb :t2 :s1 :t0)
+                   (li :t0 2) (li :t2 109) (byte-op :stb :t2 :s1 :t0)
+                   (li :t0 3) (li :t2 112) (byte-op :stb :t2 :s1 :t0)
+                   (li :t0 4) (li :t2 0) (byte-op :stb :t2 :s1 :t0)
+                   (mark (tag prefix "-digit")) (ins :udiv10 :none :t1 :t1 :t3 :none 0 :none)
+                   (imm :add :t3 48) (imm :sub :s1 1) (li :t0 0) (byte-op :stb :t3 :s1 :t0)
+                   (imm :cmp :t1 0) (branch :ne (tag prefix "-digit")))]
+    (-> suffix (li :s2 end) (alu :sub :s2 :s1))))
+
+(defn- member [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [space (record-get [:ref :linux.static.output/config] cfg :space)
+        start (-> (begin out cfg :ls.output/member-open) (load :t0 :out-active)
+                  (imm :cmp :t0 3) (branch :ne :ls.output/member-invalid)
+                  (load :t1 :out-count) (imm :cmp :t1 0) (branch :lt :ls.output/member-invalid)
+                  (li :t0 9223372036854775807) (alu :cmp :t1 :t0) (branch :hs :ls.output/member-invalid))
+        name (-> (member-name start cfg "member") (load :t0 :out-path-length)
+                 (imm :add :t0 1) (alu :add :t0 :s2) (load :t1 :len-a)
+                 (alu :cmp :t0 :t1) (branch :ne :ls.output/member-invalid)
+                 (li :s3 (record-get [:ref :linux.static.output/config] cfg :path))
+                 (li :s4 space) (li :t0 0) (mark :ls.output/member-parent)
+                 (load :t1 :out-path-length) (alu :cmp :t0 :t1) (branch :hs :ls.output/member-slash)
+                 (byte-op :ldb :t1 :s3 :t0) (byte-op :ldb :t2 :s4 :t0) (alu :cmp :t1 :t2)
+                 (branch :ne :ls.output/member-invalid) (imm :add :t0 1) (branch :always :ls.output/member-parent)
+                 (mark :ls.output/member-slash) (byte-op :ldb :t1 :s3 :t0)
+                 (imm :cmp :t1 47) (branch :ne :ls.output/member-invalid)
+                 (imm :add :t0 1) (alu :add :s3 :t0) (li :t0 0) (mark :ls.output/member-name)
+                 (alu :cmp :t0 :s2) (branch :hs :ls.output/member-checked)
+                 (byte-op :ldb :t1 :s3 :t0) (byte-op :ldb :t2 :s1 :t0) (alu :cmp :t1 :t2)
+                 (branch :ne :ls.output/member-invalid) (imm :add :t0 1) (branch :always :ls.output/member-name)
+                 (mark :ls.output/member-checked))
+        ;; openat's four operands: add mode through the general syscall helper.
+        opened (io/syscall-fragment name (record-get [:ref :linux.static.output/config] cfg :isa) :openat
+                 (io/state-field :out-directory) (io/register :s1)
+                 (io/literal (+ 524288 (if (= (record-get [:ref :linux.static.output/config] cfg :isa) :x86_64) 131072 32768) 193))
+                 (io/literal 384) (io/literal 0))
+        owned (-> opened (mov :a1 :t0) (imm :cmp :t0 0) (branch :lt :ls.output/member-done)
+                  ;; Journal before any sealed policy/result conversion can trap.
+                  (store :t0 :out-file) (load :t1 :out-count) (imm :add :t1 1) (store :t1 :out-count)
+                  (branch :always :ls.output/member-done)
+                  (mark :ls.output/member-invalid) (li :a1 -22) (mark :ls.output/member-done))]
+    (end owned)))
+
+(defn- same-path [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (end (-> (begin out cfg :ls.output/same-path) (load :t0 :out-active)
+           (imm :cmp :t0 0) (branch :eq :ls.output/path-mismatch)
+           (load :s2 :out-path-length) (load :t0 :len-a) (alu :cmp :s2 :t0)
+           (branch :ne :ls.output/path-mismatch)
+           (li :s1 (record-get [:ref :linux.static.output/config] cfg :path))
+           (li :s3 (record-get [:ref :linux.static.output/config] cfg :space))
+           (li :t0 0) (mark :ls.output/path-next) (alu :cmp :t0 :s2)
+           (branch :hs :ls.output/path-match) (byte-op :ldb :t1 :s1 :t0) (byte-op :ldb :t2 :s3 :t0)
+           (alu :cmp :t1 :t2) (branch :ne :ls.output/path-mismatch)
+           (imm :add :t0 1) (branch :always :ls.output/path-next)
+           (mark :ls.output/path-match) (li :a1 1) (branch :always :ls.output/path-return)
+           (mark :ls.output/path-mismatch) (li :a1 0) (mark :ls.output/path-return))))
+
+;; Linux consumes a close descriptor even when it reports an I/O error or EINTR.
+;; Consume the journal first; neither a later cleanup nor an error path retries it.
+(defn- close-owned [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]
+                    field :keyword prefix :string]
+  [:list [:ref :linux.static/instruction]]
+  (let [ready (-> out (load :t0 field) (imm :cmp :t0 0) (branch :lt (tag prefix "-closed"))
+                  (mov :s4 :t0) (li :t0 -1) (store :t0 field))
+        closed (sys ready cfg :close (io/register :s4) (io/literal 0) (io/literal 0))]
+    (-> closed (imm :cmp :t0 0) (branch :eq (tag prefix "-closed"))
+        (li :t0 1) (store :t0 :out-failed) (mark (tag prefix "-closed")))))
+
+(defn- cleanup [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [space (record-get [:ref :linux.static.output/config] cfg :space)
+        start (-> (begin out cfg :ls.output/cleanup) (load :t0 :out-cleaning)
+                  (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-recursive)
+                  (li :t0 1) (store :t0 :out-cleaning) (li :t0 0) (store :t0 :out-failed)
+                  (load :t0 :out-active) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-success)
+                  (imm :cmp :t0 1) (branch :eq :ls.output/cleanup-release)
+                  (imm :cmp :t0 3) (branch :ne :ls.output/cleanup-incomplete))
+        closed (close-owned start cfg :out-file "cleanup-file")
+        entries (-> closed (li :t0 0) (store :t0 :out-index)
+                    (mark :ls.output/cleanup-next) (load :t0 :out-index) (load :t1 :out-count)
+                    (alu :cmp :t0 :t1) (branch :hs :ls.output/cleanup-directory) (mov :t1 :t0))
+        removed (sys (member-name entries cfg "cleanup") cfg :unlinkat
+                  (io/state-field :out-directory) (io/register :s1) (io/literal 0))
+        next (-> removed (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-advance)
+                 (imm :cmp :t0 -2) (branch :eq :ls.output/cleanup-advance)
+                 (li :t0 1) (store :t0 :out-failed) (mark :ls.output/cleanup-advance)
+                 (load :t0 :out-index) (imm :add :t0 1) (store :t0 :out-index)
+                 (branch :always :ls.output/cleanup-next) (mark :ls.output/cleanup-directory))
+        probe (sys next cfg :openat (io/state-field :out-parent) (io/literal (+ space 4096))
+                (io/literal (+ 2621440 (if (= (record-get [:ref :linux.static.output/config] cfg :isa) :x86_64) 196608 49152))))
+        probe-fd (-> probe (imm :cmp :t0 0) (branch :lt :ls.output/cleanup-incomplete) (store :t0 :out-probe))
+        own-stat (sys probe-fd cfg :fstat (io/state-field :out-directory) (io/literal (+ space 4160)) (io/literal 0))
+        other-stat (sys (-> own-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-incomplete)) cfg
+                     :fstat (io/state-field :out-probe) (io/literal (+ space 4416)) (io/literal 0))
+        identity (-> other-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-incomplete)
+                     (li :s1 (+ space 4160)) (li :s2 (+ space 4416))
+                     (mem :ld :t0 :s1 0) (mem :ld :t1 :s2 0) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-incomplete)
+                     (mem :ld :t0 :s1 8) (mem :ld :t1 :s2 8) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-incomplete))
+        rmdir (sys identity cfg :unlinkat (io/state-field :out-parent) (io/literal (+ space 4096)) (io/literal 512))
+        result (-> rmdir (store :t0 :out-rmdir) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-release)
+                   (mark :ls.output/cleanup-incomplete) (li :t0 1) (store :t0 :out-failed)
+                   (mark :ls.output/cleanup-release))
+        ;; Every owned descriptor is released even when probe/stat/unlink fails.
+        ;; The second file guard is a no-op after the phase-3 close above.
+        released (-> result (close-owned cfg :out-file "cleanup-final-file")
+                     (close-owned cfg :out-probe "cleanup-probe")
+                     (close-owned cfg :out-directory "cleanup-directory")
+                     (close-owned cfg :out-parent "cleanup-parent"))
+        reset (-> released (load :t0 :out-failed) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-reset)
+                  ;; Phase 4 is poisoned: no new output set can hide this failure.
+                  ;; A later cleanup still reports failure, without reusing FDs.
+                  (li :t0 4) (store :t0 :out-active) (li :a1 0) (branch :always :ls.output/cleanup-done)
+                  (mark :ls.output/cleanup-reset) (li :t0 0) (store :t0 :out-active))]
+    (end (-> reset
+             (mark :ls.output/cleanup-success) (li :a1 1) (mark :ls.output/cleanup-done)
+             (li :t0 0) (store :t0 :out-cleaning) (branch :always :ls.output/cleanup-return)
+             (mark :ls.output/cleanup-recursive) (li :a1 0) (mark :ls.output/cleanup-return)))))
+
+(defn- lookup [m :document key :keyword] :i64
+  (if (not= (document-kind m) :map) -1
+    (loop [index 0]
+      (if (= index (document-count m)) -1
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))]
+          (if (document-equal? (option-value-of [:option :document] (document-vector-at pair 0) (document-null)) (document-keyword key))
+            (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at pair 1) (document-null))) -1)
+            (recur (+ index 1))))))))
+(defn routine [isa :keyword layout :document] [:ref :linux.static.output/result]
+  (let [data (lookup layout :data) space (lookup layout :output-control) path (lookup layout :buf-b) name (lookup layout :buf-c)
+        memory (lookup layout :memory-size)]
+    (if (or (not (or (= isa :x86_64) (= isa :aarch64))) (<= data 0) (< memory 5120)
+            (not= (bit-and data 4095) 0) (> memory (- 9223372036854775807 data))
+            (< space (+ data 4096)) (> space (- (+ data memory) 5120)) (not= (bit-and space 15) 0)
+            (< path (+ data 4096)) (> path (- (+ data memory) 4096))
+            (< name (+ data 4096)) (> name (- (+ data memory) 4096))
+            (not= (bit-and path 15) 0) (not= (bit-and name 15) 0)
+            (and (< space (+ path 4096)) (< path (+ space 5120)))
+            (and (< space (+ name 4096)) (< name (+ space 5120)))
+            (and (< path (+ name 4096)) (< name (+ path 4096))))
+      (record-new [:ref :linux.static.output/result] (empty-code) :output-layout)
+      (let [cfg (record-new [:ref :linux.static.output/config] isa data space path name)]
+        (record-new [:ref :linux.static.output/result]
+          (-> (empty-code) (prepare cfg) (capture cfg) (member cfg) (same-path cfg) (cleanup cfg)) :ok)))))

@@ -7,6 +7,17 @@ mechanism lives in amu's loader (`tools/kexe_gpu_vulkan.c`, supervisor side);
 every decision — which kernel, which shape, how many dispatches per command
 buffer — is in the `.kotoba` file.
 
+**Status, 2026-10-24 (JUN-375; amu ADR 0374, option D).** The run commands in
+this file are history: amu #1459 removed `kexe_loader.c`, and the owner chose
+GPU execution through Amu selfhost and Kotoba. That route is Amu's work (a
+Kotoba Vulkan loader, a native kernel driver, or browser WebGPU). Until it
+exists, nothing here runs on a GPU. The kernels stay inference's to choose, by
+name, in the layout table. 89 of the names now come from Amu's KIR v2 modules
+instead of their glslang builds: the kdot family, the nex ops and their batch
+twins, deltanet, embed, `attn_copy_dense` and `dot_rows`. They are pinned by
+SHA-256 in [`kir2/artifacts.edn`](kir2/artifacts.edn) and staged by a native
+Kotoba gate. See [`kir2/README.md`](kir2/README.md).
+
 | file | what |
 |---|---|
 | `probe.kotoba` | `INFO` → `<device>\|<api>\|<maxWgX>\|<unified>` |
