@@ -44,6 +44,35 @@ job must not mark these acceptance criteria Done. Legacy JVM/JS lint, Q9,
 runtime-values, SDK packaging, library and package admission jobs no longer
 run in CI; preserve their fixtures while porting their checks to native code.
 
+## Local reference oracle (owner decisions 2026-10-29 to 2026-11-07, JUN-579 / JUN-588)
+
+The CDCI rule above is unchanged for prerequisites and fallbacks. A reference
+oracle is a separate thing: it produces reference values (KIR, Definition
+CIDs, outputs) when porting a construct or checking cljk/edn-sugar against pure
+`.kotoba`. It is not proof that the native result is correct; a mismatch is
+reported, not forced to agree.
+
+- Oracle languages: nbb, JVM, C, Python, Basilisp, jank and Fennel, plus every
+  language that supports `.cljc` (Clojure, ClojureScript, ClojureCLR, Babashka,
+  Squint, Cherry, ClojureDart, Clojerl, Lokke, Phel and others). Hy was replaced
+  by Basilisp on 2026-11-07. The candidate table is unverified; see
+  `docs/oracle-cljc-dialects-20261107.md` in kotoba-lang/kotoba-lang, and
+  confirm tool version, feature key and `.cljc` handling at first use.
+- Record the exact command, tool versions, inputs and outputs as dated data.
+- CI exception: JVM, nbb and Babashka may run in CI as separate oracle jobs,
+  named and reported as oracle. Native build, gates, packaging and runtime do
+  not depend on them, nothing falls back to them, and an oracle job is not a
+  required check until the owner decides. Any other CI use of them stays banned
+  (JUN-290). The other oracle languages run on a developer machine, one-off.
+- CLJK stays as a reference oracle source and is treated as CLJC-equivalent
+  for oracle runs: `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
+  read, and an oracle is handed the source as `.cljc`. The route stays
+  `.kotoba`; native input rules are unchanged and native `.cljc` acceptance is
+  not pursued. Where the code disagrees, the code is the state and the
+  disagreement is reported.
+- Before a selfhost refactor of a cljk component, take its reference values
+  first from the JVM and node (nbb) oracles.
+
 ## AIUEOS UEFI image gate (JUN-709)
 
 Owner decision 2026-11-01: the AIUEOS image CI job lives in this repository.
