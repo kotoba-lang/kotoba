@@ -23,7 +23,9 @@ python3 oracle/cljc/materialize.py --rev origin/main --out "$OUT"
 ```
 
 Add `--lib kotoba.coll` (repeatable) to limit the libraries, and `--with-tests` to include
-test roots. `--no-rewrite` is the negative control.
+test roots. `--no-rewrite` is the negative control. Add `--also PATH@REV` (repeatable) for a
+namespace another repository owns, such as `kotobase.store`; each input keeps its owner, and the
+manifest records every commit.
 
 ```bash
 java -cp "$(cat "$OUT/classpath.txt"):$CLOJURE_JAR_PATHS" clojure.main \
@@ -32,7 +34,7 @@ java -cp "$(cat "$OUT/classpath.txt"):$CLOJURE_JAR_PATHS" clojure.main \
 
 ## What it rewrites
 
-Three source forms are valid for the Kotoba reader or nbb but not for hosted Clojure. The
+Four source forms are valid for the Kotoba reader or nbb but not for hosted Clojure. The
 rewrites apply to the output only, and the manifest counts them per file.
 
 | Source | Output | Why |
@@ -40,8 +42,9 @@ rewrites apply to the output only, and the manifest counts them per file.
 | `:kotoba/export [a b]` | `:kotoba/export '[a b]` | The JVM `ns` macro evaluates its metadata |
 | `(catch :default e)` | `(catch #?(:clj Throwable :default :default) e)` | The JVM reads `:default` as a class |
 | `(catch err/ExceptionInfo e)`, `(thrown? err/ExceptionInfo …)` | The class on the JVM, `:default` elsewhere | `kotoba.lang.error/ExceptionInfo` is a var |
+| Top-level `#?(:kotoba A :default (do B C))` | The forms `B C` | nbb's SCI analyzes a top-level `do` as one form, so C cannot see a var that B defines |
 
-The last one is wider than its source on a JS host, where it also catches other throwables.
+The `ExceptionInfo` rewrite is wider than its source on a JS host, where it also catches other throwables.
 
 ## Limits
 
