@@ -70,6 +70,10 @@ reported, not forced to agree.
   `.kotoba`; native input rules are unchanged and native `.cljc` acceptance is
   not pursued. Where the code disagrees, the code is the state and the
   disagreement is reported.
+- Policy and plan: ADR `adr-2611071200-cljk-oracle-cljc-standard` (com-junkawasaki/root `90-docs/adr/`), tracked in
+  Linear JUN-579 and JUN-967 to JUN-973. cljk sources follow standard cljc; cljc itself is not customised. Moving
+  the `:kotoba/*` namespace attribute-map keys to a quoted spelling (JUN-967 to JUN-969) is a plan, not yet
+  implemented; until then a JVM run stops on `{:kotoba/export [...]}`.
 - Before a selfhost refactor of a cljk component, take its reference values
   first from the JVM and node (nbb) oracles.
 
