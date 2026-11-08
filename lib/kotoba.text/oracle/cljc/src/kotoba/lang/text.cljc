@@ -3,10 +3,21 @@
   every other lib re-rolls (json/lint/time hand-roll string ops). Pure string
   ops are portable; regex uses the host's #\"...\". `format` is a pure printf
   impl with flags/width/precision (no String/format — WASM-safe), varargs like
-  clojure.core/format, which is JVM-only. Runs on JVM/SCI/CLJS/GraalVM/kotoba-WASM.
+  clojure.core/format, which is JVM-only. Runs on JVM/SCI/CLJS/GraalVM/kotoba-WASM
+  and Basilisp (:lpy).
 
-  Zero third-party runtime deps; .cljc."
-  {:kotoba/export '[ascii-lower blank-text? blank? capitalize codepoints ends-with? escape format from-codepoints includes? index-of index-of-text join last-index-of last-index-of-text lower pad-center-text pad-left pad-left-text pad-right pad-right-text re-find re-matches re-quote re-seq repeat-text replace replace-first replace-first-text reverse reverse-text segment-count-text segment-text split split-lines starts-with? trim trim-newline trim-newline-text trim-text triml triml-text trimr trimr-text truncate upper]}
+  Zero third-party runtime deps; .cljc.
+
+  Oracle file (JUN-1019): a .cljc twin of lib/kotoba.text's text.cljk for hosts
+  that cannot read .cljk (stock nbb, Basilisp). Ported from the live monorepo
+  lib (the standalone kotoba-lang/text repo is archived);
+  every :clj/:cljs reader branch below carries a :lpy branch with the same
+  values. `fixed` uses the portable loop form (no Math/*); `starts-with?`,
+  `ends-with?`, `includes?`, `index-of` and `last-index-of` use portable loops
+  with identical values; `fmt-one` pads with \"0\"/\" \" strings. The
+  {:kotoba/export [...]} ns metadata of the .cljk is intentionally absent
+  here: Basilisp rejects unknown ns metadata keys at load. Never a build,
+  gate, runtime or fallback input — one-off measurement oracle only."
   (:refer-clojure :exclude [format split join replace re-find re-matches re-seq
                             reverse]))
 
@@ -80,7 +91,19 @@
                  (set! (.-lastIndex g) (inc start)))
                (recur (conj acc {:start  start
                                  :end    end
-                                 :groups (mapv #(aget m %) (range (.-length m)))})))))))))
+                                 :groups (mapv #(aget m %) (range (.-length m)))})))))))
+     :lpy
+     ;; Python finditer already advances past zero-width matches, so no
+     ;; lastIndex bookkeeping is needed; groups arrive as a tuple with None
+     ;; for non-participating groups, which reads as nil.
+     (loop [acc [] ms (iterator-seq (.finditer re s))]
+       (if-let [m (first ms)]
+         (recur (conj acc {:start  (.start m)
+                           :end    (.end m)
+                           :groups (into [(.group m 0)]
+                                         (vec (.groups m)))})
+                (next ms))
+         acc))))
 
 ;; ---------- split / join ----------
 
@@ -90,13 +113,19 @@
   ([coll] (apply str coll))
   ([sep coll] (apply str (interpose sep coll))))
 
+;; A separator may be written as a plain STRING, meaning that exact text (not a
+;; pattern). This is what lets one call site run on the JVM/nbb host and on the
+;; guest route, where a `#"..."` literal is a reader rejection: the guest twin
+;; (`kotoba-lang/kotoba-lang` lang/compat/kotoba/lang/text.kotoba) takes only a
+;; string separator.
 (declare re-quote)
 
 (defn- literal-or-pattern [separator]
   (if (string? separator) (re-pattern (re-quote separator)) separator))
 
 (defn split
-  "Split `s` on regex `re`, returning a vector of substrings.
+  "Split `s` on regex `re`,
+  returning a vector of substrings.
 
   `java.util.regex.Pattern/split` semantics, reimplemented rather than
   delegated:
@@ -153,7 +182,7 @@
   Java does not consider them whitespace, JavaScript's `\\s` does, and this
   namespace answers the same on both hosts by choosing Java's."
   [ch]
-  (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0))]
+  (let [c #?(:clj (int ch) :cljs (.charCodeAt (str ch) 0) :lpy (ord ch))]
     (or (<= 9 c 13)
         (<= 28 c 31)
         (= c 32)
@@ -204,11 +233,11 @@
 (defn upper
   "Upper-case `s` using the host's default locale, like
   `clojure.string/upper-case`."
-  [s] #?(:clj (.toUpperCase ^String (str s)) :cljs (.toUpperCase (str s))))
+  [s] #?(:clj (.toUpperCase ^String (str s)) :cljs (.toUpperCase (str s)) :lpy (.upper (str s))))
 
 (defn lower
   "Lower-case `s` using the host's default locale."
-  [s] #?(:clj (.toLowerCase ^String (str s)) :cljs (.toLowerCase (str s))))
+  [s] #?(:clj (.toLowerCase ^String (str s)) :cljs (.toLowerCase (str s)) :lpy (.lower (str s))))
 
 (defn capitalize
   "Upper-case the first character of `s` and lower-case the rest."
@@ -220,17 +249,31 @@
 
 ;; ---------- predicates ----------
 
-(defn starts-with? [s prefix]
-  #?(:clj  (.startsWith ^String (str s) ^String (str prefix))
-     :cljs (.startsWith (str s) (str prefix))))
+(defn starts-with?
+  "True when `s` starts with `prefix`. Portable loop; same values as the host
+  methods on every runner."
+  [s prefix]
+  (let [s (str s) p (str prefix) n (count p)]
+    (and (<= n (count s)) (= p (subs s 0 n)))))
 
-(defn ends-with? [s suffix]
-  #?(:clj  (.endsWith ^String (str s) ^String (str suffix))
-     :cljs (.endsWith (str s) (str suffix))))
+(defn ends-with?
+  "True when `s` ends with `suffix`. Portable loop; same values as the host
+  methods on every runner."
+  [s suffix]
+  (let [s (str s) p (str suffix) n (count p) m (count s)]
+    (and (<= n m) (= p (subs s (- m n))))))
 
-(defn includes? [s sub]
-  #?(:clj  (.contains ^String (str s) ^CharSequence (str sub))
-     :cljs (not= -1 (.indexOf (str s) (str sub)))))
+(defn includes?
+  "True when `s` contains `sub`. Portable loop; same values as the host
+  methods on every runner."
+  [s sub]
+  (let [s (str s) sub (str sub) n (count sub) m (count s)]
+    (if (zero? n)
+      true
+      (loop [i 0]
+        (cond (> (+ i n) m) false
+              (= sub (subs s i (+ i n))) true
+              :else (recur (inc i)))))))
 
 ;; ---------- regex-driven rewriting ----------
 
@@ -260,7 +303,7 @@
         group-count (dec (count groups))
         digit-at    (fn [j]
                       (when (< j n)
-                        (let [c #?(:clj (int (nth t j)) :cljs (.charCodeAt t j))]
+                        (let [c #?(:clj (int (nth t j)) :cljs (.charCodeAt t j) :lpy (ord (nth t j)))]
                           (when (<= 48 c 57) (- c 48)))))]
     (loop [i 0, out []]
       (if (>= i n)
@@ -345,7 +388,8 @@
   [s match replacement] (rewrite s match replacement true))
 
 (defn ascii-lower
-  "Lower-case ASCII A-Z only, preserving every non-ASCII character."
+  "Lower-case ASCII A-Z only, preserving every non-ASCII character. Pure
+  (replace/subs/range over ASCII); identical on every runner."
   [s]
   (reduce (fn [value index]
             (replace value
@@ -357,12 +401,12 @@
   "Replace the first match of `match` in `s` with `replacement`."
   [s match replacement] (rewrite s match replacement false))
 
-(defn re-find    [re s] (#?(:clj clojure.core/re-find :cljs cljs.core/re-find) re s))
-(defn re-matches [re s] (#?(:clj clojure.core/re-matches :cljs cljs.core/re-matches) re s))
+(defn re-find    [re s] (#?(:clj clojure.core/re-find :cljs cljs.core/re-find :lpy basilisp.core/re-find) re s))
+(defn re-matches [re s] (#?(:clj clojure.core/re-matches :cljs cljs.core/re-matches :lpy basilisp.core/re-matches) re s))
 (defn re-seq
   "Return a lazy seq of matches of `re` in `s`. Returns nil if no match."
   [re s]
-  (#?(:clj clojure.core/re-seq :cljs cljs.core/re-seq) re s))
+  (#?(:clj clojure.core/re-seq :cljs cljs.core/re-seq :lpy basilisp.core/re-seq) re s))
 
 ;; ---------- format (pure printf: flags, width, precision) ----------
 ;;
@@ -393,26 +437,27 @@
 (defn- fixed
   "Round `x` to `prec` decimal places without String/format or goog. Uses
   integer arithmetic on the scaled value so the result does not depend on the
-  host's float printing."
+  host's float printing. Portable loop form (no Math/*) so every runner,
+  including Basilisp, shares it."
   [x prec]
   (let [neg? (neg? x)
-        x #?(:kotoba (if neg? (- x) x)
-             :default (if neg? (- (double x)) (double x)))
-        scale #?(:kotoba (loop [remaining prec result 1]
-                           (if (pos? remaining)
-                             (recur (dec remaining) (* result 10))
-                             result))
-                 :default (Math/pow 10 prec))
-        scaled #?(:kotoba (long (+ (* x scale) 0.5))
-                  :default (Math/round (* x scale)))
+        x (if neg? (- (double x)) (double x))
+        scale (loop [index 0 value 1.0]
+                (if (>= index prec)
+                  value
+                  (recur (inc index) (* value 10.0))))
+        scaled (long (+ (* x scale) 0.5))
         i (long (quot scaled scale))
         f (long (- scaled (* i scale)))
         frac (when (pos? prec) (pad (str f) prec false "0"))]
     (str (when neg? "-") i (when frac (str "." frac)))))
 
 (defn- to-hex [n]
+  ;; Negative inputs follow the host long conversion (JVM two's complement);
+  ;; the measured corpus only renders non-negative bytes and hashes.
   #?(:clj (Long/toHexString (long n))
-     :cljs (.toString (long n) 16)))
+     :cljs (.toString (long n) 16)
+     :lpy (python/format (long n) "x")))
 
 (defn- fmt-one [{:keys [flags width prec conv]} arg]
   (let [left? (includes? flags "-")
@@ -426,14 +471,16 @@
                "d" (str (long arg))
                "x" (to-hex arg)
                "X" (upper (to-hex arg))
-               "o" #?(:clj (Long/toOctalString (long arg)) :cljs (.toString (long arg) 8))
+               "o" #?(:clj (Long/toOctalString (long arg)) :cljs (.toString (long arg) 8) :lpy (python/format (long arg) "o"))
                "f" (fixed arg (or prec 6))
                "c" (str (char (if (number? arg) (long arg) arg)))
                "b" (str (boolean arg))
                (str "%" conv))
         body (if (and (includes? flags "+") (#{"d" "f"} conv) (not (starts-with? body "-")))
                (str "+" body) body)]
-    (if width (pad body width left? (if zero? \0 \space)) body)))
+    ;; Fill is a string on every runner (pad accepts chars and strings alike;
+    ;; strings keep the file free of the \0 literal).
+    (if width (pad body width left? (if zero? "0" " ")) body)))
 
 (def ^:private spec-re #"%([-+ 0#]*)(\d+)?(?:\.(\d+))?([a-zA-Z%])")
 
@@ -462,8 +509,8 @@
                   (recur (+ i (count whole)) ai (conj! out \%))
                   (recur (+ i (count whole)) (inc ai)
                          (conj! out (fmt-one {:flags (or flags "")
-                                              :width (when w #?(:clj (Long/parseLong w) :cljs (js/parseInt w)))
-                                              :prec  (when p #?(:clj (Long/parseLong p) :cljs (js/parseInt p)))
+                                              :width (when w #?(:clj (Long/parseLong w) :cljs (js/parseInt w) :lpy (parse-long w)))
+                                              :prec  (when p #?(:clj (Long/parseLong p) :cljs (js/parseInt p) :lpy (parse-long p)))
                                               :conv  conv}
                                              (nth args ai nil))))))
               (recur (inc i) ai (conj! out c)))))))))
@@ -479,13 +526,17 @@
       (if (>= i n)
         (persistent! out)
         (let [c (nth s i)
+              ;; :lpy strings are code-point indexed, so surrogates never
+              ;; appear and the pair branch below never fires there.
               cp #?(:clj  (long c)
-                    :cljs (.charCodeAt c 0))]
+                    :cljs (.charCodeAt c 0)
+                    :lpy (ord c))]
           ;; surrogate pair handling (basic): high surrogate + low surrogate
           (if (and (>= cp 0xD800) (<= cp 0xDBFF) (< (inc i) n))
             (let [c2 (nth s (inc i))
                   cp2 #?(:clj  (long c2)
-                         :cljs (.charCodeAt c2 0))]
+                         :cljs (.charCodeAt c2 0)
+                         :lpy (ord c2))]
               (if (and (>= cp2 0xDC00) (<= cp2 0xDFFF))
                 (let [combined (+ (* (- cp 0xD800) 0x400) (- cp2 0xDC00) 0x10000)]
                   (recur (+ i 2) (conj! out combined)))
@@ -496,17 +547,23 @@
   "Build a string from a seq of codepoint ints. Surrogates are emitted for
   codepoints > 0xFFFF (portable)."
   [cps]
-  (let [f #?(:clj char :cljs js/String.fromCharCode)]
-    (apply str
-           (mapcat (fn [cp]
-                     (if (> cp 0xFFFF)
-                       ;; emit a surrogate pair
-                       (let [cp' (- cp 0x10000)
-                             hi (+ 0xD800 (quot cp' 0x400))
-                             lo (+ 0xDC00 (mod cp' 0x400))]
-                         [(f hi) (f lo)])
-                       [(f cp)]))
-                   cps))))
+  #?(:lpy
+     ;; Python strings hold code points: chr answers the character directly,
+     ;; so splitting astral points into surrogates would be wrong here.
+     (apply str (map chr cps))
+     ;; JVM and JS strings hold UTF-16 units: astral points split in two.
+     :default
+     (let [f #?(:clj char :cljs js/String.fromCharCode)]
+       (apply str
+              (mapcat (fn [cp]
+                        (if (> cp 0xFFFF)
+                          ;; emit a surrogate pair
+                          (let [cp' (- cp 0x10000)
+                                hi (+ 0xD800 (quot cp' 0x400))
+                                lo (+ 0xDC00 (mod cp' 0x400))]
+                            [(f hi) (f lo)])
+                          [(f cp)]))
+                      cps)))))
 
 ;; ---------- padding / truncate ----------
 
@@ -533,24 +590,29 @@
 
 (defn index-of
   "Index of the first occurrence of `value` (string or char) in `s`, from
-  `from-index` if given, or nil if not found."
+  `from-index` if given, or nil if not found. Portable loop; same values as
+  the host indexOf on every runner."
   ([s value] (index-of s value 0))
   ([s value from-index]
-   (let [i #?(:clj  (.indexOf ^String (str s) ^String (str value) (int from-index))
-              :cljs (.indexOf (str s) (str value) from-index))]
-     (when-not (neg? i) i))))
+   ;; A negative from-index searches from 0, as the hosts do.
+   (let [s (str s) v (str value) n (count v) m (count s)]
+     (loop [i (max 0 from-index)]
+       (cond (> (+ i n) m) nil
+             (= v (subs s i (+ i n))) i
+             :else (recur (inc i)))))))
 
 (defn last-index-of
   "Index of the last occurrence of `value` (string or char) in `s`, searching
-  backward from `from-index` if given, or nil if not found."
-  ([s value]
-   (let [i #?(:clj  (.lastIndexOf ^String (str s) ^String (str value))
-              :cljs (.lastIndexOf (str s) (str value)))]
-     (when-not (neg? i) i)))
+  backward from `from-index` if given, or nil if not found. Portable loop;
+  same values as the host lastIndexOf on every runner."
+  ([s value] (last-index-of s value (count (str s))))
   ([s value from-index]
-   (let [i #?(:clj  (.lastIndexOf ^String (str s) ^String (str value) (int from-index))
-              :cljs (.lastIndexOf (str s) (str value) from-index))]
-     (when-not (neg? i) i))))
+   (let [s (str s) v (str value) n (count v)]
+     (when-not (neg? from-index)
+       (loop [i (min from-index (- (count s) n))]
+         (cond (neg? i) nil
+               (= v (subs s i (+ i n))) i
+               :else (recur (dec i))))))))
 
 (defn reverse
   "Reverse `s`, keeping surrogate pairs intact -- an astral character comes

@@ -9,12 +9,21 @@
 # Kotoba rejects .clj/.cljc/.cljs anywhere else (JUN-579), and they are not on
 # any native gate, build, CI or runtime path (AGENTS.md "CDCI").
 #
+# Hand-curated oracle twins are the exception: where the byte mirror cannot
+# load on a measured host, a curated twin takes its place, listed below as
+# "<lib>:<path under oracle/cljc/src>". Curated files are never rewritten
+# and never flagged by --check; their rationale lives in that oracle's
+# README.md (first: kotoba.text, JUN-1044 — nbb prefers the sibling .cljk,
+# Basilisp rejects the mirror's {:kotoba/export} metadata).
+#
 #   scripts/oracle-cljc-mirror.sh          rewrite the mirrors
 #   scripts/oracle-cljc-mirror.sh --check  exit 1 if any mirror is stale or has extra files
 set -eu
 cd "$(dirname "$0")/.."
 
 LIBS="kotoba.text kotoba.css kotoba.jpGoDigitalDesignSystem"
+
+CURATED="kotoba.text:kotoba/lang/text.cljc"
 
 check=${1:-}
 status=0
@@ -30,6 +39,10 @@ for lib in $LIBS; do
     rel=${f#"$src"/}
     dst="$out/${rel%.cljk}.cljc"
     echo "$dst" >>"$tmp/expected"
+    orel=${dst#"$out"/}
+    case " $CURATED " in
+      *" $lib:$orel "*) continue ;;
+    esac
     if [ "$check" = "--check" ]; then
       cmp -s "$f" "$dst" || { echo "STALE $dst" >&2; status=1; }
     else
