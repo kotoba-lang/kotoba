@@ -22,9 +22,10 @@ nbb test/run.cljc
 
 `test/dango/vectors_data.cljc` pins bytes, signatures and CIDs from the `.cljk` reference. A difference is a finding: report it, don't align it.
 
+`test/run.cljc` prints its counts and exits nonzero when anything fails or errors, so a CI job can rely on the exit code directly.
+
 ## Limits
 
 - The portable Ed25519 is not written to be constant-time, so a signer holding a valuable key should use the platform's.
-- Babashka is unverified: the suite hit its time limit with no result. nbb takes about 3 minutes.
-- `test/run.cljc` prints its counts and does not set an exit code, so a CI job must check the `ASSERTIONS` line.
+- Babashka: 89 assertions, fail 0, error 0 (slow: the interpreted Ed25519 math takes about an hour; shape/caveat/chain/vectors all pass). nbb takes about 3 minutes, JVM about 1 minute.
 - No token format stability promise exists beyond these vectors. Revocation storage, per-surface facts and the OS broker are not built.
