@@ -28,7 +28,8 @@ REQUIRED = ("id", "dock", "title", "install", "entry", "core", "localCore",
 OP_REQUIRED = ("operation", "service", "endpoint", "data", "consent", "state")
 WANT = {"murakumo", "itonami", "yataverse", "aozora", "browser", "yotei", "shakai",
         "saifu", "bunsho", "hyokeisan", "zuhyo", "tokei", "wifi", "bluetooth",
-        "settei", "itonami-apps", "updates", "torihiki"}
+        "settei", "itonami-apps", "updates", "torihiki",
+        "sound", "display", "soshiki"}
 
 
 APPS = ROOT / "resources" / "aiueos" / "session" / "apps"
