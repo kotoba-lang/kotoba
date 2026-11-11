@@ -27,7 +27,18 @@ def bytes_function(name,h):
     return f'(defn- {name} [] :vector-i64 (let ['+'\n'.join(bindings)+f'] b{len(parts)}))\n'
 def fixture(case,kind,index):
     name=f'{kind}-{index}';src=HEADER+bytes_function('wire',case['wireHex'])
-    if kind=='negative':
+    if kind=='pack':
+        src=src.replace('[multiformats.cid :as cid]', '[multiformats.cid :as cid] [ipld.car.pack :as pack]')
+        flat=[]
+        for h in case['inputHex']:flat += [len(h)//2]+list(bytes.fromhex(h))
+        bindings=[f'b0 (vector-alloc {len(flat)})']
+        for i in range(0,len(flat),64):
+            k=i//64
+            bindings.append(f'b{k+1} (put-row b{k} {i} (vector-i64 {" ".join(map(str,flat[i:i+64]))}))')
+        src+='(defn- pack-input [] :vector-i64 (let ['+' '.join(bindings)+f'] b{(len(flat)+63)//64}))\n'
+        src+=f"(defn main [] :i64 (let [input (pack-input) e (pack/encode 1 input) c (pack/root-cid 1 input)]\n"
+        src+=f"(cond (not (result-ok?-of [:result :vector-i64 :keyword] e)) 1 (not (f/same-bytes? (wire) (result-value-of [:result :vector-i64 :keyword] e (vector-i64)))) 2 (not (string=? (result-value-of [:result :string :keyword] c \"\") {quote(case['rootCid'])})) 3 :else 0)))\n"
+    elif kind=='negative':
         src+='''(defn main [] :i64
   (let [b (wire) r (f/decode b) ci (f/bytes-cid b)]
     (if (and (not (result-ok?-of [:result [:ref :awai.fs/file] :keyword] r))

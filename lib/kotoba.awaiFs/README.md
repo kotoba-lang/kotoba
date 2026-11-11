@@ -63,19 +63,36 @@ Each case gets a fresh process/output directory and complete source lock.
 `test/native_gate.py` records the actual compiler, source, lock and artifact
 hashes, rejects failed builds, and never reuses an older artifact after failure.
 
-The current Mac ARM gate runs the 47 corpus cases plus the original writer's
-six golden groups, an input-alias/70000-byte boundary, direct typed input and
-leaf-digest refusals, and three separately built/executed wrong-golden,
-version-guard and link-codec mutants (52 Native executions). The Native writer's
-`append` now copies once into fresh storage: persistent `conj` retained quadratic
-allocation history and trapped on the 1024-chunk corpus. Output bytes and input
-immutability stay unchanged; no runtime or corpus bound is reduced or widened.
+The Native gate runs 11 logical positives, 36 wire refusals, all six frozen
+legacy Pack/CAR constructors, three primitive suites and three separately
+built/executed wrong-golden, version-guard and link-codec mutants: 59 Native
+executions per target. The primitive suites include the writer's six original
+golden groups, input aliasing/70000-byte boundary, direct typed/leaf refusals
+and Pack bounds/refusals. Mac ARM64 and Linux ARM64 local receipts are recorded;
+the same gate runs on real macOS ARM64, Linux ARM64 and Linux x86_64 CI hosts.
+Linux predicates are read from the structured Native result, never inferred
+from the runner's process exit alone.
 
-Run on Mac ARM64 with an exact Amu checkout/stage matching
-`scripts/native-ci-inputs.json`:
+The Native writer's `append` now copies once into fresh storage: persistent
+`conj` retained quadratic allocation history and trapped on the 1024-chunk
+corpus. Output bytes and input immutability stay unchanged; no runtime or
+logical corpus bound is reduced or widened. `multiformats.byte-cid` factors the
+existing pure byte functions out of the text capability graph; `cid-hash`
+retains its API by delegation, and SHA-256 remains the existing primitive.
+
+`kotoba.ioIpldCar/ipld.car.pack` constructs the preserved indexless CARv2 profile
+from ordered raw leaves using the existing codec/CID owners. Its explicitly
+bounded Native admission is 65536 total encoded bytes and at most 1024 leaves;
+the six frozen old vectors compare complete CAR bytes and root CID. This is a
+constructor subset of Otehon's 16 MiB profile, not a replacement limit or a
+standalone CAR reader/storage qualification. Logical-file roots remain separate.
+
+Run on the declared actual host ISA with an Amu stage matching every required
+file in `native-inputs.json` (immutable source/artifact pin):
 
 ```
-python3 lib/kotoba.awaiFs/test/native_gate.py --amu AMU --output NEW_OUTPUT
+python3 lib/kotoba.awaiFs/test/native_gate.py --amu AMU --target macos-arm64 --output NEW_OUTPUT
+# Or --target linux-arm64 / linux-x86_64 on the corresponding Linux ISA.
 ```
 
 Python only stages, hashes and observes processes. Amu builds the fixtures;
@@ -88,5 +105,4 @@ This qualification is for the logical format/profile on the recorded host.
 Native I/O, OS-cache-loss reboot, power loss, independent nodes/EC/repair,
 private-tree/query semantics, signed authority, production acceptance and
 performance thresholds remain separate. The maximum-size case is metadata
-only; it does not allocate or verify a 16 GiB file. The preserved legacy Pack
-vectors remain a separate Native constructor qualification until executed.
+only; it does not allocate or verify a 16 GiB file. The legacy Pack vectors qualify only the constructor subset described above.
