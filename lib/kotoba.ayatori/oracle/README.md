@@ -26,8 +26,11 @@
 ## 実行
 
 ```sh
-node oracle/fs_bench.mjs --sizes=16,64,256
+node oracle/fs_bench_kgit.mjs --sizes=16
 ```
+
+正規ハーネスは kgit 版（git arm = kgit が既定）。旧 `oracle/fs_bench.mjs`
+は記録として不変で、新規実行には使わない。
 
 主要指標は操作/round-trip 数です。wall clock は負荷のかかった機械の数値であり、輸送の評価には使いません（`bench/fitness.cljk`・`bench/benchmark.edn` v1 の除外と同じ）。
 
