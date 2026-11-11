@@ -19,6 +19,7 @@
   ;; the fail-open this guards: two-valued `not` turned "undecidable" into true
   (is (false? (c/holds? [:not [:< :req/holder 5]] req)) "not of unknown")
   (is (false? (c/holds? [:not [:= :req/holder "did:key:zX"]] req)) "not of an absent fact")
+  (is (false? (c/holds? [:not [:member? :req/resource #{"kotoba://x"}]] req)) "not of an absent member")
   (is (false? (c/holds? [:or [:not [:< :req/path 5]] false] req)) "unknown through or")
   (is (false? (c/holds? [:and true [:not [:< :req/holder 5]]] req)) "unknown through and")
   (is (true? (c/holds? [:or [:< :req/holder 5] [:= :req/bytes 1000]] req))
