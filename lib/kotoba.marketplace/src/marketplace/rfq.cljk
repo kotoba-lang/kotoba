@@ -1,0 +1,233 @@
+(ns marketplace.rfq
+  "Request for Quotation — the B2B sourcing contract.
+
+  A buyer states a need (lines of canonical products × quantities);
+  suppliers answer with quotes; the buyer awards. This namespace covers
+  only the FIRST of those three moves plus the intake of the second —
+  creating an RFQ and receiving quotes — because the registries the
+  later moves need (supplier, RFQ, quotation) do not exist yet anywhere
+  in the fleet: `cloud-itonami` has a purchase-order *appview* (an XRPC
+  proxy, no sourcing logic), `marketplace.order` executes already-priced
+  orders, and `supplychain` is a parts graph with no prices.
+
+  ## What this namespace refuses to do
+
+  It never PICKS a winner. `rank-quotes` is a pure function that
+  returns every received quote WITH the comparison key that ordered it
+  (total price, lead time, then quote id as a total tie-break), so a
+  supplier who lost can reproduce the ordering exactly — the same
+  discipline `marketplace.catalog/buy-box` keeps. But ranking is not
+  awarding: `record-award` records what a NAMED buyer-side human
+  decided among the received quotes, and there is deliberately no
+  function that reads quotes and returns an outcome. Adding one would
+  break the fleet-wide invariant that no automated party adjudicates
+  (ADR-2607264000 D5; `crossborder` keeps it with `record-decision`).
+
+  Product identity is NOT owned here — it comes from
+  `kotoba.product-party` (GTIN-14 normalization + GS1 mod-10 check
+  digit + `gtin.<14>` / `prod.<slug>` id shapes). This namespace
+  consumes canonical ids; it never mints or merges them, the same
+  line `marketplace.catalog` draws.
+
+  Money is an INTEGER count of the currency's smallest circulating
+  unit, never a float. Comparisons across currencies are refused
+  rather than silently converted: this library has no FX rate and
+  inventing one would be fabrication.
+
+  Attachments (drawings, spec sheets) travel as DESCRIPTORS —
+  `{:attachment/digest .. :attachment/format ..}` — never as bytes.
+  A `\"awai.fs/carv2\"` format tag means the bytes were canonicalized
+  with the `awai.fs` manifest/format codec; digest verification itself
+  is out of scope here, stated outright because a contract that
+  claimed to verify what it never reads would be lying.
+
+  Pure: no clock, no network, no randomness."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.product-party :as pp]))
+
+;; ───────────────────────────── lifecycle ─────────────────────────────
+
+(def rfq-states
+  "RFQ lifecycle. `:awarded` has no automatic exit — `record-award`
+  requires a named buyer-side human and a received quote."
+  #{:draft :open :awarded :cancelled :expired})
+
+(def rfq-transitions
+  "Advance moves an RFQ along its lifecycle; nil otherwise. There is
+  deliberately no `:open → :awarded` edge: awarding passes through
+  `record-award`, which names the human who decided, so no code path
+  can promote a ranking into a decision."
+  {:draft     #{:open :cancelled}
+   :open      #{:cancelled :expired}
+   :awarded   #{}
+   :cancelled #{}
+   :expired   #{}})
+
+;; ───────────────────────────── construction ─────────────────────────────
+
+(defn rfq
+  "Open an RFQ draft: a buyer stating a need.
+
+  Lines are `{:product .. :qty ..}` where `:product` is a canonical
+  `kotoba.product-party` id (`gtin.<14>` / `prod.<slug>` / `int.<..>`)
+  and `:qty` a positive integer. `:invited` optionally names invited
+  suppliers (`sup-<id>` / `org.corp.<cc>.<slug>` / `did:web:` party
+  ids); `:attachments` optionally carries attachment descriptors.
+  Currency defaults to JPY and must be ISO-4217 alpha-3."
+  [{:keys [id buyer lines currency invited attachments delivery]
+    :or   {currency "JPY"}}]
+  {:rfq/id          id
+   :rfq/buyer       buyer
+   :rfq/currency    currency
+   :rfq/lines       (vec lines)
+   :rfq/invited     (vec invited)
+   :rfq/attachments (vec attachments)
+   :rfq/delivery    delivery
+   :rfq/state       :draft
+   :rfq/quotes      []
+   :rfq/award       nil})
+
+(defn- line-errors [prefix line products?]
+  (vec
+   (concat
+    (when-not (pp/valid-product-id? (:product line))
+      [{(keyword (str prefix ".error/code")) :invalid-product
+        (keyword (str prefix ".error/detail")) (pr-str (:product line))}])
+    (when-not (and (integer? (:qty line)) (pos? (:qty line)))
+      [{(keyword (str prefix ".error/code")) :invalid-qty}])
+    (when (and products? (some? (:product line))
+               (not (contains? products? (:product line))))
+      [{(keyword (str prefix ".error/code")) :unknown-product}]))))
+
+(defn rfq-errors
+  "Why this RFQ cannot be opened. Empty means openable."
+  [r]
+  (vec
+   (concat
+    (when (str/blank? (str (:rfq/id r)))
+      [{:rfq.error/code :missing-rfq-id}])
+    (when (str/blank? (str (:rfq/buyer r)))
+      [{:rfq.error/code :missing-buyer}])
+    (when-not (and (string? (:rfq/currency r))
+                   (re-matches #"^[A-Z]{3}$" (str (:rfq/currency r))))
+      [{:rfq.error/code :invalid-currency :rfq.error/detail "ISO-4217 alpha-3"}])
+    (when (empty? (:rfq/lines r))
+      [{:rfq.error/code :no-lines}])
+    (mapcat #(line-errors "rfq" % nil) (:rfq/lines r))
+    (mapcat (fn [s]
+              (when-not (pp/valid-party-id? s)
+                [{:rfq.error/code :invalid-supplier
+                  :rfq.error/detail (pr-str s)}]))
+            (:rfq/invited r))
+    (mapcat (fn [a]
+              (when (or (str/blank? (str (:attachment/digest a)))
+                        (str/blank? (str (:attachment/format a))))
+                [{:rfq.error/code :invalid-attachment}]))
+            (:rfq/attachments r)))))
+
+(defn advance-rfq
+  "Move an RFQ along its lifecycle when the table allows; nil
+  otherwise. `:open → :awarded` is NOT in the table — awarding is
+  `record-award`'s job, with a named human attached."
+  [r to]
+  (when (contains? (get rfq-transitions (:rfq/state r) #{}) to)
+    (assoc r :rfq/state to)))
+
+;; ───────────────────────────── quotes ─────────────────────────────
+
+(defn quote
+  "A supplier's answer to an open RFQ. Prices are integer minor units
+  in the RFQ's currency; `:lead-time-days` is a non-negative integer."
+  [{:keys [id rfq supplier lines currency lead-time-days note]}]
+  {:quote/id             id
+   :quote/rfq            rfq
+   :quote/supplier       supplier
+   :quote/lines          (vec lines)
+   :quote/currency       currency
+   :quote/lead-time-days lead-time-days
+   :quote/note           note})
+
+(defn quote-errors
+  "Why this quote cannot join the RFQ. Empty means receivable. Takes
+  the RFQ so line coverage and currency are checked against the
+  buyer's stated need — a quote priced in another currency is refused,
+  never converted."
+  [r q]
+  (let [products (set (map :product (:rfq/lines r)))]
+    (vec
+     (concat
+      (when (not= (:quote/rfq q) (:rfq/id r))
+        [{:rfq.error/code :unknown-rfq}])
+      (when (not= (:rfq/state r) :open)
+        [{:rfq.error/code :rfq-not-open}])
+      (when (not= (:quote/currency q) (:rfq/currency r))
+        [{:rfq.error/code :currency-mismatch}])
+      (when-not (pp/valid-party-id? (:quote/supplier q))
+        [{:rfq.error/code :invalid-supplier}])
+      (when-not (and (integer? (:quote/lead-time-days q))
+                     (not (neg? (:quote/lead-time-days q))))
+        [{:rfq.error/code :invalid-lead-time}])
+      (mapcat (fn [l]
+                (concat
+                 (line-errors "rfq" l products)
+                 (when-not (and (integer? (:unit-price-minor l))
+                                (pos? (:unit-price-minor l)))
+                   [{:rfq.error/code :invalid-price}])))
+              (:quote/lines q))
+      (let [quoted (set (map :product (:quote/lines q)))]
+        (when-not (every? quoted products)
+          [{:rfq.error/code :incomplete-coverage
+            :rfq.error/detail (pr-str (vec (remove quoted products)))}]))))))
+
+(defn add-quote
+  "Receive a quote into an open RFQ; nil when `quote-errors` is
+  non-empty. Quotes accumulate — they are never replaced or removed,
+  so the record of what each supplier actually offered cannot be
+  edited after the fact."
+  [r q]
+  (when (empty? (quote-errors r q))
+    (update r :rfq/quotes conj (dissoc q :quote/rfq))))
+
+(defn quote-total-minor
+  "One quote's total: the sum of its own line totals. Delegates the
+  shape of a line to the quote itself so the arithmetic is defined
+  once."
+  [q]
+  (reduce + 0 (map #(* (:unit-price-minor %) (:qty %)) (:quote/lines q))))
+
+(defn rank-quotes
+  "Order every received quote by the fully observable key
+  [total-minor, lead-time-days, quote-id] and return each quote WITH
+  that key, so a supplier who lost can reproduce the ordering
+  exactly. Ranking is not awarding: the RFQ is untouched and no
+  winner is named — the buyer still decides, via `record-award`."
+  [r]
+  (->> (:rfq/quotes r)
+       (map (fn [q] {:quote q
+                     :rank/key [(quote-total-minor q)
+                                (:quote/lead-time-days q)
+                                (:quote/id q)]}))
+       (sort-by :rank/key)))
+
+;; ───────────────────────────── award ─────────────────────────────
+
+(defn record-award
+  "Record that a HUMAN buyer awarded the RFQ to one received quote.
+  Returns nil unless the RFQ is `:open`, the quote was received, and
+  a human is named.
+
+  This function RECORDS a decision; it never MAKES one. There is
+  deliberately no counterpart that reads the quotes and returns a
+  winner — adding one would break the fleet-wide invariant that no
+  automated party adjudicates (ADR-2607264000 D5)."
+  [r {:keys [quote-id decided-by decided-at rationale]}]
+  (when (and (= :open (:rfq/state r))
+             (some #(= quote-id (:quote/id %)) (:rfq/quotes r))
+             (not (str/blank? (str decided-by))))
+    (assoc r
+           :rfq/state :awarded
+           :rfq/award {:award/quote-id  quote-id
+                       :award/decided-by decided-by
+                       :award/decided-at decided-at
+                       :award/rationale  rationale
+                       :award/human?     true})))
