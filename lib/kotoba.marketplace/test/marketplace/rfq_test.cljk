@@ -1,0 +1,148 @@
+(ns marketplace.rfq-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [marketplace.rfq :as rfq]))
+
+(def product "gtin.05449000000996")
+
+(defn- r [& {:keys [id buyer lines currency invited attachments]
+             :or   {id "rfq-1" buyer "buyer-1" currency "JPY"}}]
+  (rfq/rfq {:id id :buyer buyer :currency currency
+            :lines (or lines [{:product product :qty 100}])
+            :invited invited :attachments attachments}))
+
+(defn- q [& {:keys [id supplier lines currency lead-time]
+             :or   {id "q-1" supplier "sup-acme-1" currency "JPY" lead-time 14}}]
+  (rfq/quote {:id id :rfq "rfq-1" :supplier supplier :currency currency
+              :lead-time-days lead-time
+              :lines (or lines [{:product product :qty 100
+                                 :unit-price-minor 800}])}))
+
+(defn- open-r []
+  (rfq/advance-rfq (r) :open))
+
+;; ───────────────────────────── construction ─────────────────────────────
+
+(deftest rfq-opens-when-the-need-is-stated
+  (is (empty? (rfq/rfq-errors (r))))
+  (is (= :draft (:rfq/state (r))))
+  (testing "an empty RFQ states nothing and cannot open"
+    (is (some #(= :no-lines (:rfq.error/code %))
+            (rfq/rfq-errors (r :lines [])))))
+  (testing "no buyer, no RFQ"
+    (is (some #(= :missing-buyer (:rfq.error/code %))
+            (rfq/rfq-errors (r :buyer "")))))
+  (testing "currency must be ISO-4217 alpha-3"
+    (is (some #(= :invalid-currency (:rfq.error/code %))
+            (rfq/rfq-errors (r :currency "yen"))))))
+
+(deftest product-identity-is-delegated
+  (testing "a well-shaped but arithmetically impossible GTIN is rejected
+            without this namespace implementing GS1 at all"
+    (is (some #(= :invalid-product (:rfq.error/code %))
+            (rfq/rfq-errors (r :lines [{:product "gtin.99999999999999"
+                                        :qty 10}])))))
+  (testing "a non-id string is rejected the same way"
+    (is (some #(= :invalid-product (:rfq.error/code %))
+            (rfq/rfq-errors (r :lines [{:product "not-a-product"
+                                        :qty 10}])))))
+  (testing "a zero quantity states no need"
+    (is (some #(= :invalid-qty (:rfq.error/code %))
+            (rfq/rfq-errors (r :lines [{:product product :qty 0}])))))
+  (testing "invited suppliers are party ids, not free text"
+    (is (some #(= :invalid-supplier (:rfq.error/code %))
+            (rfq/rfq-errors (r :invited ["sup-acme-1" "??"]))))))
+
+(deftest attachments-are-descriptors-never-bytes
+  (testing "digest + format shape is checked; verification is out of scope"
+    (is (empty? (rfq/rfq-errors
+                 (r :attachments [{:attachment/digest "sha256:abc"
+                                    :attachment/format "awai.fs/carv2"}]))))
+    (is (some #(= :invalid-attachment (:rfq.error/code %))
+            (rfq/rfq-errors
+             (r :attachments [{:attachment/format "awai.fs/carv2"}]))))))
+
+;; ───────────────────────────── transitions ─────────────────────────────
+
+(deftest award-is-not-a-transition
+  (let [r (open-r)]
+    (is (= :open (:rfq/state r)))
+    (testing "the table has no open -> awarded edge: a ranking can never
+              be promoted into a decision by advancing"
+      (is (nil? (rfq/advance-rfq r :awarded)))
+      (is (= :open (:rfq/state r)))))
+  (testing "draft opens and cancels; open expires and cancels"
+    (is (= :cancelled (:rfq/state (rfq/advance-rfq (r) :cancelled))))
+    (is (= :expired (:rfq/state (rfq/advance-rfq (open-r) :expired))))
+    (is (nil? (rfq/advance-rfq (r) :expired))
+        "a draft that was never opened cannot expire")))
+
+;; ───────────────────────────── quotes ─────────────────────────────
+
+(deftest quotes-join-only-an-open-rfq
+  (testing "a draft RFQ receives nothing"
+    (is (nil? (rfq/add-quote (r) (q)))))
+  (testing "a received quote accumulates and is never rewritten"
+    (let [r2 (rfq/add-quote (open-r) (q))]
+      (is (= 1 (count (:rfq/quotes r2)))))))
+
+(deftest foreign-currency-is-refused-never-converted
+  (let [errs (rfq/quote-errors (open-r) (q :currency "USD"))]
+    (is (some #(= :currency-mismatch (:rfq.error/code %)) errs)))
+  (testing "a quote for another RFQ is refused"
+    (is (some #(= :unknown-rfq (:rfq.error/code %))
+            (rfq/quote-errors (open-r) (assoc (q) :quote/rfq "rfq-2"))))))
+
+(deftest quotes-must-cover-the-stated-need
+  (testing "a partial quote names what is missing instead of looking complete"
+    (let [r (rfq/advance-rfq
+             (r :lines [{:product product :qty 100}
+                        {:product "prod.widget-b" :qty 50}])
+             :open)
+          errs (rfq/quote-errors r (q))]
+      (is (some #(= :incomplete-coverage (:rfq.error/code %)) errs))))
+  (testing "a line for a product the buyer never asked for is refused"
+    (let [errs (rfq/quote-errors
+                (open-r)
+                (q :lines [{:product "prod.widget-b" :qty 1
+                            :unit-price-minor 10}]))]
+      (is (some #(= :unknown-product (:rfq.error/code %)) errs)))))
+
+;; ───────────────────────────── ranking ─────────────────────────────
+
+(deftest ranking-is-observable-and-awards-nothing
+  (let [r (-> (open-r)
+              (rfq/add-quote (q :id "q-1" :supplier "sup-a" :lead-time 14
+                               :lines [{:product product :qty 100
+                                        :unit-price-minor 800}])))
+        r (rfq/add-quote r (q :id "q-2" :supplier "sup-b" :lead-time 7
+                              :lines [{:product product :qty 100
+                                       :unit-price-minor 800}]))
+        r (rfq/add-quote r (q :id "q-3" :supplier "sup-c" :lead-time 30
+                              :lines [{:product product :qty 100
+                                       :unit-price-minor 750}]))
+        ranked (rfq/rank-quotes r)]
+    (testing "total first, then lead time, then quote id — reproducibly"
+      (is (= ["q-3" "q-2" "q-1"] (mapv (comp :quote/id :quote) ranked)))
+      (is (= [[75000 30 "q-3"] [80000 7 "q-2"] [80000 14 "q-1"]]
+             (mapv :rank/key ranked))))
+    (testing "ranking touches no state and names no winner"
+      (is (= :open (:rfq/state r)))
+      (is (nil? (:rfq/award r))))))
+
+;; ───────────────────────────── award ─────────────────────────────
+
+(deftest award-records-a-named-human-decision
+  (let [r (rfq/add-quote (open-r) (q))]
+    (testing "no human, no award — even for the only quote"
+      (is (nil? (rfq/record-award r {:quote-id "q-1" :decided-by ""}))))
+    (testing "an unreceived quote cannot be awarded"
+      (is (nil? (rfq/record-award r {:quote-id "q-9"
+                                     :decided-by "buyer-1"}))))
+    (let [a (rfq/record-award r {:quote-id "q-1" :decided-by "buyer-1"
+                                 :rationale "fastest compliant"})]
+      (is (= :awarded (:rfq/state a)))
+      (is (true? (get-in a [:rfq/award :award/human?])))
+      (is (= "buyer-1" (get-in a [:rfq/award :award/decided-by])))))
+  (testing "a draft RFQ cannot be awarded without opening"
+    (is (nil? (rfq/record-award (r) {:quote-id "q-1"
+                                     :decided-by "buyer-1"})))))

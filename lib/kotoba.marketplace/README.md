@@ -67,6 +67,7 @@ marketplace.listing      ; listing admission, restricted goods, search projectio
 marketplace.settlement   ; multi-seller split, payout destinations, escrow
 marketplace.acceptance   ; コード決済 — PSP-attested capture, refunds, custody flag
 marketplace.crossborder  ; landed cost, HS proposals, dispute intake
+marketplace.rfq          ; B2B sourcing — RFQ create/intake, observable ranking, human-recorded award
 ```
 
 ## The buy box is auditable
