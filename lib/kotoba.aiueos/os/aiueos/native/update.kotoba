@@ -25,8 +25,12 @@
   ;; manifest byte changed (signature) and refuse it with one image byte changed
   ;; (digest), all through the same chunk path the network uses.
   ;;
-  ;; Classical Ed25519 only, and no rollback protection beyond version >= 1:
-  ;; the kernel has no ML-DSA verifier yet and keeps no installed version.
+  ;; AIUEIMG1 is classical Ed25519 only. Rollback protection (JUN-813 stage 5c, ADR-0286
+  ;; amendment 4): `admit` reads a hash-checked per-channel version floor from the update
+  ;; journal (OSMETA.BIN, see `floor-load` below) and refuses a header whose version is not
+  ;; strictly above it (result 9), or when the journal cannot be read (result 10, fail closed,
+  ;; never floor 0). The floor is hash-checked, not signed (interim, see the ADR); a board
+  ;; gets its journal from scripts/aiueos-provision-esp.py, nothing here creates it.
   ;;
   ;; State: context words 180 result (0 none, 1 signature refused, 2 magic,
   ;; 3 size, 4 version, 5 reserved not zero, 6 chunk out of order, 7 digest
@@ -58,13 +62,62 @@
   ;; fixture with one image byte changed ("2"). It never installs network data,
   ;; and a physical board has no fw_cfg. The verifier uses context bytes
   ;; 2048..3071 and 4096..8191, SHA-256 bytes 3072..3647 (as native/esp).
+  ;;
+  ;; JUN-813 stage 5b (ADR-0286 amendment 2): AIUEIMG2. The header is 16384 bytes: the 64-byte manifest (as AIUEIMG1, magic
+  ;; "AIUEIMG2"), the entry count u32 at 64 (1..4, bytes 68..127 zero), then up to four 3392-byte entries from byte 128 (key id
+  ;; u32, 4 zero bytes, Ed25519 signature 64, ML-DSA-65 signature 3309, 11 zero bytes); the image follows the header. It does not fit
+  ;; the 4096-byte page, so it arrives in the same chunks as the image (the first 128 bytes, then pieces that end at the next
+  ;; 1 KiB line, so the first is 896 bytes and the rest 1024, none crossing a line) and each byte is consumed as it lands: the manifest into the verifier buffers, the signatures into
+  ;; their buffers, and when an entry's last byte lands both of its signatures are verified (aiueos.ed25519 and
+  ;; aiueos.mldsa-verify) and counted with aiueos.imgsig (N = 3 pinned slots, M = 2 distinct valid signers). Only after the header
+  ;; is admitted are the manifest's size and version checked and the image hashed against its SHA-256.
+  ;; `admit` dispatches on header byte 7 ("2" AIUEIMG2, otherwise the AIUEIMG1 path above is unchanged and still takes
+  ;; its own checks): AIUEIMG1 stays admissible here until AIUEIMG2 has a production signer set (ADR-0286 retires it only when
+  ;; AIUEIMG2 ships), so the self-test above still runs.
+  ;; Pinned signers: test=1 uses the TEST keys of aiueos.imgsig-testkeys (self-test and QEMU hook only: their seeds are public);
+  ;; test=0, the network paths, uses the PRODUCTION keys of aiueos.imgsig-prodkeys (JUN-813, ADR-0286 amendment 7: a VERIFICATION-ONLY set,
+  ;; all three slots kept on one Mac; the keys are compiled in, so rotating them is a new image signed by 2 of the current set).
+  ;; Result 8 (no production signer set pinned) is retired: nothing returns it any more.
+  ;; Memory: the ML-DSA arena is owned window 4 (20480 bytes: signature at 8192, key at 12288), which the NVMe driver and the ESP
+  ;; walk also use (queues, data page). Verifying an entry therefore overwrites them; `restore-storage` re-runs nvme/probe and
+  ;; esp/run after any header that ran ML-DSA, before the SHA state is initialised (esp hashes with the same scratch). The Ed25519
+  ;; verifier keeps its buffers (context bytes 2048..3071 and 4096..8191; key 2048, signature 2080, manifest 2144), the SHA
+  ;; state stays 3072..3647. AIUEIMG2 state words: 212 header length (128 or 16384), 216 count, 218 mask of counted slots, 220 key
+  ;; id of the entry in progress, 221 its reserved bytes, 222 its padding, 223 flags (1 size out of range, 2 version below 1),
+  ;; 224 size, 225/226 version, 227 header end, 228 ML-DSA ran, 229 stream bytes consumed from the QEMU file, 233 storage walk after
+  ;; the cases, 234 marker "UP02", 235 case count, 236.. per case k < 40, two cases per word (even k low 16 bits, odd k high 16 bits): result | counted mask << 8; 230 QEMU truncation flag. New result codes:
+  ;; 8 retired (amendment 7); 1 is also "fewer than two distinct valid signers" for AIUEIMG2.
+  ;; QEMU hook: fw_cfg file opt/aiueos/update2 (hypervisor only): [count][per case: mode (0 test keys, 1 production, 2 test keys with the stream broken before byte 7200), 16384 header
+  ;; bytes, 5000 image bytes]; with no install request every case is run to its verdict, with install request "3" case 0 is installed.
+  ;; JUN-813 stage 6 (ADR-0286 amendment 5): AIUECAT1, the signed catalog. The header is the AIUEIMG2 signature block unchanged (the same
+  ;; `h2-start` / `h2-loop` / `verify-entry` run on it); the manifest's magic is "AIUECAT1", bytes 16..27 are the body length (128 * count) and
+  ;; the entry count (1..64), 28..31 are reserved, and the ML-DSA context is "AIUECAT1". The kind is chosen by the caller (bit 1 of
+  ;; `admit`'s test argument: 3 = catalog with the TEST keys, 2 = catalog with the production set), never from the magic.
+  ;; The body (128 * count bytes) follows the header at byte 16384 and flows through `chunk-done` like an image (SHA-256 against the manifest);
+  ;; each 128-byte entry is checked in the page as its chunk lands (`cat-scan`). Result 16: the hash matches but an entry is refused (flags in
+  ;; word 270). A catalog takes no version floor and is not read by anything: QEMU hook opt/aiueos/cat1 only (hypervisor only, `self-test3`).
+  ;; Words: 231 kind (1 while a catalog is admitted), 270 entry flags, 271/272 seen dock ids, 300 + k the QEMU case results.
+  ;; JUN-813 (ADR-0286 amendment 6): AIUEFRS1, the signed freshness record, and the clock it is judged against. The kind is chosen by the caller (bit 2 of
+  ;; `admit`'s test argument: 5 = TEST keys, 4 = production set); the header is the AIUEIMG2 signature block, there is no body, the
+  ;; manifest is 0 "AIUEFRS1", 8 latest version, 16 issued-at, 24 valid-until (UTC seconds, lifetime 1 s..30 days), 32 channel (1), 36..63 zero, and the ML-DSA
+  ;; context is "AIUEFRS1". After the signatures count (2 of 3) and the structure is sound (result 15), `fresh-verdict` reads the CMOS RTC (`rtc-now`: ports
+  ;; 0x70/0x71, update flag awaited, two equal snapshots, BCD/binary and 12/24 hour decoded, refused below the build floor 2026-11-06) and leaves word 273:
+  ;; 1 fresh, 2 expired, 3 clock more than a day behind issued-at, 4 no usable clock. Words 274/275 issued-at, 276/277 valid-until, 278 channel, 279/280 the
+  ;; clock reading, 365 its status (0 ok, 1 unstable, 2 invalid field, 3 below the floor, 5 RTC lost power), 366..381 two register snapshots. QEMU hooks
+  ;; opt/aiueos/fresh (word 400 + k: result | mask << 8 | verdict << 16) and opt/aiueos/clock (probe words 364..399, decoder rows 460 / 464 + k). Not wired to
+  ;; anything: no `check`, nothing persisted, the version floor is untouched.
   (:require [aiueos.native.storage-state :as storage]
             [aiueos.native.rtl8168-debug :as nic]
             [aiueos.native.nvme :as nvme]
             [aiueos.native.esp :as esp]
+            [aiueos.native.update-journal :as journal]
             [aiueos.ed25519 :refer [aiueos-ed25519-verify]]
+            [aiueos.mldsa-verify :refer [mv-mu mv-verify]]
+            [aiueos.imgsig :refer [ims-step ims-final ims-bit]]
+            [aiueos.imgsig-testkeys :as tk]
+            [aiueos.imgsig-prodkeys :as pk]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [self-test pull report install install-report qemu-hook]))
+  (:export [self-test pull report install install-report qemu-hook confirm-installed rtc-probe]))
 
 (defn word [region i]
   (storage/word region i))
@@ -154,7 +207,50 @@
         (if (< r 56)
           (do (put-length ctx (* size 8) 0) (pad-block ctx))
           (do (pad-block ctx) (zero-pad ctx 0) (put-length ctx (* size 8) 0) (pad-block ctx)))
-        (if (= (same-digest ctx 0) 1) (fail ctx 15) (fail ctx 7)))))
+        (if (= (same-digest ctx 0) 1)
+          (if (and (= (word ctx 231) 1) (not (= (word ctx 270) 0))) (fail ctx 16) (fail ctx 15))
+          (fail ctx 7)))))
+
+;; ---- JUN-813 stage 6 (ADR-0286 amendment 5): the entries of an AIUECAT1 body, checked as each chunk lands ----
+;; Word 231 = 1 while a catalog is being admitted. A body entry is 128 bytes at page byte p: dock id u32 at 0 (19..82, no repeat), title 4..35,
+;; manifest CID 36..71, bundle CID 72..107, size u32 at 108 (1..2^25), reserved 112..127 (zero). Word 270 ORs the refusal flags of all entries
+;; (1 dock id, 2 duplicate, 4 reserved, 8 title, 16 CID, 32 size); words 271/272 are the seen dock ids (bit id - 19).
+(defn cat-nz [from to acc]
+  (if (>= from to) acc (cat-nz (+ from 1) to (bit-or acc (if (= (pg from) 0) 0 1)))))
+(defn cat-in [x lo hi] (if (and (>= x lo) (<= x hi)) 1 0))
+;; 1 when the 32-byte title at p + 4 is not 1..31 printable ASCII, a NUL, then only zeros
+(defn cat-title [p i nul bad]
+  (if (>= i 32) (bit-or bad (if (= nul 0) 1 0))
+    (let [b (pg (+ (+ p 4) i))]
+      (if (= nul 0)
+        (if (= b 0) (cat-title p (+ i 1) 1 (if (= i 0) 1 bad))
+          (cat-title p (+ i 1) 0 (if (or (< b 32) (> b 126)) 1 bad)))
+        (cat-title p (+ i 1) 1 (if (= b 0) bad 1))))))
+(defn cat-codec [c] (if (= c 85) 1 (if (= c 112) 1 (if (= c 113) 1 0))))
+;; 1 when the 36 bytes at q are not the CIDv1 envelope of aiueos.cid-v1-admit (01, codec 55 / 70 / 71, 12, 20)
+(defn cat-cid-bad [q]
+  (if (and (= (pg q) 1) (and (= (cat-codec (pg (+ q 1))) 1) (and (= (pg (+ q 2)) 18) (= (pg (+ q 3)) 32)))) 0 1))
+;; 1 when dock id bit b was already seen, else 0 and it is marked
+(defn cat-seen [ctx b]
+  (let [w (if (< b 32) 271 272)
+        bit (i64-shift-left 1 (bit-and b 31))
+        cur (word ctx w)]
+    (if (= (bit-and cur bit) 0) (do (put-word ctx w (bit-or cur bit)) 0) 1)))
+(defn cat-entry [ctx p]
+  (let [d (pg-le p 4 0)
+        inr (cat-in d 19 82)
+        dup (if (= inr 1) (cat-seen ctx (- d 19)) 0)
+        sz (pg-le (+ p 108) 4 0)
+        f (+ (- 1 inr)
+             (+ (* 2 dup)
+                (+ (* 4 (cat-nz (+ p 112) (+ p 128) 0))
+                   (+ (* 8 (cat-title p 0 0 0))
+                      (+ (* 16 (bit-or (cat-cid-bad (+ p 36)) (cat-cid-bad (+ p 72))))
+                         (* 32 (- 1 (cat-in sz 1 33554432))))))))]
+    (put-word ctx 270 (bit-or (word ctx 270) f))))
+(defn cat-scan [ctx base len j]
+  (if (>= (* j 128) len) 1
+    (do (cat-entry ctx (+ base (* j 128))) (cat-scan ctx base len (+ j 1)))))
 
 ;; In write mode (word 209 = 1) the first n page bytes go to the staging file:
 ;; 0 done or not in write mode, -1 failed.
@@ -172,6 +268,7 @@
               (and (< len 1024) (not (= now size))))
         (fail ctx 6)
         (do (put-word ctx 184 now)
+            (if (= (word ctx 231) 1) (cat-scan ctx (bit-and got 4095) len 0) 0)
             (if (< (if (= (bit-and now 4095) 0) (stage-out ctx 4096) 0) 0) (fail ctx 48)
               (do (if (= (bit-and now 4095) 0) (absorb ctx 64) 0)
                   (if (= now size)
@@ -205,7 +302,8 @@
           (chunk-done ctx n)
           (feed ctx (+ at n) flip)))))
 (defn self-run [ctx header-flip image-flip]
-  (do (put-header 0 header-flip)
+  (do (put-word ctx 231 0)
+      (put-header 0 header-flip)
       (if (= (begin ctx 1) 14) (feed ctx 0 image-flip) (word ctx 180))))
 (defn self-test [ctx]
   (let [off (put-word ctx 209 0)
@@ -255,18 +353,316 @@
           (if (= (wait (word64 ctx 172) offset len dst (+ (kernel-rdtsc) 1073741824)) 1) 1
             (fetch ctx offset len dst (+ tries 1)))
           (fetch ctx offset len dst (+ tries 1))))))
+;; ---- fw_cfg byte stream (QEMU only): the gate hook and the AIUEIMG2 cases ----
+(defn fw-byte [] (kernel-in-u8 1297))
+(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
+(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
+;; which 0 "opt/aiueos/install", 1 "opt/aiueos/update2" (18 bytes and a NUL), 2 "opt/aiueos/cat1" (JUN-813 stage 6), 3 "opt/aiueos/fresh", 4 "opt/aiueos/clock" (amendment 6)
+(defn fw-name-byte [which i]
+  (if (< i 11) (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 0)
+    (if (= which 0) (case i 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0)
+      (if (= which 1) (case i 11 117 12 112 13 100 14 97 15 116 16 101 17 50 0)
+        (if (= which 2) (case i 11 99 12 97 13 116 14 49 0)
+          (if (= which 3) (case i 11 102 12 114 13 101 14 115 15 104 0)
+                          (case i 11 99 12 108 13 111 14 99 15 107 0)))))))
+(defn fw-name [which i ok]
+  (if (>= i 56) ok
+    (let [b (fw-byte)]
+      (fw-name which (+ i 1) (if (and (= ok 1) (or (>= i 19) (= b (fw-name-byte which i)))) 1 0)))))
+(defn fw-find [left which]
+  (if (<= left 0) 0
+    (let [size (fw-be 4 0)
+          sel (fw-be 2 0)
+          skip (fw-skip 2)
+          hit (fw-name which 0 1)]
+      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1) which)))))
+(defn fw-signature [i]
+  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
+;; 1 when the hypervisor's fw_cfg file `which` is selected (its first byte is next), else 0.
+(defn fw-open [which]
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
+    (do (kernel-out-u16 1296 0)
+        (if (= (fw-signature 0) 0) 0
+          (do (kernel-out-u16 1296 25)
+              (let [sel (fw-find (least (fw-be 4 0) 256) which)]
+                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) 1))))))))
+(defn fw-request [] (if (= (fw-open 0) 1) (fw-byte) 0))
+(defn fw-fill [dst n i]
+  (if (>= i n) 1 (do (put-pg (+ dst i) (fw-byte)) (fw-fill dst n (+ i 1)))))
+
+;; ---- JUN-813 stage 5b: AIUEIMG2, a 16 KiB multi-signer header consumed as it streams ----
+(defn sb! [i v] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 8192 4096) 4096 i v))
+(defn pw! [w v] (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 12288 4096) 4096 (* 4 w) v))
+(defn nz [b] (if (= b 0) 0 1))
+;; JUN-813 stage 6: cat 1 selects the catalog object ("AIUECAT1"), 0 the image ("AIUEIMG2"); the kind is `(cat? test)`, bit 1 of the caller's test
+;; argument (bit 0: pinned TEST keys), never read from the magic.
+(defn cat? [t] (bit-and (u64-shift-right t 1) 1))
+;; JUN-813 (ADR-0286 amendment 6): bit 2 of the caller's test argument selects the freshness record ("AIUEFRS1"); 4 = production set, 5 = TEST keys.
+(defn fresh? [t] (bit-and (u64-shift-right t 2) 1))
+;; the object kind: 0 image ("AIUEIMG2"), 1 catalog ("AIUECAT1"), 2 freshness record ("AIUEFRS1")
+(defn kind-of [t] (if (= (fresh? t) 1) 2 (cat? t)))
+(defn pick [c a b] (if (= c 1) a b))
+;; k3: the value for a catalog (kind 1), a freshness record (kind 2) or an image (kind 0)
+(defn k3 [kind c f i] (if (= kind 1) c (if (= kind 2) f i)))
+(defn magic2-byte [kind i] (case i 0 65 1 73 2 85 3 69 4 (k3 kind 67 70 73) 5 (k3 kind 65 82 77) 6 (k3 kind 84 83 71) 7 (k3 kind 49 49 50) 0))
+(defn magic2-bad [kind i acc]
+  (if (>= i 8) acc (magic2-bad kind (+ i 1) (bit-or acc (nz (bit-xor (pg i) (magic2-byte kind i)))))))
+(defn zeros-nz [from to acc]
+  (if (>= from to) acc (zeros-nz (+ from 1) to (bit-or acc (nz (pg from))))))
+;; M' = 0 || 8 || "AIUEIMG2" || manifest: the 10-byte prefix at S 3392, the manifest after it
+;; the ML-DSA context: "AIUEIMG2" for an image, "AIUECAT1" for a catalog, "AIUEFRS1" for a freshness record
+(defn mp-prefix-byte [kind i] (case i 1 8 2 65 3 73 4 85 5 69 6 (k3 kind 67 70 73) 7 (k3 kind 65 82 77) 8 (k3 kind 84 83 71) 9 (k3 kind 49 49 50) 0))
+(defn mp-prefix [kind i] (if (>= i 10) 1 (do (sb! (+ 3392 i) (mp-prefix-byte kind i)) (mp-prefix kind (+ i 1)))))
+(defn copy-manifest [ctx i]
+  (if (>= i 64) 1 (do (put-byte ctx (+ 2144 i) (pg i)) (sb! (+ 3402 i) (pg i)) (copy-manifest ctx (+ i 1)))))
+
+;; Overwritten by an entry's verification: the Ed25519 verifier's buffer covers the NVMe/ESP words 600..699 and the ML-DSA arena
+;; is the NVMe queues and the ESP data page. Run the driver again (word 228 says a verifier ran).
+(defn restore-storage [ctx]
+  (if (= (word ctx 228) 0) 0
+    (do (nvme/probe ctx) (esp/run ctx) (put-word ctx 228 0))))
+
+;; ---- JUN-813 (ADR-0286 amendment 6): the clock of the freshness record is the CMOS real-time clock, index port 0x70, data port 0x71 ----
+;; Nothing else in the native kernel reads a wall clock (the TSC is calibrated against the PIT and only counts since boot). The index byte
+;; is written with bit 7 clear, so NMI stays enabled. Words: 365 status of the last `rtc-now` (0 ok, 1 update-in-progress flag stuck or
+;; no two equal snapshots, 2 a field out of range or not BCD, 3 earlier than the build floor below, 5 register D bit 7 clear: the RTC lost power),
+;; 366..373 and 374..381 two snapshots (seconds, minutes, hours, day, month, year, century register 0x32, register B).
+(defn cmos [reg]
+  (let [o (kernel-out-u8 112 reg)] (+ (kernel-in-u8 113) (* 0 o))))
+(defn rtc-idle [fuel]
+  (if (= (bit-and (cmos 10) 128) 0) 1
+    (if (= fuel 0) 0 (do (kernel-pause) (rtc-idle (- fuel 1))))))
+(defn rtc-snap [ctx at]
+  (do (put-word ctx at (cmos 0)) (put-word ctx (+ at 1) (cmos 2)) (put-word ctx (+ at 2) (cmos 4))
+      (put-word ctx (+ at 3) (cmos 7)) (put-word ctx (+ at 4) (cmos 8)) (put-word ctx (+ at 5) (cmos 9))
+      (put-word ctx (+ at 6) (cmos 50)) (put-word ctx (+ at 7) (cmos 11)) 1))
+(defn rtc-same [ctx a b i]
+  (if (>= i 8) 1 (if (= (word ctx (+ a i)) (word ctx (+ b i))) (rtc-same ctx a b (+ i 1)) 0)))
+;; 1 when the update-in-progress flag was clear, then two snapshots agree and the flag is still clear
+(defn rtc-stable [ctx tries]
+  (if (= tries 0) 0
+    (if (= (rtc-idle 2000000) 0) 0
+      (do (rtc-snap ctx 366) (rtc-snap ctx 374)
+          (if (and (= (rtc-same ctx 366 374 0) 1) (= (bit-and (cmos 10) 128) 0)) 1
+            (rtc-stable ctx (- tries 1)))))))
+(defn bcd-ok [v bin] (if (= bin 1) 1 (if (and (<= (bit-and v 15) 9) (<= (u64-shift-right v 4) 9)) 1 0)))
+(defn bcd [v bin] (if (= bin 1) v (+ (* (u64-shift-right v 4) 10) (bit-and v 15))))
+(defn leap [y] (if (= (mod y 4) 0) (if (= (mod y 100) 0) (if (= (mod y 400) 0) 1 0) 1) 0))
+(defn dim [m y] (case m 1 31 2 (+ 28 (leap y)) 3 31 4 30 5 31 6 30 7 31 8 31 9 30 10 31 11 30 12 31 0))
+;; days since 1970-01-01 of the proleptic Gregorian date (y >= 1), the era algorithm
+(defn civil-days [y m d]
+  (let [yy (if (<= m 2) (- y 1) y)
+        era (quot yy 400)
+        yoe (- yy (* era 400))
+        mp (if (> m 2) (- m 3) (+ m 9))
+        doy (+ (quot (+ (* 153 mp) 2) 5) (- d 1))
+        doe (+ (- (+ (* yoe 365) (quot yoe 4)) (quot yoe 100)) doy)]
+    (- (+ (* era 146097) doe) 719468)))
+;; UTC seconds since the epoch of the snapshot at word `at`, or 0 when a field is invalid. Register B bit 2 (4): binary, else BCD;
+;; bit 1 (2): 24 hour, else 12 hour with bit 7 of the hour byte = PM. A century register outside BCD 19..21 is ignored and 20 assumed.
+(defn rtc-unix [ctx at]
+  (let [b (word ctx (+ at 7))
+        bin (bit-and (u64-shift-right b 2) 1)
+        h24 (bit-and (u64-shift-right b 1) 1)
+        rh (word ctx (+ at 2))
+        hraw (bit-and rh 127)
+        pm (bit-and (u64-shift-right rh 7) 1)
+        rs (word ctx at) rm (word ctx (+ at 1)) rd (word ctx (+ at 3)) rn (word ctx (+ at 4)) ry (word ctx (+ at 5)) rc (word ctx (+ at 6))
+        ok (+ (bcd-ok rs bin) (+ (bcd-ok rm bin) (+ (bcd-ok hraw bin) (+ (bcd-ok rd bin) (+ (bcd-ok rn bin) (bcd-ok ry bin))))))
+        s (bcd rs bin) mi (bcd rm bin) hr (bcd hraw bin) d (bcd rd bin) mo (bcd rn bin) yy (bcd ry bin)
+        hour (if (= h24 1) hr (+ (mod hr 12) (* pm 12)))
+        hok (if (= h24 1) (if (<= hr 23) 1 0) (if (and (>= hr 1) (<= hr 12)) 1 0))
+        cc (bcd rc bin)
+        century (if (and (= (bcd-ok rc bin) 1) (and (>= cc 19) (<= cc 21))) cc 20)
+        y (+ (* century 100) yy)]
+    (if (and (= ok 6) (and (= hok 1) (and (<= s 59) (and (<= mi 59) (and (>= mo 1) (and (<= mo 12) (and (>= d 1) (<= d (dim mo y)))))))))
+      (+ (* (civil-days y mo d) 86400) (+ (* hour 3600) (+ (* mi 60) s)))
+      0)))
+;; The build floor: 2026-11-06T00:00:00Z. A clock reading earlier than the date this kernel was written is a dead or reset RTC (the usual
+;; reset values are 1970, 1980 or 2000) and is refused, not believed. The constant is bumped by hand; a stale one only loosens this bound.
+(defn rtc-now [ctx]
+  (if (= (rtc-stable ctx 8) 0) (do (put-word ctx 365 1) 0)
+    (if (= (bit-and (cmos 13) 128) 0) (do (put-word ctx 365 5) 0)
+      (let [u (rtc-unix ctx 374)]
+        (if (= u 0) (do (put-word ctx 365 2) 0)
+          (if (< u 1793923200) (do (put-word ctx 365 3) 0)
+            (do (put-word ctx 365 0) u)))))))
+;; The freshness verdict, word 273: 1 fresh, 2 expired (now after valid-until), 3 the clock is more than a day behind issued-at, 4 no usable clock.
+;; The record's own signatures are already counted (the caller). The tolerance of one day (86400 s) on issued-at covers an RTC kept in local time.
+;; Words 274/275 issued-at, 276/277 valid-until, 278 channel, 279/280 the clock reading used (0 when none).
+(defn fresh-verdict [ctx]
+  (let [now (rtc-now ctx)
+        issued (word64 ctx 274)
+        until (word64 ctx 276)
+        st (if (= now 0) 4 (if (> issued (+ now 86400)) 3 (if (> now until) 2 1)))]
+    (do (put-word64 ctx 279 now) (put-word ctx 273 st) (fail ctx 15))))
+
+(defn fresh-sok [issued until chan]
+  (if (and (>= issued 1) (and (> until issued) (and (<= (- until issued) 2592000) (= chan 1)))) 1 0))
+;; Page bytes 0..127 hold the manifest, the count and the zero bytes. 14 when the structure is sound and the
+;; entries follow, else a refusal code (2 magic, 5 reserved, 3 count or layout).
+(defn h2-start [ctx test]
+  (let [kind (kind-of test)
+        badm (magic2-bad kind 0 0)
+        rsv (if (= kind 1) (zeros-nz 28 32 0) (if (= kind 2) (zeros-nz 36 64 0) (zeros-nz 24 32 0)))
+        cnt (pg-le 64 4 0)
+        lay (zeros-nz 68 128 0)
+        size (pg-le 16 8 0)
+        version (pg-le 8 8 0)
+        ccount (pg-le 24 4 0)
+        until (pg-le 24 8 0)
+        chan (pg-le 32 4 0)
+        ;; the manifest's length is sound: an image 1..32 MiB, a catalog 128 * its entry count (1..64); a freshness record
+        ;; (bytes 16..23 issued-at, 24..31 valid-until, 32..35 channel) has issued-at >= 1, a lifetime of 1 second..30 days and channel 1
+        sok (if (= kind 1) (if (and (and (>= ccount 1) (<= ccount 64)) (= size (* ccount 128))) 1 0)
+              (if (= kind 2) (fresh-sok size until chan)
+                (if (and (> size 0) (<= size 33554432)) 1 0)))]
+    (if (not (= badm 0)) (fail ctx 2)
+      (if (not (= rsv 0)) (fail ctx 5)
+        (if (or (or (< cnt 1) (> cnt 4)) (not (= lay 0))) (fail ctx 3)
+          (do (put-word ctx 212 16384)
+              (put-word ctx 216 cnt)
+              (put-word ctx 218 0)
+              (put-word ctx 227 (+ 128 (* cnt 3392)))
+              (put-word ctx 223 (+ (if (= sok 1) 0 1) (if (< version 1) 2 0)))
+              (put-word ctx 224 (if (and (= sok 1) (not (= kind 2))) size 0))
+              (put-word64 ctx 225 (if (< version 1) 0 version))
+              (if (= kind 2) (do (put-word64 ctx 274 size) (put-word64 ctx 276 until) (put-word ctx 278 chan)) 0)
+              (copy-manifest ctx 0)
+              (mp-prefix kind 0)
+              (save-digest ctx 0)
+              (fail ctx 14)))))))
+
+;; JUN-813 (ADR-0286 amendment 7): bit 0 of the caller's test argument picks the pinned set: 1 the TEST keys, 0 the production keys.
+(defn ed-word [test id w] (if (= (bit-and test 1) 1) (tk/ims-ed-word id w) (pk/ims-ed-word id w)))
+(defn ml-word [test id w] (if (= (bit-and test 1) 1) (tk/ims-ml-word id w) (pk/ims-ml-word id w)))
+(defn load-ed-key [ctx test id w]
+  (if (>= w 8) 1 (do (put-word ctx (+ 512 w) (ed-word test id w)) (load-ed-key ctx test id (+ w 1)))))
+(defn load-ml-key [test id w]
+  (if (>= w 488) 1 (do (pw! w (ml-word test id w)) (load-ml-key test id (+ w 1)))))
+;; The entry's last byte has landed: key id (220), reserved (221), padding (222) must be a pinned slot not yet
+;; counted with zero reserved/padding bytes; then Ed25519, and only if it verified, ML-DSA-65.
+(defn verify-entry [ctx test]
+  (let [id (word ctx 220) seen (word ctx 218)]
+    (if (or (>= id 3) (or (not (= (word ctx 221) 0)) (or (not (= (word ctx 222) 0))
+                                                         (not (= (bit-and seen (ims-bit id)) 0)))))
+      0
+      (let [flag (put-word ctx 228 1)
+            k (load-ed-key ctx test id 0)
+            ed (aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 64
+                                      (kernel-subregion ctx 8192 4096 4096))
+            ml (if (= (+ ed (* 0 (+ k flag))) 1)
+                 (let [kk (load-ml-key test id 0)
+                       u (mv-mu (kernel-owned-window 4 20480) 20480 74)
+                       v (mv-verify (kernel-owned-window 4 20480) 20480)]
+                   (+ v (* 0 (+ kk u))))
+                 0)]
+        (put-word ctx 218 (ims-step seen id ed ml))))))
+
+;; Header byte h (>= 128), value b. Entry ei = (h - 128) / 3392, offset e within it.
+(defn h2-byte [ctx h b test]
+  (let [j (- h 128)
+        ei (quot j 3392)
+        e (- j (* ei 3392))]
+    (if (>= ei (word ctx 216)) 0
+      (do (if (< e 4) (put-word ctx 220 (if (= e 0) b (+ (word ctx 220) (* b (case e 1 256 2 65536 16777216))))) 0)
+          (if (and (>= e 4) (< e 8)) (put-word ctx 221 (if (= e 4) b (bit-or (word ctx 221) b))) 0)
+          (if (and (>= e 8) (< e 72)) (put-byte ctx (+ 2072 e) b) 0)
+          (if (and (>= e 72) (< e 3381)) (sb! (- e 72) b) 0)
+          (if (>= e 3381) (put-word ctx 222 (if (= e 3381) (nz b) (bit-or (word ctx 222) (nz b)))) 0)
+          (if (= e 3391) (verify-entry ctx test) 0)
+          1))))
+(defn h2-consume [ctx h i n test]
+  (if (>= i n) 1
+    (do (h2-byte ctx (+ h i) (pg (bit-and (+ h i) 4095)) test)
+        (h2-consume ctx h (+ i 1) n test))))
+
+;; src 0 the network (stream offset `off`), src 1 the QEMU file. n <= 1024 bytes land at page byte dst.
+(defn get-chunk [ctx src off n dst]
+  (if (= src 1)
+    ;; word 230 = 1 (QEMU case mode 2): the stream breaks before the piece that would pass byte 7200, like a lost network answer
+    (if (and (= (word ctx 230) 1) (> (+ (word ctx 229) n) 7200)) 0
+      (do (put-word ctx 229 (+ (word ctx 229) n)) (fw-fill dst n 0)))
+    (fetch ctx off n dst 0)))
+;; Header bytes h .. end in pieces that end at a 1 KiB line, so none crosses the page end.
+(defn h2-loop [ctx src h end test]
+  (if (>= h end) 1
+    (let [n (least (- 1024 (bit-and h 1023)) (- end h))]
+      (if (= (get-chunk ctx src h n (bit-and h 4095)) 0) 0
+        (do (h2-consume ctx h 0 n test) (h2-loop ctx src (+ h n) end test))))))
+(defn h2-admit [ctx]
+  (if (not (= (ims-final (word ctx 218)) 1)) (fail ctx 1)
+    (if (= (bit-and (word ctx 223) 1) 1) (fail ctx 3)
+      (if (= (bit-and (word ctx 223) 2) 2) (fail ctx 4)
+        (if (= (word ctx 231) 2) (fresh-verdict ctx)
+          (do (put-word64 ctx 181 (+ (word ctx 225) (* (word ctx 226) 4294967296)))
+              (put-word ctx 183 (word ctx 224))
+              (put-word ctx 184 0)
+              (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+              (fail ctx 14)))))))
+;; The first 128 header bytes are in the page. 14 when the header is admitted and the image is next.
+(defn begin2 [ctx src test]
+  (let [s (h2-start ctx test)]
+    (if (not (= s 14)) s
+      (if (= (h2-loop ctx src 128 (word ctx 227) test) 0)
+        ;; the stream broke after some entries may have been verified: the verifier left the NVMe/ESP state overwritten
+        (do (restore-storage ctx) (fail ctx 21))
+        (do (restore-storage ctx) (h2-admit ctx))))))
+;; ---- JUN-813 stage 5c (ADR-0286 amendment 4): the hash-checked per-channel version floor ----
+;; The floor lives in the update journal (native/update_journal.kotoba, OSMETA.BIN: crash-ordered double slot, SHA-256 checked, NOT
+;; signed). `floor-load` re-runs the NVMe driver and the ESP walk (a verifier may have overwritten their words), mounts OSMETA.BIN
+;; read-only and loads the journal; it FAILS CLOSED: a missing, unreadable, corrupt, hash-mismatching or never-initialised journal is
+;; result 10, never floor 0. Words 256/257 floor, 258 load result (1 ok, 0 failed), 259 advance (0 not tried, 1 advanced, 2 failed),
+;; 260/261 floor after the advance, 262 the QEMU provisioning hook's result. The journal writes its public fields to words 212..223,
+;; which are this file's header words, so they are cleared after the floor is taken (the verifier sets its own words afterwards).
+(defn clear-words [ctx i end]
+  (if (>= i end) 1 (do (put-word ctx i 0) (clear-words ctx (+ i 1) end))))
+(defn floor-load [ctx]
+  (do (put-word ctx 258 0) (put-word ctx 259 0) (put-word ctx 262 0)
+      (if (and (= (nvme/probe ctx) 15) (= (esp/run ctx) 15) (> (journal/mount 0) 0) (> (journal/load) 0))
+        (let [lo (journal/field 6) hi (journal/field 7)]
+          (do (clear-words ctx 213 224)
+              (put-word ctx 256 lo) (put-word ctx 257 hi) (put-word ctx 258 1)
+              1))
+        (do (clear-words ctx 213 224) 0))))
+;; The manifest is signed and its version is known (181/182): it must be strictly above the floor. No image byte has been taken.
+(defn floor-ok [ctx]
+  (> (word64 ctx 181) (word64 ctx 256)))
+(defn floor-check [ctx]
+  (if (floor-ok ctx) 14 (fail ctx 9)))
+;; Fetch the first 128 bytes and dispatch on the magic's last byte: "2" AIUEIMG2, anything else the AIUEIMG1 path.
+;; The floor is read first (result 10 when it cannot be) and compared once the header is admitted (result 9).
+;; JUN-813 stage 6: a catalog (`(cat? test)`) takes no version floor: that floor is the image channel's (ADR-0286 amendment 4) and a catalog needs its own.
+(defn admit-cat [ctx src test]
+  (do (put-word ctx 212 128) (put-word ctx 228 0) (put-word ctx 231 1)
+      (put-word ctx 270 0) (put-word ctx 271 0) (put-word ctx 272 0)
+      (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+        (begin2 ctx src test))))
+(defn admit-fresh [ctx src test]
+  (do (put-word ctx 212 128) (put-word ctx 228 0) (put-word ctx 231 2) (put-word ctx 273 0)
+      (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+        (begin2 ctx src test))))
+(defn admit [ctx src test]
+  (if (= (fresh? test) 1) (admit-fresh ctx src test)
+   (if (= (cat? test) 1) (admit-cat ctx src test)
+   (if (= (floor-load ctx) 0) (fail ctx 10)
+    (do (put-word ctx 212 128) (put-word ctx 228 0) (put-word ctx 231 0)
+        (if (= (get-chunk ctx src 0 128 0) 0) (fail ctx 21)
+          (let [r (if (= (pg 7) 50) (begin2 ctx src test)
+                    (if (= (begin ctx test) 14) 14 (word ctx 180)))]
+            (if (= r 14) (floor-check ctx) r))))))))
+
 (defn chunks [ctx at]
   (let [size (word ctx 183)]
     (if (or (>= at size) (not (= (word ctx 180) 14))) (word ctx 180)
       (let [n (least 1024 (- size at))]
-        (if (= (fetch ctx (+ 128 at) n (bit-and at 4095) 0) 0) (fail ctx 21)
+        (if (= (fetch ctx (+ (word ctx 212) at) n (bit-and at 4095) 0) 0) (fail ctx 21)
           (do (chunk-done ctx n) (chunks ctx (+ at n))))))))
 ;; The boot nonce is remote-cmd's (context words 172/173).
 (defn pull [ctx]
   (do (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0) (put-word ctx 186 0) (put-word ctx 187 0)
       (if (= (nic/link-info) 0) (fail ctx 20)
-        (if (= (fetch ctx 0 128 0 0) 0) (fail ctx 21)
-          (if (= (begin ctx 0) 14) (chunks ctx 0) (word ctx 180))))))
+        (if (= (admit ctx 0 0) 14) (chunks ctx 0) (word ctx 180)))))
 
 ;; KDBG 0xc120 result | repeats << 16, 0xc121 version, 0xc122 size | taken << 32,
 ;; 0xc123 failed offset, 0xc124..0xc127 the computed SHA-256 (8 bytes each).
@@ -308,17 +704,55 @@
                          (= (same-words ctx 680 190 0) 1))
                   (ifail ctx 15)
                   (ifail ctx 47)))))))))
+;; ---- JUN-813 stage 5c: advance the floor after a committed install ----
+;; Order: the floor is advanced AFTER the install is committed (BOOTX64.EFI swapped and re-hashed), never before. A crash between the two
+;; leaves the new image installed with the old floor: one repeat install of the same version is admitted, nothing is bricked. Advancing
+;; first would turn every failed install into a refused retry. The journal state after an advance is "prepared" (phase 1, floor =
+;; candidate = the installed version); nothing confirms it yet (no boot-health evidence exists), so an install that finds an earlier
+;; unconfirmed prepare first abandons it through the journal's own trial and rollback transitions (phase 3, floor kept).
+(defn put-digest-bytes [i]
+  (if (>= i 8) 1
+    (let [w (word (kernel-browser-context) (+ 190 i))]
+      (do (put-pg (* i 4) (bit-and (u64-shift-right w 24) 255))
+          (put-pg (+ (* i 4) 1) (bit-and (u64-shift-right w 16) 255))
+          (put-pg (+ (* i 4) 2) (bit-and (u64-shift-right w 8) 255))
+          (put-pg (+ (* i 4) 3) (bit-and w 255))
+          (put-digest-bytes (+ i 1))))))
+(defn abandon-pending [phase]
+  (if (= phase 1) (if (> (journal/trial) 0) (if (> (journal/rollback) 0) 1 0) 0)
+    (if (= phase 2) (if (> (journal/rollback) 0) 1 0) 1)))
+(defn advance [ctx]
+  (let [version (word64 ctx 181)
+        d (put-digest-bytes 0)]
+    (if (and (> (journal/mount 0) 0) (> (journal/load) 0)
+             (= (abandon-pending (journal/field 4)) (+ 1 (* 0 d)))
+             (> (journal/prepare version (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) 0))
+      (do (put-word ctx 260 (journal/field 6)) (put-word ctx 261 (journal/field 7)) (put-word ctx 259 1) 1)
+      (do (put-word ctx 259 2) 0))))
+;; The journal's `confirm` needs boot-health evidence that does not exist yet (nothing boots the installed image and reports back), so nothing calls
+;; this: it is the single place the follow-up will, and it also gives the compiler the extent of confirm's digest region. It is not
+;; reachable from any remote command, hook or boot path.
+(defn confirm-installed []
+  (let [ctx (kernel-browser-context) d (put-digest-bytes 0)]
+    (if (and (> (journal/mount 0) 0) (> (journal/load) 0))
+      (+ (journal/confirm (word64 ctx 181) (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) (* 0 d))
+      -1)))
+;; r is commit's result: only a fully committed install (15) advances the floor; if the advance itself fails the image is installed
+;; but the floor is not (50), which the operator must see.
+(defn after-commit [ctx r]
+  (if (= r 15)
+    (if (= (advance ctx) 1) (ifail ctx 15) (ifail ctx 50))
+    r))
 (defn install [ctx]
   (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0)
       (put-word ctx 186 0) (put-word ctx 187 0)
       (if (= (nic/link-info) 0) (ifail ctx 20)
-        (if (= (fetch ctx 0 128 0 0) 0) (ifail ctx 21)
-          (if (not (= (begin ctx 0) 14)) (ifail ctx (word ctx 180))
-            (let [r (ready ctx)]
-              (if (> r 0) (ifail ctx r)
-                (do (start-stream ctx) (chunks ctx 0) (commit ctx)))))))))
+        (if (not (= (admit ctx 0 0) 14)) (ifail ctx (word ctx 180))
+          (let [r (ready ctx)]
+            (if (> r 0) (ifail ctx r)
+              (do (start-stream ctx) (chunks ctx 0) (after-commit ctx (commit ctx)))))))))
 (defn self-install [ctx flip]
-  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0)
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 231 0)
       (put-header 0 -1)
       (if (not (= (begin ctx 1) 14)) (ifail ctx (word ctx 180))
         (let [r (ready ctx)]
@@ -340,33 +774,281 @@
       (word ctx 208)))
 
 ;; ---- QEMU gate hook (fw_cfg) ----
-(defn fw-byte [] (kernel-in-u8 1297))
-(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
-(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
-;; "opt/aiueos/install" and its NUL
-(defn fw-name-byte [i] (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0))
-(defn fw-name [i ok]
-  (if (>= i 56) ok
-    (let [b (fw-byte)]
-      (fw-name (+ i 1) (if (and (= ok 1) (or (>= i 19) (= b (fw-name-byte i)))) 1 0)))))
-(defn fw-find [left]
-  (if (<= left 0) 0
-    (let [size (fw-be 4 0)
-          sel (fw-be 2 0)
-          skip (fw-skip 2)
-          hit (fw-name 0 1)]
-      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1))))))
-(defn fw-signature [i]
-  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
-(defn fw-request []
-  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
-    (do (kernel-out-u16 1296 0)
-        (if (= (fw-signature 0) 0) 0
-          (do (kernel-out-u16 1296 25)
-              (let [sel (fw-find (least (fw-be 4 0) 256))]
-                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) (fw-byte)))))))))
+;; AIUEIMG2 cases from opt/aiueos/update2: [count][per case: mode, 16384 header bytes, 5000 image bytes]. The image of an
+;; admitted case flows through chunk-done (digest check); a refused case's stream is skipped to keep the file aligned.
+(defn feed2 [ctx at]
+  (if (or (>= at (word ctx 183)) (not (= (word ctx 180) 14))) (word ctx 180)
+    (let [n (least 1024 (- (word ctx 183) at))]
+      (do (get-chunk ctx 1 0 n (bit-and at 4095))
+          (chunk-done ctx n)
+          (feed2 ctx (+ at n))))))
+(defn test-of [mode] (if (= mode 1) 0 1))
+(defn run-case2 [ctx k]
+  (let [mode (fw-byte)]
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 230 (if (= mode 2) 1 0))
+        (let [a (admit ctx 1 (test-of mode))
+              hn (- 16384 (word ctx 229))
+              hs (fw-skip hn)
+              r (if (= a 14) (feed2 ctx 0) (word ctx 180))
+              is (fw-skip (- 21384 (+ hn (word ctx 229))))]
+          ;; two cases per word: case k at word 236 + k / 2, low half for even k, high half for odd k
+          (let [v (+ r (* 256 (word ctx 218)))
+                w (+ 236 (quot k 2))]
+            (do (put-word ctx w (if (= (bit-and k 1) 0) v (+ (word ctx w) (* 65536 v))))
+                (+ 1 (* 0 (+ hs is)))))))))
+(defn cases2 [ctx k n]
+  (if (>= k n) 1 (do (run-case2 ctx k) (cases2 ctx (+ k 1) n))))
+;; ---- JUN-813 stage 6: AIUECAT1 cases from opt/aiueos/cat1: [count][per case: mode (0 test keys, 1 production), 16384 header bytes,
+;; 8192 body bytes (only the manifest's length of them are streamed)]. Case k leaves at word 300 + k: result | counted mask << 8 | entry
+;; flags << 16 (flags only for result 16). Words 233 the ESP walk afterwards, 234 the marker "CAT1", 235 the count.
+(defn run-case3 [ctx k]
+  (let [mode (fw-byte)]
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 230 0)
+        (let [a (admit ctx 1 (+ 2 (test-of mode)))
+              hn (- 16384 (word ctx 229))
+              hs (fw-skip hn)
+              r (if (= a 14) (feed2 ctx 0) (word ctx 180))
+              is (fw-skip (- 24576 (+ hn (word ctx 229))))
+              v (+ r (+ (* 256 (word ctx 218)) (* 65536 (if (= r 16) (word ctx 270) 0))))]
+          (do (put-word ctx 231 0)
+              (put-word ctx (+ 300 k) v)
+              (+ 1 (* 0 (+ hs is))))))))
+(defn cases3 [ctx k n]
+  (if (>= k n) 1 (do (run-case3 ctx k) (cases3 ctx (+ k 1) n))))
+(defn self-test3 [ctx]
+  (if (= (fw-open 2) 0) 0
+    (let [count (fw-byte)]
+      (do (cases3 ctx 0 (least count 64))
+          (put-word ctx 233 (esp/run ctx))
+          (put-word ctx 235 count)
+          (put-word ctx 234 1128354865)
+          (put-word ctx 180 0)
+          count))))
+;; ---- JUN-813 amendment 6: AIUEFRS1 freshness records from opt/aiueos/fresh: [count][per case: mode (0 test keys, 1 production), 16384 header bytes];
+;; case k leaves at word 400 + k: result | counted mask << 8 | freshness verdict (word 273) << 16. Words 233 the ESP walk afterwards, 234 the marker "FRS1", 235 the count.
+(defn run-case4 [ctx k]
+  (let [mode (fw-byte)]
+    (do (put-word ctx 229 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 230 0) (put-word ctx 273 0)
+        (let [a (admit ctx 1 (+ 4 (test-of mode)))
+              hn (- 16384 (word ctx 229))
+              hs (fw-skip hn)
+              v (+ (word ctx 180) (+ (* 256 (word ctx 218)) (* 65536 (word ctx 273))))]
+          (do (put-word ctx 231 0)
+              (put-word ctx (+ 400 k) v)
+              (+ 1 (* 0 (+ hs a))))))))
+(defn cases4 [ctx k n]
+  (if (>= k n) 1 (do (run-case4 ctx k) (cases4 ctx (+ k 1) n))))
+(defn self-test4 [ctx]
+  (if (= (fw-open 3) 0) 0
+    (let [count (fw-byte)]
+      (do (cases4 ctx 0 (least count 64))
+          (put-word ctx 233 (esp/run ctx))
+          (put-word ctx 235 count)
+          (put-word ctx 234 1179800369)
+          (put-word ctx 180 0)
+          count))))
+;; opt/aiueos/clock: measure the RTC. 382/383 the clock reading at the start, 384/385 TSC then, 386..391 TSC at the next three changes of
+;; the seconds register, 392/393 the clock reading at the end, 394 the four seconds-register values (one byte each), 395 the three wait
+;; results (bits 0..2), 364 the marker "CLK1". Registers and status: words 365..381 (see `rtc-now`).
+(defn wait-sec [s0 fuel]
+  (if (= fuel 0) 0
+    (if (and (= (bit-and (cmos 10) 128) 0) (not (= (cmos 0) s0))) 1
+      (do (kernel-pause) (wait-sec s0 (- fuel 1))))))
+(defn put-tsc [ctx at]
+  (let [t (kernel-rdtsc)]
+    (do (put-word ctx at (bit-and t 4294967295)) (put-word ctx (+ at 1) (u64-shift-right t 32)) t)))
+(defn clock-probe [ctx]
+  (let [u0 (rtc-now ctx)
+        st0 (word ctx 365)
+        r0 (rtc-unix ctx 374)
+        t0 (put-tsc ctx 384)
+        s0 (cmos 0)
+        w1 (wait-sec s0 40000000)
+        t1 (put-tsc ctx 386)
+        s1 (cmos 0)
+        w2 (wait-sec s1 40000000)
+        t2 (put-tsc ctx 388)
+        s2 (cmos 0)
+        w3 (wait-sec s2 40000000)
+        t3 (put-tsc ctx 390)
+        s3 (cmos 0)
+        u3 (rtc-now ctx)]
+    (do (put-word64 ctx 382 u0) (put-word64 ctx 392 u3) (put-word ctx 397 st0) (put-word64 ctx 398 r0)
+        (put-word ctx 394 (+ s0 (+ (* s1 256) (+ (* s2 65536) (* s3 16777216)))))
+        (put-word ctx 395 (+ w1 (+ (* w2 2) (* w3 4))))
+        (put-word ctx 364 1129073457)
+        (+ 1 (* 0 (+ t0 (+ t1 (+ t2 t3))))))))
+;; Synthetic register rows through the same decoder: [n][n rows of 8 bytes: seconds, minutes, hours, day, month, year, century, register B]; the
+;; unix time of row k (0 when invalid) is word 464 + k, n <= 40 is word 460.
+(defn fw-row [ctx i]
+  (if (>= i 8) 1 (do (put-word ctx (+ 366 i) (fw-byte)) (fw-row ctx (+ i 1)))))
+(defn clock-rows [ctx k n]
+  (if (>= k n) 1
+    (do (fw-row ctx 0) (put-word ctx (+ 464 k) (rtc-unix ctx 366)) (clock-rows ctx (+ k 1) n))))
+(defn self-test5 [ctx]
+  (if (= (fw-open 4) 0) 0
+    (let [n (least (fw-byte) 40)]
+      (do (put-word ctx 460 n) (clock-rows ctx 0 n) (clock-probe ctx)))))
+(defn self-test2 [ctx]
+  (if (= (fw-open 1) 0) 0
+    (let [count (fw-byte)]
+      (do (cases2 ctx 0 (least count 40))
+          (put-word ctx 233 (esp/run ctx))
+          (put-word ctx 235 count)
+          (put-word ctx 234 1431318578)
+          (put-word ctx 180 0)
+          count))))
+;; Install case 0 of the file through the same admit / ready / stream / commit as the network install.
+(defn install2 [ctx adv]
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 218 0) (put-word ctx 229 0) (put-word ctx 230 0)
+      (if (= (fw-open 1) 0) (ifail ctx 21)
+        (do (fw-byte)
+            (let [mode (fw-byte)]
+              (if (not (= (admit ctx 1 (test-of mode)) 14)) (ifail ctx (word ctx 180))
+                (do (fw-skip (- 16384 (word ctx 229)))
+                    (let [r (ready ctx)]
+                      (if (> r 0) (ifail ctx r)
+                        (do (start-stream ctx) (feed2 ctx 0)
+                               (if (= adv 1) (after-commit ctx (commit ctx)) (commit ctx))))))))))))
+;; Hook request "4": provision OSMETA.BIN (never done at boot or by the network path): floor 4, active 4, a fixed digest. QEMU only.
+(defn fill-digest [i] (if (>= i 32) 1 (do (put-pg i (+ 165 i)) (fill-digest (+ i 1)))))
+(defn provision [ctx]
+  (let [m (journal/mount 1)
+        d (fill-digest 0)
+        r (if (> m 0) (journal/initialize 4 4 0 (kernel-subregion (kernel-owned-window 14 4096) 4096 0 32)) m)]
+    (do (clear-words ctx 213 224) (put-word ctx 208 0)
+        (put-word ctx 262 (if (> (+ r (* 0 d)) 0) 1 2))
+        1)))
+;; ---- JUN-813 (ADR-0286 amendment 6, owner decision 2026-11-06): the RTC probe for the real board ----
+;; The debug entry runs `rtc-probe` once at boot (before qemu-hook), read only: ports 0x70/0x71, no RTC write, no disk, no fw_cfg, so the same code
+;; runs under QEMU and on a physical board. It reports twelve KDBG records, tag 0xc400 + k, and keeps each as three context words at 1500 + 3k
+;; (tag, value low, value high; word 1499 = records so far, word 1498 = "RTC1" when finished). Register snapshots live at words 1400..1414 (A),
+;; 1420..1434 (B), 1440..1454 (temporary): word at + r is CMOS register r (r = 0..13), at + 14 is register 0x32 (century).
+;;   c400 "RTC1" << 32 | 1 (version)       c401 / c403 registers 0x00..0x07 of snapshot A / B, register 0 in the low byte
+;;   c402 / c404 registers 0x08 0x09 0x0A 0x0B 0x0C 0x0D 0x32 (bytes 0..6)    c405 guest conversion, face value read as UTC: A | B << 32 (0 = invalid)
+;;   c406 / c407 TSC at A / B       c408 spins to see the update flag | spins to see the seconds change << 24 | retries A << 48 | retries B << 56
+;;   c409 `rtc-now` (the freshness clock itself): unix | status << 32       c40a verdict: flags | hypervisor << 32 | rtc-now status << 40 | flag self-check << 48 | verdict << 56
+;;   c40b 0x5254433100000000 | records
+;; Flags, low 10 bits fail the clock: 1 update flag stuck, 2 no two equal snapshots, 4 register D bit 7 clear (battery dead, power lost), 8 a field invalid
+;; (BCD nibble over 9 or out of range), 16 earlier than the build floor 2026-11-06, 32 seconds did not change, 64 change not 1..2 s, 128 register B SET bit
+;; (updates halted), 256 `rtc-now` disagrees with this probe, 512 the probe's own update-flag wait did not clear the flag. Information only: 65536 century
+;; register 0x32 is plausible (19..21), 131072 12-hour mode, 262144 binary mode, 524288 DST bit, 1048576 update flag never seen, 2097152 divider not 010.
+;; The conversion assumes the face value is UTC (as `rtc-now` does); the zone, if it is local time, is for the operator to read off (runbook-6600h-rtc-probe.md).
+(defn pr-idle [fuel]
+  (if (= (bit-and (cmos 10) 128) 0) 1
+    (if (= fuel 0) 0 (do (kernel-pause) (pr-idle (- fuel 1))))))
+(defn pr-reg [i] (if (= i 14) 50 i))
+(defn pr-snap [ctx at i]
+  (if (>= i 15) 1 (do (put-word ctx (+ at i) (cmos (pr-reg i))) (pr-snap ctx at (+ i 1)))))
+(defn pr-cmp [i] (case i 0 1 2 1 4 1 6 1 7 1 8 1 9 1 11 1 14 1 0))
+(defn pr-same [ctx a b i]
+  (if (>= i 15) 1
+    (if (and (= (pr-cmp i) 1) (not (= (word ctx (+ a i)) (word ctx (+ b i))))) 0 (pr-same ctx a b (+ i 1)))))
+;; 1: two snapshots with the update flag clear before and after agree (the first stays at `at`); 0: none did; 2: the flag never cleared
+(defn pr-stable [ctx at tries]
+  (if (= tries 0) 0
+    (if (= (pr-idle 500000) 0) 2
+      (do (pr-snap ctx at 0) (pr-snap ctx 1440 0)
+          (if (and (= (pr-same ctx at 1440 0) 1) (= (bit-and (cmos 10) 128) 0)) 1
+            (do (put-word ctx 1492 (+ (word ctx 1492) 1)) (pr-stable ctx at (- tries 1))))))))
+;; the two spins are bounded by a TSC deadline (4e9 ticks: 4 s at 1 GHz, over a second on any TSC up to 3.5 GHz), not by a count: a count that is a
+;; second on a slow port bus is a fraction of a second under TCG, and a dead RTC must not hold the boot past the watchdog. They return the spin count, 0 on timeout.
+(defn pr-find-uip [n limit]
+  (if (> (kernel-rdtsc) limit) 0 (if (= (bit-and (cmos 10) 128) 0) (pr-find-uip (+ n 1) limit) n)))
+(defn pr-change [s0 n limit]
+  (if (> (kernel-rdtsc) limit) 0
+    (if (and (= (bit-and (cmos 10) 128) 0) (not (= (cmos 0) s0))) n (pr-change s0 (+ n 1) limit))))
+;; self-check of the wait: catch the update flag set, wait, and read register A again: 1 cleared, 2 still set, 0 never seen
+(defn pr-check [ctx]
+  (let [n (pr-find-uip 1 (+ (kernel-rdtsc) 4000000000))]
+    (if (= n 0) 0
+      (let [w (pr-idle 500000)
+            a (cmos 10)]
+        (do (put-word ctx 1490 n)
+            (if (and (= w 1) (= (bit-and a 128) 0)) 1 2))))))
+(defn pr-pack [ctx at i lo acc]
+  (if (< i lo) acc (pr-pack ctx at (- i 1) lo (+ (i64-shift-left acc 8) (word ctx (+ at i))))))
+;; the layout `rtc-unix` reads: seconds, minutes, hours, day, month, year, century, register B
+(defn pr-unix [ctx at]
+  (do (put-word ctx 1460 (word ctx at)) (put-word ctx 1461 (word ctx (+ at 2))) (put-word ctx 1462 (word ctx (+ at 4)))
+      (put-word ctx 1463 (word ctx (+ at 7))) (put-word ctx 1464 (word ctx (+ at 8))) (put-word ctx 1465 (word ctx (+ at 9)))
+      (put-word ctx 1466 (word ctx (+ at 14))) (put-word ctx 1467 (word ctx (+ at 11)))
+      (rtc-unix ctx 1460)))
+(defn pr-emit [ctx k tag value]
+  (do (put-word ctx (+ 1500 (* k 3)) tag) (put-word64 ctx (+ 1501 (* k 3)) value) (put-word ctx 1499 (+ k 1))
+      (nic/log tag value)))
+(defn pr-flag [c v] (if (= c 1) v 0))
+;; the inputs sit in words 1470..1476: okA okB uA uB `rtc-now` self-check seconds-change spins
+(defn pr-fail [ctx]
+  (let [okA (word ctx 1470) okB (word ctx 1471) uA (word ctx 1472) uB (word ctx 1473)
+        now (word ctx 1474) chk (word ctx 1475) nchg (word ctx 1476)
+        rb (word ctx 1411) rd (word ctx 1413)
+        both (if (and (> uA 0) (> uB 0)) 1 0)
+        diff (- uB uA)
+        bad (if (and (= okA 1) (and (= okB 1) (or (= uA 0) (= uB 0)))) 1 0)
+        low (if (and (= okA 1) (and (> uA 0) (< uA 1793923200))) 1 0)
+        unusable (if (or (not (= okA 1)) (or (= (bit-and rd 128) 0) (or (= uA 0) (= low 1)))) 1 0)
+        disagree (if (= (if (= now 0) 1 0) unusable) 0 1)
+        far (if (and (> now 0) (and (> uA 0) (> (if (> now uA) (- now uA) (- uA now)) 3))) 1 0)]
+    (+ (pr-flag (if (= okA 2) 1 0) 1)
+       (+ (pr-flag (if (or (= okA 0) (= okB 0)) 1 0) 2)
+          (+ (pr-flag (if (= (bit-and rd 128) 0) 1 0) 4)
+             (+ (pr-flag bad 8)
+                (+ (pr-flag low 16)
+                   (+ (pr-flag (if (or (= nchg 0) (and (= both 1) (= diff 0))) 1 0) 32)
+                      (+ (pr-flag (if (and (= both 1) (or (< diff 0) (> diff 2))) 1 0) 64)
+                         (+ (pr-flag (if (= (bit-and rb 128) 128) 1 0) 128)
+                            (+ (pr-flag (if (or (= disagree 1) (= far 1)) 1 0) 256)
+                               (pr-flag (if (= chk 2) 1 0) 512))))))))))))
+(defn pr-info [ctx]
+  (let [rb (word ctx 1411) ra (word ctx 1410) rc (word ctx 1414) chk (word ctx 1475)
+        bin (bit-and (u64-shift-right rb 2) 1)
+        plausible (if (and (= (bcd-ok rc bin) 1) (and (>= (bcd rc bin) 19) (<= (bcd rc bin) 21))) 1 0)]
+    (+ (pr-flag plausible 65536)
+       (+ (pr-flag (if (= (bit-and rb 2) 0) 1 0) 131072)
+          (+ (pr-flag bin 262144)
+             (+ (pr-flag (bit-and rb 1) 524288)
+                (+ (pr-flag (if (= chk 0) 1 0) 1048576)
+                   (pr-flag (if (= (bit-and (u64-shift-right ra 4) 7) 2) 0 1) 2097152))))))))
+(defn rtc-probe [ctx]
+  (let [hv (bit-and (u64-shift-right (kernel-cpuid-ecx 1 0) 31) 1)
+        z (do (put-word ctx 1498 0) (put-word ctx 1499 0) (put-word ctx 1490 0) (put-word ctx 1492 0) 0)
+        chk (pr-check ctx)
+        okA (pr-stable ctx 1400 8)
+        tA (kernel-rdtsc)
+        retA (word ctx 1492)
+        nchg (pr-change (word ctx 1400) 1 (+ (kernel-rdtsc) 4000000000))
+        okB (pr-stable ctx 1420 8)
+        tB (kernel-rdtsc)
+        retB (- (word ctx 1492) retA)
+        uA (pr-unix ctx 1400)
+        uB (pr-unix ctx 1420)
+        now (rtc-now ctx)
+        nst (word ctx 365)
+        inp (do (put-word ctx 1470 okA) (put-word ctx 1471 okB) (put-word ctx 1472 uA) (put-word ctx 1473 uB)
+               (put-word ctx 1474 now) (put-word ctx 1475 chk) (put-word ctx 1476 nchg) 0)
+        flags (+ (pr-fail ctx) (+ (pr-info ctx) (* 0 inp)))
+        verdict (if (= (bit-and flags 1023) 0) 1 0)]
+    (do (pr-emit ctx 0 50176 5932440486886244353)
+        (pr-emit ctx 1 50177 (pr-pack ctx 1400 7 0 0))
+        (pr-emit ctx 2 50178 (pr-pack ctx 1400 14 8 0))
+        (pr-emit ctx 3 50179 (pr-pack ctx 1420 7 0 0))
+        (pr-emit ctx 4 50180 (pr-pack ctx 1420 14 8 0))
+        (pr-emit ctx 5 50181 (+ uA (i64-shift-left uB 32)))
+        (pr-emit ctx 6 50182 tA)
+        (pr-emit ctx 7 50183 tB)
+        (pr-emit ctx 8 50184 (+ (word ctx 1490) (+ (i64-shift-left nchg 24) (+ (i64-shift-left retA 48) (i64-shift-left retB 56)))))
+        (pr-emit ctx 9 50185 (+ now (i64-shift-left nst 32)))
+        (pr-emit ctx 10 50186 (+ flags (+ (i64-shift-left hv 32) (+ (i64-shift-left nst 40) (+ (i64-shift-left chk 48) (i64-shift-left verdict 56))))))
+        (pr-emit ctx 11 50187 5932440486886244364)
+        (put-word ctx 1498 1381253937)
+        (+ verdict (* 0 z)))))
 (defn qemu-hook [ctx]
   (let [b (fw-request)]
     (do (put-word ctx 211 b)
         (if (= b 49) (self-install ctx -1)
-          (if (= b 50) (self-install ctx 4097) 0)))))
+          (if (= b 50) (self-install ctx 4097)
+            (if (= b 51) (install2 ctx 1)
+              (if (= b 52) (provision ctx)
+                (if (= b 53) (install2 ctx 0)
+                  (do (self-test2 ctx) (self-test3 ctx) (self-test4 ctx) (self-test5 ctx) 0)))))))))

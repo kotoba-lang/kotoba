@@ -159,6 +159,13 @@ def main(args):
         effect = REPO.parent / "kotoba.browser/src/browser/effects.kotoba"
         sources["/os/browser/effects.kotoba"] = stage_file(
             effect, stage / "os/browser/effects.kotoba")
+        # JUN-920: the region modules of the CSSOM style slice (ns cssom.*-k) are staged under the kotoba source root, like the
+        # shared effect owner above; only the modules an entry reaches are locked into the build.
+        # AIUEOS_CSSOM_K_SOURCE_PATH points the stage at another directory of those modules (the gate's mutant builds).
+        cssom_k = Path(os.environ.get("AIUEOS_CSSOM_K_SOURCE_PATH", REPO.parent / "kotoba.cssom/src/cssom")).resolve(strict=True)
+        for source in sorted(list(cssom_k.glob("*_k.kotoba")) + list(cssom_k.glob("*_q6.kotoba"))):
+            relative = Path("os/aiueos/kotoba/cssom") / source.name
+            sources["/" + relative.as_posix()] = stage_file(source, stage / relative)
         owner_manifest = json.loads(DEPENDENCIES.read_text())
         if owner_manifest["schema"] != "aiueos.native-source-dependencies.v1":
             raise ValueError("unexpected owner dependency manifest")

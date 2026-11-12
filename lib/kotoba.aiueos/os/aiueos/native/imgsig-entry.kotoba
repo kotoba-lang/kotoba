@@ -1,0 +1,157 @@
+(ns aiueos.native.imgsig-entry
+  (:require [aiueos.native.desktop :as desktop]
+            [aiueos.value-runtime-entry :as runtime]
+            [aiueos.value-runtime-syscall-plan :as syscall]
+            [aiueos.value-runtime-domain :as domain]
+            [aiueos.value-runtime-capability-table :as capability]
+            [aiueos.value-runtime-provider-policy :as provider]
+            [aiueos.value-runtime-provider-transport :as transport]
+            [aiueos.value-runtime-cas-verify :as cas]
+            [aiueos.ed25519 :refer [aiueos-ed25519-verify]]
+            [aiueos.mldsa-verify :refer [mv-mu mv-verify]]
+            [aiueos.imgsig :refer [ims-step ims-final]]
+            [aiueos.imgsig-testkeys :refer [ims-ed-word ims-ml-word]])
+  (:export [main aiueos-value-runtime-entry aiueos-value-runtime-syscall-plan
+            aiueos-value-runtime-publish-domain aiueos-value-runtime-provider-status
+            aiueos-value-runtime-capability-grant aiueos-value-runtime-provider-claim
+            aiueos-value-runtime-provider-complete aiueos-value-runtime-cas-verify]))
+
+(defn aiueos-value-runtime-entry [a :i64 p :i64 u :i64 r :i64 c :i64] :i64
+  (runtime/aiueos-value-runtime-entry a p u r c))
+(defn aiueos-value-runtime-syscall-plan [n :i64 d :i64 p :i64 i :i64 s :i64] :i64
+  (syscall/aiueos-value-runtime-syscall-plan n d p i s))
+(defn aiueos-value-runtime-publish-domain [d :i64] :i64
+  (domain/aiueos-value-runtime-publish-domain d))
+(defn aiueos-value-runtime-provider-status [g :i64 a :i64] :i64
+  (provider/aiueos-value-runtime-provider-status g a))
+(defn aiueos-value-runtime-capability-grant [a :i64 s :i64 g :i64 r :i64 o :i64] :i64
+  (provider/aiueos-value-runtime-capability-grant a s g r o))
+(defn aiueos-value-runtime-provider-claim [] :i64
+  (transport/aiueos-value-runtime-provider-claim))
+(defn aiueos-value-runtime-provider-complete [t :i64 r :i64 b :i64 n :i64 d :i64] :i64
+  (transport/aiueos-value-runtime-provider-complete t r b n d))
+(defn aiueos-value-runtime-cas-verify [b :i64 n :i64 e :i64 o :i64 w :i64] :i64
+  (cas/aiueos-value-runtime-cas-verify b n e o w))
+
+;; JUN-813 stage 5a (ADR-0286 amendment 2): before the desktop starts the kernel runs the multi-signer admission rule of aiueos.imgsig
+;; over AIUEIMG2 headers handed in through fw_cfg (file opt/aiueos/imgsig, only under a hypervisor, as native/mldsa-verify-entry):
+;; [count:1] then per case a 16384-byte header (layout in scripts/imgsig_oracle.py). The pinned keys are the TEST keys of
+;; aiueos.imgsig-testkeys. Case k (k < 40) leaves at context byte 1280 + 8 k the verdict (1 admitted, 2 magic, 3 count/layout,
+;; 4 below M, 5 manifest reserved), then the mask of counted slots (two words; no third word is written). An entry whose key id is not a
+;; pinned slot (all four id bytes count), whose reserved bytes 4..7 or padding bytes 3381..3391 are not all zero is skipped, as in
+;; scripts/imgsig_oracle.py verdict(). Word 99 is the marker
+;; "IS01" (1230188593 as a u32), written last. Arena = owned window 4: S 8192 (ML-DSA signature, M' at 3392), P 12288 (key).
+;; The Ed25519 verifier uses context bytes 2048..3071 (key 0, signature 32, manifest 96) and 4096..8191.
+(defn sb! [i v] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 8192 4096) 4096 i v))
+(defn pb! [i v] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 12288 4096) 4096 i v))
+(defn pw! [w v] (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 12288 4096) 4096 (* 4 w) v))
+(defn put-u32 [ctx at v] (kernel-store-u32 (kernel-subregion ctx 8192 at 4) 4 0 v))
+(defn get-u32 [ctx at] (kernel-load-u32 (kernel-subregion ctx 8192 at 4) 4 0))
+(defn cb! [ctx at v] (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 v))
+
+(defn fw-min [a b] (if (< a b) a b))
+(defn fw-byte [] (kernel-in-u8 1297))
+(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
+(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
+;; "opt/aiueos/imgsig" and its NUL
+(defn fw-name-byte [i] (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 11 105 12 109 13 103 14 115 15 105 16 103 0))
+(defn fw-name [i ok]
+  (if (>= i 56) ok
+    (let [b (fw-byte)]
+      (fw-name (+ i 1) (if (and (= ok 1) (or (>= i 18) (= b (fw-name-byte i)))) 1 0)))))
+(defn fw-find [left]
+  (if (<= left 0) 0
+    (let [size (fw-be 4 0)
+          sel (fw-be 2 0)
+          skip (fw-skip 2)
+          hit (fw-name 0 1)]
+      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1))))))
+(defn fw-signature [i]
+  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
+(defn fw-select []
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
+    (do (kernel-out-u16 1296 0)
+        (if (= (fw-signature 0) 0) 0
+          (do (kernel-out-u16 1296 25)
+              (let [sel (fw-find (fw-min (fw-be 4 0) 256))]
+                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) 1))))))))
+
+;; flags kept in the context: 1008 magic mismatch, 1012 manifest reserved, 1016 count, 1020 layout (bytes 68..127 not zero)
+(defn nz [b] (if (= b 0) 0 1))
+;; 0 when the next n stream bytes are all zero, else 1 (consumes all n)
+(defn fw-nz [n acc] (if (<= n 0) acc (fw-nz (- n 1) (bit-or acc (nz (fw-byte))))))
+(defn magic-byte [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 50 0))
+(defn hdr-byte [ctx i]
+  (let [b (fw-byte)]
+    (do (if (< i 64) (do (cb! ctx (+ 2144 i) b) (sb! (+ 3402 i) b)) 0)
+        (if (< i 8) (put-u32 ctx 1008 (bit-or (get-u32 ctx 1008) (nz (bit-xor b (magic-byte i))))) 0)
+        (if (and (>= i 24) (< i 32)) (put-u32 ctx 1012 (bit-or (get-u32 ctx 1012) (nz b))) 0)
+        (if (and (>= i 64) (< i 68)) (put-u32 ctx 1016 (+ (get-u32 ctx 1016) (* b (case (- i 64) 0 1 1 256 2 65536 16777216)))) 0)
+        (if (and (>= i 68) (< i 128)) (put-u32 ctx 1020 (bit-or (get-u32 ctx 1020) (nz b))) 0)
+        1)))
+(defn hdr [ctx i] (if (>= i 128) 1 (hdr ctx (+ i 1 (* 0 (hdr-byte ctx i))))))
+;; M' = 0 || 8 || "AIUEIMG2" || manifest: the 10-byte prefix
+(defn mp-prefix-byte [i] (case i 1 8 2 65 3 73 4 85 5 69 6 73 7 77 8 71 9 50 0))
+(defn mp-prefix [i] (if (>= i 10) 1 (mp-prefix (+ i 1 (* 0 (sb! (+ 3392 i) (mp-prefix-byte i)))))))
+
+(defn load-bytes [ctx at i n] (if (>= i n) 1 (load-bytes ctx at (+ i 1) (+ n (* 0 (cb! ctx (+ at i) (fw-byte)))))))
+(defn load-sig [i n] (if (>= i n) 1 (load-sig (+ i 1) (+ n (* 0 (sb! i (fw-byte)))))))
+(defn load-ed-key [ctx id w] (if (>= w 8) 1 (load-ed-key ctx id (+ w 1 (* 0 (put-u32 ctx (+ 2048 (* 4 w)) (ims-ed-word id w)))))))
+(defn load-ml-key [id w] (if (>= w 488) 1 (load-ml-key id (+ w 1 (* 0 (pw! w (ims-ml-word id w)))))))
+
+;; one entry: 3392 bytes. Returns the new mask (ims-step) after counting the entry when it is a pinned, unseen slot with zero reserved/padding bytes and both signatures valid.
+(defn entry [ctx seen]
+  (let [id (fw-be 1 0)
+        id1 (fw-byte) id2 (fw-byte) id3 (fw-byte)
+        rsv (fw-be 4 0)
+        a (load-bytes ctx 2080 0 64)
+        b (load-sig 0 3309)
+        pad (fw-nz 11 0)
+        idv (+ id (* 256 (+ id1 (* 256 (+ id2 (* 256 id3))))))]
+    (if (or (>= (+ idv (* 0 (+ a b))) 3) (or (not (= rsv 0)) (not (= pad 0))))
+      seen
+      (let [k (load-ed-key ctx idv 0)
+            ed (aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 64 (kernel-subregion ctx 8192 4096 4096))
+            ml (if (= (+ ed (* 0 k)) 1)
+                 (let [kk (load-ml-key idv 0)
+                       u (mv-mu (kernel-owned-window 4 20480) 20480 74)
+                       v (mv-verify (kernel-owned-window 4 20480) 20480)]
+                   (+ v (* 0 (+ kk u))))
+                 0)]
+        (ims-step seen idv ed ml)))))
+(defn entries [ctx i n seen] (if (>= i n) seen (entries ctx (+ i 1) n (entry ctx seen))))
+
+(defn run-case [ctx k]
+  (let [z1 (put-u32 ctx 1008 0) z2 (put-u32 ctx 1012 0) z3 (put-u32 ctx 1016 0) z4 (put-u32 ctx 1020 0)
+        p (mp-prefix 0)
+        h (hdr ctx 0)
+        cnt (get-u32 ctx 1016)
+        code (if (not (= (get-u32 ctx 1008) 0)) 2
+               (if (not (= (get-u32 ctx 1012) 0)) 5
+                 (if (or (or (< cnt 1) (> cnt 4)) (not (= (get-u32 ctx 1020) 0))) 3 0)))
+        seen (if (= code 0) (entries ctx 0 cnt 0) 0)
+        used (if (= code 0) (* cnt 3392) 0)
+        rest (fw-skip (- 16256 used))
+        verdict (if (= code 0) (ims-final seen) code)
+        r (put-u32 ctx (+ 1280 (* 8 k)) verdict)
+        s (put-u32 ctx (+ 1284 (* 8 k)) seen)]
+    (+ 1 (* 0 (+ z1 (+ z2 (+ z3 (+ z4 (+ p (+ h (+ rest (+ r s))))))))))))
+(defn cases [ctx k count] (if (>= k count) 1 (cases ctx (+ k 1 (* 0 (run-case ctx k))) count)))
+
+(defn imgsig-selftest []
+  (let [ctx (kernel-browser-context)
+        sel (fw-select)]
+    (if (= sel 1)
+      (let [count (fw-byte)
+            done (cases ctx 0 (fw-min count 40))
+            w (put-u32 ctx 1276 count)]
+        (put-u32 ctx 396 (+ 1230188593 (* 0 (+ done w)))))
+      0)))
+
+(defn main [] :i64
+  (let [width (kernel-framebuffer-width)
+        registered (kernel-register-value-domain 73)
+        published (kernel-publish-current-domain 73)
+        enabled (kernel-value-enable-user)]
+    (if (and (> width 0) (> registered 0) (= published 73) (= enabled 1))
+      (do (imgsig-selftest) (desktop/goal-model-main)) 0)))

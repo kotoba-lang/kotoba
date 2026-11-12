@@ -1,0 +1,253 @@
+;; Complete C3 fs/browse mechanism, with explicit kernel-record bounds.
+;; Canonical source candidate; owning C1/path/byte decisions are retained.
+(ns kotoba.native.linux-static-browse
+  {:kotoba/export [routine]}
+  (:require [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io]
+            [kotoba.native.linux-static-fs-protocol :as protocol]
+            [kotoba.native.linux-static-paths :as paths]
+            [kotoba.native.linux-static-strings :as strings])
+  (:schemas
+   {:linux.static.browse/config
+    [:record :linux.static.browse/config
+     [[:isa :keyword] [:data :i64] [:dents :i64] [:names :i64] [:index :i64]
+      [:index-capacity :i64] [:pair [:list [:ref :linux.static/instruction]]]]]
+    :linux.static.browse/result
+    [:record :linux.static.browse/result
+     [[:code [:list [:ref :linux.static/instruction]]] [:binding :keyword] [:error :keyword]]]}))
+
+(defn- empty-code [] [:list [:ref :linux.static/instruction]]
+  (typed-list-new [:list [:ref :linux.static/instruction]]))
+(defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out
+    (asm/instruction op aux d s b i n target (vector-alloc 0))))
+(defn- join [out [:list [:ref :linux.static/instruction]] code [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [index 0 current out]
+    (if (>= index (vector-count code)) current
+      (recur (+ index 1) (typed-list-conj [:list [:ref :linux.static/instruction]] current
+                            (typed-list-nth [:list [:ref :linux.static/instruction]] code index))))))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :label :none :none :none :none :none 0 label))
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :li :none d :none :none :none n :none))
+(defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 :none))
+(defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :ld :none d :none :s0 :none (io/state-offset key) :none))
+(defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :st :none d :none :s0 :none (io/state-offset key) :none))
+(defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none base :none n :none))
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none base i 0 :none))
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :alu op d s :none :none 0 :none))
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :alui op d :none :none :none n :none))
+(defn- shift [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :shli :none d :none :none :none n :none))
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 label))
+(defn- hd [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config] op :i64
+           a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand] c [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/decision-fragment out (record-get [:ref :linux.static.browse/config] cfg :data)
+    :ls.cap/h-decide (io/literal op) a b c (io/literal 0)))
+(defn- sys [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config] call :keyword
+            a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand] c [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/syscall-fragment out (record-get [:ref :linux.static.browse/config] cfg :isa) call
+    a b c (io/literal 0) (io/literal 0)))
+(defn- outcome [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]
+                stage :i64 retry :keyword errno-done :keyword proceed :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [errno (-> out (store :t0 :x6) (li :t1 0) (imm :cmp :t0 0) (branch :ge errno-done)
+                  (mov :t1 :t0) (append :neg :none :t1 :none :none :none 0 :none) (mark errno-done))]
+    (-> (hd errno cfg 12 (io/literal 20) (io/literal stage) (io/register :t1))
+        (imm :cmp :t0 3) (branch :eq proceed) (imm :cmp :t0 2) (branch :eq retry)
+        (branch :always :ls/bad) (mark proceed) (load :t0 :x6))))
+(defn- copy [out [:list [:ref :linux.static/instruction]] dst :keyword src :keyword n :keyword
+             loop-label :keyword done :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :t0 0) (mark loop-label) (alu :cmp :t0 n) (branch :hs done)
+      (byte-op :ldb :t1 src :t0) (byte-op :stb :t1 dst :t0)
+      (imm :add :t0 1) (branch :always loop-label) (mark done)))
+
+(defn- record-name [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mark :ls.browse/record) (alu :cmp :s4 :s3) (branch :eq :ls.browse/batch)
+      (branch :hi :ls/bad) (mov :t0 :s3) (alu :sub :t0 :s4) (imm :cmp :t0 20) (branch :lo :ls/bad)
+      (li :s1 (record-get [:ref :linux.static.browse/config] cfg :dents)) (alu :add :s1 :s4)
+      (li :t0 16) (byte-op :ldb :t1 :s1 :t0) (li :t0 17) (byte-op :ldb :t2 :s1 :t0) (shift :t2 8)
+      (alu :or :t1 :t2) (imm :cmp :t1 20) (branch :lo :ls/bad)
+      (mov :t0 :s3) (alu :sub :t0 :s4) (alu :cmp :t1 :t0) (branch :hi :ls/bad) (store :t1 :x5)
+      (li :t0 18) (byte-op :ldb :t1 :s1 :t0) (store :t1 :x4) (imm :add :s1 19)
+      (load :t2 :x5) (imm :sub :t2 19) (li :s2 0) (mark :ls.browse/name)
+      (alu :cmp :s2 :t2) (branch :hs :ls/bad) (byte-op :ldb :t0 :s1 :s2)
+      (imm :cmp :t0 0) (branch :eq :ls.browse/named) (imm :add :s2 1) (branch :always :ls.browse/name)
+      (mark :ls.browse/named) (imm :cmp :s2 0) (branch :eq :ls/bad)
+      (li :a2 2) (imm :cmp :s2 1) (branch :ne :ls.browse/class-two)
+      (li :t0 0) (byte-op :ldb :t0 :s1 :t0) (imm :cmp :t0 46) (branch :ne :ls.browse/classed)
+      (li :a2 0) (branch :always :ls.browse/classed) (mark :ls.browse/class-two)
+      (imm :cmp :s2 2) (branch :ne :ls.browse/classed)
+      (li :t1 0) (byte-op :ldb :t0 :s1 :t1) (imm :cmp :t0 46) (branch :ne :ls.browse/classed)
+      (li :t1 1) (byte-op :ldb :t0 :s1 :t1) (imm :cmp :t0 46) (branch :ne :ls.browse/classed)
+      (li :a2 1) (mark :ls.browse/classed) (store :a2 :x3)))
+
+(defn- collect [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [skip (-> (hd out cfg 18 (io/state-field :x3) (io/literal 0) (io/literal 0))
+                 (imm :cmp :t0 1) (branch :eq :ls.browse/next) (imm :cmp :t0 0) (branch :ne :ls/bad)
+                 (mov :t2 :s2) (imm :add :t2 2) (load :t0 :fs-frame) (imm :cmp :t0 0)
+                 (branch :ne :ls.browse/extra-byte)
+                 (load :t0 :cnt) (imm :cmp :t0 0) (branch :eq :ls.browse/first)
+                 (mark :ls.browse/extra-byte) (imm :add :t2 1) (mark :ls.browse/first) (store :t2 :x2))
+        charge (-> (hd skip cfg 6 (io/state-field :tot) (io/state-field :x2) (io/state-field :bytes))
+                   (imm :cmp :t0 1) (branch :ne :ls/bad)
+                   (load :t0 :tot) (load :t1 :bytes) (alu :cmp :t0 :t1) (branch :hi :ls/bad)
+                   (alu :sub :t1 :t0) (load :t2 :x2) (alu :cmp :t2 :t1) (branch :hi :ls/bad)
+                   (alu :add :t0 :t2) (store :t0 :tot)
+                   (load :t0 :n1) (load :t1 :bytes) (alu :cmp :t0 :t1) (branch :hi :ls/bad)
+                   (alu :sub :t1 :t0) (alu :cmp :s2 :t1) (branch :hi :ls/bad)
+                   (li :t3 (record-get [:ref :linux.static.browse/config] cfg :names)) (alu :add :t3 :t0))
+        name (-> (copy charge :t3 :s1 :s2 :ls.browse/copy-name :ls.browse/name-copied)
+                 (load :t0 :cnt) (li :t1 (record-get [:ref :linux.static.browse/config] cfg :index-capacity))
+                 (alu :cmp :t0 :t1) (branch :hs :ls/bad) (mov :t2 :t0) (shift :t2 4) (shift :t0 3) (alu :add :t2 :t0)
+                 (li :t3 (record-get [:ref :linux.static.browse/config] cfg :index)) (alu :add :t3 :t2)
+                 (load :t0 :n1) (mem :st :t0 :t3 0) (mem :st :s2 :t3 8)
+                 (li :t1 0) (load :t0 :x4) (imm :cmp :t0 4) (branch :ne :ls.browse/not-dir) (li :t1 1)
+                 (mark :ls.browse/not-dir) (mem :st :t1 :t3 16)
+                 (load :t0 :n1) (alu :add :t0 :s2) (store :t0 :n1)
+                 (load :t0 :cnt) (imm :add :t0 1) (store :t0 :cnt))]
+    (-> name (mark :ls.browse/next) (load :t0 :x5) (alu :add :s4 :t0) (branch :always :ls.browse/record))))
+
+(defn- batches [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [start (-> out (store :t0 :fd) (li :t0 0) (store :t0 :tot) (store :t0 :cnt) (store :t0 :n1) (mark :ls.browse/batch))
+        got (outcome (sys start cfg :getdents64 (io/state-field :fd)
+                       (io/literal (record-get [:ref :linux.static.browse/config] cfg :dents)) (io/literal 32768))
+              cfg 3 :ls.browse/batch :ls.browse/read-errno :ls.browse/read-ok)
+        records (-> got (imm :cmp :t0 0) (branch :eq :ls.browse/batches-done)
+                    (imm :cmp :t0 32768) (branch :hi :ls/bad) (mov :s3 :t0) (li :s4 0))
+        complete (-> (collect (record-name records cfg) cfg) (mark :ls.browse/batches-done))]
+    (sys complete cfg :close (io/state-field :fd) (io/literal 0) (io/literal 0))))
+
+(defn- sort-index [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (load :s3 :cnt) (li :s1 24) (li :s4 1) (mark :ls.browse/sort-i)
+      (alu :cmp :s4 :s3) (branch :hs :ls.browse/sorted)
+      (li :t3 (record-get [:ref :linux.static.browse/config] cfg :index)) (alu :add :t3 :s1)
+      (mem :ld :t0 :t3 0) (store :t0 :x0) (mem :ld :t0 :t3 8) (store :t0 :x1)
+      (mem :ld :t0 :t3 16) (store :t0 :x2) (mov :s2 :s1) (mark :ls.browse/sort-j)
+      (imm :cmp :s2 0) (branch :eq :ls.browse/insert)
+      (li :t3 (record-get [:ref :linux.static.browse/config] cfg :index)) (alu :add :t3 :s2) (imm :sub :t3 24)
+      (mem :ld :a1 :t3 0) (mem :ld :a2 :t3 8) (li :t2 (record-get [:ref :linux.static.browse/config] cfg :names))
+      (alu :add :a1 :t2) (load :a3 :x0) (alu :add :a3 :t2) (load :a4 :x1) (li :t0 0)
+      (mark :ls.browse/compare) (alu :cmp :t0 :a2) (branch :hs :ls.browse/insert)
+      (alu :cmp :t0 :a4) (branch :hs :ls.browse/greater)
+      (byte-op :ldb :t1 :a1 :t0) (byte-op :ldb :t2 :a3 :t0) (alu :cmp :t1 :t2)
+      (branch :hi :ls.browse/greater) (branch :lo :ls.browse/insert)
+      (imm :add :t0 1) (branch :always :ls.browse/compare)
+      (mark :ls.browse/greater) (mem :ld :t0 :t3 0) (mem :st :t0 :t3 24)
+      (mem :ld :t0 :t3 8) (mem :st :t0 :t3 32) (mem :ld :t0 :t3 16) (mem :st :t0 :t3 40)
+      (imm :sub :s2 24) (branch :always :ls.browse/sort-j) (mark :ls.browse/insert)
+      (li :t3 (record-get [:ref :linux.static.browse/config] cfg :index)) (alu :add :t3 :s2)
+      (load :t0 :x0) (mem :st :t0 :t3 0) (load :t0 :x1) (mem :st :t0 :t3 8)
+      (load :t0 :x2) (mem :st :t0 :t3 16)
+      (imm :add :s1 24) (imm :add :s4 1) (branch :always :ls.browse/sort-i) (mark :ls.browse/sorted)))
+
+(defn- listing [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.browse/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [charge (-> (hd out cfg 6 (io/state-field :pool-used) (io/state-field :tot) (io/state-field :bytes))
+                   (imm :cmp :t0 1) (branch :ne :ls/trap-bytes)
+                   (load :s1 :pool-used) (load :t0 :bytes) (alu :cmp :s1 :t0) (branch :hi :ls/trap-bytes)
+                   (alu :sub :t0 :s1) (load :t1 :tot) (alu :cmp :t1 :t0) (branch :hi :ls/trap-bytes)
+                   (load :s2 :pool-base) (alu :add :s2 :s1) (li :s4 0)
+                   (li :t3 (record-get [:ref :linux.static.browse/config] cfg :index)) (mark :ls.browse/emit)
+                   (alu :cmp :s4 :s3) (branch :hs :ls.browse/emitted)
+                   (load :t0 :fs-frame) (imm :cmp :t0 0) (branch :ne :ls.browse/newline-done)
+                   (imm :cmp :s4 0) (branch :eq :ls.browse/newline-done)
+                   (li :t0 10) (li :t1 0) (byte-op :stb :t0 :s2 :t1) (imm :add :s2 1)
+                   (mark :ls.browse/newline-done) (mem :ld :a1 :t3 0)
+                   (li :t0 (record-get [:ref :linux.static.browse/config] cfg :names)) (alu :add :a1 :t0) (mem :ld :a2 :t3 8))
+        emitted (-> (copy charge :s2 :a1 :a2 :ls.browse/copy-output :ls.browse/output-copied)
+                    (alu :add :s2 :a2) (li :t0 9) (load :t1 :fs-frame) (imm :cmp :t1 0)
+                    (branch :eq :ls.browse/separator) (li :t0 0) (mark :ls.browse/separator)
+                    (li :t1 0) (byte-op :stb :t0 :s2 :t1)
+                    (mem :ld :t0 :t3 16) (imm :add :t0 48) (li :t1 1) (byte-op :stb :t0 :s2 :t1)
+                    (load :t0 :fs-frame) (imm :cmp :t0 0) (branch :eq :ls.browse/row-end)
+                    (li :t0 0) (li :t1 2) (byte-op :stb :t0 :s2 :t1) (imm :add :s2 1)
+                    (mark :ls.browse/row-end) (imm :add :s2 2)
+                    (imm :add :t3 24) (imm :add :s4 1) (branch :always :ls.browse/emit)
+                    (mark :ls.browse/emitted) (load :s2 :tot) (mov :t0 :s1) (alu :add :t0 :s2)
+                    (store :t0 :pool-used) (mov :s4 :s1) (append :not :none :s4 :none :none :none 0 :none))]
+    (-> (join emitted (record-get [:ref :linux.static.browse/config] cfg :pair))
+        (store :t0 :res) (branch :always :ls.fs-protocol/finish)
+        (mark :ls.browse/fail) (branch :always :ls/bad)
+        (append :align :none :none :none :none :none 16 :none))))
+
+(defn- lookup [m :document key :keyword] :document
+  (if (not= (document-kind m) :map) (document-null)
+    (loop [index 0]
+      (if (>= index (document-count m)) (document-null)
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
+              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
+          (if (document-equal? k (document-keyword key))
+            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
+(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
+(defn- region? [base :i64 size :i64 begin :i64 end :i64] :bool
+  (and (>= base begin) (<= base end) (= (bit-and base 15) 0) (<= size (- end base))))
+(defn- configuration-error [isa :keyword source-plan :document layout :document] :keyword
+  (let [bytes (i64-of (lookup source-plan :bytes)) data (i64-of (lookup layout :data))
+        memory (i64-of (lookup layout :memory-size))]
+    (cond
+      (not (or (= isa :x86_64) (= isa :aarch64))) :unknown-isa
+      (not (document-equal? (lookup source-plan :handlers?) (document-bool true))) :handlers-not-planned
+      (or (< bytes 0) (> (+ 2 (quot bytes 3)) (quot 9223372036854775807 24))) :index-overflow
+      (or (<= data 0) (not= (bit-and data 4095) 0) (< memory 4096)
+          (> memory (- 9223372036854775807 data))) :layout-input
+      :else (let [begin (+ data 4096) end (+ data memory)]
+              (if (and (region? (i64-of (lookup layout :dents)) 32768 begin end)
+                       (region? (i64-of (lookup layout :names)) bytes begin end)
+                       (region? (i64-of (lookup layout :index)) (* 24 (+ 2 (quot bytes 3))) begin end)
+                       (region? (i64-of (lookup layout :pool)) bytes begin end)) :ok :scratch-region)))))
+(defn- failure [error :keyword] [:ref :linux.static.browse/result]
+  (record-new [:ref :linux.static.browse/result] (empty-code) :none error))
+
+(defn routine [isa :keyword source-plan :document layout :document] [:ref :linux.static.browse/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (let [path (paths/resolve-path isa source-plan layout "browse-path" :ls.browse/fail
+                   (i64-of (lookup layout :buf-b)) :len-a :rel-a)
+            flags (+ 524288 (if (= isa :x86_64) (+ 65536 131072) (+ 16384 32768)))
+            opened (paths/open-at isa source-plan layout (io/state-field :rel-a) flags 0)
+            pair (strings/pool-pair-fragment (lookup source-plan :context-abi))
+            frame (protocol/request-fragment :browse :ls.browse/legacy-request)]
+        (cond
+          (not= (record-get [:ref :linux.static.paths/result] path :error) :ok)
+          (failure (record-get [:ref :linux.static.paths/result] path :error))
+          (not= (record-get [:ref :linux.static.paths/result] opened :error) :ok)
+          (failure (record-get [:ref :linux.static.paths/result] opened :error))
+          (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
+          (failure (record-get [:ref :linux.static.strings/result] pair :error))
+          (not= (record-get [:ref :linux.static.fs.protocol/result] frame :error) :ok)
+          (failure (record-get [:ref :linux.static.fs.protocol/result] frame :error))
+          :else
+          (let [cfg (record-new [:ref :linux.static.browse/config] isa (i64-of (lookup layout :data))
+                      (i64-of (lookup layout :dents)) (i64-of (lookup layout :names)) (i64-of (lookup layout :index))
+                      (+ 2 (quot (i64-of (lookup source-plan :bytes)) 3))
+                      (record-get [:ref :linux.static.strings/result] pair :code))
+                start (-> (empty-code) (append :align :none :none :none :none :none 16 :none)
+                          (mark :ls.cap/fs-browse))
+                framed (-> (join start (record-get [:ref :linux.static.fs.protocol/result] frame :code))
+                           (branch :always :ls.browse/request-ready) (mark :ls.browse/legacy-request)
+                           (load :s1 :rp) (load :s2 :rl) (mark :ls.browse/request-ready))
+                resolved (-> (join framed (record-get [:ref :linux.static.paths/result] path :code)) (mark :ls.browse/open))
+                fd (outcome (join resolved (record-get [:ref :linux.static.paths/result] opened :code))
+                     cfg 0 :ls.browse/open :ls.browse/open-errno :ls.browse/opened)
+                code (listing (sort-index (batches fd cfg) cfg) cfg)]
+            (record-new [:ref :linux.static.browse/result] code :ls.cap/fs-browse :ok)))))))

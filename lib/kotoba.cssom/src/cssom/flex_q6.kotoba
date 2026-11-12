@@ -1,0 +1,189 @@
+(ns cssom.flex-q6
+  (:require [cssom.length-q6 :as len])
+  (:export [invalid item-word hi-bytes line-word with-select solve share offset auto-offset]))
+
+;; Flexible-length resolution and main-axis placement in Q6 / D4 fixed point (JUN-920 slice 3, census group G07, the flex
+;; part; ADR-0287). Mirrors layout.cljk resolve-flexible-lengths (CSS Flexbox 9.7: grow / scaled shrink distribution,
+;; min/max clamp, freeze-and-redistribute), place-main-axis and place-main-axis-auto-margins (f64 oracle: cssom.flex).
+;; Scalar i64 only, at most five parameters per function, no heap, no strings, records or floats, no rem/mod and no `/`.
+;;
+;; BOUND. At most FOUR flex items per line (n = 1..4); a line with more items is refused by the caller, nothing is
+;; truncated. Why four and not 8 or 16: the target dialect has no store and no vector, and a function takes at most five
+;; scalar parameters of 63 usable bits, so the whole line (every item's base size, min, max and factor, plus the free
+;; space) has to fit in five words = 310 bits; an item needs 18 + 18 + 18 + 16 = 70 bits. Four items and the line header
+;; use 300 of them. The justify-content / auto-margin placement below has no item bound (it needs only sums).
+;;
+;; SCALES. Lengths are Q6 raw (1/64 px). A flex factor is D4 raw (1/10000: flex-grow 1.5 = 15000). Per item:
+;;   base size 0..262143 raw (< 4096 px)   min 0..262143 (0 = no minimum, which is what `(or min 0)` means in the source)
+;;   max 0..262142 or none                 factor 0..65535 (< 6.5535), flex-grow when the line grows, flex-shrink otherwise
+;; The line's net space avail - gaps is -524288..524287 raw (< 8192 px). A value outside these ranges is not encoded:
+;; item-word / line-word answer (invalid). (The census proposed lengths to 2^30; five words cannot carry that.)
+;;
+;; WORDS. Item k is one word  base | min << 18 | max << 36 | (factor & 255) << 54  (max field 262143 = none), see item-word.
+;; The line word is           (net + 2^19) | (n - 1) << 20 | select << 22 | grow << 24 | pass << 25 | hi-bytes << 28, where
+;; hi-bytes holds factor >> 8 of the four items (8 bits each) and select names the item whose size solve returns. The grow
+;; bit and the pass counter are set by solve itself and must be zero on entry.
+;;
+;; SOLVER. layout.cljk keeps `sizes` and `frozen` across passes. Here the state is rewritten into the words: an item the clamp
+;; moved (or an initially frozen item the clamp moves) gets base := its clamped size and factor := 0; a zero weight IS the frozen
+;; flag (the source freezes exactly the items with a non-positive weight, and an item stays frozen once frozen). The source's
+;; guard `n` can never trigger (every pass after the first freezes at least one item), so the Q6 recursion carries no guard;
+;; a pass counter above 5 answers (invalid) as a safety stop, and the differential test compares against a reference that
+;; implements the guard literally (it never fires in 2,500,000 comparisons; that is evidence, not a proof).
+;;   grow?  = net > sum(base)            (decided once, from the ORIGINAL sizes, as in the source)
+;;   weight = factor                     when growing,   factor * base   when shrinking
+;;   pass   = free R = net - sum(base); an item with positive weight proposes v = max(0, base + R * weight / W) with W the
+;;            sum of the weights; clamp(v) = min(max, max(min, v)); if no item is changed by its clamp the pass answers the
+;;            sizes (proposals rounded half up, changed items at their bound), else the changed items are frozen and the next
+;;            pass runs.
+;; THE FREEZE TEST IS MADE ON THE EXACT PROPOSAL, never on its rounded value. R * weight / W is computed as a floor F and a
+;; remainder f / W (long division on 7-bit chunks of |R|, every product below 2^44); "v < min" is then "F < min" and "v > max"
+;; is "F >= max" (f > 0) or an integer comparison (f = 0). Rounding first is wrong, and the grid found it: an item whose exact
+;; proposal is 99.994 against a minimum of 100 rounds to 100, is NOT frozen, and in the next pass (the other items having been
+;; frozen at a bound that gave space back) absorbs all of it - 30100 instead of 100 in the spec point of the test. The only
+;; inexact operation left is the final rounding of the unchanged items, ONE half-up rounding of the exact share.
+;; |R| >= 2^21 raw (32768 px) is refused. Because every item is rounded on its own, the sizes of a line need not sum exactly to
+;; the free space (an exact tie between two items rounds both up): the error is at most n/2 raw (largest-remainder rounding
+;; would conserve the sum; that is an owner decision, see the README).
+(defn invalid [] :i64 -4611686018427387904)
+(defn abs [x :i64] :i64 (if (< x 0) (- 0 x) x))
+(defn imax [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn imin [a :i64 b :i64] :i64 (if (< a b) a b))
+(defn in? [x :i64 lo :i64 hi :i64] :bool (and (>= x lo) (<= x hi)))
+
+;; ---- encoders (used by the caller) ----
+(defn item-word [base :i64 mn :i64 mx :i64 factor :i64] :i64
+  (if (and (and (in? base 0 262143) (in? mn 0 262143)) (and (in? mx -1 262142) (in? factor 0 65535)))
+    (+ base (+ (i64-shift-left mn 18)
+               (+ (i64-shift-left (if (< mx 0) 262143 mx) 36) (i64-shift-left (bit-and factor 255) 54))))
+    (invalid)))
+(defn hi-bytes [f0 :i64 f1 :i64 f2 :i64 f3 :i64] :i64
+  (+ (bit-and (i64-shift-right f0 8) 255)
+     (+ (i64-shift-left (bit-and (i64-shift-right f1 8) 255) 8)
+        (+ (i64-shift-left (bit-and (i64-shift-right f2 8) 255) 16) (i64-shift-left (bit-and (i64-shift-right f3 8) 255) 24)))))
+(defn line-word [net :i64 n :i64 hi :i64] :i64
+  (if (and (in? net -524288 524287) (and (in? n 1 4) (in? hi 0 4294967295)))
+    (+ (+ net 524288) (+ (i64-shift-left (- n 1) 20) (i64-shift-left hi 28)))
+    (invalid)))
+(defn with-select [l :i64 k :i64] :i64
+  (if (and (in? k 0 3) (and (>= l 0) (< l 1152921504606846976))) (+ l (i64-shift-left k 22)) (invalid)))
+
+;; ---- decoders ----
+(defn f-base [p :i64] :i64 (bit-and p 262143))
+(defn f-min [p :i64] :i64 (bit-and (i64-shift-right p 18) 262143))
+(defn f-max [p :i64] :i64 (bit-and (i64-shift-right p 36) 262143))
+(defn f-lo [p :i64] :i64 (bit-and (i64-shift-right p 54) 255))
+(defn l-net [l :i64] :i64 (- (bit-and l 1048575) 524288))
+(defn l-count [l :i64] :i64 (+ 1 (bit-and (i64-shift-right l 20) 3)))
+(defn l-sel [l :i64] :i64 (bit-and (i64-shift-right l 22) 3))
+(defn l-grow [l :i64] :i64 (bit-and (i64-shift-right l 24) 1))
+(defn l-pass [l :i64] :i64 (bit-and (i64-shift-right l 25) 7))
+(defn l-hi [l :i64 k :i64] :i64 (bit-and (i64-shift-right l (+ 28 (* 8 k))) 255))
+(defn factor [p :i64 l :i64 k :i64] :i64 (+ (f-lo p) (* 256 (l-hi l k))))
+(defn weight [p :i64 l :i64 k :i64] :i64
+  (if (= (l-grow l) 1) (factor p l k) (* (factor p l k) (f-base p))))
+(defn pick [k :i64 a :i64 b :i64 c :i64 d :i64] :i64 (cond (= k 0) a (= k 1) b (= k 2) c :else d))
+
+;; ---- the exact share: R * w / W = F + f / W, F the floor, 0 <= f < W; products below 2^44 ----
+;; dv packs (F + 2^21) << 37 | f.  |R| >= 2^21, W <= 0 or w > W answer (invalid).
+(defn dv [r :i64 w :i64 tw :i64] :i64
+  (if (and (and (> tw 0) (<= w tw)) (and (>= w 0) (< (abs r) 2097152)))
+    (let [a (abs r)
+          c2 (bit-and (i64-shift-right a 14) 127) c1 (bit-and (i64-shift-right a 7) 127) c0 (bit-and a 127)
+          t2 (* c2 w) q2 (quot t2 tw) r2 (- t2 (* q2 tw))
+          t1 (+ (* r2 128) (* c1 w)) q1 (quot t1 tw) r1 (- t1 (* q1 tw))
+          t0 (+ (* r1 128) (* c0 w)) q0 (quot t0 tw) r0 (- t0 (* q0 tw))
+          q (+ (* (+ (* q2 128) q1) 128) q0)
+          neg (< r 0)
+          fl (if neg (- 0 (+ q (if (> r0 0) 1 0))) q)
+          fr (if neg (if (> r0 0) (- tw r0) 0) r0)]
+      (+ (i64-shift-left (+ fl 2097152) 37) fr))
+    (invalid)))
+(defn dvf [d :i64] :i64 (- (i64-shift-right d 37) 2097152))
+(defn dvr [d :i64] :i64 (bit-and d 137438953471))
+;; share = round-half-up(R * w / W) = F + (2 f >= W)
+(defn share [r :i64 w :i64 tw :i64] :i64
+  (let [d (dv r w tw)] (if (= d (invalid)) (invalid) (+ (dvf d) (if (>= (* 2 (dvr d)) tw) 1 0)))))
+
+;; ---- one pass ----
+(defn clampv [p :i64 v :i64] :i64
+  (let [v1 (imax (f-min p) v) mx (f-max p)] (if (= mx 262143) v1 (imin mx v1))))
+;; ev: 2 * size + changed, for item k. The freeze test is done on the EXACT proposal v = base + F + f / W (never on its
+;; rounded value: a proposal a hair beyond a bound must freeze, as it does in the source), max(0, v) first.
+;;   changed (f > 0): v < min or v > max, i.e. F-part < min or >= max;   changed (f = 0): clamp(v) != v.
+;; The size of an unchanged item is its proposal rounded half up, of a changed item the bound clamp(v).
+(defn ev [p :i64 l :i64 k :i64 r :i64 tw :i64] :i64
+  (let [w (weight p l k) b (f-base p)]
+    (if (= w 0)
+      (let [c (clampv p b)] (+ (* 2 c) (if (= c b) 0 1)))
+      (let [d (dv r w tw) v0 (+ b (dvf d)) neg (< v0 0)
+            v (if neg 0 v0) f (if neg 0 (dvr d))
+            c (clampv p v) mx (f-max p)
+            ch (if (> f 0) (if (or (< v (f-min p)) (and (not= mx 262143) (>= v mx))) 1 0) (if (= c v) 0 1))]
+        (+ (* 2 (if (= ch 1) c (+ v (if (>= (* 2 f) tw) 1 0)))) ch)))))
+;; the rewritten item word: base := the clamped size, factor low byte cleared (the item keeps its min and max)
+(defn upd [p :i64 e :i64] :i64
+  (if (= (bit-and e 1) 1) (+ (i64-shift-right e 1) (i64-shift-left (bit-and (i64-shift-right p 18) 68719476735) 18)) p))
+(defn clr [l :i64 k :i64 e :i64] :i64
+  (if (= (bit-and e 1) 1) (- l (i64-shift-left (l-hi l k) (+ 28 (* 8 k)))) l))
+(defn run [p0 :i64 p1 :i64 p2 :i64 p3 :i64 l :i64] :i64
+  (let [w0 (weight p0 l 0) w1 (weight p1 l 1) w2 (weight p2 l 2) w3 (weight p3 l 3)
+        tw (+ (+ w0 w1) (+ w2 w3))
+        r (- (l-net l) (+ (+ (f-base p0) (f-base p1)) (+ (f-base p2) (f-base p3))))]
+    (cond (= tw 0) (pick (l-sel l) (f-base p0) (f-base p1) (f-base p2) (f-base p3))
+          (>= (abs r) 2097152) (invalid)
+          (>= (l-pass l) 6) (invalid)
+          :else
+          (let [e0 (ev p0 l 0 r tw) e1 (ev p1 l 1 r tw) e2 (ev p2 l 2 r tw) e3 (ev p3 l 3 r tw)]
+            (if (= (+ (+ (bit-and e0 1) (bit-and e1 1)) (+ (bit-and e2 1) (bit-and e3 1))) 0)
+              (pick (l-sel l) (i64-shift-right e0 1) (i64-shift-right e1 1) (i64-shift-right e2 1) (i64-shift-right e3 1))
+              (run (upd p0 e0) (upd p1 e1) (upd p2 e2) (upd p3 e3)
+                   (+ (clr (clr (clr (clr l 0 e0) 1 e1) 2 e2) 3 e3) 33554432)))))))
+(defn word-ok? [p :i64] :bool (and (>= p 0) (< p 4611686018427387904)))
+(defn absent-ok? [p :i64 l :i64 k :i64] :bool (or (< k (l-count l)) (and (= p 0) (= (l-hi l k) 0))))
+;; solve: the final size (Q6 raw) of the selected item, or (invalid)
+(defn solve [p0 :i64 p1 :i64 p2 :i64 p3 :i64 l :i64] :i64
+  (let [n (l-count l)]
+    (if (and (and (word-ok? p0) (word-ok? p1)) (and (word-ok? p2) (word-ok? p3)))
+      (if (and (and (>= l 0) (< l 1152921504606846976)) (and (= (bit-and (i64-shift-right l 24) 15) 0) (< (l-sel l) n)))
+        (if (and (and (absent-ok? p0 l 0) (absent-ok? p1 l 1)) (and (absent-ok? p2 l 2) (absent-ok? p3 l 3)))
+          (run p0 p1 p2 p3
+               (+ l (i64-shift-left (if (> (l-net l) (+ (+ (f-base p0) (f-base p1)) (+ (f-base p2) (f-base p3)))) 1 0) 24)))
+          (invalid))
+        (invalid))
+      (invalid))))
+
+;; ---- main-axis placement (place-main-axis, place-main-axis-auto-margins); no item bound ----
+;; mi = mode + 8 * safe + 16 * n + 4096 * i   (n = 1..255 items, i = 0..n-1 the item asked for)
+;;   mode 0 start (flex-start, start, left, and every unknown keyword)   1 space-between   2 center   3 end
+;;   4 space-around   5 space-evenly;  safe applies to center / end only (free is then clamped at zero)
+;; container, total (sum of the n item sizes), gap, prefix (sum of the sizes of the items before item i): all Q6.
+;; offset of item i = lead + prefix + i * gap + distributed part, where the distributed part is ONE rounding of an exact
+;; fraction of the free space F = container - (total + gap * (n - 1)):
+;;   between  F+ * i / (n - 1)    center  F? / 2    end  F?    around  F+ * (2i + 1) / (2n)    evenly  F+ * (i + 1) / (n + 1)
+;; (F+ = max(0, F); F? = F, or F+ when safe). The source computes the same positions by accumulating a rounded step; the
+;; exact fraction avoids accumulating the rounding (n * 1/2 raw at most, against 1/2 raw here).
+(defn offset [mi :i64 container :i64 total :i64 gap :i64 prefix :i64] :i64
+  (let [mode (bit-and mi 7) safe (bit-and (i64-shift-right mi 3) 1)
+        n (bit-and (i64-shift-right mi 4) 255) i (i64-shift-right mi 12)
+        f (- container (+ total (* gap (- n 1)))) fp (imax 0 f) fs (if (= safe 1) fp f)
+        base (+ prefix (* i gap))]
+    (if (and (and (in? n 1 255) (and (>= i 0) (< i n))) (and (and (len/in-range? container) (len/in-range? total))
+                                                           (and (len/in-range? gap) (and (>= gap 0) (len/in-range? prefix)))))
+      (let [r (cond (= mode 1) (+ base (if (> n 1) (len/rdiv (* i fp) (- n 1)) 0))
+                    (= mode 2) (+ base (len/rdiv fs 2))
+                    (= mode 3) (+ base fs)
+                    (= mode 4) (+ base (len/rdiv (* (+ (* 2 i) 1) fp) (* 2 n)))
+                    (= mode 5) (+ base (len/rdiv (* (+ i 1) fp) (+ n 1)))
+                    :else base)]
+        (if (len/in-range? r) r (invalid)))
+      (invalid))))
+;; auto margins: every bit of positive free space goes to the `nauto` auto margins on the line, split equally; the
+;; offset of an item is its prefix (sizes and gaps before it) plus the `before` auto margins in front of it
+;; (counting its own lead margin), each one share = F+ / nauto, as ONE rounding: round-half-up(before * F+ / nauto).
+;; totalg = sum of the sizes plus the gaps.
+(defn auto-offset [container :i64 totalg :i64 nauto :i64 before :i64 prefix :i64] :i64
+  (if (and (and (len/in-range? container) (len/in-range? totalg)) (and (in? nauto 1 255) (and (in? before 0 nauto) (len/in-range? prefix))))
+    (let [r (+ prefix (len/rdiv (* before (imax 0 (- container totalg))) nauto))]
+      (if (len/in-range? r) r (invalid)))
+    (invalid)))

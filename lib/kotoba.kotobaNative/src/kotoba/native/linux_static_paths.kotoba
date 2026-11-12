@@ -1,0 +1,345 @@
+;; Canonical complete C3 path, parent and scope-startup mechanism.
+;; Source candidate: owning C1/handler decisions remain authoritative.
+(ns kotoba.native.linux-static-paths
+  {:kotoba/export [startup resolve-path open-at open-parent]}
+  (:require [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io])
+  (:schemas
+   {:linux.static.paths/config
+    [:record :linux.static.paths/config
+     [[:isa :keyword] [:data :i64] [:buf-a :i64] [:buf-b :i64] [:buf-c :i64]
+      [:cwd :i64] [:root-real :i64] [:scope :string] [:scoped? :bool] [:root-length :i64]]]
+    :linux.static.paths/result
+    [:record :linux.static.paths/result
+     [[:code [:list [:ref :linux.static/instruction]]]
+      [:start [:list [:ref :linux.static/instruction]]] [:error :keyword]]]}))
+
+(defn- empty-code [] [:list [:ref :linux.static/instruction]]
+  (typed-list-new [:list [:ref :linux.static/instruction]]))
+(defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out
+    (asm/instruction op aux d s b i n target (vector-alloc 0))))
+(defn- tag [prefix :string suffix :string] :keyword
+  (keyword-from-string (string-concat (string-concat "ls.path/" prefix) (string-concat "-" suffix))))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :label :none :none :none :none :none 0 label))
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :li :none d :none :none :none n :none))
+(defn- la [out [:list [:ref :linux.static/instruction]] d :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :la :none d :none :none :none 0 label))
+(defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 :none))
+(defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :ld :none d :none :s0 :none (io/state-offset key) :none))
+(defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :st :none d :none :s0 :none (io/state-offset key) :none))
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none base i 0 :none))
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (append out :alu op d s :none :none 0 :none))
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (append out :alui op d :none :none :none n :none))
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 label))
+
+(defn- hd [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config] op :i64
+           a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+           c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/decision-fragment out (record-get [:ref :linux.static.paths/config] cfg :data)
+    :ls.cap/h-decide (io/literal op) a b c d))
+(defn- sys [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config] call :keyword
+            a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+            c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (io/syscall-fragment out (record-get [:ref :linux.static.paths/config] cfg :isa) call a b c d (io/literal 0)))
+(defn- copy [out [:list [:ref :linux.static/instruction]] prefix :string dst :keyword src :keyword n :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :t0 0) (mark (tag prefix "copy")) (alu :cmp :t0 n) (branch :hs (tag prefix "copied"))
+      (byte-op :ldb :t1 src :t0) (byte-op :stb :t1 dst :t0)
+      (imm :add :t0 1) (branch :always (tag prefix "copy")) (mark (tag prefix "copied"))))
+(defn- root-key [length-key :keyword] :keyword (if (= length-key :len-a) :ru-a :ru-c))
+(defn- open-flags [cfg [:ref :linux.static.paths/config]] :i64
+  (+ 2621440 (if (= (record-get [:ref :linux.static.paths/config] cfg :isa) :x86_64) 65536 16384)))
+
+(defn- prefix-root [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config]
+                    prefix :string spelling :i64 length-key :keyword admitted :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [choice (-> (hd out cfg 43 (io/literal spelling) (io/literal 0) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :eq (tag prefix "spelling-skip"))
+                   (imm :cmp :t0 1) (branch :ne :ls/bad))
+        length (if (= spelling 0) (li choice :t0 (record-get [:ref :linux.static.paths/config] cfg :root-length))
+                 (load choice :t0 :root-real-len))
+        before (-> length (imm :cmp :t0 0) (branch :eq (tag prefix "spelling-skip"))
+                   (store :t0 (root-key length-key)) (mov :a3 :t0) (li :t2 0)
+                   (alu :cmp :s2 :a3) (branch :lo (tag prefix "prefix-done")))
+        address (if (= spelling 0) (la before :a2 :ls.path/root)
+                  (li before :a2 (record-get [:ref :linux.static.paths/config] cfg :root-real)))
+        compared (-> address (li :a1 0) (mark (tag prefix "prefix-loop"))
+                     (alu :cmp :a1 :a3) (branch :hs (tag prefix "prefix-equal"))
+                     (byte-op :ldb :t0 :s4 :a1) (byte-op :ldb :t1 :a2 :a1)
+                     (alu :cmp :t0 :t1) (branch :ne (tag prefix "prefix-done"))
+                     (imm :add :a1 1) (branch :always (tag prefix "prefix-loop"))
+                     (mark (tag prefix "prefix-equal")) (li :t2 1) (mark (tag prefix "prefix-done"))
+                     (li :t1 0) (imm :cmp :t2 0) (branch :eq (tag prefix "next-done"))
+                     (byte-op :ldb :t1 :s4 :a3) (mark (tag prefix "next-done")) (store :t1 :x4))
+        decided (io/decision-fragment compared (record-get [:ref :linux.static.paths/config] cfg :data)
+                  :ls.cap/c1-decide (io/literal 8) (io/register :t2) (io/state-field :x4)
+                  (io/state-field length-key) (io/state-field (root-key length-key)))]
+    (-> decided (imm :cmp :t0 1) (branch :eq admitted)
+        (imm :cmp :t0 0) (branch :ne :ls/bad) (mark (tag prefix "spelling-skip")))))
+
+;; Resolve the canonical spelling before scope admission, as the owning API
+;; specifies. This is lexical path semantics, not raw POSIX component walking.
+(defn- normalize [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config]
+                  prefix :string target :i64]
+  [:list [:ref :linux.static/instruction]]
+  (let [begin (-> out (mark (tag prefix "normalize")) (li :s4 target) (li :t0 47) (li :t1 0)
+                  (byte-op :stb :t0 :s4 :t1) (li :s1 0) (li :s2 1)
+                  (mark (tag prefix "segment")) (mark (tag prefix "skip"))
+                  (byte-op :ldb :t0 :s3 :s1) (imm :cmp :t0 47) (branch :ne (tag prefix "skipped"))
+                  (imm :add :s1 1) (branch :always (tag prefix "skip")) (mark (tag prefix "skipped"))
+                  (imm :cmp :t0 0) (branch :eq (tag prefix "end")) (store :s1 :x1)
+                  (mark (tag prefix "scan")) (byte-op :ldb :t0 :s3 :s1)
+                  (imm :cmp :t0 0) (branch :eq (tag prefix "scanned"))
+                  (imm :cmp :t0 47) (branch :eq (tag prefix "scanned"))
+                  (imm :add :s1 1) (branch :always (tag prefix "scan")) (mark (tag prefix "scanned"))
+                  (mov :t2 :s1) (load :t1 :x1) (alu :sub :t2 :t1) (store :t2 :x2)
+                  (li :a2 2) (imm :cmp :t2 1) (branch :ne (tag prefix "class-two"))
+                  (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                  (li :a2 0) (branch :always (tag prefix "class-done")) (mark (tag prefix "class-two"))
+                  (imm :cmp :t2 2) (branch :ne (tag prefix "class-done"))
+                  (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                  (imm :add :t1 1) (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                  (li :a2 1) (mark (tag prefix "class-done")) (store :a2 :x3))
+        action (-> (hd begin cfg 13 (io/state-field :x3) (io/literal 0) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :eq (tag prefix "segment"))
+                   (imm :cmp :t0 1) (branch :ne (tag prefix "push"))
+                   (imm :cmp :s2 1) (branch :ls (tag prefix "segment")) (imm :sub :s2 1)
+                   (mark (tag prefix "pop")) (imm :cmp :s2 1) (branch :ls (tag prefix "segment"))
+                   (mov :t1 :s2) (imm :sub :t1 1) (byte-op :ldb :t0 :s4 :t1)
+                   (imm :cmp :t0 47) (branch :eq (tag prefix "segment"))
+                   (imm :sub :s2 1) (branch :always (tag prefix "pop"))
+                   (mark (tag prefix "push")) (load :t2 :x1) (alu :add :t2 :s3)
+                   (mov :t3 :s4) (alu :add :t3 :s2) (load :a1 :x2))]
+    (-> (copy action (string-concat prefix "-segment") :t3 :t2 :a1)
+        (alu :add :s2 :a1) (li :t0 47) (byte-op :stb :t0 :s4 :s2) (imm :add :s2 1)
+        (branch :always (tag prefix "segment")) (mark (tag prefix "end"))
+        (imm :cmp :s2 1) (branch :ls (tag prefix "ended")) (imm :sub :s2 1)
+        (mark (tag prefix "ended")) (li :t0 0) (byte-op :stb :t0 :s4 :s2))))
+
+(defn- resolve-code [cfg [:ref :linux.static.paths/config] prefix :string fail :keyword
+                     target :i64 length-key :keyword relative-key :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [first (-> (empty-code) (li :t0 0) (store :t0 :path-denied)
+                  (imm :cmp :s2 0) (branch :lt :ls/bad) (li :t2 0)
+                  (imm :cmp :s2 0) (branch :eq (tag prefix "first-done"))
+                  (li :t0 0) (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 47) (branch :ne (tag prefix "first-done"))
+                  (li :t2 1) (mark (tag prefix "first-done")))
+        planned (-> (hd first cfg 14 (io/register :s2) (io/register :t2) (io/state-field :cwd-len) (io/literal 0))
+                    (imm :cmp :t0 0) (branch :eq fail)
+                    ;; The whole admitted span must be a native path, including a
+                    ;; rename destination. A NUL must not truncate normalization.
+                    (mov :s4 :t0) (li :t0 0) (mark (tag prefix "no-nul"))
+                    (alu :cmp :t0 :s2) (branch :hs (tag prefix "no-nul-done"))
+                    (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 0) (branch :eq :ls/bad)
+                    (imm :add :t0 1) (branch :always (tag prefix "no-nul"))
+                    (mark (tag prefix "no-nul-done")) (mov :t0 :s4)
+                    (li :s3 (record-get [:ref :linux.static.paths/config] cfg :buf-a))
+                    (imm :cmp :t0 1) (branch :eq (tag prefix "absolute"))
+                    (imm :cmp :t0 2) (branch :ne :ls/bad) (load :s4 :cwd-len)
+                    (li :t2 (record-get [:ref :linux.static.paths/config] cfg :cwd)))
+        cwd (-> (copy planned (string-concat prefix "-cwd") :s3 :t2 :s4)
+                (li :t1 47) (byte-op :stb :t1 :s3 :s4) (mov :t2 :s3) (alu :add :t2 :s4) (imm :add :t2 1))
+        relative (-> (copy cwd (string-concat prefix "-relative") :t2 :s1 :s2)
+                     (li :t1 0) (byte-op :stb :t1 :t2 :s2) (branch :always (tag prefix "normalize"))
+                     (mark (tag prefix "absolute")))
+        absolute (-> (copy relative (string-concat prefix "-absolute") :s3 :s1 :s2)
+                     (li :t1 0) (byte-op :stb :t1 :s3 :s2))
+        normalized (-> (normalize absolute cfg prefix target) (store :s2 length-key)
+                       (load :t0 :fs-root-fd) (imm :cmp :t0 0) (branch :lt fail))
+        sealed (prefix-root normalized cfg (string-concat prefix "-sealed") 0 length-key (tag prefix "admitted"))
+        resolved (prefix-root sealed cfg (string-concat prefix "-real") 1 length-key (tag prefix "admitted"))]
+    ;; Only failure of both real C1 scope-prefix decisions is an absent path.
+    ;; Invalid spans, unavailable cwd/root and inconsistent state keep flag zero.
+    (-> resolved (li :t0 1) (store :t0 :path-denied) (branch :always fail)
+        (mark (tag prefix "admitted"))
+        (li :t2 target) (load :t0 (root-key length-key)) (alu :add :t2 :t0) (load :t1 :x4)
+        (imm :cmp :t1 47) (branch :ne (tag prefix "relative-slash")) (imm :add :t2 1)
+        (mark (tag prefix "relative-slash")) (li :t0 0) (byte-op :ldb :t1 :t2 :t0)
+        (imm :cmp :t1 0) (branch :ne (tag prefix "relative-done")) (la :t2 :ls.path/dot)
+        (mark (tag prefix "relative-done")) (store :t2 relative-key))))
+
+(defn- open-code [cfg [:ref :linux.static.paths/config] relative [:ref :linux.static.io/operand] flags :i64 mode :i64]
+  [:list [:ref :linux.static/instruction]]
+  (let [saved (io/operand-fragment (empty-code) :a4 relative)
+        how (-> saved (li :t1 flags) (store :t1 :how) (li :t1 mode) (store :t1 :how-mode)
+                ;; BENEATH | NO_MAGICLINKS | NO_SYMLINKS: reject interior links
+                ;; too; O_NOFOLLOW alone only protects the final component.
+                (li :t1 14) (store :t1 :how-resolve))]
+    (sys how cfg :openat2 (io/state-field :fs-root-fd) (io/register :a4)
+      (io/literal (+ (record-get [:ref :linux.static.paths/config] cfg :data) (io/state-offset :how))) (io/literal 24))))
+
+(defn- join [out [:list [:ref :linux.static/instruction]] code [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [index 0 current out]
+    (if (>= index (vector-count code)) current
+      (recur (+ index 1) (typed-list-conj [:list [:ref :linux.static/instruction]] current
+                            (typed-list-nth [:list [:ref :linux.static/instruction]] code index))))))
+
+(defn- parent-code [cfg [:ref :linux.static.paths/config] prefix :string form :i64 target :i64
+                    length-key :keyword fd-key :keyword base-key :keyword negative :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [scan (-> (empty-code) (load :s1 length-key) (li :s4 target) (mark (tag prefix "slash"))
+                 (imm :cmp :s1 0) (branch :eq (tag prefix "found")) (imm :sub :s1 1)
+                 (byte-op :ldb :t0 :s4 :s1) (imm :cmp :t0 47) (branch :ne (tag prefix "slash")) (mark (tag prefix "found"))
+                 (load :s2 length-key) (alu :sub :s2 :s1) (imm :sub :s2 1) (mov :s3 :s4) (alu :add :s3 :s1) (imm :add :s3 1)
+                 (li :a2 2) (imm :cmp :s2 1) (branch :ne (tag prefix "class-two"))
+                 (li :t0 0) (byte-op :ldb :t0 :s3 :t0) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                 (li :a2 0) (branch :always (tag prefix "class-done")) (mark (tag prefix "class-two"))
+                 (imm :cmp :s2 2) (branch :ne (tag prefix "class-done"))
+                 (li :t1 0) (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                 (li :t1 1) (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
+                 (li :a2 1) (mark (tag prefix "class-done")) (store :a2 :x3) (store :s3 base-key))
+        base (-> (hd scan cfg 15 (io/register :s1) (io/register :s2) (io/state-field :x3) (io/literal 0))
+                 (imm :cmp :t0 2) (branch :eq negative) (imm :cmp :t0 1) (branch :ne :ls/bad))
+        parent (-> (hd base cfg 19 (io/register :s1) (io/state-field (root-key length-key)) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :eq negative) (la :t2 :ls.path/dot)
+                   (imm :cmp :t0 1) (branch :eq (tag prefix "dot"))
+                   (imm :cmp :t0 2) (branch :ne :ls/bad)
+                   (li :t0 0) (byte-op :stb :t0 :s4 :s1)
+                   (load :t2 (if (= length-key :len-a) :rel-a :rel-c)) (mark (tag prefix "dot"))
+                   (store :t2 :x5) (mark (tag prefix "open")))
+        opened (-> (join parent (open-code cfg (io/state-field :x5) (open-flags cfg) 0))
+                   (store :t0 :x6) (li :t1 0) (imm :cmp :t0 0) (branch :ge (tag prefix "errno-done"))
+                   (mov :t1 :t0) (append :neg :none :t1 :none :none :none 0 :none) (mark (tag prefix "errno-done")))
+        decided (hd opened cfg 12 (io/literal form) (io/literal 1) (io/register :t1) (io/literal 0))]
+    (-> decided (imm :cmp :t0 3) (branch :eq (tag prefix "proceed"))
+        (imm :cmp :t0 2) (branch :eq (tag prefix "open"))
+        (imm :cmp :t0 0) (branch :eq negative) (branch :always :ls/bad)
+        (mark (tag prefix "proceed")) (load :t0 :x6) (store :t0 fd-key))))
+
+(defn- startup-code [cfg [:ref :linux.static.paths/config]] [:list [:ref :linux.static/instruction]]
+  (let [initial (-> (empty-code) (li :s0 (record-get [:ref :linux.static.paths/config] cfg :data))
+                    (li :t0 -1) (store :t0 :root-fd) (store :t0 :fs-root-fd)
+                    (li :t0 0) (store :t0 :root-real-len))
+        cwd (-> (sys initial cfg :getcwd (io/literal (record-get [:ref :linux.static.paths/config] cfg :cwd))
+                  (io/literal 4096) (io/literal 0) (io/literal 0))
+                (li :t1 0) (imm :cmp :t0 1) (branch :le :ls.path/no-cwd) (imm :cmp :t0 4096) (branch :hi :ls/bad)
+                (li :t2 (record-get [:ref :linux.static.paths/config] cfg :cwd)) (li :t3 0) (byte-op :ldb :t3 :t2 :t3)
+                (imm :cmp :t3 47) (branch :ne :ls.path/no-cwd) (mov :t1 :t0) (imm :sub :t1 1)
+                (mark :ls.path/no-cwd) (store :t1 :cwd-len))
+        opened (-> (sys cwd cfg :openat (io/literal -100) (io/label-address :ls.path/root)
+                      (io/literal (open-flags cfg)) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :lt :ls.path/no-root) (store :t0 :fs-root-fd))]
+    ;; Filesystem always needs an anchor. Spawn uses the separate root-fd
+    ;; only for explicit scopes, otherwise retaining its inherited cwd.
+    (if (not (record-get [:ref :linux.static.paths/config] cfg :scoped?)) (mark opened :ls.path/no-root)
+      (let [root (store opened :t0 :root-fd)
+            saved (-> (sys root cfg :openat (io/literal -100) (io/label-address :ls.path/dot) (io/literal (open-flags cfg)) (io/literal 0))
+                      (imm :cmp :t0 0) (branch :lt :ls.path/no-real) (store :t0 :x0))
+            entered (-> (sys saved cfg :fchdir (io/state-field :root-fd) (io/literal 0) (io/literal 0) (io/literal 0))
+                        (imm :cmp :t0 0) (branch :ne :ls.path/back))
+            captured (-> (sys entered cfg :getcwd (io/literal (record-get [:ref :linux.static.paths/config] cfg :root-real))
+                           (io/literal 4096) (io/literal 0) (io/literal 0))
+                         (imm :cmp :t0 1) (branch :le :ls.path/back) (imm :cmp :t0 4096) (branch :hi :ls/bad)
+                         (li :t2 (record-get [:ref :linux.static.paths/config] cfg :root-real)) (li :t3 0)
+                         (byte-op :ldb :t3 :t2 :t3) (imm :cmp :t3 47) (branch :ne :ls.path/back)
+                         (imm :sub :t0 1) (store :t0 :root-real-len) (mark :ls.path/back))
+            restored (-> (sys captured cfg :fchdir (io/state-field :x0) (io/literal 0) (io/literal 0) (io/literal 0))
+                         (imm :cmp :t0 0) (branch :ne :ls/bad))]
+        (-> (sys restored cfg :close (io/state-field :x0) (io/literal 0) (io/literal 0) (io/literal 0))
+            (mark :ls.path/no-real) (mark :ls.path/no-root))))))
+
+(defn- data-bytes [out [:list [:ref :linux.static/instruction]] label :keyword text :string]
+  [:list [:ref :linux.static/instruction]]
+  (let [input (string-to-utf8 text)
+        bytes (loop [index 0 data (vector-alloc 0)]
+                (if (>= index (bytes-count input)) data (recur (+ index 1) (vector-conj data (bytes-at input index)))))]
+    (typed-list-conj [:list [:ref :linux.static/instruction]] (mark out label)
+      (asm/instruction :bytes :none :none :none :none :none 0 :none bytes))))
+(defn- constants [cfg [:ref :linux.static.paths/config]] [:list [:ref :linux.static/instruction]]
+  (append (data-bytes (data-bytes (empty-code) :ls.path/root
+                       (string-concat (record-get [:ref :linux.static.paths/config] cfg :scope) "\u0000")) :ls.path/dot ".\u0000")
+    :align :none :none :none :none :none 16 :none))
+
+(defn- lookup [m :document key :keyword] :document
+  (if (not= (document-kind m) :map) (document-null)
+    (loop [index 0]
+      (if (>= index (document-count m)) (document-null)
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
+              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
+          (if (document-equal? k (document-keyword key))
+            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
+(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
+(defn- scope-string [source-plan :document] :string
+  (option-value-of [:option :string] (document-string-value (lookup source-plan :fs-scope)) "/"))
+(defn- no-nul? [text :string] :bool
+  (let [bytes (string-to-utf8 text)]
+    (loop [index 0]
+      (if (>= index (bytes-count bytes)) true
+        (if (= (bytes-at bytes index) 0) false (recur (+ index 1)))))))
+(defn- region? [base :i64 data :i64 end :i64] :bool
+  (and (>= base data) (<= base end) (= (bit-and base 15) 0) (<= 4096 (- end base))))
+(defn- configuration-error [isa :keyword source-plan :document layout :document] :keyword
+  (let [data (i64-of (lookup layout :data)) memory (i64-of (lookup layout :memory-size))
+        scope (lookup source-plan :fs-scope) bytes (string-to-utf8 (scope-string source-plan))]
+    (cond
+      (not (or (= isa :x86_64) (= isa :aarch64))) :unknown-isa
+      (not (document-equal? (lookup source-plan :handlers?) (document-bool true))) :handlers-not-planned
+      (not (document-equal? (lookup (lookup source-plan :context-abi) :version) (document-i64 11))) :context-abi-version
+      (and (not= (document-kind scope) :null) (not (document-equal? scope (document-bool false)))
+           (not= (document-kind scope) :string)) :scope-shape
+      (and (= (document-kind scope) :string)
+           (or (= (bytes-count bytes) 0) (>= (bytes-count bytes) 4096)
+               (not= (bytes-at bytes 0) 47) (not (no-nul? (scope-string source-plan))))) :scope-shape
+      (or (<= data 0) (not= (bit-and data 4095) 0) (< memory 4096)
+          (> memory (- 9223372036854775807 data))) :layout-input
+      :else (let [begin (+ data 4096) end (+ data memory)]
+              (if (and (region? (i64-of (lookup layout :buf-a)) begin end)
+                       (region? (i64-of (lookup layout :buf-b)) begin end)
+                       (region? (i64-of (lookup layout :buf-c)) begin end)
+                       (region? (i64-of (lookup layout :cwd)) begin end)
+                       (region? (i64-of (lookup layout :root-real)) begin end)) :ok :scratch-region)))))
+(defn- configuration [isa :keyword source-plan :document layout :document] [:ref :linux.static.paths/config]
+  (record-new [:ref :linux.static.paths/config] isa (i64-of (lookup layout :data))
+    (i64-of (lookup layout :buf-a)) (i64-of (lookup layout :buf-b)) (i64-of (lookup layout :buf-c))
+    (i64-of (lookup layout :cwd)) (i64-of (lookup layout :root-real)) (scope-string source-plan)
+    (= (document-kind (lookup source-plan :fs-scope)) :string) (bytes-count (string-to-utf8 (scope-string source-plan)))))
+(defn- failure [reason :keyword] [:ref :linux.static.paths/result]
+  (record-new [:ref :linux.static.paths/result] (empty-code) (empty-code) reason))
+(defn- success [code [:list [:ref :linux.static/instruction]]] [:ref :linux.static.paths/result]
+  (record-new [:ref :linux.static.paths/result] code (empty-code) :ok))
+(defn- path-slot? [cfg [:ref :linux.static.paths/config] target :i64 length-key :keyword] :bool
+  (or (and (= length-key :len-a) (= target (record-get [:ref :linux.static.paths/config] cfg :buf-b)))
+      (and (= length-key :len-c) (= target (record-get [:ref :linux.static.paths/config] cfg :buf-c)))))
+
+(defn startup [isa :keyword source-plan :document layout :document] [:ref :linux.static.paths/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration isa source-plan layout)]
+        (record-new [:ref :linux.static.paths/result] (constants cfg) (startup-code cfg) :ok)))))
+(defn resolve-path [isa :keyword source-plan :document layout :document prefix :string fail :keyword
+                    target :i64 length-key :keyword relative-key :keyword] [:ref :linux.static.paths/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration isa source-plan layout)]
+        (if (not (and (path-slot? cfg target length-key)
+                      (or (and (= length-key :len-a) (= relative-key :rel-a))
+                          (and (= length-key :len-c) (= relative-key :rel-c))))) (failure :path-state-key)
+          (success (resolve-code cfg prefix fail target length-key relative-key)))))))
+(defn open-at [isa :keyword source-plan :document layout :document relative [:ref :linux.static.io/operand]
+               flags :i64 mode :i64] [:ref :linux.static.paths/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (success (open-code (configuration isa source-plan layout) relative flags mode)))))
+(defn open-parent [isa :keyword source-plan :document layout :document prefix :string form :i64 target :i64
+                   length-key :keyword fd-key :keyword base-key :keyword negative :keyword] [:ref :linux.static.paths/result]
+  (let [error (configuration-error isa source-plan layout)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration isa source-plan layout)]
+        (if (or (not (path-slot? cfg target length-key)) (< (io/state-offset fd-key) 1024) (< (io/state-offset base-key) 1024))
+          (failure :path-state-key) (success (parent-code cfg prefix form target length-key fd-key base-key negative)))))))

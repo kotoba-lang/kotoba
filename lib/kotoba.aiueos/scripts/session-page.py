@@ -1,0 +1,195 @@
+#!/usr/bin/env python3 -I
+"""Build and check the hosted session page from its Kotoba source (JUN-821).
+
+  session-page.py embed          copy assets/torihiki.js into index.kotoba as the js-3 constant
+  session-page.py build          embed, then run index.kotoba with Amu and write index.html
+  session-page.py check          refuse if index.html is not what index.kotoba prints
+                                 (needs Amu), and if the app table differs from the records
+  session-page.py check-table    the table-versus-records check and the js-3 embed check (no Amu)
+
+index.kotoba is the source of the page; index.html is its generated output and is
+committed because the host serves that path. Amu is found through $AMU_HOME/bin/amu
+or `amu` on PATH. Host-side only: it compiles nothing but the one source and boots
+nothing. `amu run` prints main's value ("0") after the page; it is stripped only when
+the output ends exactly with "</html>\\n0\\n".
+"""
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SESSION = ROOT / "resources" / "aiueos" / "session"
+SRC = SESSION / "index.kotoba"
+PAGE = SESSION / "index.html"
+DAPPS = ROOT / "distributions" / "awai" / "dapps"
+ASSET_JS3 = SESSION / "assets" / "torihiki.js"
+JS3 = re.compile(r'^\(defn js-3 \[\] :string ".*"\)$', re.M)
+
+
+def fail(msg, code=1):
+    print("AIUEOS_SESSION_PAGE_FAIL " + msg)
+    sys.exit(code)
+
+
+def amu():
+    home = os.environ.get("AMU_HOME")
+    path = pathlib.Path(home) / "bin" / "amu" if home else None
+    if path and path.is_file():
+        return str(path)
+    found = shutil.which("amu")
+    if found:
+        return found
+    fail("Amu not found (set AMU_HOME or put amu on PATH); the page cannot be built or checked", 2)
+
+
+HTML_LIB = ROOT.parent / "kotoba.html" / "kotoba"
+APPS = SESSION / "apps"
+DOC_ID = re.compile(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?")
+MAX_DOCUMENTS = 64
+
+
+def documents():
+    """Ids named by the records' ui.document, sorted and bounded: the app modules of the lock."""
+    ids = []
+    for p in sorted(DAPPS.glob("*.json")):
+        d = json.loads(p.read_text(encoding="utf-8")).get("ui", {}).get("document")
+        if d is not None:
+            if not isinstance(d, str) or not DOC_ID.fullmatch(d):
+                fail("%s: ui.document %r is not an id" % (p.name, d))
+            ids.append(d)
+    if len(ids) > MAX_DOCUMENTS:
+        fail("more than %d documents" % MAX_DOCUMENTS)
+    return sorted(ids)
+
+
+def modules():
+    mods = {"index": SRC, "html-core": HTML_LIB / "html_core.kotoba", "html-hiccup": HTML_LIB / "html_hiccup.kotoba",
+            "ui-components": HTML_LIB / "ui_components.kotoba"}
+    for d in documents():
+        mods["app-" + d] = APPS / (d + ".kotoba")
+    return mods
+
+
+def source_lock(path):
+    """KSL2 source lock over the page and the shared html libraries it requires (JUN-856)."""
+    mods = {n: p.resolve(strict=True) for n, p in modules().items()}
+    text = "KSL2\nentry %s\n" % mods["index"]
+    text += "".join("module %s %s\n" % (n, p) for n, p in sorted(mods.items()))
+    text += "".join("file %s %s\n" % (hashlib.sha256(p.read_bytes()).hexdigest(), p) for p in sorted(mods.values()))
+    path.write_text(text, encoding="utf-8")
+
+
+def render():
+    with tempfile.TemporaryDirectory() as tmp:
+        lock = pathlib.Path(tmp) / "page.ksl"
+        source_lock(lock)
+        r = subprocess.run([amu(), "run", str(SRC), "--source-lock", str(lock)], capture_output=True, timeout=300)
+    if r.returncode != 0:
+        fail("amu run exited %d: %s" % (r.returncode, r.stderr.decode("utf-8", "replace")[:300]))
+    out = r.stdout
+    if not out.endswith(b"</html>\n0\n"):
+        fail("unexpected end of output (want </html>, newline, main's 0)")
+    return out[:-2]
+
+
+def table_rows(text, name):
+    m = re.search(r"\(defn %s \[d :i64\] :string \(case d (.*?) \"\"\)\)\n" % re.escape(name), text)
+    if not m:
+        fail("table function %s not found" % name)
+    pairs = re.findall(r"(\d+) \"((?:[^\"\\]|\\.)*)\"", m.group(1))
+    return {int(k): v for k, v in pairs}
+
+
+def klit(text):
+    return '"' + (text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                  .replace("\r", "\\r").replace("\t", "\\t")) + '"'
+
+
+def js3_line():
+    text = ASSET_JS3.read_text(encoding="utf-8")
+    if "</script" in text.lower():
+        fail("assets/torihiki.js contains </script")
+    return "(defn js-3 [] :string %s)" % klit(text)
+
+
+def embed():
+    src = SRC.read_text(encoding="utf-8")
+    line = js3_line()
+    if JS3.search(src):
+        src = JS3.sub(lambda m: line, src, count=1)
+    else:
+        src = re.sub(r"^(\(defn js-2 \[\] :string \".*\"\))$", lambda m: m.group(1) + "\n" + line, src, count=1, flags=re.M)
+        if not JS3.search(src):
+            fail("js-2 constant not found; cannot place js-3")
+    SRC.write_text(src, encoding="utf-8")
+
+
+def check_embed():
+    m = JS3.search(SRC.read_text(encoding="utf-8"))
+    if not m or m.group(0) != js3_line():
+        fail("js-3 in index.kotoba differs from assets/torihiki.js: run `session-page.py embed`")
+
+
+def check_table():
+    check_embed()
+    text = SRC.read_text(encoding="utf-8")
+    count = int(re.search(r"\(defn app-count \[\] :i64 (\d+)\)", text).group(1))
+    recs = {}
+    for p in sorted(DAPPS.glob("*.json")):
+        r = json.loads(p.read_text(encoding="utf-8"))
+        recs[r["dock"]] = r
+    if count != len(recs) or sorted(recs) != list(range(1, count + 1)):
+        fail("app-count %d differs from %d records with docks 1..N" % (count, len(recs)))
+    want = {
+        "rec-id": lambda r: r["id"],
+        "rec-title": lambda r: r["title"],
+        "rec-cat": lambda r: r.get("category", ""),
+        "rec-ops": lambda r: ", ".join(o["operation"] for o in r["remoteOperations"]),
+    }
+    for fn, get in want.items():
+        rows = table_rows(text, fn)
+        for dock, r in recs.items():
+            if rows.get(dock) != get(r):
+                fail("%s row %d is %r, record %s says %r" % (fn, dock, rows.get(dock), r["id"], get(r)))
+        if set(rows) != set(recs):
+            fail("%s has rows %s, records have %s" % (fn, sorted(rows), sorted(recs)))
+    want_req = sorted("app-" + d for d in documents())
+    ns = re.match(r"\(ns index \(:require (.*?)\)\)\n", text, re.S)
+    if not ns:
+        fail("index.kotoba does not start with (ns index (:require ...))")
+    got_req = sorted(re.findall(r"\[(app-[a-z0-9-]+) :as [a-z0-9]+\]", ns.group(1)))
+    if got_req != want_req:
+        fail("index.kotoba requires %s, the records' ui.document name %s" % (got_req, want_req))
+    print("AIUEOS_SESSION_TABLE_OK apps=%d documents=%d" % (count, len(want_req)))
+
+
+def main(mode):
+    if mode == "embed":
+        embed()
+        print("AIUEOS_SESSION_JS3_EMBEDDED")
+    elif mode == "build":
+        embed()
+        check_table()
+        PAGE.write_bytes(render())
+        print("AIUEOS_SESSION_PAGE_BUILT bytes=%d" % PAGE.stat().st_size)
+    elif mode == "check-table":
+        check_table()
+    elif mode == "check":
+        check_table()
+        if render() != PAGE.read_bytes():
+            fail("index.html is stale: run `session-page.py build`")
+        print("AIUEOS_SESSION_PAGE_OK")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    main(sys.argv[1])

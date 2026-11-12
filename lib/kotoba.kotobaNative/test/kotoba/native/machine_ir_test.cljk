@@ -864,6 +864,76 @@
     (doseq [target [:x86-64 :aarch64]]
       (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
 
+(deftest a-typed-list-built-at-run-time-lowers-to-the-word-arena
+  ;; `[:list T]` shares the word arena with `[:set T]`: new, conj (append) and
+  ;; nth lower to vector-conj / vector-at, so a list whose length is known only
+  ;; while the program runs compiles for both native targets. The same program
+  ;; ran to 1 on AArch64 (amu ADR 0354 / typed-list-conj).
+  (let [ints [:list :i64]
+        body (list 'let ['xs (list 'typed-list-conj ints
+                                   (list 'typed-list-conj ints (list 'typed-list-new ints) 7)
+                                   9)]
+                    (list '+ (list 'vector-count 'xs)
+                          (list 'typed-list-nth ints 'xs 1)))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types []
+                             :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)]
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
+(def ^:private tree-record
+  [:record :t/tree [[:v :i64] [:kids [:list [:ref :t/tree]]] [:data :bytes]]])
+(def ^:private tree-kids [:list [:ref :t/tree]])
+
+(deftest a-record-holding-a-list-of-its-own-handles-and-bytes-lowers-natively
+  ;; The Form record every selfhost guest walks: a list of `[:ref q]` handles
+  ;; beside a `:bytes` member. Both are one machine word, so the pair chain
+  ;; holds them like any other field and the list is the word arena. Rebuilding
+  ;; one with `record-assoc` reads the other fields back from the operand.
+  (let [module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions
+                [{:name 'leaf :params '[v] :param-types [:i64] :result [:ref :t/tree]
+                  :body (list 'record-new tree-record 'v (list 'typed-list-new tree-kids)
+                              (list 'bytes-empty))}
+                 {:name 'grow :params '[n k] :param-types [[:ref :t/tree] [:ref :t/tree]]
+                  :result [:ref :t/tree]
+                  :body (list 'record-assoc tree-record 'n :kids
+                              (list 'typed-list-conj tree-kids
+                                    (list 'record-get tree-record 'n :kids) 'k))}
+                 {:name 'first-kid :params '[n] :param-types [[:ref :t/tree]] :result :i64
+                  :body (list 'record-get tree-record
+                              (list 'typed-list-nth tree-kids
+                                    (list 'record-get tree-record 'n :kids) 0)
+                              :v)}
+                 {:name 'main :params [] :param-types [] :result :i64
+                  :body (list 'first-kid (list 'grow (list 'leaf 1) (list 'leaf 41)))}]}
+        gmir (machine/lower-kir-module module)]
+    (is (machine/pilot-module? module))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
+(deftest record-assoc-on-a-scalar-replaced-local-rebuilds-the-record
+  ;; No function boundary names the record, so it stays scalar-replaced: the
+  ;; update is a `record-new` over reads of the operand.
+  (let [point [:record :t/point [[:x :i64] [:y :i64]]]
+        body (list 'let ['p (list 'record-new point 3 4)]
+                   (list '+ (list 'record-get point (list 'record-assoc point 'p :y 10) :x)
+                         (list 'record-get point (list 'record-assoc point 'p :y 10) :y)))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types [] :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)]
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target)))
+  (testing "a field the record does not declare is refused by name"
+    (let [point [:record :t/point [[:x :i64] [:y :i64]]]
+          module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                  :functions [{:name 'main :params [] :param-types [] :result :i64
+                               :body (list 'record-get point
+                                           (list 'record-assoc point (list 'record-new point 1 2) :z 3)
+                                           :x)}]}]
+      (is (thrown? :default (machine/lower-kir-module module))))))
+
 (deftest capability-call-encoders-check-policy-before-the-host-call
   (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
         x86-typed (machine/compile-expression
@@ -4181,6 +4251,25 @@
         (is (= v (coalesce v)) "x0 was rewritten in between; the copy carries information"))
       (let [v [(mov :aarch64/x19 :aarch64/x0) call (mov :aarch64/x0 :aarch64/x19) call]]
         (is (= v (coalesce v)) "a call clobbers x0; the alias does not survive it")))))
+
+(deftest fs-bytes-contracts-lower-through-the-module-pipeline
+  ;; fs/app-data-bytes (wire 35): READ / RANGE is [:string :bytes] (typed kind 9) and
+  ;; WRITE / APPEND is [:bytes :bytes] (kind 8). Bytes are one-word vector-arena handles.
+  (doseq [[request-type request result-kind]
+          [[:string "/tmp/a" :string-bytes-v1]
+           [:bytes '(bytes-empty) :bytes-v1]]]
+    (let [body (list 'let ['b (list 'typed-cap-call 35 request-type :bytes request)]
+                     (list 'bytes-count 'b))
+          module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                  :functions [{:name 'main :params [] :param-types []
+                               :result :i64 :body body}]}
+          gmir (machine/lower-kir-module module)
+          calls (filter #(= :gmir/capability-call (:gmir/op %))
+                        (get-in gmir [:gmir/functions 0 :gmir/instructions]))]
+      (is (= 1 (count calls)) request-type)
+      (is (= result-kind (:gmir/kind (first calls))) request-type)
+      (doseq [target [:x86-64 :aarch64]]
+        (is (seq (:mc/functions (machine/compile-gmir target gmir))) [request-type target])))))
 
 ;; amu ADR 0353 floor :native-record-operations: `record-assoc`, the update a
 ;; row operation on a present field elaborates to. In a record-boundary module

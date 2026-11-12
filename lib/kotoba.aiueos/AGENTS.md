@@ -143,6 +143,11 @@ iterations need no power cycle. Evidence:
 Ed25519 only (below the post-quantum floor) and exists only in the debug
 entry; KDBG tags 0x2000.. are taken by the blur timing log.
 
+The debug entry also runs a read-only CMOS RTC probe once at boot (JUN-813, ADR-0286 Amendment 8): `rtc-probe` in `native/update.kotoba` reports KDBG
+0xc400..0xc40b (raw registers, the conversion, two reads a second apart with the TSC between them, the production `rtc-now` answer, a verdict word) and keeps the
+same records in context words 1498..1535. Gate: `build-native-desktop-macos.py --profile rtc` (`check-native-rtc-qemu.py`, decoder `rtc_probe_decode.py`, which the
+operator also uses to record and decode the board's report). Operator steps for the 6600H: `docs/runbook-6600h-rtc-probe.md`. The 6600H's RTC is not yet measured.
+
 ## Verified network update, stage 1: read-only NVMe (AWAI-122)
 
 A network update is verified only if the installed OS boots from disk, fetches
@@ -200,8 +205,16 @@ image and wait for KDBG 0008 (desktop loop up) before sending commands; a
 command sent during boot is lost with that boot's nonce. A board running
 the installed OS, powered off, or on an image without the watchdog still
 needs a manual (or switched-outlet) power cycle.
-Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
-protection beyond version >= 1, since no installed version is kept.
+Still open at stage 3: Ed25519 only (no ML-DSA verifier yet). Rollback
+protection (JUN-813 stage 5c, ADR-0286 amendment 4; this replaces the former
+"no rollback protection beyond version >= 1"): `native/update.kotoba` refuses
+a header whose version is not strictly above a hash-checked (not signed,
+interim) floor kept in `\EFI\ITONAMI\OSMETA.BIN` (result 9) and refuses
+with 10 when that journal is missing, unreadable or corrupt (fail closed,
+never floor 0). A board gets the journal from
+`os/aiueos/scripts/aiueos-provision-esp.py DISK --version N` (N = the image
+version the board runs now); nothing at boot or on the network path creates
+it, and no image builder creates `\EFI\ITONAMI\` (open gap).
 Stage 4 writes the ESP (FAT32 only): remote command 6 (`aiueos-remote.py
 install`) pulls and verifies the image as stage 3 and also writes it into the
 staging file `\EFI\ITONAMI\UPDATE.BIN`. `native/esp.kotoba` creates that

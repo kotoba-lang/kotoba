@@ -1,0 +1,229 @@
+;; Kotoba-owned Awai logical-file v1. Physical locations are never inputs.
+;; Native ABI keeps chunk rows in a flat, bounded vector: offset,length,CID[36].
+;; This is an in-memory representation only; canonical bytes use the schema maps.
+(ns awai.fs.logical-file
+  (:require [ipld.dag-cbor-write :as w] [multiformats.cid :as cid]
+            [multiformats.byte-cid :as hash])
+  (:export [profile-new file-new chunk-row refusal profile-refusal encode
+            profile-encode file-cid profile-cid verify-leaf same-bytes? decode profile-decode bytes-cid])
+  (:schemas {:awai.fs/profile [:record :awai.fs/profile
+               [[:version :i64] [:kind :string] [:leaf-size :i64]]]
+             :awai.fs/file [:record :awai.fs/file
+               [[:version :i64] [:size :i64] [:profile [:ref :awai.fs/profile]] [:rows :vector-i64]]]
+             :awai.fs/read [:record :awai.fs/read [[:value :i64] [:next :i64] [:error :keyword]]]
+             :awai.fs/profile-read [:record :awai.fs/profile-read
+               [[:profile [:ref :awai.fs/profile]] [:next :i64] [:error :keyword]]]
+             :awai.fs/rows-read [:record :awai.fs/rows-read [[:rows :vector-i64] [:next :i64] [:error :keyword]]]}))
+(def max-chunks 1024)
+(def max-leaf-size 16777216)
+(def row-width 38)
+(def max-file-size 17179869184)
+(def max-wire-bytes 131072)
+(defn profile-new [version :i64 kind :string leaf-size :i64] [:ref :awai.fs/profile]
+  (record-new [:ref :awai.fs/profile] version kind leaf-size))
+(defn file-new [version :i64 size :i64 profile [:ref :awai.fs/profile] rows :vector-i64] [:ref :awai.fs/file]
+  (record-new [:ref :awai.fs/file] version size profile rows))
+(defn same-bytes? [a :vector-i64 b :vector-i64] :bool
+  (and (= (vector-count a) (vector-count b))
+    (loop [i 0] (if (= i (vector-count a)) true
+      (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false)))))
+(defn- slice [b :vector-i64 start :i64 length :i64] :vector-i64
+  (loop [i 0 out (vector-i64)]
+    (if (= i length) out (recur (+ i 1) (vector-conj out (vector-at b (+ start i)))))))
+(defn profile-refusal [p [:ref :awai.fs/profile]] :keyword
+  (cond (not= (record-get [:ref :awai.fs/profile] p :version) 1) :profile-version
+        (not (string=? (record-get [:ref :awai.fs/profile] p :kind) "fixed")) :profile-kind
+        (or (< (record-get [:ref :awai.fs/profile] p :leaf-size) 1)
+            (> (record-get [:ref :awai.fs/profile] p :leaf-size) max-leaf-size)) :leaf-size
+        :else :none))
+(defn- raw-link? [raw :vector-i64] :bool
+  (if (not= (vector-count raw) 36) false
+    (let [s (string-concat "b" (cid/base32 raw)) p (cid/cid->parts s)]
+      (and (= (record-get [:ref :multiformats.cid/parts] p :error) :none)
+           (= (record-get [:ref :multiformats.cid/parts] p :version) 1)
+           (= (record-get [:ref :multiformats.cid/parts] p :codec) 85)
+           (= (record-get [:ref :multiformats.cid/parts] p :hash-code) 18)
+           (= (record-get [:ref :multiformats.cid/parts] p :digest-size) 32)))))
+(defn chunk-row [offset :i64 length :i64 link :string] :vector-i64
+  (w/append (vector-i64 offset length) (cid/cid->bytes link)))
+(defn refusal [f [:ref :awai.fs/file]] :keyword
+  (let [p (record-get [:ref :awai.fs/file] f :profile)
+        size (record-get [:ref :awai.fs/file] f :size)
+        rows (record-get [:ref :awai.fs/file] f :rows)
+        width (vector-count rows) n (quot width row-width) pe (profile-refusal p)
+        leaf (record-get [:ref :awai.fs/profile] p :leaf-size)]
+    (cond (not= (record-get [:ref :awai.fs/file] f :version) 1) :file-version
+          (not= pe :none) pe
+          (or (< size 0) (> size max-file-size)) :file-size
+          (or (not= (rem width row-width) 0) (> n max-chunks)) :chunk-count
+          :else (loop [i 0 offset 0]
+            (if (= i n) (if (= offset size) :none :file-size)
+              (let [at (* i row-width) length (vector-at rows (+ at 1))]
+                (cond (not= (vector-at rows at) offset) :extent
+                      (or (< length 1) (> length leaf) (and (< (+ i 1) n) (not= length leaf))) :extent
+                      (not (raw-link? (slice rows (+ at 2) 36))) :link
+                      :else (recur (+ i 1) (+ offset length)))))))))
+(defn- field [out :vector-i64 key :string value :vector-i64] :vector-i64
+  (w/append (w/append out (w/text-item key)) value))
+(defn- profile-bytes [p [:ref :awai.fs/profile]] :vector-i64
+  (field (field (field (w/head 5 3) "kind" (w/text-item (record-get [:ref :awai.fs/profile] p :kind)))
+    "version" (w/int-item (record-get [:ref :awai.fs/profile] p :version)))
+    "leafSize" (w/int-item (record-get [:ref :awai.fs/profile] p :leaf-size))))
+(defn profile-encode [p [:ref :awai.fs/profile]] [:result :vector-i64 :keyword]
+  (let [e (profile-refusal p)]
+    (if (= e :none) (result-ok-of [:result :vector-i64 :keyword] (profile-bytes p))
+      (result-err-of [:result :vector-i64 :keyword] e))))
+(defn- copy-at [out :vector-i64 at :i64 bytes :vector-i64] :vector-i64
+  (loop [i 0 b out]
+    (if (= i (vector-count bytes)) b
+      (recur (+ i 1) (vector-assoc! b (+ at i) (vector-at bytes i))))))
+(defn- file-bytes [f [:ref :awai.fs/file]] :vector-i64
+  (let [rows (record-get [:ref :awai.fs/file] f :rows) n (quot (vector-count rows) row-width)
+        ah (w/array-head n)
+        chunks (loop [i 0 cursor (vector-count ah) out (copy-at (vector-alloc max-wire-bytes) 0 ah)]
+          (if (= i n) (vector-take out cursor)
+            (let [at (* i row-width)
+                  chunk (field (field (field (w/head 5 3) "cid" (w/link-bytes-item (slice rows (+ at 2) 36)))
+                                "length" (w/int-item (vector-at rows (+ at 1))))
+                               "offset" (w/int-item (vector-at rows at)))]
+              (recur (+ i 1) (+ cursor (vector-count chunk)) (copy-at out cursor chunk)))))]
+    (field (field (field (field (field (w/head 5 5) "chunks" chunks)
+      "format" (w/text-item "awai.logical-file")) "version" (w/int-item (record-get [:ref :awai.fs/file] f :version)))
+      "fileSize" (w/int-item (record-get [:ref :awai.fs/file] f :size)))
+      "chunkProfile" (profile-bytes (record-get [:ref :awai.fs/file] f :profile)))))
+(defn encode [f [:ref :awai.fs/file]] [:result :vector-i64 :keyword]
+  (let [e (refusal f)] (if (= e :none) (result-ok-of [:result :vector-i64 :keyword] (file-bytes f))
+    (result-err-of [:result :vector-i64 :keyword] e))))
+(defn profile-cid [p [:ref :awai.fs/profile]] [:result :string :keyword]
+  (let [e (profile-refusal p)]
+    (if (= e :none) (result-ok-of [:result :string :keyword] (hash/cidv1-dag-cbor-bytes (profile-bytes p)))
+      (result-err-of [:result :string :keyword] e))))
+(defn file-cid [f [:ref :awai.fs/file]] [:result :string :keyword]
+  (let [e (refusal f)]
+    (if (= e :none) (result-ok-of [:result :string :keyword] (hash/cidv1-dag-cbor-bytes (file-bytes f)))
+      (result-err-of [:result :string :keyword] e))))
+(defn verify-leaf [row :vector-i64 bytes :vector-i64] :keyword
+  (cond (not= (vector-count row) row-width) :chunk-count
+        (or (< (vector-at row 0) 0) (> (vector-at row 0) max-file-size)
+            (< (vector-at row 1) 1) (> (vector-at row 1) max-leaf-size)
+            (not= (vector-at row 1) (vector-count bytes))) :extent
+        (not (raw-link? (slice row 2 36))) :link
+        (not (string=? (hash/cidv1-raw-bytes bytes) (string-concat "b" (cid/base32 (slice row 2 36))))) :digest
+        :else :none))
+
+;; Closed schema reader: no generic DAG-CBOR implementation or alternate CID
+;; primitive. Literal heads/keys use the owning writer, integer heads enforce
+;; its shortest form, and the final exact re-encode binds all accepted bytes.
+(defn- read-new [value :i64 next :i64 error :keyword] [:ref :awai.fs/read]
+  (record-new [:ref :awai.fs/read] value next error))
+(defn- uint [b :vector-i64 pos :i64 major :i64 limit :i64] [:ref :awai.fs/read]
+  (if (or (< pos 0) (>= pos (vector-count b))) (read-new 0 pos :truncated)
+    (let [head (vector-at b pos) ai (bit-and head 31)]
+      (cond (not= (quot head 32) major) (read-new 0 pos :shape)
+            (< ai 24) (if (> ai limit) (read-new 0 pos :limit) (read-new ai (+ pos 1) :none))
+            (> ai 27) (read-new 0 pos :shape)
+            :else (let [width (cond (= ai 24) 1 (= ai 25) 2 (= ai 26) 4 :else 8)
+                        minimum (cond (= ai 24) 24 (= ai 25) 256 (= ai 26) 65536 :else 4294967296)]
+              (if (> (+ pos 1 width) (vector-count b)) (read-new 0 pos :truncated)
+                (loop [i 0 value 0]
+                  (if (= i width)
+                    (if (< value minimum) (read-new 0 pos :noncanonical) (read-new value (+ pos 1 width) :none))
+                    (let [digit (vector-at b (+ pos 1 i))]
+                      (if (or (> value (quot limit 256))
+                              (and (= value (quot limit 256)) (> digit (rem limit 256))))
+                        (read-new 0 pos :limit)
+                        (recur (+ i 1) (+ (* value 256) digit))))))))))))
+(defn- expect [b :vector-i64 pos :i64 literal :vector-i64] :i64
+  (if (or (< pos 0) (> (+ pos (vector-count literal)) (vector-count b))) -1
+    (if (same-bytes? (slice b pos (vector-count literal)) literal) (+ pos (vector-count literal)) -1)))
+(defn- wire-refusal [b :vector-i64] :keyword
+  (if (> (vector-count b) max-wire-bytes) :limit
+    (loop [i 0]
+      (if (= i (vector-count b)) :none
+        (if (or (< (vector-at b i) 0) (> (vector-at b i) 255)) :byte (recur (+ i 1)))))))
+(defn- profile-read [b :vector-i64 pos :i64] [:ref :awai.fs/profile-read]
+  (let [empty (profile-new 0 "" 0)
+        start (expect b pos (w/append (w/head 5 3) (w/text-item "kind")))
+        kind-end (expect b start (w/text-item "fixed"))
+        vp (expect b kind-end (w/text-item "version"))
+        vr (uint b vp 0 9223372036854775807)
+        lp (expect b (record-get [:ref :awai.fs/read] vr :next) (w/text-item "leafSize"))
+        lr (uint b lp 0 max-leaf-size)
+        err (cond (< start 0) :shape (< kind-end 0) :profile-kind (< vp 0) :shape
+                  (not= (record-get [:ref :awai.fs/read] vr :error) :none) (record-get [:ref :awai.fs/read] vr :error)
+                  (< lp 0) :shape :else (record-get [:ref :awai.fs/read] lr :error))]
+    (if (not= err :none) (record-new [:ref :awai.fs/profile-read] empty pos err)
+      (let [p (profile-new (record-get [:ref :awai.fs/read] vr :value) "fixed" (record-get [:ref :awai.fs/read] lr :value))]
+        (record-new [:ref :awai.fs/profile-read] p (record-get [:ref :awai.fs/read] lr :next) (profile-refusal p))))))
+(defn profile-decode [b :vector-i64] [:result [:ref :awai.fs/profile] :keyword]
+  (let [e (wire-refusal b)]
+    (if (not= e :none) (result-err-of [:result [:ref :awai.fs/profile] :keyword] e)
+      (let [r (profile-read b 0) error (record-get [:ref :awai.fs/profile-read] r :error)
+            p (record-get [:ref :awai.fs/profile-read] r :profile)]
+        (cond (not= error :none) (result-err-of [:result [:ref :awai.fs/profile] :keyword] error)
+              (not= (record-get [:ref :awai.fs/profile-read] r :next) (vector-count b))
+                (result-err-of [:result [:ref :awai.fs/profile] :keyword] :trailing)
+              (not (same-bytes? b (profile-bytes p))) (result-err-of [:result [:ref :awai.fs/profile] :keyword] :noncanonical)
+              :else (result-ok-of [:result [:ref :awai.fs/profile] :keyword] p))))))
+(defn- rows-read [b :vector-i64 pos :i64 count :i64] [:ref :awai.fs/rows-read]
+  (loop [i 0 cursor pos rows (vector-alloc (* count row-width))]
+    (if (= i count) (record-new [:ref :awai.fs/rows-read] rows cursor :none)
+      (let [start (expect b cursor (w/append (w/head 5 3) (w/text-item "cid")))
+            tag-end (expect b start (w/head 6 42))
+            br (uint b tag-end 2 37) size (record-get [:ref :awai.fs/read] br :value)
+            data (record-get [:ref :awai.fs/read] br :next)]
+        (cond (< start 0) (record-new [:ref :awai.fs/rows-read] rows cursor :shape)
+              (< tag-end 0) (record-new [:ref :awai.fs/rows-read] rows cursor :link)
+              (not= (record-get [:ref :awai.fs/read] br :error) :none)
+                (record-new [:ref :awai.fs/rows-read] rows cursor (record-get [:ref :awai.fs/read] br :error))
+              (or (not= size 37) (> (+ data size) (vector-count b)))
+                (record-new [:ref :awai.fs/rows-read] rows cursor :link)
+              (not= (vector-at b data) 0) (record-new [:ref :awai.fs/rows-read] rows cursor :link)
+              :else (let [raw (slice b (+ data 1) 36)
+                          lp (expect b (+ data size) (w/text-item "length"))
+                          lr (uint b lp 0 max-leaf-size)
+                          op (expect b (record-get [:ref :awai.fs/read] lr :next) (w/text-item "offset"))
+                          offset (uint b op 0 max-file-size)
+                          e (cond (not (raw-link? raw)) :link (< lp 0) :shape
+                                  (not= (record-get [:ref :awai.fs/read] lr :error) :none) (record-get [:ref :awai.fs/read] lr :error)
+                                  (< op 0) :shape :else (record-get [:ref :awai.fs/read] offset :error))]
+                      (if (not= e :none) (record-new [:ref :awai.fs/rows-read] rows cursor e)
+                        (recur (+ i 1) (record-get [:ref :awai.fs/read] offset :next)
+                          (copy-at (copy-at rows (* i row-width) (vector-i64 (record-get [:ref :awai.fs/read] offset :value)
+                                                                        (record-get [:ref :awai.fs/read] lr :value))) (+ (* i row-width) 2) raw)))))))))
+(defn decode [b :vector-i64] [:result [:ref :awai.fs/file] :keyword]
+  (let [e (wire-refusal b)]
+    (if (not= e :none) (result-err-of [:result [:ref :awai.fs/file] :keyword] e)
+      (let [start (expect b 0 (w/append (w/head 5 5) (w/text-item "chunks")))
+            ar (uint b start 4 max-chunks)
+            ae (record-get [:ref :awai.fs/read] ar :error)]
+        (cond (< start 0) (result-err-of [:result [:ref :awai.fs/file] :keyword] :shape)
+              (not= ae :none) (result-err-of [:result [:ref :awai.fs/file] :keyword] ae)
+              :else (let [rr (rows-read b (record-get [:ref :awai.fs/read] ar :next) (record-get [:ref :awai.fs/read] ar :value))
+                          re (record-get [:ref :awai.fs/rows-read] rr :error)
+                          fp (expect b (record-get [:ref :awai.fs/rows-read] rr :next)
+                               (w/append (w/append (w/text-item "format") (w/text-item "awai.logical-file")) (w/text-item "version")))
+                          vr (uint b fp 0 9223372036854775807)
+                          sp (expect b (record-get [:ref :awai.fs/read] vr :next) (w/text-item "fileSize"))
+                          sr (uint b sp 0 max-file-size)
+                          pp (expect b (record-get [:ref :awai.fs/read] sr :next) (w/text-item "chunkProfile"))
+                          pr (profile-read b pp)
+                          error (cond (not= re :none) re (< fp 0) :shape
+                                      (not= (record-get [:ref :awai.fs/read] vr :error) :none) (record-get [:ref :awai.fs/read] vr :error)
+                                      (< sp 0) :shape
+                                      (not= (record-get [:ref :awai.fs/read] sr :error) :none) (record-get [:ref :awai.fs/read] sr :error)
+                                      (< pp 0) :shape :else (record-get [:ref :awai.fs/profile-read] pr :error))]
+                      (if (not= error :none) (result-err-of [:result [:ref :awai.fs/file] :keyword] error)
+                        (let [f (file-new (record-get [:ref :awai.fs/read] vr :value) (record-get [:ref :awai.fs/read] sr :value)
+                                         (record-get [:ref :awai.fs/profile-read] pr :profile) (record-get [:ref :awai.fs/rows-read] rr :rows))
+                              semantic (refusal f)]
+                          (cond (not= semantic :none) (result-err-of [:result [:ref :awai.fs/file] :keyword] semantic)
+                                (not= (record-get [:ref :awai.fs/profile-read] pr :next) (vector-count b))
+                                  (result-err-of [:result [:ref :awai.fs/file] :keyword] :trailing)
+                                (not (same-bytes? b (file-bytes f))) (result-err-of [:result [:ref :awai.fs/file] :keyword] :noncanonical)
+                                :else (result-ok-of [:result [:ref :awai.fs/file] :keyword] f))))))))))
+(defn bytes-cid [b :vector-i64] [:result :string :keyword]
+  (let [r (decode b)]
+    (if (result-ok?-of [:result [:ref :awai.fs/file] :keyword] r)
+      (result-ok-of [:result :string :keyword] (hash/cidv1-dag-cbor-bytes b))
+      (result-err-of [:result :string :keyword] (result-error-of [:result [:ref :awai.fs/file] :keyword] r :shape)))))

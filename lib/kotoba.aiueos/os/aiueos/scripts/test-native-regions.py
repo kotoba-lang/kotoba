@@ -32,7 +32,9 @@ t85 = (amu / "seed/85-aiueos-project.kotoba").read_text()
 r.verify_layout_text(t95, t85, table)
 for what, a, b, c in (("v1 page-table root", t95.replace("(def UV-PML4 0x30000)", "(def UV-PML4 0x31000)", 1), t85, table),
                       ("v3 page-table root", t95.replace("(def UV-V5-PML4 0x130000)", "(def UV-V5-PML4 0x131000)", 1), t85, table),
-                      ("text cap", t95, t85.replace("2097152 1048576)", "2097152 524288)", 1), table),
+                      ("v1 text cap", t95, t85.replace("(if (kp-v2?) 2097152 1048576)", "(if (kp-v2?) 2097152 524288)", 1), table),
+                      ("v3 text cap", t95, t85.replace("(if (kp-v3?) 3080192", "(if (kp-v3?) 2097152", 1), table),
+                      ("removed cap definition", t95, t85.replace("(defn- kp-text-cap", "(defn- kp-text-capx", 1), table),
                       ("missing rung", t95, t85, {"rungs": {"0x200000": table["rungs"]["0x200000"]}}),
                       ("stale row", t95, t85, {"rungs": {**table["rungs"], "0x400000": {**table["rungs"]["0x400000"], "pageTableRootOffset": "0x30000"}}})):
     try:

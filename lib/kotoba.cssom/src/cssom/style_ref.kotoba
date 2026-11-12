@@ -1,0 +1,290 @@
+(ns cssom.style-ref (:export [run-case run-status run-props run-values run-prop-count]))
+;; Host-native reference of the style slice (JUN-920, ADR-0287): selector matching, specificity, cascade order and
+;; inheritance, written independently of the kernel-region modules (intern-k, selector-k, match-k, cascade-k).
+;; Maps, vectors and strings are allowed here; the kernel dialect has none of them. It transcribes the semantics of
+;; core.cljk, not the encodings of the region modules:
+;;   - selector-tokens / selector-parts / parse-simple-selector / matches-simple? / parts-match?: tokens split at
+;;     whitespace and at > + ~, a compound is [tag] [#id] [.class]*, matched right to left with backtracking (the
+;;     descendant combinator tries every ancestor), only the FIRST #id of a compound counts;
+;;   - simple-selector-specificity / specificity: [ids classes tags] summed over the compounds, compared as a vector;
+;;   - resolve-style-and-flow sort-by (juxt :important? :origin ... :specificity ... :order :decl-index), last wins;
+;;   - inherited-property? (the engine's list of inherited properties) for the inheritance of computed values.
+;; Input: one case document {:sheet [[origin selector [[property value important] ...]] ...] :doc [tag id classes [child ...]]}
+;; (origin 0 user agent, 1 author, important 0 or 1; an empty id or class string means none). Output: the case sum
+;; S = sum over elements (document order) of (n + 1) * digest(n), digest = sum of H(property ":" value) mod 2^32 over the
+;; computed style, H(s) = fold h <- (257 h + byte + 1) mod 2^32 from 5381; or a negative status: -12 a selector outside
+;; the subset, -13 a CSS-wide keyword value, -1 a property repeated inside one rule (the refusals that are semantic; the capacity refusals of the region
+;; modules belong to their encodings and are not modelled here).
+(defn- at [d :document i :i64] :document (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+(defn- txt [d :document] :string (option-value-of [:option :string] (document-string-value d) ""))
+(defn- num [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) 0))
+(defn- fld [d :document k :keyword] :document (option-or (document-get d k) (document-null)))
+(defn- cnt [d :document] :i64 (document-count d))
+(defn- ch [s :string i :i64] :i64 (string-code-point-at s i))
+(defn- alpha? [c :i64] :bool (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+(defn- identst? [c :i64] :bool (or (alpha? c) (= c 95)))
+(defn- identrest? [c :i64] :bool (or (identst? c) (or (= c 45) (and (>= c 48) (<= c 57)))))
+(defn- blank? [c :i64] :bool (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 13) (= c 12))))))
+(defn- vstr [d :document i :i64] :string (txt (at d i)))
+
+;; ---- classes of an element: the set of the space-separated tokens ----
+(defn- has-class? [cs :string c :string] :bool
+  (loop [i 0 start 0 found false]
+    (if (>= i (+ (string-length cs) 1)) found
+      (if (or (= i (string-length cs)) (= (ch cs i) 32))
+        (recur (+ i 1) (+ i 1) (or found (and (> i start) (string=? (string-substring cs start i) c))))
+        (recur (+ i 1) start found)))))
+
+;; ---- selectors ----
+;; the end of the identifier that starts at i (identst? is checked by the caller)
+(defn- ident-end [s :string i :i64] :i64
+  (loop [j i] (if (and (< j (string-length s)) (identrest? (ch s j))) (recur (+ j 1)) j)))
+;; a compound token -> [tag id [classes] ids classes tags] or nil-as-null when outside the subset
+(defn- compound [s :string] :document
+  (let [n (string-length s)
+        c0 (if (> n 0) (ch s 0) 0)
+        t-end (cond (= c0 42) 1 (alpha? c0) (ident-end s 0) :else 0)
+        tag (if (alpha? c0) (string-fold-case (string-substring s 0 t-end)) "")]
+    (if (and (= t-end 0) (not (or (= c0 46) (= c0 35)))) (document-null)
+      (loop [i t-end id "" cls (document-vector) ids 0]
+        (if (>= i n)
+          (document-vector (document-string tag) (document-string id) cls (document-i64 ids))
+          (let [c (ch s i) e (if (and (< (+ i 1) n) (identst? (ch s (+ i 1)))) (ident-end s (+ i 1)) 0)]
+            (cond (and (= c 35) (> e 0))
+                  (recur e (if (= ids 0) (string-substring s (+ i 1) e) id) cls (+ ids 1))
+                  (and (= c 46) (> e 0))
+                  (recur e id (document-vector-conj cls (document-string (string-substring s (+ i 1) e))) ids)
+                  :else (document-null))))))))
+;; tokens: split at blanks and at > + ~ (the latter become tokens of their own), as selector-tokens
+(defn- tokens [s :string] :document
+  (loop [i 0 start 0 out (document-vector)]
+    (if (>= i (+ (string-length s) 1))
+      out
+      (if (or (= i (string-length s)) (blank? (ch s i)) (= (ch s i) 62) (= (ch s i) 43) (= (ch s i) 126))
+        (let [piece (string-substring s start i)
+              out1 (if (> (string-length piece) 0) (document-vector-conj out (document-string piece)) out)
+              out2 (if (and (< i (string-length s)) (not (blank? (ch s i))))
+                     (document-vector-conj out1 (document-string (string-substring s i (+ i 1)))) out1)]
+          (recur (+ i 1) (+ i 1) out2))
+        (recur (+ i 1) start out)))))
+(defn- comb-code [t :string] :i64
+  (cond (string=? t ">") 2 (string=? t "+") 3 (string=? t "~") 4 :else 0))
+;; one trimmed selector -> [[comb tag id classes] ...] with specificity, or null
+;; result: [a b c parts] where parts is a vector of [comb tag id classes]
+(defn- complex [s :string] :document
+  (let [ts (tokens s)]
+    (loop [i 0 pending 0 parts (document-vector) a 0 b 0 c 0]
+      (if (>= i (cnt ts))
+        (if (or (> pending 0) (= (cnt parts) 0)) (document-null)
+          (document-vector (document-i64 a) (document-i64 b) (document-i64 c) parts))
+        (let [t (vstr ts i) k (comb-code t)]
+          (if (> k 0)
+            (if (or (> pending 0) (= (cnt parts) 0)) (document-null) (recur (+ i 1) k parts a b c))
+            (let [cp (compound t)]
+              (if (= (document-kind cp) :null) (document-null)
+                (recur (+ i 1) 0
+                       (document-vector-conj parts
+                         (document-vector (document-i64 (if (= (cnt parts) 0) 0 (if (= pending 0) 1 pending)))
+                                          (at cp 0) (at cp 1) (at cp 2)))
+                       (+ a (if (> (string-length (txt (at cp 1))) 0) 1 0))
+                       (+ b (cnt (at cp 2)))
+                       (+ c (if (> (string-length (txt (at cp 0))) 0) 1 0)))))))))))
+;; a selector list -> vector of complex selectors, or null when any non-blank item is outside the subset
+(defn- trim [s :string] :string
+  (let [n (string-length s)]
+    (loop [a 0] (if (and (< a n) (blank? (ch s a)))
+                  (recur (+ a 1))
+                  (loop [b n] (if (and (> b a) (blank? (ch s (- b 1)))) (recur (- b 1)) (string-substring s a b)))))))
+;; the non-blank comma-separated items of a selector list (document vectors hold at most 32 elements, so no vector of items)
+(defn- item-count [s :string] :i64
+  (loop [i 0 start 0 k 0]
+    (if (>= i (+ (string-length s) 1)) k
+      (if (or (= i (string-length s)) (= (ch s i) 44))
+        (recur (+ i 1) (+ i 1) (if (> (string-length (trim (string-substring s start i))) 0) (+ k 1) k))
+        (recur (+ i 1) start k)))))
+(defn- item-at [s :string want :i64] :string
+  (loop [i 0 start 0 k 0]
+    (if (>= i (+ (string-length s) 1)) ""
+      (if (or (= i (string-length s)) (= (ch s i) 44))
+        (let [item (trim (string-substring s start i))]
+          (if (> (string-length item) 0)
+            (if (= k want) item (recur (+ i 1) (+ i 1) (+ k 1)))
+            (recur (+ i 1) (+ i 1) k)))
+        (recur (+ i 1) start k)))))
+
+
+;; ---- document ----
+;; node = [tag id classes parent prev]; the nodes are a typed list (a :document vector built by conj holds 32 elements at most)
+(defn- size [n :document] :i64
+  (let [kids (at n 3)] (loop [i 0 t 1] (if (>= i (cnt kids)) t (recur (+ i 1) (+ t (size (at kids i))))))))
+(defn- walk [n :document idx :i64 parent :i64 prev :i64 out [:list :document]] [:list :document]
+  (let [out1 (typed-list-conj [:list :document] out (document-vector (at n 0) (at n 1) (at n 2) (document-i64 parent) (document-i64 prev)))
+        kids (at n 3)]
+    (loop [i 0 next (+ idx 1) p -1 o out1]
+      (if (>= i (cnt kids)) o
+        (recur (+ i 1) (+ next (size (at kids i))) next (walk (at kids i) next idx p o))))))
+(defn- node [nodes [:list :document] n :i64] :document (typed-list-nth [:list :document] nodes n))
+(defn- parent-of [nodes [:list :document] n :i64] :i64 (num (at (node nodes n) 3)))
+(defn- prev-of [nodes [:list :document] n :i64] :i64 (num (at (node nodes n) 4)))
+(defn- simple-match? [nodes [:list :document] n :i64 part :document] :bool
+  (let [nd (node nodes n) tag (txt (at part 1)) id (txt (at part 2)) cls (at part 3) cs (txt (at nd 2))]
+    (and (or (= (string-length tag) 0) (string=? tag (txt (at nd 0))))
+         (and (or (= (string-length id) 0) (string=? id (txt (at nd 1))))
+              (loop [j 0] (if (>= j (cnt cls)) true
+                            (if (has-class? cs (txt (at cls j))) (recur (+ j 1)) false)))))))
+;; parts-match?: right to left, the descendant combinator backtracks over every ancestor
+(defn- match-at? [nodes [:list :document] n :i64 parts :document idx :i64] :bool
+  (let [part (at parts idx)]
+    (and (simple-match? nodes n part)
+         (if (= idx 0) true
+           (let [k (num (at part 0))]
+             (cond (= k 2) (and (>= (parent-of nodes n) 0) (match-at? nodes (parent-of nodes n) parts (- idx 1)))
+                   (= k 1) (loop [a (parent-of nodes n)]
+                             (if (< a 0) false (if (match-at? nodes a parts (- idx 1)) true (recur (parent-of nodes a)))))
+                   (= k 3) (and (>= (prev-of nodes n) 0) (match-at? nodes (prev-of nodes n) parts (- idx 1)))
+                   :else (loop [s (prev-of nodes n)]
+                           (if (< s 0) false (if (match-at? nodes s parts (- idx 1)) true (recur (prev-of nodes s)))))))))))
+
+;; ---- the engine's list of inherited properties, wide keywords, the digest ----
+(def inherited "|color|font|font-family|font-size|font-style|font-weight|font-variant|font-stretch|line-height|letter-spacing|word-spacing|text-align|text-indent|text-transform|text-shadow|white-space|word-break|overflow-wrap|word-wrap|tab-size|hyphens|direction|visibility|cursor|quotes|list-style|list-style-type|list-style-position|list-style-image|border-collapse|border-spacing|caption-side|empty-cells|orphans|widows|writing-mode|text-orientation|")
+(defn- inherited? [p :string] :bool (string-contains? inherited (string-concat "|" (string-concat p "|"))))
+(defn- wide? [v :string] :bool
+  (let [f (string-fold-case v)]
+    (or (string=? f "inherit") (or (string=? f "initial") (or (string=? f "unset") (or (string=? f "revert") (string=? f "revert-layer")))))))
+(defn- hash [s :string h :i64] :i64
+  (loop [i 0 x h] (if (>= i (string-length s)) x (recur (+ i 1) (bit-and (+ (* x 257) (+ (ch s i) 1)) 4294967295)))))
+
+;; ---- the sheet ----
+;; a property repeated inside one rule is refused (-1), as selector-k does
+(defn- dup-prop? [decls :document] :bool
+  (loop [i 0] (if (>= i (cnt decls)) false
+    (if (loop [j 0] (if (>= j i) false (if (string=? (txt (at (at decls j) 0)) (txt (at (at decls i) 0))) true (recur (+ j 1))))) true (recur (+ i 1))))))
+(defn- any-wide? [decls :document] :bool
+  (loop [j 0] (if (>= j (cnt decls)) false (if (wide? (txt (at (at decls j) 1))) true (recur (+ j 1))))))
+;; 0 when every rule is inside the subset, else the first refusal in rule order (declarations before the selector, as selector-k)
+(defn- sheet-status [sheet :document] :i64
+  (loop [i 0]
+    (if (>= i (cnt sheet)) 0
+      (let [r (at sheet i) decls (at r 2) s (txt (at r 1))]
+        (cond (dup-prop? decls) -1
+              (any-wide? decls) -13
+              (not (= (string-byte-length s) (string-length s))) -12
+              (loop [k 0 bad false] (if (>= k (item-count s)) bad (recur (+ k 1) (or bad (= (document-kind (complex (item-at s k))) :null))))) -12
+              :else (recur (+ i 1)))))))
+(defn- entry-count [sheet :document] :i64
+  (loop [i 0 t 0] (if (>= i (cnt sheet)) t (recur (+ i 1) (+ t (item-count (txt (at (at sheet i) 1))))))))
+(defn- decl-count [sheet :document] :i64
+  (loop [i 0 t 0] (if (>= i (cnt sheet)) t (recur (+ i 1) (+ t (cnt (at (at sheet i) 2)))))))
+;; entry = [origin a b c parts decls first-declaration-index]
+(defn- entries [sheet :document] [:list :document]
+  (loop [i 0 d0 0 out (typed-list-new [:list :document])]
+    (if (>= i (cnt sheet)) out
+      (let [r (at sheet i) s (txt (at r 1)) n (item-count s)]
+        (recur (+ i 1) (+ d0 (cnt (at r 2)))
+               (loop [k 0 o out]
+                 (if (>= k n) o
+                   (let [cx (complex (item-at s k))]
+                     (recur (+ k 1) (typed-list-conj [:list :document] o
+                              (document-vector (at r 0) (at cx 0) (at cx 1) (at cx 2) (at cx 3) (at r 2) (document-i64 d0))))))))))))
+;; the distinct property names, in order of first appearance: a declaration counts when no earlier declaration names the same property
+(defn- earlier? [sheet :document i :i64 j :i64 p :string] :bool
+  (loop [a 0 found false]
+    (if (or found (> a i)) found
+      (let [decls (at (at sheet a) 2) lim (if (= a i) j (cnt decls))]
+        (recur (+ a 1) (loop [b 0 f false] (if (or f (>= b lim)) f (recur (+ b 1) (string=? (txt (at (at decls b) 0)) p)))))))))
+(defn- props [sheet :document] [:list :string]
+  (loop [i 0 out (typed-list-new [:list :string])]
+    (if (>= i (cnt sheet)) out
+      (let [decls (at (at sheet i) 2)]
+        (recur (+ i 1) (loop [j 0 o out]
+                         (if (>= j (cnt decls)) o
+                           (let [p (txt (at (at decls j) 0))]
+                             (recur (+ j 1) (if (earlier? sheet i j p) o (typed-list-conj [:list :string] o p)))))))))))
+(defn- prop-count [sheet :document] :i64
+  (loop [i 0 n 0]
+    (if (>= i (cnt sheet)) n
+      (let [decls (at (at sheet i) 2)]
+        (recur (+ i 1) (loop [j 0 m n]
+                         (if (>= j (cnt decls)) m
+                           (recur (+ j 1) (if (earlier? sheet i j (txt (at (at decls j) 0))) m (+ m 1))))))))))
+
+;; ---- cascade ----
+;; matched[e] of node n: 1 when entry e's selector matches n
+(defn- matched [nodes [:list :document] n :i64 es [:list :document] ne :i64] [:list :i64]
+  (loop [e 0 out (typed-list-new [:list :i64])]
+    (if (>= e ne) out
+      (let [parts (at (typed-list-nth [:list :document] es e) 4)]
+        (recur (+ e 1) (typed-list-conj [:list :i64] out (if (match-at? nodes n parts (- (cnt parts) 1)) 1 0)))))))
+;; the winning value of property p at node n: "" when no declaration applies. Larger key wins: (important origin a b c order).
+(defn- larger? [i1 :i64 o1 :i64 a1 :i64 b1 :i64 c1 :i64 d1 :i64 i2 :i64 o2 :i64 a2 :i64 b2 :i64 c2 :i64 d2 :i64] :bool
+  (cond (> i1 i2) true (< i1 i2) false
+        (> o1 o2) true (< o1 o2) false
+        (> a1 a2) true (< a1 a2) false
+        (> b1 b2) true (< b1 b2) false
+        (> c1 c2) true (< c1 c2) false
+        :else (> d1 d2)))
+(defn- winner [es [:list :document] ne :i64 mt [:list :i64] p :string] :string
+  (loop [e 0 val "" have false bi 0 bo 0 ba 0 bb 0 bc 0 bd 0]
+    (if (>= e ne) val
+      (if (= (typed-list-nth [:list :i64] mt e) 0) (recur (+ e 1) val have bi bo ba bb bc bd)
+        (let [en (typed-list-nth [:list :document] es e) decls (at en 5) d0 (num (at en 6))
+              r (loop [k 0 v val h have xi bi xo bo xa ba xb bb xc bc xd bd]
+                  (if (>= k (cnt decls)) (document-vector (document-string v) (document-i64 (if h 1 0)) (document-i64 xi) (document-i64 xo) (document-i64 xa) (document-i64 xb) (document-i64 xc) (document-i64 xd))
+                    (let [d (at decls k)]
+                      (if (string=? (txt (at d 0)) p)
+                        (let [ni (num (at d 2)) no (num (at en 0)) na (num (at en 1)) nb (num (at en 2)) nc (num (at en 3)) nd (+ d0 k)]
+                          (if (or (not h) (larger? ni no na nb nc nd xi xo xa xb xc xd))
+                            (recur (+ k 1) (txt (at d 1)) true ni no na nb nc nd)
+                            (recur (+ k 1) v h xi xo xa xb xc xd)))
+                        (recur (+ k 1) v h xi xo xa xb xc xd)))))]
+          (recur (+ e 1) (txt (at r 0)) (= (num (at r 1)) 1) (num (at r 2)) (num (at r 3)) (num (at r 4)) (num (at r 5)) (num (at r 6)) (num (at r 7))))))))
+(defn- digest [styles [:list :string] n :i64 np :i64 ps [:list :string]] :i64
+  (loop [k 0 acc 0]
+    (if (>= k np) acc
+      (let [v (typed-list-nth [:list :string] styles (+ (* n np) k))]
+        (recur (+ k 1) (if (= (string-length v) 0) acc
+                         (bit-and (+ acc (hash v (hash ":" (hash (typed-list-nth [:list :string] ps k) 5381)))) 4294967295)))))))
+(defn run-case [c :document] :i64
+  (let [sheet (fld c :sheet) st (sheet-status sheet)]
+    (if (< st 0) st
+      (let [doc (fld c :doc)
+            nn (size doc)
+            nodes (walk doc 0 -1 -1 (typed-list-new [:list :document]))
+            es (entries sheet) ne (entry-count sheet)
+            ps (props sheet) np (prop-count sheet)]
+        (loop [n 0 styles (typed-list-new [:list :string]) total 0]
+          (if (>= n nn) total
+            (let [mt (matched nodes n es ne)
+                  par (parent-of nodes n)
+                  row (loop [k 0 o styles]
+                        (if (>= k np) o
+                          (let [p (typed-list-nth [:list :string] ps k) w (winner es ne mt p)
+                                v (if (> (string-length w) 0) w
+                                    (if (and (inherited? p) (>= par 0)) (typed-list-nth [:list :string] styles (+ (* par np) k)) ""))]
+                            (recur (+ k 1) (typed-list-conj [:list :string] o v)))))]
+              (recur (+ n 1) row (+ total (* (+ n 1) (digest row n np ps)))))))))))
+
+;; JUN-920 (layout slice): the same cascade, exported as data for the layout reference (layout_ref.kotoba). run-status is 0 or the sheet's
+;; refusal (-1, -12, -13); run-props the property names in order of first appearance; run-values the computed value ("" absent) of
+;; property k of element n at index n * (property count) + k. Nothing above this line changed.
+(defn run-status [c :document] :i64 (sheet-status (fld c :sheet)))
+(defn run-props [c :document] [:list :string] (props (fld c :sheet)))
+(defn run-values [c :document] [:list :string]
+  (let [sheet (fld c :sheet)
+        doc (fld c :doc)
+        nn (size doc)
+        nodes (walk doc 0 -1 -1 (typed-list-new [:list :document]))
+        es (entries sheet) ne (entry-count sheet)
+        ps (props sheet) np (prop-count sheet)]
+    (loop [n 0 styles (typed-list-new [:list :string])]
+      (if (>= n nn) styles
+        (let [mt (matched nodes n es ne)
+              par (parent-of nodes n)
+              row (loop [k 0 o styles]
+                    (if (>= k np) o
+                      (let [p (typed-list-nth [:list :string] ps k) w (winner es ne mt p)
+                            v (if (> (string-length w) 0) w
+                                (if (and (inherited? p) (>= par 0)) (typed-list-nth [:list :string] styles (+ (* par np) k)) ""))]
+                        (recur (+ k 1) (typed-list-conj [:list :string] o v)))))]
+          (recur (+ n 1) row))))))
+(defn run-prop-count [c :document] :i64 (prop-count (fld c :sheet)))

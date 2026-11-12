@@ -1,0 +1,216 @@
+(ns cssom.transform-q6
+  (:require [cssom.length-q6 :as len] [cssom.pack-q6 :as pk] [cssom.trig-q6 :as tg])
+  (:export [invalid one17 lin-ok? tr-ok? pair-lin? pair-tr?
+            ident-ab ident-cd zero-ef ident?
+            coef-of-number mk-lin mk-tr scale-ab scale-cd rotate-ab rotate-cd skew-ab skew-cd
+            mul-ab mul-cd mul-ef about-ef map-x map-y xs-min xs-max ys-min ys-max bbox-x bbox-w bbox-y bbox-h
+            isqrt uniform-scale font-scale origin-coord flow-rotation flow-ab flow-cd orthogonal-fallback]))
+
+;; 2D CSS transform matrices in fixed point (JUN-929 / C2b-4, census group G05; ADR-0287 amendment 1). Mirrors layout.cljk 17593-18130:
+;; identity-matrix, matrix*, round-4, transform-function-matrix, transform-origin-point, transform-ops (px, py, the corner bounding box,
+;; the font-size factor sqrt|det|), apply-element-transform (the origin conjugation), flow-rotation, apply-flow-rotation and
+;; orthogonal-fallback-inline-size. Scalar i64 only, at most five parameters per function, no loops, strings, records or floats; the only
+;; division is quot (through cssom.length-q6 rdiv / fdiv). The trigonometry is cssom.trig-q6 (no native f64 oracle exists for it).
+;;
+;; WHAT layout.cljk NEEDS, READ FROM THE CODE (it differs from the task text and from ADR prose): the matrices are 2D AFFINE, six numbers
+;; (a b c d e f) in CSS matrix() order, composed by `matrix*`. There is NO 4x4 matrix, no perspective, no matrix3d / rotate3d / rotateX /
+;; rotateY (transform-function-matrix returns nil for them and the whole declaration is dropped), and NO matrix inverse or decomposition
+;; (flow-rotation inverts a signed permutation by its determinant +-1; the only other root is sqrt|det| for the font size). So this module has
+;; no 4x4 multiply, no invert, no decompose: that would be code layout.cljk does not contain.
+;;
+;; SCALES. Linear coefficients a b c d: Q17 (1.0 = 131072), |raw| < 2^23 (|coefficient| < 64). Translations e f and every coordinate or
+;; length: Q6 (the Blink LayoutUnit scale), |raw| <= 2^22 (65536 px). The bounds make every multiplication below 2^46 (2^23 * 2^23 = 2^46
+;; for two coefficients, 2^23 * 2^22 = 2^45 for a coefficient and a coordinate) and a sum of two or three of them far below 2^63.
+;; A value outside is not clamped: every function answers (invalid) = -2^62 and (invalid) propagates (it is not a valid pack).
+;; A matrix is three packed i64: ab = pack(a, b), cd = pack(c, d), ef = pack(e, f) (cssom.pack-q6, two signed 32-bit fields each).
+;; OUTPUT PRECISION. The oracle rounds every output to 4 decimals (round-4, 1e-4 px); this module rounds to Q6 (1/64 px = 0.0156 px) half up,
+;; so it is coarser than the oracle by design (ADR-0287: Q6 lengths); the coefficients are 13 times finer than the oracle's own rounding
+;; (2^-17 = 7.6e-6 against 1e-4).
+;; ROUNDING. One rounding per output component: a sum of products is accumulated exactly and divided ONCE (rdiv, half up), so
+;; mul-ab / mul-cd / mul-ef / map-x / map-y / about-ef are the exact rational result rounded once (checked bit-exact against Python fractions).
+;; Numbers: a CSS <number> arrives as a D6 integer (millionths) from the host scanner; this module does not parse strings.
+(defn invalid [] :i64 -4611686018427387904)
+(defn one17 [] :i64 131072)
+(defn lin-ok? [x :i64] :bool (and (> x -8388608) (< x 8388608)))
+(defn tr-ok? [x :i64] :bool (and (>= x -4194304) (<= x 4194304)))
+(defn pair-lin? [p :i64] :bool (and (lin-ok? (pk/hi p)) (lin-ok? (pk/lo p))))
+(defn pair-tr? [p :i64] :bool (and (tr-ok? (pk/hi p)) (tr-ok? (pk/lo p))))
+(defn ident-ab [] :i64 (pk/pack 131072 0))
+(defn ident-cd [] :i64 (pk/pack 0 131072))
+(defn zero-ef [] :i64 (pk/pack 0 0))
+(defn ident? [ab :i64 cd :i64 ef :i64] :bool (and (= ab (ident-ab)) (and (= cd (ident-cd)) (= ef (zero-ef)))))
+
+;; a <number> as a D6 integer -> a Q17 coefficient (scale(2), matrix(...)): round half up, refused when |coefficient| >= 64
+(defn coef-of-number [v6 :i64] :i64
+  (if (and (>= v6 -1073741824) (<= v6 1073741824))
+    (let [r (len/rdiv (* v6 2048) 15625)] (if (lin-ok? r) r (invalid)))
+    (invalid)))
+(defn mk-lin [a :i64 b :i64] :i64 (if (and (lin-ok? a) (lin-ok? b)) (pk/pack a b) (invalid)))
+(defn mk-tr [e :i64 f :i64] :i64 (if (and (tr-ok? e) (tr-ok? f)) (pk/pack e f) (invalid)))
+;; scale(sx, sy) = [sx 0 0 sy 0 0]
+(defn scale-ab [sx :i64] :i64 (mk-lin sx 0))
+(defn scale-cd [sy :i64] :i64 (mk-lin 0 sy))
+;; rotate(angle) = [cos sin -sin cos 0 0]   (unit, v: see cssom.trig-q6)
+(defn rotate-ab [unit :i64 v :i64] :i64 (mk-lin (tg/cos17 unit v) (tg/sin17 unit v)))
+(defn rotate-cd [unit :i64 v :i64] :i64 (mk-lin (- 0 (tg/sin17 unit v)) (tg/cos17 unit v)))
+;; skew(ax, ay) = [1 tan(ay) tan(ax) 1 0 0]; skewX(ax) = skew(ax, 0); skewY(ay) = skew(0, ay). tan17 is refused for |tan| >= 64.
+(defn skew-ab [uy :i64 vy :i64] :i64 (mk-lin 131072 (tg/tan17 uy vy)))
+(defn skew-cd [ux :i64 vx :i64] :i64 (mk-lin (tg/tan17 ux vx) 131072))
+
+;; ---- matrix* : m1 THEN m2 (ordinary product m1 x m2) ----
+;; ab1 = pack(a1, b1), cd1 = pack(c1, d1), ab2 = pack(a2, b2), cd2 = pack(c2, d2), ef1 = pack(e1, f1), ef2 = pack(e2, f2)
+;; a = a1 a2 + c1 b2   b = b1 a2 + d1 b2   c = a1 c2 + c1 d2   d = b1 c2 + d1 d2   e = a1 e2 + c1 f2 + e1   f = b1 e2 + d1 f2 + f1
+(defn mul-ab [ab1 :i64 cd1 :i64 ab2 :i64] :i64
+  (if (and (pair-lin? ab1) (and (pair-lin? cd1) (pair-lin? ab2)))
+    (mk-lin (len/rdiv (+ (* (pk/hi ab1) (pk/hi ab2)) (* (pk/hi cd1) (pk/lo ab2))) 131072)
+            (len/rdiv (+ (* (pk/lo ab1) (pk/hi ab2)) (* (pk/lo cd1) (pk/lo ab2))) 131072))
+    (invalid)))
+(defn mul-cd [ab1 :i64 cd1 :i64 cd2 :i64] :i64
+  (if (and (pair-lin? ab1) (and (pair-lin? cd1) (pair-lin? cd2)))
+    (mk-lin (len/rdiv (+ (* (pk/hi ab1) (pk/hi cd2)) (* (pk/hi cd1) (pk/lo cd2))) 131072)
+            (len/rdiv (+ (* (pk/lo ab1) (pk/hi cd2)) (* (pk/lo cd1) (pk/lo cd2))) 131072))
+    (invalid)))
+(defn mul-ef [ab1 :i64 cd1 :i64 ef1 :i64 ef2 :i64] :i64
+  (if (and (pair-lin? ab1) (and (pair-lin? cd1) (and (pair-tr? ef1) (pair-tr? ef2))))
+    (mk-tr (len/rdiv (+ (+ (* (pk/hi ab1) (pk/hi ef2)) (* (pk/hi cd1) (pk/lo ef2))) (* (pk/hi ef1) 131072)) 131072)
+           (len/rdiv (+ (+ (* (pk/lo ab1) (pk/hi ef2)) (* (pk/lo cd1) (pk/lo ef2))) (* (pk/lo ef1) 131072)) 131072))
+    (invalid)))
+
+;; The translation of T(c) x M x T(-c), the transform about the origin point c (apply-element-transform's `about`), in ONE rounding:
+;; e' = e + cx - (a cx + c cy),  f' = f + cy - (b cx + d cy). The linear part is unchanged.
+(defn about-ef [ab :i64 cd :i64 ef :i64 cxy :i64] :i64
+  (if (and (pair-lin? ab) (and (pair-lin? cd) (and (pair-tr? ef) (pair-tr? cxy))))
+    (mk-tr (len/rdiv (- (* (+ (pk/hi ef) (pk/hi cxy)) 131072) (+ (* (pk/hi ab) (pk/hi cxy)) (* (pk/hi cd) (pk/lo cxy)))) 131072)
+           (len/rdiv (- (* (+ (pk/lo ef) (pk/lo cxy)) 131072) (+ (* (pk/lo ab) (pk/hi cxy)) (* (pk/lo cd) (pk/lo cxy)))) 131072))
+    (invalid)))
+
+;; ---- transform-ops : px = a x + c y + e, py = b x + d y + f, rounded once to Q6 (round-4 in the oracle) ----
+(defn map-x2 [ab :i64 cd :i64 ef :i64 x :i64 y :i64] :i64
+  (if (and (pair-lin? ab) (and (pair-lin? cd) (and (pair-tr? ef) (and (tr-ok? x) (tr-ok? y)))))
+    (let [r (len/rdiv (+ (+ (* (pk/hi ab) x) (* (pk/hi cd) y)) (* (pk/hi ef) 131072)) 131072)] (if (tr-ok? r) r (invalid)))
+    (invalid)))
+(defn map-y2 [ab :i64 cd :i64 ef :i64 x :i64 y :i64] :i64
+  (if (and (pair-lin? ab) (and (pair-lin? cd) (and (pair-tr? ef) (and (tr-ok? x) (tr-ok? y)))))
+    (let [r (len/rdiv (+ (+ (* (pk/lo ab) x) (* (pk/lo cd) y)) (* (pk/lo ef) 131072)) 131072)] (if (tr-ok? r) r (invalid)))
+    (invalid)))
+(defn map-x [ab :i64 cd :i64 ef :i64 xy :i64] :i64 (map-x2 ab cd ef (pk/hi xy) (pk/lo xy)))
+(defn map-y [ab :i64 cd :i64 ef :i64 xy :i64] :i64 (map-y2 ab cd ef (pk/hi xy) (pk/lo xy)))
+;; the axis-aligned bounding box of the four transformed corners of (x, y, w, h); xy = pack(x, y), wh = pack(w, h), w and h >= 0.
+;; Every corner is rounded to Q6 first (as the oracle rounds each corner), then min / max, then w = max - min (exact).
+(defn bad4? [a :i64 b :i64 c :i64 d :i64] :bool (or (= a (invalid)) (or (= b (invalid)) (or (= c (invalid)) (= d (invalid))))))
+(defn min4 [a :i64 b :i64 c :i64 d :i64] :i64
+  (let [m1 (if (< a b) a b) m2 (if (< c d) c d)] (if (< m1 m2) m1 m2)))
+(defn max4 [a :i64 b :i64 c :i64 d :i64] :i64
+  (let [m1 (if (> a b) a b) m2 (if (> c d) c d)] (if (> m1 m2) m1 m2)))
+(defn box-ok? [wh :i64] :bool (and (>= (pk/hi wh) 0) (>= (pk/lo wh) 0)))
+(defn xs-min [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [x (pk/hi xy) y (pk/lo xy) w (pk/hi wh) h (pk/lo wh)
+        p0 (map-x2 ab cd ef x y) p1 (map-x2 ab cd ef (+ x w) y) p2 (map-x2 ab cd ef x (+ y h)) p3 (map-x2 ab cd ef (+ x w) (+ y h))]
+    (if (or (bad4? p0 p1 p2 p3) (not (box-ok? wh))) (invalid) (min4 p0 p1 p2 p3))))
+(defn xs-max [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [x (pk/hi xy) y (pk/lo xy) w (pk/hi wh) h (pk/lo wh)
+        p0 (map-x2 ab cd ef x y) p1 (map-x2 ab cd ef (+ x w) y) p2 (map-x2 ab cd ef x (+ y h)) p3 (map-x2 ab cd ef (+ x w) (+ y h))]
+    (if (or (bad4? p0 p1 p2 p3) (not (box-ok? wh))) (invalid) (max4 p0 p1 p2 p3))))
+(defn ys-min [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [x (pk/hi xy) y (pk/lo xy) w (pk/hi wh) h (pk/lo wh)
+        p0 (map-y2 ab cd ef x y) p1 (map-y2 ab cd ef (+ x w) y) p2 (map-y2 ab cd ef x (+ y h)) p3 (map-y2 ab cd ef (+ x w) (+ y h))]
+    (if (or (bad4? p0 p1 p2 p3) (not (box-ok? wh))) (invalid) (min4 p0 p1 p2 p3))))
+(defn ys-max [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [x (pk/hi xy) y (pk/lo xy) w (pk/hi wh) h (pk/lo wh)
+        p0 (map-y2 ab cd ef x y) p1 (map-y2 ab cd ef (+ x w) y) p2 (map-y2 ab cd ef x (+ y h)) p3 (map-y2 ab cd ef (+ x w) (+ y h))]
+    (if (or (bad4? p0 p1 p2 p3) (not (box-ok? wh))) (invalid) (max4 p0 p1 p2 p3))))
+(defn bbox-x [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64 (xs-min ab cd ef xy wh))
+(defn bbox-y [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64 (ys-min ab cd ef xy wh))
+(defn bbox-w [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [lo (xs-min ab cd ef xy wh) hi (xs-max ab cd ef xy wh)] (if (or (= lo (invalid)) (= hi (invalid))) (invalid) (- hi lo))))
+(defn bbox-h [ab :i64 cd :i64 ef :i64 xy :i64 wh :i64] :i64
+  (let [lo (ys-min ab cd ef xy wh) hi (ys-max ab cd ef xy wh)] (if (or (= lo (invalid)) (= hi (invalid))) (invalid) (- hi lo))))
+
+;; ---- sqrt|det| : the uniform scale factor of a text op's font size ----
+;; floor(sqrt(n)) for 0 <= n < 2^46 by 23 descending bit tests: no loop, every product (r + b)^2 below 2^46
+(defn isq-step [n :i64 r :i64 b :i64] :i64 (if (<= (* (+ r b) (+ r b)) n) (+ r b) r))
+(defn isqrt [n :i64] :i64
+  (if (and (>= n 0) (< n 70368744177664))
+    (let [r22 (isq-step n 0 4194304)
+          r21 (isq-step n r22 2097152)
+          r20 (isq-step n r21 1048576)
+          r19 (isq-step n r20 524288)
+          r18 (isq-step n r19 262144)
+          r17 (isq-step n r18 131072)
+          r16 (isq-step n r17 65536)
+          r15 (isq-step n r16 32768)
+          r14 (isq-step n r15 16384)
+          r13 (isq-step n r14 8192)
+          r12 (isq-step n r13 4096)
+          r11 (isq-step n r12 2048)
+          r10 (isq-step n r11 1024)
+          r9 (isq-step n r10 512)
+          r8 (isq-step n r9 256)
+          r7 (isq-step n r8 128)
+          r6 (isq-step n r7 64)
+          r5 (isq-step n r6 32)
+          r4 (isq-step n r5 16)
+          r3 (isq-step n r4 8)
+          r2 (isq-step n r3 4)
+          r1 (isq-step n r2 2)
+          r0 (isq-step n r1 1)]
+      r0)
+    (invalid)))
+(defn abs-i [x :i64] :i64 (if (< x 0) (- 0 x) x))
+;; sqrt(|a d - b c|) in Q17 (the determinant is Q34, its root Q17), rounded half up; refused when |det| >= 2^46 (= 64^2 * 2^34)
+(defn uniform-scale [ab :i64 cd :i64] :i64
+  (if (and (pair-lin? ab) (pair-lin? cd))
+    (let [n (abs-i (- (* (pk/hi ab) (pk/lo cd)) (* (pk/lo ab) (pk/hi cd))))]
+      (if (< n 70368744177664)
+        (let [r (isqrt n)] (if (> (- n (* r r)) r) (+ r 1) r))
+        (invalid)))
+    (invalid)))
+;; (round-4 (* font-size scale)) : a Q6 font size times a Q17 factor, one rounding, Q6
+(defn font-scale [fs :i64 scale :i64] :i64
+  (if (and (tr-ok? fs) (lin-ok? scale))
+    (let [r (len/rdiv (* fs scale) 131072)] (if (tr-ok? r) r (invalid)))
+    (invalid)))
+
+;; ---- transform-origin-point : one component of the origin in the border box (basis = the box's own width or height, Q6) ----
+;; kind 0 center (0.5 * basis, half up), 1 the keyword at 0 (left / top), 2 the keyword at 100% (right / bottom, = basis),
+;; 3 a length in Q6 raw (px), 4 hundredths of a percent of the basis (cssom.length-q6 percent-of). The unresolvable component of the
+;; source falls back to the centre: the host passes kind 0 for it.
+(defn origin-coord [kind :i64 v :i64 basis :i64] :i64
+  (if (tr-ok? basis)
+    (cond (= kind 0) (len/rdiv basis 2)
+          (= kind 1) 0
+          (= kind 2) basis
+          (= kind 3) (if (tr-ok? v) v (invalid))
+          (= kind 4) (if (and (>= v -65535) (<= v 65535)) (len/percent-of v basis) (invalid))
+          :else (invalid))
+    (invalid)))
+
+;; ---- flow-rotation : the change of basis between two writing modes, a SIGNED PERMUTATION (exact integers, determinant +-1) ----
+;; A 2x2 matrix with entries in {-1, 0, 1} is coded (a+1) 27 + (b+1) 9 + (c+1) 3 + (d+1), 0..80: horizontal-tb [1 0 0 1] = 68,
+;; vertical-rl and sideways-rl [0 1 -1 0] = 46, vertical-lr [0 1 1 0] = 52, sideways-lr [0 -1 1 0] = 34.
+;; result: the coded matrix inverse(parent) x child, or -1 when it is the identity (the source answers nil), or (invalid) when an operand
+;; is not unimodular (|det| != 1), a code is outside 0..80, or an entry of the product leaves {-1, 0, 1} (cannot happen for the four
+;; writing-mode-basis matrices, which are signed permutations).
+(defn dig [code :i64 k :i64] :i64
+  (let [q1 (quot code 3) q2 (quot q1 3)
+        c0 (- code (* 3 q1)) c1 (- q1 (* 3 q2)) c2 (- q2 (* 3 (quot q2 3))) c3 (quot q2 3)]
+    (- (cond (= k 0) c3 (= k 1) c2 (= k 2) c1 :else c0) 1)))
+(defn det2 [code :i64] :i64 (- (* (dig code 0) (dig code 3)) (* (dig code 1) (dig code 2))))
+(defn code-ok? [code :i64] :bool (and (>= code 0) (and (<= code 80) (= (abs-i (det2 code)) 1))))
+(defn enc [a :i64 b :i64 c :i64 d :i64] :i64 (+ (+ (* (+ a 1) 27) (* (+ b 1) 9)) (+ (* (+ c 1) 3) (+ d 1))))
+(defn small? [x :i64] :bool (and (>= x -1) (<= x 1)))
+(defn flow-rotation [child :i64 parent :i64] :i64
+  (if (and (code-ok? child) (code-ok? parent))
+    (let [det (det2 parent)
+          ia (* det (dig parent 3)) ib (* det (- 0 (dig parent 1))) ic (* det (- 0 (dig parent 2))) jd (* det (dig parent 0))
+          a (dig child 0) b (dig child 1) c (dig child 2) d (dig child 3)
+          ma (+ (* ia a) (* ic b)) mb (+ (* ib a) (* jd b)) mc (+ (* ia c) (* ic d)) md (+ (* ib c) (* jd d))]
+      (cond (not (and (small? ma) (and (small? mb) (and (small? mc) (small? md))))) (invalid)
+            (and (= ma 1) (and (= mb 0) (and (= mc 0) (= md 1)))) -1
+            :else (enc ma mb mc md)))
+    (invalid)))
+;; the coded matrix as Q17 pairs (ab = pack(a, b), cd = pack(c, d)) for the apply-flow-rotation corner maps
+(defn flow-ab [code :i64] :i64 (if (code-ok? code) (mk-lin (* 131072 (dig code 0)) (* 131072 (dig code 1))) (invalid)))
+(defn flow-cd [code :i64] :i64 (if (code-ok? code) (mk-lin (* 131072 (dig code 2)) (* 131072 (dig code 3))) (invalid)))
+;; orthogonal-fallback-inline-size, 1e7 px in Q6
+(defn orthogonal-fallback [] :i64 640000000)

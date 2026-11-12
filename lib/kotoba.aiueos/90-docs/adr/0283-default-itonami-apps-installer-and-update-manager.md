@@ -37,6 +37,7 @@ Measured in the source (2026-11-03):
    limit and the 259-op budget stay, so each window still draws under the budget; only one full window is open per
    page of launcher. This needs a native Amu rebuild, the QEMU gates and a new KIR contract, and replaces the
    fixed-size `app-catalog` with a signed one (`app-catalog.sig`).
+   ADR-0285 (2026-11-04) fixes the launcher and slot rules for apps beyond four; the signed catalog stays open.
 3. **Itonami Apps installs by digest.** The app lists the signed catalog (offline copy first). Install of an entry
    fetches its artifact only after a fresh each-operation approval naming service, endpoint, operation and data
    (`fetch-catalog`, `download-app`), admits it by CID (`aiueos.cid-v1-admit`) and signature, then records it in the
@@ -46,7 +47,7 @@ Measured in the source (2026-11-03):
    it never contacts a service by itself, and check, download and install each wait for their own approval. Install
    uses the AWAI-122 signed-image path with its rollback copy. App updates apply to catalog entries whose digest and
    signature verify, and the old version stays until the new one is admitted.
-5. **Saifu is read and verify only.** It does not sign transactions, broadcast or settle (etzhayyim-exclusive).
+5. **Saifu is read and verify only in this build.** It does not sign transactions, broadcast or settle. Those are operations of the Awai network's own services (network-awai): an app declares them, and the user approves each one (ADR-0284).
 
 ## Consequences
 
@@ -66,3 +67,14 @@ render the same document through the shared browser render (`browser`/`cssom`/`d
 the host supplies them. Native rendering is blocked on JUN-93/JUN-134..137/JUN-353 (cssom typed calc AST, regex in
 layout, f64/document ABI, Browser graph link); until then the frame ABI v3 (JUN-811) is an interim, not the target.
 The hand-written JS DOM builder from PR #1187 is removed.
+
+## Amendment 2 2026-11-04 — the hosted page is a Kotoba source (JUN-821)
+
+The hosted session page is authored as `resources/aiueos/session/index.kotoba`: HTML built by pure Kotoba functions
+(escape, attributes, elements; the tree lives in the call graph), run with Amu, printing `index.html`. This replaces the
+amendment above for the hosted surface: `ui.cljk` (kbb/SCI, JVM `java.io`), its `generated/` output and `dapp-ui.py` are
+removed. The app table (id, title, category, operations by dock id) lives in `index.kotoba`; `scripts/session-page.py check`
+refuses a table that differs from `distributions/awai/dapps/*.json` and a page that is not what the source prints. The
+stylesheet and the two inline scripts are carried as exact string constants, not re-authored. The native renderer path
+(JUN-810) is unchanged and still blocked. The html library's `.kotoba` port (`kotoba-lang/html` `kotoba/html_core.kotoba`) was
+not used: it does not pass `amu check` on the current compiler (`record-get` arity, E2103).

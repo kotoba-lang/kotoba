@@ -1,7 +1,7 @@
 # Explicit JVM compatibility gates
 
 `cljk_loader.cljk` is a byte-identical copy of
-`kotoba-lang/kotoba-lang` commit `b77db77494bbd14b52fef97bb16b3ffe965755dc`,
+`kotoba-lang/kotoba-lang` commit `b1f60b6b5bdb6cf264e3e0aa238989430ae3a5cc`,
 `src/kotoba/lang/cljk_loader.cljk`. It preserves CLJK namespace loading and
 reader-conditionals for the repository's explicitly declared JVM launcher
 and compatibility tests. It is not a native Amu target or an automatic

@@ -1,0 +1,8 @@
+#!/bin/zsh
+H=$(cd "$(dirname "$0")" && pwd)
+# run-guest.sh BIN OFFSET < input
+S=${KR_WORK:-/tmp/kotoba-route}; H=$(cd "$(dirname "$0")" && pwd)
+KEXE_COMMAND=1 KEXE_STRING_POOL=${GUEST_POOL:-268435456} KEXE_PAIRS=${GUEST_PAIRS:-33554432} \
+  KEXE_VECTORS=${GUEST_VECTORS:-4194304} KEXE_VECTOR_ITEMS=${GUEST_VECTOR_ITEMS:-134217728} \
+  KEXE_CPU_SECONDS=${GUEST_SECONDS:-600} KEXE_WALL_SECONDS=${GUEST_SECONDS:-600} \
+  $S/kexe-loader $1 $2 0 aarch64 ${GUEST_GRANT:-3,37,41}

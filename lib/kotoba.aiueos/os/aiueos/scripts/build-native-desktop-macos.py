@@ -100,10 +100,10 @@ def repository_bootstrap(amu, args):
     verified_file(manifest)
     names = [line for line in manifest.read_text().splitlines()
              if line and not line.startswith("#")]
-    # The signed Mac root has shipped with 47-, 48- and 49-module source
-    # graphs. The descriptor's fullSource digest below binds the exact
+    # The signed Mac root has shipped with 47-, 48-, 49- and 61-module source
+    # graphs (the count only has to be plausible). The descriptor's fullSource digest below binds the exact
     # ordered graph; a stale or truncated manifest must still be refused.
-    if len(names) not in (47, 48, 49) or len(set(names)) != len(names):
+    if len(names) < 47 or len(set(names)) != len(names):
         raise ValueError("Mac bootstrap manifest is not a complete native source graph")
     source_hash = hashlib.sha256()
     source_bytes = 0
@@ -137,8 +137,13 @@ def main(args):
     # the gates keep one region table (native_regions.py); the compiler's definition (Amu seed/97) must equal it
     sys.path.insert(0, str(HERE))
     import native_regions
+    import native_text_margin
     native_regions.verify_amu(amu)
     native_regions.verify_layout(amu, OS / "native/layout-table.json")
+    # the app catalog is generated from app_catalog.json (JUN-811); a hand-edited or stale one is refused before any compile
+    stale = subprocess.run([sys.executable, "-I", str(HERE / "gen-app-catalog.py"), "check"], capture_output=True, text=True)
+    if stale.returncode:
+        raise ValueError("app catalog is stale against app_catalog.json: " + stale.stdout.strip())
     owners = args.owner_repo_root.resolve(strict=True)
     if not amu.is_dir() or not owners.is_dir():
         raise ValueError("source roots must be directories")
@@ -157,6 +162,8 @@ def main(args):
         raise ValueError("QEMU is not executable")
     source_root_pins = {}
     env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "LANG": "C"}
+    if os.environ.get("AIUEOS_CSSOM_K_SOURCE_PATH"):      # JUN-920: the style gate's mutant builds stage mutated cssom region modules
+        env["AIUEOS_CSSOM_K_SOURCE_PATH"] = os.environ["AIUEOS_CSSOM_K_SOURCE_PATH"]
     for name, variable in OWNER_ENV.items():
         root = owners / name / "kotoba"
         if root.is_symlink() or not root.is_dir():
@@ -169,9 +176,9 @@ def main(args):
             "build-native-font-macos.py", "build-native-bluetooth-payload-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "native_media_retention.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
-            "check-native-media-format.py", "native_regions.py", "native_ops.py",
-            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-keccak-qemu.py", "check-native-mldsa-ntt-qemu.py", "mldsa_ntt_oracle.py", "check-native-mldsa-sample-qemu.py", "mldsa_sample_oracle.py", "check-native-mldsa-verify-qemu.py", "mldsa_verify_oracle.py", "check-native-imgsig-qemu.py", "imgsig_oracle.py", "check-native-style-qemu.py", "check-native-layout-qemu.py", "check-native-flex-qemu.py", "check-native-grid-qemu.py", "check-native-draw-qemu.py", "check-native-uidoc-qemu.py", "check-native-update2-qemu.py", "update2_oracle.py", "check-native-provision-esp-qemu.py", "aiueos-provision-esp.py", "check-native-builder-layout-qemu.py", "check-builder-layout.py", "check-provision-esp.py", "make-release-image.py", "aiueos-image.py", "check-native-catalog-qemu.py", "cat_oracle.py", "check-native-fresh-qemu.py", "fresh_oracle.py", "check-native-prodsig-qemu.py", "prodsig_oracle.py", "check-native-rtc-qemu.py", "rtc_probe_decode.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
+            "check-native-media-format.py", "native_regions.py", "native_ops.py", "native_text_margin.py",
+            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py", "check-native-launcher-pages-qemu.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}
@@ -261,12 +268,23 @@ def main(args):
                         else "consent-entry.kotoba" if args.profile in ("consent", "keystore")
                         else "cid-entry.kotoba" if args.profile == "cid"
                         else "sha512-entry.kotoba" if args.profile == "sha512"
+                        else "keccak-entry.kotoba" if args.profile == "keccak"
+                        else "mldsa-ntt-entry.kotoba" if args.profile == "mldsa-ntt"
+                        else "mldsa-sample-entry.kotoba" if args.profile == "mldsa-sample"
+                        else "mldsa-verify-entry.kotoba" if args.profile == "mldsa-verify"
+                        else "imgsig-entry.kotoba" if args.profile == "imgsig"
+                        else "style-entry.kotoba" if args.profile == "style"
+                        else "layout-entry.kotoba" if args.profile == "layout"
+                        else "flex-entry.kotoba" if args.profile == "flex"
+                        else "grid-entry.kotoba" if args.profile == "grid"
+                        else "draw-entry.kotoba" if args.profile == "draw"
+                        else "uidoc-entry.kotoba" if args.profile == "uidoc"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
                         else "input-entry.kotoba" if args.profile == "input-state"
-                        else "desktop-debug-entry.kotoba" if args.profile == "nvme"
+                        else "desktop-debug-entry.kotoba" if args.profile in ("nvme", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "rtc")
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -277,13 +295,27 @@ def main(args):
         kernel_state = json.loads((kernel / "build-state.json").read_text())
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
+        # JUN-813 (ADR-0286 amendment 7): update.kotoba imports aiueos.imgsig-prodkeys, one module more than the counts below for every graph that has it
+        graph_names = list(kernel_state["sourceGraph"])
+        update_in_graph = any(n.endswith("/native/update.kotoba") for n in graph_names)
+        if update_in_graph != any(n.endswith("/kotoba/aiueos/imgsig_prodkeys.kotoba") for n in graph_names):
+            raise ValueError("the production signer keys module must be in the kernel graph exactly when update.kotoba is")
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 44
+                or kernel_state["sourceModuleCount"] != ({"style": 55, "layout": 61, "flex": 54, "grid": 53, "draw": 62, "uidoc": 63}.get(args.profile, 51) + (1 if update_in_graph else 0))
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
                 or kernel_state["bootPayload"] != payload_pin):
             raise ValueError("kernel or EFI build receipt mismatch")
+        # JUN-811: the compiler prints no code extent when the kernel fits, so estimate the margin under its cap
+        layout = json.loads((OS / "native/layout-table.json").read_text())
+        rung = next(row for row in layout["rungs"].values() if row["target"] == args.kernel_target)
+        text_margin = native_text_margin.text_margin(image.read_bytes(), rung["compilerTextCapBytes"],
+                                                     args.compiler_sha256, rung)
+        if args.profile == "desktop" and text_margin["state"] == "FAIL":
+            raise ValueError("kernel text margin is below the minimum: " + json.dumps(text_margin, sort_keys=True))
+        if text_margin["state"] == "WARN":
+            print("warning: kernel text margin is low: " + json.dumps(text_margin, sort_keys=True), file=sys.stderr)
 
         call("media", scripts["build-native-media-macos.py"], [
             "--amu-source", amu, "--compiler-image", compiler,
@@ -309,6 +341,17 @@ def main(args):
                         else "check-native-idle-silent-qemu.py" if args.profile == "idle"
                         else "check-native-cid-qemu.py" if args.profile == "cid"
                         else "check-native-sha512-qemu.py" if args.profile == "sha512"
+                        else "check-native-keccak-qemu.py" if args.profile == "keccak"
+                        else "check-native-mldsa-ntt-qemu.py" if args.profile == "mldsa-ntt"
+                        else "check-native-mldsa-sample-qemu.py" if args.profile == "mldsa-sample"
+                        else "check-native-mldsa-verify-qemu.py" if args.profile == "mldsa-verify"
+                        else "check-native-imgsig-qemu.py" if args.profile == "imgsig"
+                        else "check-native-style-qemu.py" if args.profile == "style"
+                        else "check-native-layout-qemu.py" if args.profile == "layout"
+                        else "check-native-flex-qemu.py" if args.profile == "flex"
+                        else "check-native-grid-qemu.py" if args.profile == "grid"
+                        else "check-native-draw-qemu.py" if args.profile == "draw"
+                        else "check-native-uidoc-qemu.py" if args.profile == "uidoc"
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
@@ -316,6 +359,13 @@ def main(args):
                         else "check-native-dapps-qemu.py" if args.profile == "dapps"
                         else "check-native-input-state-qemu.py" if args.profile == "input-state"
                         else "check-native-nvme-qemu.py" if args.profile == "nvme"
+                        else "check-native-update2-qemu.py" if args.profile == "update2"
+                        else "check-native-provision-esp-qemu.py" if args.profile == "provision"
+                        else "check-native-builder-layout-qemu.py" if args.profile == "builder-layout"
+                        else "check-native-catalog-qemu.py" if args.profile == "catalog"
+                        else "check-native-fresh-qemu.py" if args.profile == "fresh"
+                        else "check-native-prodsig-qemu.py" if args.profile == "prodsig"
+                        else "check-native-rtc-qemu.py" if args.profile == "rtc"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -331,6 +381,17 @@ def main(args):
                         else "native-idle-silent-qemu.json" if args.profile == "idle"
                         else "native-cid-qemu.json" if args.profile == "cid"
                         else "native-sha512-qemu.json" if args.profile == "sha512"
+                        else "native-keccak-qemu.json" if args.profile == "keccak"
+                        else "native-mldsa-ntt-qemu.json" if args.profile == "mldsa-ntt"
+                        else "native-mldsa-sample-qemu.json" if args.profile == "mldsa-sample"
+                        else "native-mldsa-verify-qemu.json" if args.profile == "mldsa-verify"
+                        else "native-imgsig-qemu.json" if args.profile == "imgsig"
+                        else "native-style-qemu.json" if args.profile == "style"
+                        else "native-layout-qemu.json" if args.profile == "layout"
+                        else "native-flex-qemu.json" if args.profile == "flex"
+                        else "native-grid-qemu.json" if args.profile == "grid"
+                        else "native-draw-qemu.json" if args.profile == "draw"
+                        else "native-uidoc-qemu.json" if args.profile == "uidoc"
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
@@ -338,6 +399,13 @@ def main(args):
                         else "native-dapps-qemu.json" if args.profile == "dapps"
                         else "native-input-state-qemu.json" if args.profile == "input-state"
                         else "native-nvme-qemu.json" if args.profile == "nvme"
+                        else "native-update2-qemu.json" if args.profile == "update2"
+                        else "native-provision-esp-qemu.json" if args.profile == "provision"
+                        else "native-builder-layout-qemu.json" if args.profile == "builder-layout"
+                        else "native-catalog-qemu.json" if args.profile == "catalog"
+                        else "native-fresh-qemu.json" if args.profile == "fresh"
+                        else "native-prodsig-qemu.json" if args.profile == "prodsig"
+                        else "native-rtc-qemu.json" if args.profile == "rtc"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
@@ -346,6 +414,17 @@ def main(args):
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
                            else "PASS_NATIVE_SHA512_QEMU" if args.profile == "sha512"
+                           else "PASS_NATIVE_KECCAK_QEMU" if args.profile == "keccak"
+                           else "PASS_NATIVE_MLDSA_NTT_QEMU" if args.profile == "mldsa-ntt"
+                           else "PASS_NATIVE_MLDSA_SAMPLE_QEMU" if args.profile == "mldsa-sample"
+                           else "PASS_NATIVE_MLDSA_VERIFY_QEMU" if args.profile == "mldsa-verify"
+                           else "PASS_NATIVE_IMGSIG_QEMU" if args.profile == "imgsig"
+                           else "PASS_NATIVE_STYLE_K_QEMU" if args.profile == "style"
+                           else "PASS_NATIVE_LAYOUT_K_QEMU" if args.profile == "layout"
+                           else "PASS_NATIVE_FLEX_K_QEMU" if args.profile == "flex"
+                           else "PASS_NATIVE_GRID_K_QEMU" if args.profile == "grid"
+                           else "PASS_NATIVE_DRAW_K_QEMU" if args.profile == "draw"
+                           else "PASS_NATIVE_UIDOC_K_QEMU" if args.profile == "uidoc"
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
@@ -353,6 +432,13 @@ def main(args):
                            else "PASS_NATIVE_DAPPS_QEMU" if args.profile == "dapps"
                            else "PASS_NATIVE_USB_HID_NVME_STATE_QEMU" if args.profile == "input-state"
                            else "PASS_NATIVE_NVME_READ_QEMU" if args.profile == "nvme"
+                           else "PASS_NATIVE_UPDATE2_QEMU" if args.profile == "update2"
+                           else "PASS_NATIVE_PROVISION_ESP_QEMU" if args.profile == "provision"
+                           else "PASS_NATIVE_BUILDER_LAYOUT_QEMU" if args.profile == "builder-layout"
+                           else "PASS_NATIVE_CATALOG_QEMU" if args.profile == "catalog"
+                           else "PASS_NATIVE_FRESH_QEMU" if args.profile == "fresh"
+                           else "PASS_NATIVE_PRODSIG_QEMU" if args.profile == "prodsig"
+                           else "PASS_NATIVE_RTC_PROBE_QEMU" if args.profile == "rtc"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 18 if args.expect_stuck_entropy
@@ -363,7 +449,13 @@ def main(args):
                            else 11 if args.profile == "dapps"
                            else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
+                           else 12 if args.profile == "update2"
+                           else 8 if args.profile in ("provision", "builder-layout")
+                           else 3 if args.profile == "catalog"
+                           else 7 if args.profile == "fresh"
+                           else 5 if args.profile == "prodsig"
+                           else 7 if args.profile == "rtc"
+                           else 2 if args.profile in ("cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "draw", "uidoc", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -406,6 +498,80 @@ def main(args):
                     or observed["events"][1]["matches"] != ["abc", "fips-two-block", "abd"]
                     or observed["signing"] or observed["physicalHardware"]):
                 raise ValueError("sha512 verdict is incomplete")
+        elif args.profile == "keccak":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "keccak-outputs"]
+                    or observed["events"][1]["matches"] != ["shake128-empty", "shake256-abc", "shake128-200-squeeze-400"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("keccak verdict is incomplete")
+        elif args.profile == "mldsa-ntt":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "ntt-records"]
+                    or observed["events"][1]["matches"] != ["ntt-p", "ntt-q", "mul", "intt-product", "roundtrip"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("mldsa-ntt verdict is incomplete")
+        elif args.profile == "mldsa-sample":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "sample-records"]
+                    or observed["events"][1]["matches"] != ["expand-a-0-0", "expand-a-5-4", "sample-in-ball", "unpack10", "unpack20",
+                                                            "rsub20", "unpack4", "pack4", "pack10", "hint-bitmap", "hint-refusals"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("mldsa-sample verdict is incomplete")
+        elif args.profile == "mldsa-verify":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "verify-cases"]
+                    or observed["events"][1]["matches"] != ["valid-a", "valid-b", "wrong-message", "flip-ctilde", "flip-z",
+                                                            "hint-order", "hint-padding", "hint-limit", "z-over-bound"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("mldsa-verify verdict is incomplete")
+        elif args.profile == "imgsig":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "admission-cases"]
+                    or observed["events"][1]["matches"] != ["two-signers", "three-signers", "order-2-0", "one-signer", "duplicate-id",
+                                                            "unknown-id", "ed-half-bad", "ml-half-bad", "ed25519-only", "mldsa-only",
+                                                            "manifest-tamper", "wrong-context", "bad-magic", "count-zero", "count-five",
+                                                            "manifest-reserved", "pad-nonzero-first", "pad-nonzero-last",
+                                                            "entry-reserved-4", "entry-reserved-7", "layout-68", "layout-127",
+                                                            "count-four-dup", "count-four-last-counts", "id-256", "id-65536",
+                                                            "id-16777216"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("imgsig verdict is incomplete")
+        elif args.profile == "layout":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "layout-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["recorded"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("layout verdict is incomplete")
+        elif args.profile == "style":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "style-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("style verdict is incomplete")
+        elif args.profile == "flex":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "flex-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("flex verdict is incomplete")
+        elif args.profile == "grid":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "grid-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("grid verdict is incomplete")
+        elif args.profile == "draw":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "draw-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("draw verdict is incomplete")
+        elif args.profile == "uidoc":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "uidoc-cases"]
+                    or observed["events"][1]["cases"] != observed["events"][1]["matches"]
+                    or observed["signing"] or observed["physicalHardware"]):
+                raise ValueError("uidoc verdict is incomplete")
         elif args.profile == "gf25519":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "gf25519"]
@@ -455,6 +621,92 @@ def main(args):
                     or not observed["events"][5].get("noNewClusters")
                     or not observed["writesOnlyThroughInstallHook"] or observed["physicalHardware"]):
                 raise ValueError("nvme verdict is incomplete")
+        elif args.profile == "update2":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["update2-provision", "update2-cases", "update2-install", "update2-replay", "update2-newer",
+                                                                                     "update2-crash-before-advance", "update2-crash-repeat", "update2-crash-refused",
+                                                                                     "update2-tampered", "update2-one-signer", "update2-journal-corrupt", "update2-journal-absent"]
+                    or observed["events"][1]["matches"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "one-signer", "ml-half-bad",
+                                                            "ed-half-bad", "tampered-image", "tampered-manifest", "duplicate-id", "unknown-id",
+                                                            "production-mode", "bad-magic", "count-zero", "manifest-reserved", "version-zero",
+                                                            "size-too-big", "entry-reserved-4", "entry-reserved-7", "pad-nonzero-first",
+                                                            "pad-nonzero-last", "layout-68", "layout-127", "count-five", "count-four-dup",
+                                                            "count-four-last-counts", "id-256", "id-65536", "id-16777216", "wrong-context",
+                                                            "floor-above", "floor-equal", "floor-below", "v1-above-floor", "v1-equal-floor",
+                                                            "v1-below-floor", "catalog-context-both", "catalog-context-one", "fresh-context-both", "stream-broken-after-verify"]
+                    or [row["install"] for row in observed["events"][2:]] != [15, 9, 15, 15, 15, 9, 7, 1, 10, 10]
+                    or [row.get("floorAfter") for row in observed["events"][2:]] != [5, None, 6, None, 5, None, None, None, None, None]
+                    or not observed.get("versionFloorHashCheckedNotSigned")
+                    or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
+                raise ValueError("update2 verdict is incomplete")
+        elif args.profile == "catalog":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["catalog-cases", "catalog-storage-restored", "catalog-regression"]
+                    or len(observed["events"][0]["matches"]) != observed["events"][0]["cases"]
+                    or observed["events"][0]["admitted"] != ["two-of-three-0-1", "two-of-three-2-0", "three-signers", "full-64-entries",
+                                                             "title-31-chars-ok", "size-max-ok"]
+                    or not observed["events"][1]["diskUnchanged"] or not observed["events"][2]["desktopStillDraws"]
+                    or not observed["testKeysOnly"] or observed["productionSignerSet"] or not observed["notWiredToDesktop"]
+                    or observed["physicalHardware"]):
+                raise ValueError("catalog verdict is incomplete")
+        elif args.profile == "prodsig":
+            # JUN-813 amendment 7: production mode admits exactly the golden fixtures (signed once with the real, verification-only slots)
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["prodsig-provision", "prodsig-image", "prodsig-catalog", "prodsig-fresh",
+                                                                       "prodsig-regression"]
+                    or observed["events"][1]["admitted"] != ["golden-image-production"]
+                    or observed["events"][2]["admitted"] != ["golden-catalog-production"]
+                    or observed["events"][3]["admitted"] != ["golden-freshness-production"]
+                    or any(len(observed["events"][i]["matches"]) != observed["events"][i]["cases"] for i in (1, 2, 3))
+                    or any(observed["events"][i]["testModeAdmits"] != ["test-keys-header-under-test-keys"] for i in (1, 2, 3))
+                    or not observed["events"][4]["diskUnchanged"] or not observed["events"][4]["desktopStillDraws"]
+                    or not observed["productionSignerSet"] or not observed["verificationOnlySignerSet"]
+                    or observed["privateKeysInRepository"] or not observed["goldenSignedOnceWithRealSlots"]
+                    or not observed["notWiredToDesktop"] or observed["physicalHardware"]):
+                raise ValueError("prodsig verdict is incomplete")
+        elif args.profile == "fresh":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["fresh-clock-probes", "fresh-clock-decoder", "fresh-cases",
+                                                                       "fresh-cases-clock-ahead", "fresh-cases-no-clock",
+                                                                       "fresh-storage-restored", "fresh-regression"]
+                    or len(observed["events"][0]["probes"]) != 5
+                    or len(observed["events"][2]["matches"]) != observed["events"][2]["cases"]
+                    or len(observed["events"][3]["matches"]) != observed["events"][3]["cases"]
+                    or len(observed["events"][4]["matches"]) != observed["events"][4]["cases"]
+                    or sorted(observed["events"][2]["admittedStates"]) != sorted(["two-of-three-0-1", "two-of-three-2-0", "three-signers",
+                                                                                 "expired-one-hour-ago-30-day-lifetime", "expired-two-months-ago",
+                                                                                 "fresh-three-hours-left", "issued-23-hours-ahead-within-skew",
+                                                                                 "issued-two-days-ahead-clock-behind", "lifetime-exactly-30-days",
+                                                                                 "version-one", "version-max-signed"])
+                    or not observed["events"][5]["diskUnchanged"] or not observed["events"][6]["desktopStillDraws"]
+                    or not observed["testKeysOnly"] or observed["productionSignerSet"] or not observed["notWiredToDesktop"]
+                    or observed["physicalHardware"] or not observed["clockIsQemuNotABoard"]):
+                raise ValueError("fresh verdict is incomplete")
+        elif args.profile == "rtc":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["rtc-default-host", "rtc-vm-2026-11-06", "rtc-vm-leap-day-2028", "rtc-vm-2100-03-01",
+                                                                       "rtc-vm-before-build-floor", "rtc-decoder-negative-controls", "rtc-regression"]
+                    or [row["verdict"] for row in observed["events"][:5]] != [1, 1, 1, 0, 0]
+                    or observed["decoder"] != script_pins["rtc_probe_decode.py"]
+                    or not observed["readOnly"] or not observed["clockIsQemuNotABoard"] or observed["physicalHardware"]):
+                raise ValueError("rtc verdict is incomplete")
+        elif args.profile == "provision":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["provision-esp", "provision-cases-checked", "provision-equal",
+                                                                       "provision-above", "neg-absent", "neg-wrong-hash", "neg-floor-high", "neg-floor-low"]
+                    or [row["install"] for row in observed["events"][2:]] != [9, 15, 10, 10, 9, 15]
+                    or [row.get("floorAfter") for row in observed["events"][2:]] != [None, 6, None, None, None, 4]
+                    or observed["provisioningHookUsed"] or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
+                raise ValueError("provision verdict is incomplete")
+        elif args.profile == "builder-layout":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["builder-esp", "builder-cases-checked", "builder-equal",
+                                                                       "builder-above", "neg-absent", "neg-wrong-hash", "neg-floor-high", "neg-floor-low"]
+                    or [row["install"] for row in observed["events"][2:]] != [9, 15, 10, 10, 9, 15]
+                    or [row.get("floorAfter") for row in observed["events"][2:]] != [None, 5, None, None, None, 4]
+                    or not observed["eachInstallKeptEfiBoot"] or observed["firmwareBootOfLayout"]
+                    or observed["provisioningHookUsed"] or not observed["testKeysOnly"] or observed["productionSignerSet"] or observed["physicalHardware"]):
+                raise ValueError("builder-layout verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
@@ -514,6 +766,22 @@ def main(args):
                         "reduced-effects", "effects-restored", "home-pointer-launch"]
                     or material_observed["physicalHardware"] or material_observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("native shell materials observation is not bound to this build")
+        launcher_observed = None
+        if args.profile == "desktop":
+            call("qemu-launcher-pages", scripts["check-native-launcher-pages-qemu.py"], [
+                "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                "--qemu", qemu, "--firmware", firmware, "--output", output / "qemu-launcher-pages"])
+            launcher_observed = json.loads((output / "qemu-launcher-pages/native-launcher-pages-qemu.json").read_text())
+            if (launcher_observed["status"] != "PASS_NATIVE_LAUNCHER_PAGES_QEMU"
+                    or launcher_observed["kernel"] != kernel_state["kernel"]
+                    or launcher_observed["efi"] != kernel_state["efi"]
+                    or launcher_observed["media"] != media_state["image"]
+                    or launcher_observed["font"] != font_state["padded"]
+                    or launcher_observed["qemu"] != qemu_pin or launcher_observed["firmware"] != firmware_pin
+                    or launcher_observed["observer"] != script_pins["check-native-launcher-pages-qemu.py"]
+                    or launcher_observed["opsFourWindowsFullPage"] > launcher_observed["opsLimit"]
+                    or launcher_observed["physicalHardware"] or launcher_observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("launcher pages observation is not bound to this build")
         gui_observed = []
         if args.profile == "desktop":
             for name, options in (("absent", []), ("audio", ["--audio"]),
@@ -560,18 +828,32 @@ def main(args):
                             else "MACOS_NATIVE_IDLE_SILENT_QEMU_CANDIDATE" if args.profile == "idle"
                             else "MACOS_NATIVE_CID_QEMU_CANDIDATE" if args.profile == "cid"
                             else "MACOS_NATIVE_SHA512_QEMU_CANDIDATE" if args.profile == "sha512"
+                            else "MACOS_NATIVE_KECCAK_QEMU_CANDIDATE" if args.profile == "keccak"
+                            else "MACOS_NATIVE_MLDSA_NTT_QEMU_CANDIDATE" if args.profile == "mldsa-ntt"
+                            else "MACOS_NATIVE_MLDSA_SAMPLE_QEMU_CANDIDATE" if args.profile == "mldsa-sample"
+                            else "MACOS_NATIVE_MLDSA_VERIFY_QEMU_CANDIDATE" if args.profile == "mldsa-verify"
+                            else "MACOS_NATIVE_IMGSIG_QEMU_CANDIDATE" if args.profile == "imgsig"
+                            else "MACOS_NATIVE_STYLE_K_QEMU_CANDIDATE" if args.profile == "style"
+                            else "MACOS_NATIVE_LAYOUT_K_QEMU_CANDIDATE" if args.profile == "layout"
+                            else "MACOS_NATIVE_FLEX_K_QEMU_CANDIDATE" if args.profile == "flex"
+                            else "MACOS_NATIVE_GRID_K_QEMU_CANDIDATE" if args.profile == "grid"
+                            else "MACOS_NATIVE_DRAW_K_QEMU_CANDIDATE" if args.profile == "draw"
+                            else "MACOS_NATIVE_UIDOC_K_QEMU_CANDIDATE" if args.profile == "uidoc"
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
                             else "MACOS_NATIVE_KEYSTORE_QEMU_CANDIDATE" if args.profile == "keystore"
                             else "MACOS_NATIVE_DAPPS_QEMU_CANDIDATE" if args.profile == "dapps"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
-                     font=font_state["padded"], kernel=kernel_state["kernel"],
+                     font=font_state["padded"], kernel=kernel_state["kernel"], textMargin=text_margin,
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
                      isoBootQualified=iso_observed is not None,
                      nativeShellMaterialsQualified=material_observed is not None,
+                     nativeLauncherPagesQualified=launcher_observed is not None,
+                     nativeLauncherPagesEvents=len(launcher_observed["events"]) if launcher_observed else 0,
+                     nativeLauncherPagesOpsFourWindows=launcher_observed["opsFourWindowsFullPage"] if launcher_observed else None,
                      nativeGUIEffectsQualified=len(gui_observed) == 3,
                      nativeGUIEffectsEvents=sum(len(g["events"]) for g in gui_observed),
                      nativePCMDevice="Intel 8086:2415 AC97" if gui_observed else None,
@@ -588,6 +870,28 @@ def main(args):
                                     if args.profile == "cid"
                                     else "Mac native SHA-512 self-test (FIPS 180-4 vectors) on QEMU"
                                     if args.profile == "sha512"
+                                    else "Mac native Keccak (SHAKE128/256) sponge self-test on QEMU"
+                                    if args.profile == "keccak"
+                                    else "Mac native ML-DSA-65 polynomial (NTT) self-test on QEMU"
+                                    if args.profile == "mldsa-ntt"
+                                    else "Mac native ML-DSA-65 sampling (ExpandA, SampleInBall, hint unpack) and bit packing self-test on QEMU"
+                                    if args.profile == "mldsa-sample"
+                                    else "Mac native ML-DSA-65 signature verification (nine signatures from the Python reference) on QEMU"
+                                    if args.profile == "mldsa-verify"
+                                    else "Mac native AIUEIMG2 multi-signer admission (sixteen headers, 2-of-3 Ed25519 plus ML-DSA-65, test keys) on QEMU"
+                                    if args.profile == "imgsig"
+                                    else "Mac native CSSOM style slice (selector matching, specificity, cascade, inheritance as kernel region code) against the host reference grid on QEMU"
+                                    if args.profile == "style"
+                                    else "Mac native CSSOM layout slice (normal block flow into a box table as kernel region code) against the host f64 reference grid on QEMU"
+                                    if args.profile == "layout"
+                                    else "Mac native CSSOM flex lines of up to sixteen items (grow, scaled shrink, clamp, freeze, justify-content, auto margins as kernel region code) against the host exact grid on QEMU"
+                                    if args.profile == "flex"
+                                    else "Mac native CSSOM grid track sizing and table column widths (layout.cljk track-sizes, distribute-fr, distribute-equally-with-caps, table-column-widths, distribute-excess as kernel region code) against the host references on QEMU"
+                                    if args.profile == "grid"
+                                    else "Mac native CSSOM draw list (the laid-out box table as rect fills and borders in a shared region, Q6 coordinates, kernel region code) against the independent host reference and decoder on QEMU"
+                                    if args.profile == "draw"
+                                    else "Mac native CSSOM UI-document front end (a compact UI document in a region becomes the style slice's wire stream, then style, layout and draw run on it; kernel region code) against the independent host reference, the canonical wire stream and the direct path on QEMU"
+                                    if args.profile == "uidoc"
                                     else "Mac native GF(2^255-19) arithmetic self-test on QEMU"
                                     if args.profile == "gf25519"
                                     else "Mac native Ed25519 public keys from RFC 8032 seeds on QEMU"
@@ -627,7 +931,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bluetooth-firmware", choices=("v1",), help="explicit pinned Realtek bundle in native font padding")
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "keccak", "mldsa-ntt", "mldsa-sample", "mldsa-verify", "imgsig", "style", "layout", "flex", "grid", "update2", "provision", "builder-layout", "catalog", "fresh", "prodsig", "rtc", "draw", "uidoc", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "

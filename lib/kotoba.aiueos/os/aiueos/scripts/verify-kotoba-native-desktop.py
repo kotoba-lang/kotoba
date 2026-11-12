@@ -41,6 +41,12 @@ if b"aiueos.browser-frame2" not in source.read_bytes() and b"aiueos.browser-fram
     raise SystemExit("error: Kotoba Browser desktop frame dependency is absent")
 if b"aiueos.session.app-catalog" not in source.read_bytes() or not catalog.is_file():
     raise SystemExit("error: shared Kotoba app catalog dependency is absent")
+# The catalog is generated (JUN-811): refuse a committed app_catalog.kotoba that differs from app_catalog.json.
+import subprocess
+generated = subprocess.run([sys.executable, "-I", str(pathlib.Path(__file__).resolve().parent / "gen-app-catalog.py"), "check"],
+                           capture_output=True, text=True)
+if generated.returncode != 0:
+    raise SystemExit("error: app catalog is stale against app_catalog.json: " + generated.stdout.strip())
 
 fuel = int(os.environ.get("AIUEOS_NATIVE_FUEL", "9007199254740991"))
 value = {
