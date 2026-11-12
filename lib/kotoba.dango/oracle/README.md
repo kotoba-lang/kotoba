@@ -7,6 +7,7 @@
 | Chain, caveats, shape | `src/dango/` |
 | The value codec dango needs (`kotoba.value.v1` subset) and CID | `src/dango/value.cljc`, `cid.cljc` |
 | Scope lattice, SHA-2, Ed25519 | `src/authority`, `sha2`, `ed25519`, `x25519`: copies of this repository's `.cljk`, without the `ns` attribute map |
+| Revoked-CID store | `src/authority/revocation.cljc`: set semantics, canonical wire vector, distribution merge; `verify` reads it as `:revoked` |
 
 It also adds web3 roots. `chain/root-for-external-signer` has a wallet or passkey sign `chain/root-message`, which names the root CID and cannot pass as a login. The verifier checks it through a trusted `:root-verifier` the host supplies. ERC-191, ERC-1271 and WebAuthn checks belong in that function, not here.
 
@@ -27,5 +28,5 @@ nbb test/run.cljc
 ## Limits
 
 - The portable Ed25519 is not written to be constant-time, so a signer holding a valuable key should use the platform's.
-- Babashka: 89 assertions, fail 0, error 0 (slow: the interpreted Ed25519 math takes about an hour; shape/caveat/chain/vectors all pass). nbb takes about 3 minutes, JVM about 1 minute.
-- No token format stability promise exists beyond these vectors. Revocation storage, per-surface facts and the OS broker are not built.
+- 120 assertions (baseline on main before this change measured 90). nbb: 120 pass, 0 fail; JVM: 120 pass, 0 fail. nbb takes about 3 minutes, JVM about 1 minute. Babashka takes about an hour (interpreted Ed25519); this revision's bb run is pending.
+- No token format stability promise exists beyond these vectors. The revocation store covers data semantics, wire form and merge only — persistence, freshness and distribution transport stay the host's job. Per-surface facts and the OS broker are not built.
