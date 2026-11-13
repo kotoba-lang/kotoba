@@ -1,0 +1,94 @@
+;; Scoped Native FS2 positioned reads for the limited Forest v1 profile.
+;; Index is untrusted; the selected block is checked against its supplied CID.
+(ns awai.fs.forest-file
+  (:capabilities #{:fs/app-data})
+  (:require [awai.fs.forest-index :as index] [awai.fs.forest-blocks :as blocks]
+            [zstd.frame-header :as z])
+  (:export [get-block]))
+
+(defn- digit [n :i64] :string (string-substring "0123456789" n (+ n 1)))
+(defn- decimal [n :i64] :string
+  (if (< n 10) (digit n) (string-concat (decimal (quot n 10)) (digit (rem n 10)))))
+(defn- stat-size [path :string] [:result :i64 :keyword]
+  (let [s (typed-cap-call :fs/app-data :string :string (string-concat "\u0000FS2\u0000F" (string-concat path "\u0000")))
+        n (string-length s)]
+    (if (or (< n 8) (not= (string-code-point-at s 0) 0) (not= (string-code-point-at s 1) 70)
+            (not= (string-code-point-at s 2) 83) (not= (string-code-point-at s 3) 50)
+            (not= (string-code-point-at s 4) 0))
+      (result-err-of [:result :i64 :keyword] :stat-refused)
+      (let [start (loop [i 5] (cond (>= i n) -1 (= (string-code-point-at s i) 32) (+ i 1) :else (recur (+ i 1))))]
+        (if (or (< start 7) (>= start n)) (result-err-of [:result :i64 :keyword] :stat-refused)
+          (loop [i start value 0 digits 0]
+            (if (or (= i n) (= (string-code-point-at s i) 32))
+              (if (= digits 0) (result-err-of [:result :i64 :keyword] :stat-refused)
+                (result-ok-of [:result :i64 :keyword] value))
+              (let [d (- (string-code-point-at s i) 48)]
+                (if (or (< d 0) (> d 9) (> value 104857) (and (= value 104857) (> d 6)))
+                  (result-err-of [:result :i64 :keyword] :stat-refused)
+                  (recur (+ i 1) (+ (* value 10) d) (+ digits 1)))))))))))
+(defn- path-valid? [p :string] :bool
+  (let [n (string-length p)]
+    (and (> n 0) (<= (string-byte-length p) 4096)
+      (loop [i 0] (if (= i n) true
+        (if (= (string-code-point-at p i) 0) false (recur (+ i 1))))))))
+(defn- range [path :string offset :i64 length :i64] [:result :vector-i64 :keyword]
+  (if (or (< offset 0) (< length 1) (> length 262144))
+    (result-err-of [:result :vector-i64 :keyword] :range-limit)
+    (let [req (string-concat "\u0000FS2\u0000E" (string-concat path
+                (string-concat "\u0000" (string-concat (decimal offset) (string-concat ":" (decimal length))))))
+          reply (typed-cap-call :fs/app-data :string :bytes req)]
+      (if (and (= (bytes-count reply) (+ length 5)) (= (bytes-at reply 0) 0)
+               (= (bytes-at reply 1) 70) (= (bytes-at reply 2) 83)
+               (= (bytes-at reply 3) 50) (= (bytes-at reply 4) 0))
+        (result-ok-of [:result :vector-i64 :keyword] (vector-i64-from-bytes (bytes-slice reply 5 (+ length 5))))
+        (result-err-of [:result :vector-i64 :keyword] :read-refused)))))
+(defn- le [b :vector-i64 p :i64 n :i64] :i64
+  (loop [i 0 v 0] (if (= i n) v
+    (recur (+ i 1) (bit-or v (i64-shift-left (vector-at b (+ p i)) (* i 8)))))))
+(defn- copy-at [out :vector-i64 pos :i64 b :vector-i64] :vector-i64
+  (loop [i 0 v out] (if (= i (vector-count b)) v
+    (recur (+ i 1) (vector-assoc! v (+ pos i) (vector-at b i))))))
+
+;; `size` is caller-supplied and bounded. The provider must serve exact ranges;
+;; A size preflight rejects an already-short file, but a concurrent truncation
+;; can still terminate some providers during range read. This does not hold a snapshot or
+;; establish whole-file identity, and :no-candidate is not an absence proof.
+(defn get-block [path :string size :i64 cid :vector-i64 max-window :i64 max-output :i64] [:result :vector-i64 :keyword]
+  (cond (not (path-valid? path)) (result-err-of [:result :vector-i64 :keyword] :invalid-path)
+        (not (index/cid-valid? cid)) (result-err-of [:result :vector-i64 :keyword] :invalid-cid)
+        (or (< size 64) (> size 1048576) (< max-window 0) (< max-output 0) (> max-output 16777216))
+          (result-err-of [:result :vector-i64 :keyword] :invalid-bound)
+        :else
+        (let [st (stat-size path)]
+          (cond (not (result-ok?-of [:result :i64 :keyword] st)) (result-err-of [:result :vector-i64 :keyword] :stat-refused)
+                (not= (result-value-of [:result :i64 :keyword] st -1) size) (result-err-of [:result :vector-i64 :keyword] :file-size-mismatch)
+                :else (let [footer (range path (- size 16) 16)]
+          (if (not (result-ok?-of [:result :vector-i64 :keyword] footer)) footer
+            (let [f (result-value-of [:result :vector-i64 :keyword] footer (vector-i64))
+                  pointer (le f 8 8) start (if (< pointer 8) 0 (- pointer 8))]
+              (cond (or (not= (vector-at f 0) 80) (not= (vector-at f 1) 42)
+                        (not= (vector-at f 2) 77) (not= (vector-at f 3) 24)
+                        (not= (le f 4 4) 8)) (result-err-of [:result :vector-i64 :keyword] :invalid-footer)
+                    (or (< pointer 9) (> pointer (- size 48))) (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                    (> (- size start) 262144) (result-err-of [:result :vector-i64 :keyword] :range-limit)
+                    :else
+                    (let [tail (range path start (- size start))]
+                      (if (not (result-ok?-of [:result :vector-i64 :keyword] tail)) tail
+                        (let [synthetic (copy-at (vector-alloc size) start (result-value-of [:result :vector-i64 :keyword] tail (vector-i64)))
+                              spans (index/find-frames synthetic cid)]
+                          (if (not (result-ok?-of [:result :vector-i64 :keyword] spans)) spans
+                            (let [v (result-value-of [:result :vector-i64 :keyword] spans (vector-i64))]
+                              (loop [i 0]
+                                (if (= i (vector-count v)) (result-err-of [:result :vector-i64 :keyword] :no-candidate)
+                                  (let [lo (vector-at v i) hi (vector-at v (+ i 1)) part (range path lo (- hi lo))]
+                                    (if (not (result-ok?-of [:result :vector-i64 :keyword] part)) part
+                                      (let [bytes (result-value-of [:result :vector-i64 :keyword] part (vector-i64))
+                                            frame (z/decode-frame bytes 0 (vector-count bytes) max-window max-output)
+                                            err (record-get [:ref :zstd/frame-output] frame :error)]
+                                        (cond (not= err :none) (result-err-of [:result :vector-i64 :keyword] err)
+                                              (not= (record-get [:ref :zstd/frame-output] frame :next) (vector-count bytes))
+                                                (result-err-of [:result :vector-i64 :keyword] :frame-extent)
+                                              :else (let [block (blocks/get-block (record-get [:ref :zstd/frame-output] frame :bytes) cid)]
+                                                      (if (result-ok?-of [:result :vector-i64 :keyword] block) block
+                                                        (let [why (result-error-of [:result :vector-i64 :keyword] block :invalid-section)]
+                                                          (if (= why :not-found) (recur (+ i 2)) (result-err-of [:result :vector-i64 :keyword] why))))))))))))))))))))))))

@@ -1,0 +1,496 @@
+;; RFC 8878 sections 3.1.1.1 and 3.1.1.2: bounded frame and block headers.
+;; Raw/RLE and one compressed subset are supported; checksums are not.
+(ns zstd.frame-header
+  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table decode-predefined-sequences execute-sequences decode-predefined-block decode-frame])
+  (:schemas {:zstd/header [:record :zstd/header
+               [[:error :keyword] [:header-size :i64] [:window-size :i64]
+                [:content-size :i64] [:checksum :i64]]]
+             :zstd/block-header [:record :zstd/block-header
+               [[:error :keyword] [:last :i64] [:kind :i64]
+                [:size :i64] [:payload-size :i64]]]
+             :zstd/literals [:record :zstd/literals
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64]]]
+             :zstd/sequences [:record :zstd/sequences
+               [[:error :keyword] [:next :i64] [:count :i64] [:ll :i64] [:offset :i64] [:match :i64]]]
+             :zstd/reverse [:record :zstd/reverse
+               [[:error :keyword] [:next :i64] [:value :i64]]]
+             :zstd/placement [:record :zstd/placement
+               [[:position :i64] [:symbols :vector-i64]]]
+             :zstd/repeat [:record :zstd/repeat
+               [[:offset :i64] [:r1 :i64] [:r2 :i64] [:r3 :i64]]]
+             :zstd/execution [:record :zstd/execution
+               [[:error :keyword] [:bytes :vector-i64] [:reps :vector-i64]]]
+             :zstd/decoded-block [:record :zstd/decoded-block
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64] [:reps :vector-i64]]]
+             :zstd/frame-output [:record :zstd/frame-output
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64]]]}))
+
+(defn- failure [reason :keyword] [:ref :zstd/header]
+  (record-new [:ref :zstd/header] reason 0 0 -1 0))
+
+(defn- block-failure [reason :keyword] [:ref :zstd/block-header]
+  (record-new [:ref :zstd/block-header] reason 0 0 0 0))
+
+(defn- literals-failure [reason :keyword] [:ref :zstd/literals]
+  (record-new [:ref :zstd/literals] reason 0 (vector-i64)))
+
+(defn- sequences-failure [reason :keyword] [:ref :zstd/sequences]
+  (record-new [:ref :zstd/sequences] reason 0 0 0 0 0))
+(defn- reverse-failure [reason :keyword] [:ref :zstd/reverse]
+  (record-new [:ref :zstd/reverse] reason 0 0))
+(defn- execute-failure [reason :keyword] [:ref :zstd/execution]
+  (record-new [:ref :zstd/execution] reason (vector-i64) (vector-i64)))
+(defn- valid-input-bytes? [b :vector-i64] :bool
+  (loop [i 0]
+    (if (= i (vector-count b)) true
+      (let [x (vector-at b i)]
+        (if (or (< x 0) (> x 255)) false (recur (+ i 1)))))))
+
+(defn- repeat-offset [value :i64 literal-length :i64 r1 :i64 r2 :i64 r3 :i64] [:ref :zstd/repeat]
+  (if (> value 3) (record-new [:ref :zstd/repeat] (- value 3) (- value 3) r1 r2)
+    (let [v (+ value (if (= literal-length 0) 1 0))]
+      (cond (= v 1) (record-new [:ref :zstd/repeat] r1 r1 r2 r3)
+            (= v 2) (record-new [:ref :zstd/repeat] r2 r2 r1 r3)
+            (= v 3) (record-new [:ref :zstd/repeat] r3 r3 r1 r2)
+            (= v 4) (record-new [:ref :zstd/repeat] (- r1 1) (- r1 1) r1 r2)
+            :else (record-new [:ref :zstd/repeat] 0 r1 r2 r3)))))
+
+;; Execute decoded triples against already-verified preceding frame bytes.
+;; Returns only this block's bytes and the repeat offsets for the next block.
+(defn execute-sequences [history :vector-i64 literals :vector-i64 seqs :vector-i64 reps :vector-i64 window :i64 cap :i64] [:ref :zstd/execution]
+  (let [n (vector-count seqs) ln (vector-count literals) hn (vector-count history)
+        max-out (if (< window 131072) window 131072)]
+    (cond (or (< cap 0) (< window 0)) (execute-failure :invalid-bound)
+          (or (not= (rem n 3) 0) (not= (vector-count reps) 3)) (execute-failure :invalid-sequences)
+          (or (<= (vector-at reps 0) 0) (<= (vector-at reps 1) 0) (<= (vector-at reps 2) 0)) (execute-failure :invalid-offset)
+          (or (not (valid-input-bytes? history)) (not (valid-input-bytes? literals))) (execute-failure :invalid-byte)
+          :else
+          (let [bound (if (< cap max-out) cap max-out)
+                total (loop [i 0 lp 0 size 0]
+                        (if (= i n) (if (> (- ln lp) (- bound size)) -1 (+ size (- ln lp)))
+                          (let [ll (vector-at seqs i) ml (vector-at seqs (+ i 1)) ov (vector-at seqs (+ i 2))]
+                            (cond (or (< ll 0) (< ml 3) (< ov 1) (> ll (- ln lp))) -1
+                                  (> ll (- bound size)) -1
+                                  (> ml (- (- bound size) ll)) -1
+                                  :else (recur (+ i 3) (+ lp ll) (+ size ll ml))))))]
+            (if (< total 0) (execute-failure :invalid-sequences)
+              (loop [i 0 lp 0 p 0 r1 (vector-at reps 0) r2 (vector-at reps 1) r3 (vector-at reps 2)
+                     out (vector-alloc total)]
+                (if (= i n)
+                  (loop [j lp at p v out]
+                    (if (= j ln) (record-new [:ref :zstd/execution] :none v (vector-i64 r1 r2 r3))
+                      (let [x (vector-at literals j)]
+                        (if (or (< x 0) (> x 255)) (execute-failure :invalid-byte)
+                          (recur (+ j 1) (+ at 1) (vector-assoc! v at x))))))
+                  (let [ll (vector-at seqs i) ml (vector-at seqs (+ i 1)) ov (vector-at seqs (+ i 2))
+                        repeat (repeat-offset ov ll r1 r2 r3) off (record-get [:ref :zstd/repeat] repeat :offset)
+                        after (+ p ll)]
+                    (if (or (<= off 0) (> off window) (> (- off after) hn))
+                      (execute-failure :invalid-offset)
+                      (let [copied (loop [j 0 v out]
+                                     (if (= j ll) v
+                                       (recur (+ j 1) (vector-assoc! v (+ p j) (vector-at literals (+ lp j))))))
+                            ok (loop [j 0] (if (= j ll) true
+                                 (let [x (vector-at literals (+ lp j))]
+                                   (if (or (< x 0) (> x 255)) false (recur (+ j 1))))))]
+                        (if (not ok) (execute-failure :invalid-byte)
+                          (let [matched (loop [j 0 v copied]
+                                          (if (= j ml) v
+                                            (let [from (- (+ after j) off)
+                                                  x (if (< from 0) (vector-at history (+ hn from)) (vector-at v from))]
+                                              (recur (+ j 1) (vector-assoc! v (+ after j) x)))))]
+                            (recur (+ i 3) (+ lp ll) (+ after ml)
+                              (record-get [:ref :zstd/repeat] repeat :r1)
+                              (record-get [:ref :zstd/repeat] repeat :r2)
+                              (record-get [:ref :zstd/repeat] repeat :r3) matched)))))))))))))
+
+;; FSE state table, flat triples [symbol number-of-bits new-state]. Counts
+;; are normalized weights; -1 occupies one low-probability state. The caller
+;; must validate mode-specific alphabet and accuracy limits before use.
+(defn fse-table [counts :vector-i64 log :i64] [:result :vector-i64 :keyword]
+  (let [n (vector-count counts)]
+    (if (or (< log 5) (> log 9) (< n 1) (> n 256))
+      (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+      (let [size (i64-shift-left 1 log)
+            total (loop [i 0 sum 0]
+                    (if (= i n) sum
+                      (let [c (vector-at counts i)]
+                        (if (or (< c -1) (> c size)) -1
+                          (recur (+ i 1) (+ sum (if (= c -1) 1 c)))))))]
+        (if (not= total size) (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+          (let [initial (loop [i 0 out (vector-alloc size)]
+                          (if (= i size) out (recur (+ i 1) (vector-assoc! out i -1))))
+                low (loop [i 0 high (- size 1) out initial]
+                      (if (= i n) (record-new [:ref :zstd/placement] high out)
+                        (if (= (vector-at counts i) -1)
+                          (recur (+ i 1) (- high 1) (vector-assoc! out high i))
+                          (recur (+ i 1) high out))))
+                high (record-get [:ref :zstd/placement] low :position)
+                step (+ (quot size 2) (quot size 8) 3) mask (- size 1)
+                placed (loop [s 0 pos 0 out (record-get [:ref :zstd/placement] low :symbols)]
+                         (if (= s n) (record-new [:ref :zstd/placement] pos out)
+                           (let [c (vector-at counts s)
+                                 p (loop [i 0 current pos v out]
+                                     (if (>= i c) (record-new [:ref :zstd/placement] current v)
+                                       (let [next-pos (loop [x (bit-and (+ current step) mask)]
+                                                        (if (> x high) (recur (bit-and (+ x step) mask)) x))]
+                                         (recur (+ i 1) next-pos (vector-assoc! v current s)))))]
+                             (recur (+ s 1) (record-get [:ref :zstd/placement] p :position)
+                                    (record-get [:ref :zstd/placement] p :symbols)))))
+                symbols (record-get [:ref :zstd/placement] placed :symbols)
+                nexts (loop [i 0 out (vector-alloc n)]
+                        (if (= i n) out
+                          (let [c (vector-at counts i)]
+                            (recur (+ i 1) (vector-assoc! out i (if (= c -1) 1 c))))))]
+            (if (not= (record-get [:ref :zstd/placement] placed :position) 0)
+              (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+              (loop [i 0 states nexts out (vector-alloc (* size 3))]
+                (if (= i size) (result-ok-of [:result :vector-i64 :keyword] out)
+                  (let [s (vector-at symbols i)]
+                    (if (or (< s 0) (>= s n)) (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+                      (let [state (vector-at states s)
+                            highbit (loop [v state k -1] (if (= v 0) k (recur (quot v 2) (+ k 1))))
+                            bits (- log highbit) new-state (- (* state (i64-shift-left 1 bits)) size)
+                            j (* i 3)]
+                        (if (or (< highbit 0) (< bits 0) (< new-state 0) (> new-state (- size 1)))
+                          (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+                          (recur (+ i 1) (vector-assoc! states s (+ state 1))
+                            (vector-assoc! (vector-assoc! (vector-assoc! out j s) (+ j 1) bits) (+ j 2) new-state)))))))))))))))
+
+;; This parses the sequence section header only. Table modes and streams must
+;; still be decoded and checked against the containing compressed block.
+(defn parse-sequences [b :vector-i64 pos :i64 end :i64 cap :i64] [:ref :zstd/sequences]
+  (let [n (vector-count b)]
+    (cond (< cap 0) (sequences-failure :invalid-bound)
+          (or (< pos 0) (< end pos) (> end n) (= pos end)) (sequences-failure :truncated)
+          :else
+          (let [a (vector-at b pos) width (cond (< a 128) 1 (< a 255) 2 :else 3)]
+            (cond (or (< a 0) (> a 255)) (sequences-failure :invalid-byte)
+                  (< (- end pos) width) (sequences-failure :truncated)
+                  :else
+                  (let [c (if (> width 1) (vector-at b (+ pos 1)) 0)
+                        d (if (> width 2) (vector-at b (+ pos 2)) 0)
+                        count (cond (= width 1) a (= width 2) (+ (* (- a 128) 256) c)
+                                    :else (+ 32512 c (* d 256)))
+                        next (+ pos width)]
+                    (cond (or (< c 0) (> c 255) (< d 0) (> d 255)) (sequences-failure :invalid-byte)
+                          (> count cap) (sequences-failure :sequence-limit)
+                          (= count 0) (record-new [:ref :zstd/sequences] :none next 0 0 0 0)
+                          (= next end) (sequences-failure :truncated)
+                          :else (let [m (vector-at b next)]
+                                  (cond (or (< m 0) (> m 255)) (sequences-failure :invalid-byte)
+                                        (not= (bit-and m 3) 0) (sequences-failure :reserved-bits)
+                                        :else (record-new [:ref :zstd/sequences] :none (+ next 1) count
+                                               (bit-and (u64-shift-right m 6) 3)
+                                               (bit-and (u64-shift-right m 4) 3)
+                                               (bit-and (u64-shift-right m 2) 3)))))))))))
+
+;; Reverse bit position counts down from the end, including the marker and
+;; its leading padding. Zero-extension is visible in :next: the caller must
+;; apply the sequence/Huffman stream's own end-of-stream validity rules.
+(defn reverse-start [b :vector-i64 start :i64 end :i64] [:ref :zstd/reverse]
+  (cond (or (< start 0) (<= end start) (> end (vector-count b)) (> (- end start) 16777216))
+          (reverse-failure :invalid-range)
+        :else (let [last (vector-at b (- end 1))]
+          (cond (or (< last 0) (> last 255)) (reverse-failure :invalid-byte)
+                (= last 0) (reverse-failure :missing-marker)
+                :else (loop [i 7]
+                        (if (not= (bit-and last (i64-shift-left 1 i)) 0)
+                          (record-new [:ref :zstd/reverse] :none (- 8 i) 0)
+                          (recur (- i 1))))))))
+(defn reverse-read [b :vector-i64 start :i64 end :i64 pos :i64 width :i64] [:ref :zstd/reverse]
+  (cond (or (< start 0) (<= end start) (> end (vector-count b)) (> (- end start) 16777216))
+          (reverse-failure :invalid-range)
+        (or (< pos 0) (> pos (+ (* (- end start) 8) 32)) (< width 0) (> width 32))
+          (reverse-failure :invalid-bound)
+        :else (let [total (* (- end start) 8)]
+          (loop [i 0 value 0]
+            (if (= i width) (record-new [:ref :zstd/reverse] :none (+ pos width) value)
+              (let [p (+ pos i) bit-index (- total 1 p)]
+                (if (>= p total) (recur (+ i 1) (* value 2))
+                  (let [x (vector-at b (+ start (quot bit-index 8)))]
+                    (if (or (< x 0) (> x 255)) (reverse-failure :invalid-byte)
+                      (recur (+ i 1) (+ (* value 2) (bit-and (u64-shift-right x (rem bit-index 8)) 1))))))))))))
+
+;; A sequence can read several fields at once, but never beyond the marker-
+;; delimited bitstream. Result is [next-position value...].
+(defn- read-widths [b :vector-i64 start :i64 end :i64 pos :i64 widths :vector-i64] [:result :vector-i64 :keyword]
+  (let [n (vector-count widths) total (* (- end start) 8)]
+    (loop [i 0 p pos out (vector-alloc (+ n 1))]
+      (if (= i n) (result-ok-of [:result :vector-i64 :keyword] (vector-assoc! out 0 p))
+        (let [width (vector-at widths i)]
+          (if (> (+ p width) total) (result-err-of [:result :vector-i64 :keyword] :truncated)
+            (let [r (reverse-read b start end p width) e (record-get [:ref :zstd/reverse] r :error)]
+              (if (not= e :none) (result-err-of [:result :vector-i64 :keyword] e)
+                (recur (+ i 1) (record-get [:ref :zstd/reverse] r :next)
+                       (vector-assoc! out (+ i 1) (record-get [:ref :zstd/reverse] r :value)))))))))))
+
+(defn- length-code [code :i64 match :bool] :vector-i64
+  (let [direct (if match 32 16)
+        extras (if match (vector-i64 1 1 1 1 2 2 3 3 4 4 5 7 8 9 10 11 12 13 14 15 16)
+                         (vector-i64 1 1 1 1 2 2 3 3 4 6 7 8 9 10 11 12 13 14 15 16))]
+    (if (< code direct) (vector-i64 (+ code (if match 3 0)) 0)
+      (let [idx (- code direct)]
+        (loop [i 0 base (if match 35 16)]
+          (if (= i idx) (vector-i64 base (vector-at extras i))
+            (recur (+ i 1) (+ base (i64-shift-left 1 (vector-at extras i))))))))))
+
+;; Decode sequence triples [literal-length match-length offset-value] in
+;; predefined mode. Dynamic/RLE/repeat table modes are refused explicitly.
+(defn decode-predefined-sequences [b :vector-i64 pos :i64 end :i64 cap :i64] [:result :vector-i64 :keyword]
+  (let [h (parse-sequences b pos end cap) e (record-get [:ref :zstd/sequences] h :error)
+        count (record-get [:ref :zstd/sequences] h :count) start (record-get [:ref :zstd/sequences] h :next)]
+    (cond (not= e :none) (result-err-of [:result :vector-i64 :keyword] e)
+          (= count 0) (if (= start end) (result-ok-of [:result :vector-i64 :keyword] (vector-i64))
+                        (result-err-of [:result :vector-i64 :keyword] :trailing-bits))
+          (or (not= (record-get [:ref :zstd/sequences] h :ll) 0)
+              (not= (record-get [:ref :zstd/sequences] h :offset) 0)
+              (not= (record-get [:ref :zstd/sequences] h :match) 0))
+            (result-err-of [:result :vector-i64 :keyword] :table-mode-unsupported)
+          :else
+          (let [ll (result-value-of [:result :vector-i64 :keyword]
+                     (fse-table (vector-i64 4 3 2 2 2 2 2 2 2 2 2 2 2 1 1 1 2 2 2 2 2 2 2 2 2 3 2 1 1 1 1 1 -1 -1 -1 -1) 6) (vector-i64))
+                ml (result-value-of [:result :vector-i64 :keyword]
+                     (fse-table (vector-i64 1 4 3 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1) 6) (vector-i64))
+                of (result-value-of [:result :vector-i64 :keyword]
+                     (fse-table (vector-i64 1 1 1 1 1 1 2 2 2 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1) 5) (vector-i64))
+                marker (reverse-start b start end)]
+            (if (not= (record-get [:ref :zstd/reverse] marker :error) :none)
+              (result-err-of [:result :vector-i64 :keyword] (record-get [:ref :zstd/reverse] marker :error))
+              (let [init (read-widths b start end (record-get [:ref :zstd/reverse] marker :next) (vector-i64 6 5 6))]
+                (if (not (result-ok?-of [:result :vector-i64 :keyword] init))
+                  (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result :vector-i64 :keyword] init :truncated))
+                  (let [v (result-value-of [:result :vector-i64 :keyword] init (vector-i64))]
+                    (loop [i 0 p (vector-at v 0) ls (vector-at v 1) os (vector-at v 2) ms (vector-at v 3)
+                           out (vector-alloc (* count 3))]
+                      (if (= i count)
+                        (if (= p (* (- end start) 8)) (result-ok-of [:result :vector-i64 :keyword] out)
+                          (result-err-of [:result :vector-i64 :keyword] :trailing-bits))
+                        (if (or (< ls 0) (>= ls 64) (< os 0) (>= os 32) (< ms 0) (>= ms 64))
+                          (result-err-of [:result :vector-i64 :keyword] :invalid-state)
+                          (let [li (* ls 3) oi (* os 3) mi (* ms 3)
+                                lc (vector-at ll li) oc (vector-at of oi) mc (vector-at ml mi)
+                                l (length-code lc false) m (length-code mc true) last (= (+ i 1) count)
+                                widths (vector-i64 oc (vector-at m 1) (vector-at l 1)
+                                         (if last 0 (vector-at ll (+ li 1)))
+                                         (if last 0 (vector-at ml (+ mi 1)))
+                                         (if last 0 (vector-at of (+ oi 1))))
+                                r (read-widths b start end p widths)]
+                            (if (not (result-ok?-of [:result :vector-i64 :keyword] r))
+                              (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result :vector-i64 :keyword] r :truncated))
+                              (let [x (result-value-of [:result :vector-i64 :keyword] r (vector-i64)) j (* i 3)]
+                                (recur (+ i 1) (vector-at x 0)
+                                  (+ (vector-at ll (+ li 2)) (vector-at x 4))
+                                  (+ (vector-at of (+ oi 2)) (vector-at x 6))
+                                  (+ (vector-at ml (+ mi 2)) (vector-at x 5))
+                                  (vector-assoc! (vector-assoc! (vector-assoc! out j (+ (vector-at l 0) (vector-at x 3)))
+                                                 (+ j 1) (+ (vector-at m 0) (vector-at x 2)))
+                                                 (+ j 2) (+ (i64-shift-left 1 oc) (vector-at x 1))))))))))))))))))
+
+;; Parse one raw/RLE literal section inside a bounded compressed block. The
+;; returned next offset starts the sequence section, not the end of the block.
+(defn decode-literals [b :vector-i64 pos :i64 end :i64 limit :i64] [:ref :zstd/literals]
+  (let [n (vector-count b)]
+    (cond (< limit 0) (literals-failure :invalid-bound)
+          (or (< pos 0) (< end pos) (> end n) (= pos end)) (literals-failure :truncated)
+          :else
+          (let [a (vector-at b pos) kind (bit-and a 3) format (bit-and (u64-shift-right a 2) 3)
+                width (cond (or (= format 0) (= format 2)) 1 (= format 1) 2 :else 3)]
+            (cond (or (< a 0) (> a 255)) (literals-failure :invalid-byte)
+                  (> kind 1) (literals-failure :huffman-unsupported)
+                  (< (- end pos) width) (literals-failure :truncated)
+                  :else
+                  (let [c (if (> width 1) (vector-at b (+ pos 1)) 0)
+                        d (if (> width 2) (vector-at b (+ pos 2)) 0)
+                        size (if (= width 1) (u64-shift-right a 3)
+                               (+ (u64-shift-right a 4) (* c 16) (* d 4096)))
+                        start (+ pos width) payload (if (= kind 1) 1 size)]
+                    (cond (or (< c 0) (> c 255) (< d 0) (> d 255)) (literals-failure :invalid-byte)
+                          (> size 131072) (literals-failure :block-limit)
+                          (> size limit) (literals-failure :output-limit)
+                          (> payload (- end start)) (literals-failure :truncated)
+                          (and (= kind 1) (or (< (vector-at b start) 0) (> (vector-at b start) 255)))
+                            (literals-failure :invalid-byte)
+                          :else (loop [i 0 out (vector-alloc size)]
+                                  (if (= i size) (record-new [:ref :zstd/literals] :none (+ start payload) out)
+                                    (let [x (vector-at b (if (= kind 1) start (+ start i)))]
+                                      (if (or (< x 0) (> x 255)) (literals-failure :invalid-byte)
+                                        (recur (+ i 1) (vector-assoc! out i x)))))))))))))
+
+;; Header only: the caller must bound and read payload-size bytes, decode the
+;; block, and enforce the output limit before accepting content.
+(defn parse-block [b :vector-i64 pos :i64 window :i64] [:ref :zstd/block-header]
+  (let [n (vector-count b)]
+    (cond
+      (< window 0) (block-failure :invalid-bound)
+      (or (< pos 0) (> pos n) (< (- n pos) 3)) (block-failure :truncated)
+      :else
+      (let [a (vector-at b pos) c (vector-at b (+ pos 1)) d (vector-at b (+ pos 2))]
+        (if (or (< a 0) (> a 255) (< c 0) (> c 255) (< d 0) (> d 255))
+          (block-failure :invalid-byte)
+          (let [v (+ a (* c 256) (* d 65536)) kind (bit-and (u64-shift-right v 1) 3)
+                size (u64-shift-right v 3) max-size (if (< window 131072) window 131072)]
+            (cond (= kind 3) (block-failure :reserved-type)
+                  (> size max-size) (block-failure :block-limit)
+                  :else (record-new [:ref :zstd/block-header] :none (bit-and v 1) kind size
+                                    (if (= kind 1) 1 size)))))))))
+
+;; Decode exactly one already-framed raw or RLE block. Compressed blocks are
+;; explicitly unsupported until the entropy decoder is implemented.
+(defn decode-raw-rle [b :vector-i64 pos :i64 window :i64 limit :i64] [:result :vector-i64 :keyword]
+  (let [header (parse-block b pos window)
+        error (record-get [:ref :zstd/block-header] header :error)
+        kind (record-get [:ref :zstd/block-header] header :kind)
+        size (record-get [:ref :zstd/block-header] header :size)
+        payload (record-get [:ref :zstd/block-header] header :payload-size)]
+    (cond (< limit 0) (result-err-of [:result :vector-i64 :keyword] :invalid-bound)
+          (not= error :none) (result-err-of [:result :vector-i64 :keyword] error)
+          (= kind 2) (result-err-of [:result :vector-i64 :keyword] :compressed-unsupported)
+          (> size limit) (result-err-of [:result :vector-i64 :keyword] :output-limit)
+          (> payload (- (vector-count b) (+ pos 3))) (result-err-of [:result :vector-i64 :keyword] :truncated)
+          (and (= kind 1) (or (< (vector-at b (+ pos 3)) 0) (> (vector-at b (+ pos 3)) 255)))
+            (result-err-of [:result :vector-i64 :keyword] :invalid-byte)
+          :else
+          (let [start (+ pos 3)]
+            (loop [i 0 out (vector-alloc size)]
+              (if (= i size) (result-ok-of [:result :vector-i64 :keyword] out)
+                (let [x (vector-at b (if (= kind 1) start (+ start i)))]
+                  (if (or (< x 0) (> x 255))
+                    (result-err-of [:result :vector-i64 :keyword] :invalid-byte)
+                    (recur (+ i 1) (vector-assoc! out i x))))))))))
+
+(defn- bytes-valid [b :vector-i64 n :i64] :bool
+  (loop [i 0]
+    (if (= i n) true
+      (let [x (vector-at b i)]
+        (if (or (< x 0) (> x 255)) false (recur (+ i 1)))))))
+
+;; Caller verifies available bytes and rejects a high signed bit for n=8.
+(defn- little [b :vector-i64 pos :i64 n :i64] :i64
+  (loop [i (- n 1) value 0]
+    (if (< i 0) value
+      (recur (- i 1) (+ (* value 256) (vector-at b (+ pos i)))))))
+
+(defn parse [b :vector-i64 max-window :i64 max-content :i64] [:ref :zstd/header]
+  (let [n (vector-count b)]
+    (cond
+      (or (< max-window 0) (< max-content 0)) (failure :invalid-bound)
+      (< n 5) (failure :truncated)
+      (not (bytes-valid b 5)) (failure :invalid-byte)
+      (or (not= (vector-at b 0) 40) (not= (vector-at b 1) 181)
+          (not= (vector-at b 2) 47) (not= (vector-at b 3) 253)) (failure :magic)
+      :else
+      (let [d (vector-at b 4) size-flag (bit-and (u64-shift-right d 6) 3)
+            single (bit-and (u64-shift-right d 5) 1)
+            dict-flag (bit-and d 3)
+            dict-size (cond (= dict-flag 0) 0 (= dict-flag 1) 1 (= dict-flag 2) 2 :else 4)
+            size-bytes (cond (= size-flag 0) single (= size-flag 1) 2 (= size-flag 2) 4 :else 8)
+            window-bytes (if (= single 1) 0 1)
+            dict-pos (+ 5 window-bytes) size-pos (+ dict-pos dict-size)
+            end (+ size-pos size-bytes)]
+        (cond
+          (not= (bit-and d 8) 0) (failure :reserved-bit)
+          (> end n) (failure :truncated)
+          (not (bytes-valid b end)) (failure :invalid-byte)
+          (and (= size-bytes 8) (>= (vector-at b (+ size-pos 7)) 128)) (failure :content-limit)
+          :else
+          (let [size (if (= size-bytes 0) -1
+                       (+ (little b size-pos size-bytes) (if (= size-bytes 2) 256 0)))
+                wd (if (= single 1) 0 (vector-at b 5))
+                exponent (u64-shift-right wd 3) mantissa (bit-and wd 7)
+                base (if (= single 1) 0 (i64-shift-left 1 (+ 10 exponent)))
+                window (if (= single 1) size (+ base (* (u64-shift-right base 3) mantissa)))]
+            (cond
+              ;; Match the existing portable decoder's conservative profile:
+              ;; any explicit dictionary field is refused, including ID 0.
+              (> dict-size 0) (failure :dictionary-required)
+              (> window max-window) (failure :window-limit)
+              (> size max-content) (failure :content-limit)
+              :else (record-new [:ref :zstd/header] :none end window size
+                                 (bit-and (u64-shift-right d 2) 1)))))))))
+
+(defn- decoded-block-failure [reason :keyword] [:ref :zstd/decoded-block]
+  (record-new [:ref :zstd/decoded-block] reason 0 (vector-i64) (vector-i64)))
+
+;; Integrated compressed-block path for raw/RLE literals and predefined FSE
+;; tables. This does not assemble or authenticate a whole frame.
+(defn decode-predefined-block [b :vector-i64 pos :i64 end :i64 history :vector-i64 reps :vector-i64 window :i64 cap :i64] [:ref :zstd/decoded-block]
+  (cond (or (< window 0) (< cap 0)) (decoded-block-failure :invalid-bound)
+        (or (< pos 0) (< end pos) (> end (vector-count b)) (< (- end pos) 3))
+          (decoded-block-failure :truncated)
+        :else
+        (let [header (parse-block b pos window) e (record-get [:ref :zstd/block-header] header :error)
+              kind (record-get [:ref :zstd/block-header] header :kind)
+              size (record-get [:ref :zstd/block-header] header :payload-size) start (+ pos 3)]
+          (cond (not= e :none) (decoded-block-failure e)
+                (not= kind 2) (decoded-block-failure :block-type-unsupported)
+                (> size (- end start)) (decoded-block-failure :truncated)
+                :else
+                (let [block-end (+ start size) limit (if (< cap 131072) cap 131072)
+                      literals (decode-literals b start block-end limit)
+                      le (record-get [:ref :zstd/literals] literals :error)]
+                  (if (not= le :none) (decoded-block-failure le)
+                    (let [seqs (decode-predefined-sequences b (record-get [:ref :zstd/literals] literals :next)
+                                                           block-end (quot limit 3))]
+                      (if (not (result-ok?-of [:result :vector-i64 :keyword] seqs))
+                        (decoded-block-failure (result-error-of [:result :vector-i64 :keyword] seqs :invalid-sequences))
+                        (let [out (execute-sequences history (record-get [:ref :zstd/literals] literals :bytes)
+                                                     (result-value-of [:result :vector-i64 :keyword] seqs (vector-i64))
+                                                     reps window cap)
+                              oe (record-get [:ref :zstd/execution] out :error)]
+                          (if (not= oe :none) (decoded-block-failure oe)
+                            (record-new [:ref :zstd/decoded-block] :none block-end
+                              (record-get [:ref :zstd/execution] out :bytes)
+                              (record-get [:ref :zstd/execution] out :reps))))))))))))
+
+(defn- frame-failure [reason :keyword] [:ref :zstd/frame-output]
+  (record-new [:ref :zstd/frame-output] reason 0 (vector-i64)))
+(defn- frame-copy [out :vector-i64 at :i64 bytes :vector-i64] :vector-i64
+  (loop [i 0 v out]
+    (if (= i (vector-count bytes)) v
+      (recur (+ i 1) (vector-assoc! v (+ at i) (vector-at bytes i))))))
+(defn- frame-prefix [b :vector-i64 pos :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)]
+    (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at b (+ pos i)))))))
+
+;; Bounded, checksum-free subset: raw/RLE blocks and compressed blocks with
+;; raw/RLE literals and predefined FSE tables. Other modes fail closed.
+(defn decode-frame [b :vector-i64 pos :i64 end :i64 max-window :i64 max-output :i64] [:ref :zstd/frame-output]
+  (cond (or (< max-window 0) (< max-output 0) (> max-output 16777216)) (frame-failure :invalid-bound)
+        (or (< pos 0) (< end pos) (> end (vector-count b)) (> (- end pos) 16777216)) (frame-failure :invalid-range)
+        :else
+        (let [available (- end pos) prefix (if (< available 18) available 18)
+              h (parse (frame-prefix b pos prefix) max-window max-output)
+              e (record-get [:ref :zstd/header] h :error)]
+          (cond (not= e :none) (frame-failure e)
+                (not= (record-get [:ref :zstd/header] h :checksum) 0) (frame-failure :checksum-unsupported)
+                :else
+                (let [window (record-get [:ref :zstd/header] h :window-size)
+                      declared (record-get [:ref :zstd/header] h :content-size)]
+                  (loop [p (+ pos (record-get [:ref :zstd/header] h :header-size)) used 0
+                         reps (vector-i64 1 4 8) out (vector-alloc max-output)]
+                    (if (< (- end p) 3) (frame-failure :truncated)
+                      (let [bh (parse-block b p window) be (record-get [:ref :zstd/block-header] bh :error)
+                            kind (record-get [:ref :zstd/block-header] bh :kind)
+                            payload (record-get [:ref :zstd/block-header] bh :payload-size)
+                            start (+ p 3)]
+                        (cond (not= be :none) (frame-failure be)
+                              (> payload (- end start)) (frame-failure :truncated)
+                              :else
+                              (let [next (+ start payload)
+                                    compressed (if (= kind 2)
+                                                 (decode-predefined-block b p next (vector-take out used) reps window (- max-output used))
+                                                 (decoded-block-failure :block-type-unsupported))
+                                    raw (if (= kind 2) (result-err-of [:result :vector-i64 :keyword] :block-type-unsupported)
+                                          (decode-raw-rle b p window (- max-output used)))
+                                    err (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :error)
+                                          (result-error-of [:result :vector-i64 :keyword] raw :none))]
+                                (if (not= err :none) (frame-failure err)
+                                  (let [block (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :bytes)
+                                                (result-value-of [:result :vector-i64 :keyword] raw (vector-i64)))
+                                        nr (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :reps) reps)
+                                        total (+ used (vector-count block)) updated (frame-copy out used block)]
+                                    (if (= (record-get [:ref :zstd/block-header] bh :last) 1)
+                                      (if (and (not= declared -1) (not= declared total)) (frame-failure :size-mismatch)
+                                        (record-new [:ref :zstd/frame-output] :none next (vector-take updated total)))
+                                      (recur next total nr updated))))))))))))))
