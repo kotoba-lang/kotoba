@@ -164,3 +164,30 @@ signed commit. The experiment reads two selected blocks, not the complete
 1 GiB. It does not prove a production Native catalog/writer, concurrent file
 snapshot, guest or host cache loss, or power-loss durability. Other platforms
 and exact-head CI are separate.
+
+## Native manifest-bound chunk view
+
+`awai.fs.forest-view/read-chunk` makes the earlier fixture composition a
+reusable Native call. It decodes and validates canonical logical-file bytes,
+checks their CID against the caller's expected CID, checks the chunk index,
+derives the CID and length from the manifest row, searches the caller-supplied
+bounded file locations, and requires the returned verified block length to
+match the logical row. It propagates physical read and selected-block errors.
+The caller is responsible for authenticating the expected manifest CID and
+physical locations; index misses remain untrusted and the provider's
+concurrent truncation limitation is unchanged.
+
+On macOS arm64, the Native gate used the preserved 1 GiB Otehon manifest and
+Pack fixtures to retrieve row 16 through this function. It checked wrong root
+and negative/out-of-range indexes against a missing-file location, showing the
+logical rejections happen before file access; it also checked missing-file
+propagation and a valid one-chunk manifest whose declared length conflicts
+with the real CID-addressed block. The combined Native file/view gate passed
+10 positive and negative cases. A separately compiled mutant that ignores the
+view's manifest CID check returned 10 as expected. Positive view source lock:
+`0c09113249ab201b364108a41e58046a337727a50aceca0ab0dae534cf2a0a67`;
+Native executable SHA-256:
+`a6f2e314a93151bc38ebf9750cb491900d674be4710b879b08f06572a6472191`.
+This tests selected blocks, not Native full-file 1 GiB recovery, signed basis,
+atomic publication, or cache/power-loss recovery. Other platforms and
+exact-head CI remain separate.
