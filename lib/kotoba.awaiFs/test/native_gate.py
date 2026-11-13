@@ -26,6 +26,14 @@ def main(a):
     for name,p in zip(roles[target],[compiler,provider]):
         if p.is_symlink() or sha(p)!=pins['files'][name]['sha256']:raise ValueError('native artifact/source pin mismatch')
         if target=='macos-arm64':subprocess.run(['/usr/bin/codesign','--verify','--strict',str(p)],capture_output=True,check=True,timeout=30)
+    io_compiler=None
+    if target=='linux-x86_64':
+        if not a.x86_io_amu:raise ValueError('x86 file I/O compiler checkout is required')
+        io_amu=a.x86_io_amu.resolve();io_pin=pins['x86FileCompiler']
+        revision=subprocess.run(['git','-C',str(io_amu),'rev-parse','HEAD'],capture_output=True,text=True,check=True,timeout=30).stdout.strip()
+        io_compiler=io_amu/io_pin['path']
+        if revision!=io_pin['revision'] or io_compiler.is_symlink() or not io_compiler.is_file() or io_compiler.stat().st_size!=io_pin['bytes'] or sha(io_compiler)!=io_pin['sha256']:
+            raise ValueError('x86 file I/O compiler pin mismatch')
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     runner=None
     if target=='linux-x86_64':
@@ -51,6 +59,7 @@ def main(a):
     zstd_test=REPO/'lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba'
     forest_fixture=ROOT/'test/fixtures/forest-part0.car.zst'
     watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',forest_fixture,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
+    if io_compiler:watched.append(io_compiler)
     inputs={str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p):sha(p) for p in watched}
     initial={p:sha(p) for p in watched};results=[]
     def run_case(kind,index,case,control=None):
@@ -185,8 +194,15 @@ def main(a):
                 binary.chmod(0o700);r=call('execute',[binary],check=False,runtime=True);verdict=r.returncode
             else:
                 binary=directory/'program.kx64'
-                call('compile',[compiler,'compile',entry_arg,'--target','x86_64-linux','--output',binary,'--format','kx64-v1',
-                     '--source-path',src_arg,'--source-lock',lock,'--source-lock-sha256',sha(lock)])
+                selected=io_compiler if file_case else compiler
+                args=[selected,'compile',entry_arg,'--target','x86_64-linux','--output',binary,'--format','kx64-v1',
+                     '--source-path',src_arg,'--source-lock',lock,'--source-lock-sha256',sha(lock)]
+                if file_case:
+                    denied=call('compile-denied',args,check=False)
+                    if denied.returncode==0 or b'E7101' not in denied.stdout+denied.stderr or binary.exists():
+                        raise RuntimeError(('x86 capability denial control failed',denied.returncode,denied.stdout[-500:],denied.stderr[-500:]))
+                    args+=['--project-capabilities','35']
+                call('compile',args)
                 header,payload=binary.read_bytes().split(b'\n\n',1)
                 m=re.fullmatch(rb'KX64V1 x86_64-linux sysv-ctx-v11 ([0-9]+) 0',header)
                 if not m or int(m[1])!=len(payload) or not payload or payload[0]!=0xe9:raise ValueError('invalid Native payload framing')
@@ -235,9 +251,10 @@ def main(a):
     if any(sha(p)!=h for p,h in initial.items()):raise ValueError('input drift during gate')
     receipt={'status':'PASS_NATIVE_AWAI_LOGICAL_FILE','host':[platform.system(),platform.machine(),platform.release()],
              'target':target,'compilerRevision':pins['revision'],'runnerSha256':sha(runner) if runner else None,'inputs':inputs,'cases':results,'allCorpus':not bool(a.only),
+             'x86FileCompilerRevision':pins['x86FileCompiler']['revision'] if io_compiler else None,
              'legacyPacksExecuted':not bool(a.only),'nativeIoQualified':False,'productionQualified':False,'hostedFallback':False}
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(receipt['status'],len(results),flush=True)
 if __name__=='__main__':
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--amu',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--only',action='append');p.add_argument('--target',choices=['macos-arm64','linux-arm64','linux-x86_64'])
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--amu',type=Path,required=True);p.add_argument('--x86-io-amu',type=Path);p.add_argument('--output',type=Path,required=True);p.add_argument('--only',action='append');p.add_argument('--target',choices=['macos-arm64','linux-arm64','linux-x86_64'])
     main(p.parse_args())
