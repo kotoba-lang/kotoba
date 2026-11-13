@@ -152,6 +152,11 @@ def main(a):
             needle='7786c19371f6b8a948e551624e0dd2993ca6c21439bf876f67a14821807b8c88'
             if fixture.count(needle)!=1:raise ValueError('second Forest digest control anchor drift')
             fixture=fixture.replace(needle,'0'+needle[1:])
+        elif control=='allow-group-error-fallback':
+            p=src/'awai/fs/forest_file.kotoba';body=p.read_text()
+            needle='(recur (+ i 1)) r)'
+            if body.count(needle)!=1:raise ValueError('group fallback control anchor drift')
+            p.write_text(body.replace(needle,'(recur (+ i 1)) (recur (+ i 1)))'))
         elif control=='allow-plan-overflow':
             p=src/'awai/fs/chunk_plan.kotoba';body=p.read_text()
             needle='(> count 1024)'
@@ -224,7 +229,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=13 if control=='wrong-second-forest-digest' else 3 if control=='wrong-forest-file-digest' else 137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=20 if control=='allow-group-error-fallback' else 13 if control=='wrong-second-forest-digest' else 3 if control=='wrong-forest-file-digest' else 137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -253,6 +258,7 @@ def main(a):
     if not a.only or 'forest_file_io' in a.only:
         run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'wrong-forest-file-digest')
         run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'wrong-second-forest-digest')
+        run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'allow-group-error-fallback')
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:

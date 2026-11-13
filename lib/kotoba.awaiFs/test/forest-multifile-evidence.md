@@ -30,3 +30,24 @@ This uses two immutable fixture files and one Native process. It does not
 establish concurrent mutation safety, general Forest/Zstd coverage, durable
 publication or recovery, a Native writer, OS-cache loss, GiB scale or product
 qualification. Native tests on other hosts and exact-head CI are separate.
+
+## Ordered Native file search
+
+`get-block-in-files` accepts 1–64 paths and the same number of file sizes.
+It returns the first verified matching block, proceeds only for an individual
+`:no-candidate`, and propagates other errors. A group-level `:no-candidate`
+is also only an untrusted-index outcome: later files are not read after a hit,
+and unread frames/files are not scrubbed. This is an in-memory list of
+locations, not an authenticated catalog or an atomic multi-Pack publication.
+The single-file provider's concurrent truncation limitation still applies.
+
+The macOS arm64 Native gate exercised a hit in the first and second file,
+all-index misses, selected corrupted data, a missing file before a valid file,
+and empty, mismatched and >64 entry bounds. Its Native executable returned 0.
+Independent wrong-digest controls returned 3 and 13. A separate compiled
+negative control that silently continued past all errors returned 20, proving
+the selected corruption test detects that regression. Positive source lock:
+`4e51381e59015da39aad5450cbed5e3d61b10814dff570cd08e0d4050daf477d`;
+Native executable SHA-256:
+`45ca739f184fdd845829db9e09a0353a8e8b8586542a9c772a2475da636b1aad`.
+Other hosts and exact-head CI remain separate.
