@@ -37,6 +37,7 @@ def main(a):
         runner.chmod(0o700)
     source={
         'awai/fs/logical_file.kotoba':ROOT/'src/awai/fs/logical_file.kotoba',
+        'awai/fs/chunk_plan.kotoba':ROOT/'src/awai/fs/chunk_plan.kotoba',
         'ipld/car/pack.kotoba':REPO/'lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba',
         'ipld/dag_cbor_write.kotoba':REPO/'lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba',
         **{f'multiformats/{name}.kotoba':REPO/f'lib/kotoba.ioMultiformats/src/multiformats/{name}.kotoba' for name in ['cid','byte_cid','sha256']}}
@@ -50,6 +51,7 @@ def main(a):
         name=f'{kind}-{index}'+('-'+control if control else '')
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
         for relative_name,original in source.items():
+            if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
             if kind=='primitive' and case['name']=='pack_values' and relative_name=='awai/fs/logical_file.kotoba':continue
@@ -59,6 +61,11 @@ def main(a):
             old=json.dumps(case['cid']);new=json.dumps(case['cid'][:-1]+('a' if case['cid'][-1]!='a' else 'b'))
             if old not in fixture:raise ValueError('golden control anchor drift')
             fixture=fixture.replace(old,new)
+        elif control=='allow-plan-overflow':
+            p=src/'awai/fs/chunk_plan.kotoba';body=p.read_text()
+            needle='(> count 1024)'
+            if body.count(needle)!=1:raise ValueError('native mutation anchor drift')
+            p.write_text(body.replace(needle,'false'))
         elif control:
             p=src/'awai/fs/logical_file.kotoba';body=p.read_text()
             needle={'allow-file-version':'(not= (record-get [:ref :awai.fs/file] f :version) 1)',
@@ -117,7 +124,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -128,12 +135,13 @@ def main(a):
             if not a.only or case['name'] in a.only:run_case(kind,i,case)
     for i,case in enumerate(data['legacyPacks']['cases']):
         if not a.only or case['name'] in a.only:run_case('pack',i,dict(case,wireHex=case['carHex']))
-    for i,name in enumerate(['writer','values','pack_values']):
+    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values']):
         if not a.only or name in a.only:run_case('primitive',i,{'name':name,'file':name+'.kotoba'})
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:
             i=next(i for i,c in enumerate(data['negative']) if c['name']==name);run_case('negative',i,data['negative'][i],control)
+        run_case('primitive',3,{'name':'chunk_plan_values','file':'chunk_plan_values.kotoba'},'allow-plan-overflow')
     if any(sha(p)!=h for p,h in initial.items()):raise ValueError('input drift during gate')
     receipt={'status':'PASS_NATIVE_AWAI_LOGICAL_FILE','host':[platform.system(),platform.machine(),platform.release()],
              'target':target,'compilerRevision':pins['revision'],'runnerSha256':sha(runner) if runner else None,'inputs':inputs,'cases':results,'allCorpus':not bool(a.only),

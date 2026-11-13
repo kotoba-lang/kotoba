@@ -64,9 +64,11 @@ Each case gets a fresh process/output directory and complete source lock.
 hashes, rejects failed builds, and never reuses an older artifact after failure.
 
 The Native gate runs 11 logical positives, 36 wire refusals, all six frozen
-legacy Pack/CAR constructors, three primitive suites and three separately
-built/executed wrong-golden, version-guard and link-codec mutants: 59 Native
-executions per target. The primitive suites include the writer's six original
+legacy Pack/CAR constructors, four primitive suites and four separately
+built/executed wrong-golden, version-guard, link-codec and chunk-count mutants: 61 Native
+executions per target. Existing 2026-11-11 receipts cover the previous 59-case
+gate; the expanded planner gate must pass separately on each target. The
+primitive suites include the writer's six original
 golden groups, input aliasing/70000-byte boundary, direct typed/leaf refusals
 and Pack bounds/refusals. Mac ARM64 and Linux ARM64 local receipts are recorded;
 the same gate runs on real macOS ARM64, Linux ARM64 and Linux x86_64 CI hosts.
@@ -106,3 +108,20 @@ Native I/O, OS-cache-loss reboot, power loss, independent nodes/EC/repair,
 private-tree/query semantics, signed authority, production acceptance and
 performance thresholds remain separate. The maximum-size case is metadata
 only; it does not allocate or verify a 16 GiB file. The legacy Pack vectors qualify only the constructor subset described above.
+
+## Logical extent planning
+
+`src/awai/fs/chunk_plan.kotoba` ports the bounded logical extent operation
+from Otehon's `awai.fs.large-file/chunk-plan`: a file size and an admitted
+fixed profile produce flat `[index offset length ...]` rows. Empty, exact and
+partial final leaves match the recorded JVM and nbb reference values in
+`docs/evidence/chunk-plan-oracle-20261113.md`. It rejects an invalid profile,
+negative or out-of-range size, and more than 1024 chunks. The 16GiB boundary
+test plans metadata only. Otehon's general unbounded planner is not made
+equivalent beyond this Native profile.
+
+The planner does not choose media, Pack size, placement, offset in a Pack,
+perform I/O, compute a CID or connect an Awai, Kotobase or Yataverse adapter.
+Logical-file v1's original codec, corpus and pinned Otehon consumer source are
+unchanged. See `docs/shared-storage-source-map-20261113.md` for the audited
+owners and connection sequence.
