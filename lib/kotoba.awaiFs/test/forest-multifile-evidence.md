@@ -109,3 +109,32 @@ This exercises one seeded, essentially incompressible frame and does not prove
 all Zstd modes, stable concurrent file identity, Native publication, a 1 GiB
 Native read, cache-loss recovery or production qualification. Other platforms
 and exact-head CI require their own results.
+
+## Native lookup into the 1 GiB Otehon fixture
+
+Two checked-in Forest files are byte-for-byte copies of the first two Packs
+from the prior 1 GiB sparse AWAI-532 fixture, whose logical manifest CID is
+`bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy`.
+The source file was highly compressible and its SHA-256 was
+`dd4ec50fea8f5a68daf225da4945af367e25bb870a09346060fa9dc088c001b0`.
+The Pack SHA-256 values are
+`932d89b5e28f61bba5a2fd644b04e8201186218afa90ae5194d8434dbabe6b4f`
+and `aa2f7daab2da7bc8f145e439748589e64d7ea1c72b716de0532738a40627bdfc`.
+A fresh Otehon recovery of all 64 Packs and `forest/verify-file` of these two
+identified 1 MiB blocks whose SHA-256 digests are
+`6ffb6ccd5ca18062fb3e6175f6682800e623056b77256e074f1fef9ceb10b900` and
+`ad1925fe80c09fb367e0a7b3630232403b03161c78f50e432b48dc723258f4c0`.
+
+The pinned macOS arm64 Native gate read the first selected block directly and
+the second through ordered multi-file lookup. It checked both full block sizes
+and digests. An independently compiled wrong-second-Pack digest returned 38;
+other digest and error-swallowing controls returned their expected failures.
+Positive source lock:
+`877462795970f0908fbf74b48b61fd2cd6e0df699e4fb4b07f17f6bc706aeaae`;
+Native executable SHA-256:
+`5d87e5fad7a43a1dfd4f731ee742b96a360fbc3828a8d97f8890adb3c9c9beb9`.
+This reads two selected blocks from two real Packs, not all 1 GiB or all 64
+Packs in Native. The Native caller receives the locations and CIDs as fixture
+inputs; the Otehon logical manifest or root is not authenticated by Native.
+OS cache loss, concurrent mutation, Native publication and other platforms
+remain separate evidence requirements.
