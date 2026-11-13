@@ -241,3 +241,23 @@ test SHA-256
 This is a single predefined-mode block with raw literals, not generic Zstd,
 whole-frame assembly, checksum validation, Forest index access or Native I/O.
 The JVM oracle remains a local reference, not a build or runtime dependency.
+
+## Integrated predefined compressed-block path
+
+`decode-predefined-block` connects block admission, raw/RLE literals, bounded
+predefined FSE sequences and sequence execution. With the full 348 bytes at
+fixture offsets 74..421 as input it returns the next offset 348, 65,575 output
+bytes with the same SHA-256 and repeat offsets as the block oracle above. A
+second test prefixes the actual six-byte frame header and checks the nonzero
+block offset and equal output. Truncated input, output cap and wrong block type
+are refused; independently mutating the integrated expected digest returns 108.
+The pinned macOS Native gate passed this positive case and nine independent
+controls. Exact-head cross-platform CI remains separate.
+
+This supports only raw/RLE literals and predefined sequence tables, with
+strict bitstream consumption. It is not a general Zstd decoder, complete frame
+or checksum verifier, Forest index reader, Native I/O or production evidence.
+Native source SHA-256
+`44730a8edc0b82e8866edd2d050b5a96ec315a5c386732c8f18cabed1b43c024`;
+test SHA-256
+`a8fd5bb064687264ab7920c3cbc6d3d8c610f46b01b433bac06c870798f97bb6`.
