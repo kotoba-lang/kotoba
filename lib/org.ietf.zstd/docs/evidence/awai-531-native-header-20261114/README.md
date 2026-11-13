@@ -86,3 +86,6 @@ window control (12), and an independently compiled wrong block-size control
 (28). The updated three-platform CI must be checked on its own revision.
 Parser SHA-256 `d27e62dc4d1f2aaf77220dafc41384eccd046cb3f6dd405fab928dbffdcc97f3`;
 test SHA-256 `68363c1abf3a46a5e60087ca9bc548d17db6876bace5fc8f43489f960280fff6`.
+After correcting the source preamble to mention both header types, parser
+SHA-256 became `51f49522176b8442d1febe688897e34eb8c52c97d9860e8824d852409561d80d`;
+the same three macOS Native gate cases were rerun and passed.
