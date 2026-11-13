@@ -107,3 +107,25 @@ checked. Parser SHA-256
 `f81baf23321de07b020c1ef9fc2aadf796dc1c94be76c52341a4dbea0e05e8fe`,
 test SHA-256
 `f97ef9e2a26c6f549a74b60cda64f2bcebcbc288929db13e80800e5775b097bb`.
+
+## Compressed-block raw literals
+
+The second frame of the same Forest fixture begins a compressed block. Its
+raw literals section starts at absolute offset 77 with header `74 12`, which
+declares 295 bytes; those bytes have SHA-256
+`a2521f5f723cb192bdac6c1cd080b95e50f7439539dee3e835744981b77936c2`.
+Native code now reads raw and RLE literal sections with an explicit containing
+block end and output cap, returns the sequence-section offset, and refuses
+truncation, invalid bytes, overlarge output and unsupported Huffman literals.
+The caller must also supply the applicable remaining block/window budget.
+The test compares all 295 fixture literals, not just the header. A separate
+literal-byte mutation causes native result 52; positive, window, block-size,
+raw-byte and literal-byte controls returned 0, 12, 28, 42 and 52 on macOS
+arm64. The test checks 1/2/3-byte headers, RLE, end bounds and refusals.
+
+This still cannot decode the fixture's sequences or whole compressed block,
+and does not implement frame assembly, checksums, Forest index or Native I/O.
+Exact-head CI remains separate. Native source SHA-256
+`cff144c8b5452c480fe7cab02bb824db90b89d60dd0fc45859a0cf0f41d9567d`;
+test SHA-256
+`59cd525564e2467ceaff9d916310cf5f3fa0359489ca19bfb599f69132348743`.
