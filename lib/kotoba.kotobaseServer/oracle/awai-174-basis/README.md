@@ -36,3 +36,14 @@ individual test vars selected by `clojure.test/test-vars`; full exact commands
 and outputs remain in the task scratch. No dependencies were downloaded for
 this run. Signed basis, revocation freshness, durable receipt and Native query
 remain open; a pinned read basis alone establishes none of them.
+
+## Extended read surfaces — 2026-11-13 UTC
+
+The same moving-head test now also covers `datoms` and `basisT`. With the
+old handler the protected datom leaks via `datoms` and `basisT` returns the
+new head; both surfaces fetch the head twice. Old handler: 1 test, 10 passes,
+8 expected failures. Fixed handler: 1 test, 18 passes, no failures or errors.
+The input hashes for this additional run are in `inputs-expanded.json`; the
+earlier run and its hashes above remain unchanged. The test source SHA-256 is
+`696656e1e6cf63221f04938aaa76adef3e0a055502ec95d460f01ae4d2e601c5`. The same local
+Clojure oracle, adaptations and coverage limits apply.
