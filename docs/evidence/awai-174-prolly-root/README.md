@@ -150,3 +150,23 @@ node .agent-output/cljs-provider.js
 ```
 
 Candidate output: `provider corrupt head and metadata rejected before following links`.
+
+### 2026-11-13: asynchronous provider reads a disk fixture
+
+The `oracle/awai-174/provider_disk.cljs` driver uses a read-only, Promise-based
+filesystem block backend to open the same JVM-written 12-block fixture and
+physical root recorded above. The candidate provider restored it in a separate
+Node 26.0.0 process and its real asynchronous cursor returned `after` at the
+current basis and `before` at `:as-of 1`; eight block reads were observed. The
+fixture uses identity encryption and synthetic blinding, so this is neither a
+real policy/receipt nor an encrypted, Native, remote-storage or OS-cache-loss
+qualification. The driver's SHA-256 is
+`f9122bef667982ebe28ca37f92d2d4b22fbe4a2beb5196d53b81df579d765158`.
+
+With the v5 classpath and source adaptations above, copy this driver as
+`awai_oracle/provider_disk.cljs`, compile it using ClojureScript 1.12.42 with
+`:target :nodejs` and `-c awai-oracle.provider-disk`, then run the generated
+Node script from the experiment worktree containing the fixture. Observed:
+`disk provider restore and current/as-of scans passed; block reads 8`.
+The first trial supplied a synchronous blind function and failed because the
+CLJS cursor requires a Promise; the final driver wraps it in a Promise.
