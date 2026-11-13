@@ -8,3 +8,5 @@ Source baseline: Kotoba `426ddd2a635b6714ad60a8d7852f4f802e3e54b6`. These are lo
 - nbb 1.4.208 / Node v26.0.0: both baseline and candidate fail to load existing `cbor.core` because `Tagged` cannot be resolved. No nbb success is claimed.
 
 Limits in these tests cover oversized input, nesting, item counts, declared container sizes, canonical IPLD rejection, and 10,000 nested arrays. They do not establish Native execution, hostile-input memory ceilings for the full product, or durable storage recovery.
+
+Follow-up on the same date: `get-node-bounded` validates limits before fetching, applies the byte bound before hashing, verifies CID, then dispatches only raw and bounded DAG-CBOR. DAG-JSON is rejected at this entry point because its decoder is not bounded. The provider still owns the allocation of the returned bytes; this check is not a bound on the provider's own allocations. The same local oracle setup passed JVM 33 tests / 161 assertions and compiled ClojureScript 6 tests / 39 assertions. These are hosted results only.
