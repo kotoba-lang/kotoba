@@ -1,7 +1,7 @@
 ;; RFC 8878 sections 3.1.1.1 and 3.1.1.2: bounded frame and block headers.
 ;; Raw/RLE and one compressed subset are supported; checksums are not.
 (ns zstd.frame-header
-  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table decode-predefined-sequences execute-sequences decode-predefined-block])
+  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table decode-predefined-sequences execute-sequences decode-predefined-block decode-frame])
   (:schemas {:zstd/header [:record :zstd/header
                [[:error :keyword] [:header-size :i64] [:window-size :i64]
                 [:content-size :i64] [:checksum :i64]]]
@@ -21,7 +21,9 @@
              :zstd/execution [:record :zstd/execution
                [[:error :keyword] [:bytes :vector-i64] [:reps :vector-i64]]]
              :zstd/decoded-block [:record :zstd/decoded-block
-               [[:error :keyword] [:next :i64] [:bytes :vector-i64] [:reps :vector-i64]]]}))
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64] [:reps :vector-i64]]]
+             :zstd/frame-output [:record :zstd/frame-output
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64]]]}))
 
 (defn- failure [reason :keyword] [:ref :zstd/header]
   (record-new [:ref :zstd/header] reason 0 0 -1 0))
@@ -440,3 +442,55 @@
                             (record-new [:ref :zstd/decoded-block] :none block-end
                               (record-get [:ref :zstd/execution] out :bytes)
                               (record-get [:ref :zstd/execution] out :reps))))))))))))
+
+(defn- frame-failure [reason :keyword] [:ref :zstd/frame-output]
+  (record-new [:ref :zstd/frame-output] reason 0 (vector-i64)))
+(defn- frame-copy [out :vector-i64 at :i64 bytes :vector-i64] :vector-i64
+  (loop [i 0 v out]
+    (if (= i (vector-count bytes)) v
+      (recur (+ i 1) (vector-assoc! v (+ at i) (vector-at bytes i))))))
+(defn- frame-prefix [b :vector-i64 pos :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)]
+    (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at b (+ pos i)))))))
+
+;; Bounded, checksum-free subset: raw/RLE blocks and compressed blocks with
+;; raw/RLE literals and predefined FSE tables. Other modes fail closed.
+(defn decode-frame [b :vector-i64 pos :i64 end :i64 max-window :i64 max-output :i64] [:ref :zstd/frame-output]
+  (cond (or (< max-window 0) (< max-output 0) (> max-output 16777216)) (frame-failure :invalid-bound)
+        (or (< pos 0) (< end pos) (> end (vector-count b)) (> (- end pos) 16777216)) (frame-failure :invalid-range)
+        :else
+        (let [available (- end pos) prefix (if (< available 18) available 18)
+              h (parse (frame-prefix b pos prefix) max-window max-output)
+              e (record-get [:ref :zstd/header] h :error)]
+          (cond (not= e :none) (frame-failure e)
+                (not= (record-get [:ref :zstd/header] h :checksum) 0) (frame-failure :checksum-unsupported)
+                :else
+                (let [window (record-get [:ref :zstd/header] h :window-size)
+                      declared (record-get [:ref :zstd/header] h :content-size)]
+                  (loop [p (+ pos (record-get [:ref :zstd/header] h :header-size)) used 0
+                         reps (vector-i64 1 4 8) out (vector-alloc max-output)]
+                    (if (< (- end p) 3) (frame-failure :truncated)
+                      (let [bh (parse-block b p window) be (record-get [:ref :zstd/block-header] bh :error)
+                            kind (record-get [:ref :zstd/block-header] bh :kind)
+                            payload (record-get [:ref :zstd/block-header] bh :payload-size)
+                            start (+ p 3)]
+                        (cond (not= be :none) (frame-failure be)
+                              (> payload (- end start)) (frame-failure :truncated)
+                              :else
+                              (let [next (+ start payload)
+                                    compressed (if (= kind 2)
+                                                 (decode-predefined-block b p next (vector-take out used) reps window (- max-output used))
+                                                 (decoded-block-failure :block-type-unsupported))
+                                    raw (if (= kind 2) (result-err-of [:result :vector-i64 :keyword] :block-type-unsupported)
+                                          (decode-raw-rle b p window (- max-output used)))
+                                    err (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :error)
+                                          (result-error-of [:result :vector-i64 :keyword] raw :none))]
+                                (if (not= err :none) (frame-failure err)
+                                  (let [block (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :bytes)
+                                                (result-value-of [:result :vector-i64 :keyword] raw (vector-i64)))
+                                        nr (if (= kind 2) (record-get [:ref :zstd/decoded-block] compressed :reps) reps)
+                                        total (+ used (vector-count block)) updated (frame-copy out used block)]
+                                    (if (= (record-get [:ref :zstd/block-header] bh :last) 1)
+                                      (if (and (not= declared -1) (not= declared total)) (frame-failure :size-mismatch)
+                                        (record-new [:ref :zstd/frame-output] :none next (vector-take updated total)))
+                                      (recur next total nr updated))))))))))))))

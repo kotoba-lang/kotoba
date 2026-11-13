@@ -1,5 +1,8 @@
 # Native Zstd frame-header admission, 2026-11-14 JST
 
+This log records successive checkpoints; later sections supersede earlier
+statements about functionality added afterwards.
+
 This is a bounded **header parser**, not decompression, Forest index access,
 Native filesystem I/O, a complete Zstd profile, or production qualification.
 The field sizes, little-endian encoding and window formula come from
@@ -261,3 +264,35 @@ Native source SHA-256
 `44730a8edc0b82e8866edd2d050b5a96ec315a5c386732c8f18cabed1b43c024`;
 test SHA-256
 `a8fd5bb064687264ab7920c3cbc6d3d8c610f46b01b433bac06c870798f97bb6`.
+
+## Bounded multi-block frame subset
+
+Native now assembles checksum-free frames with raw/RLE blocks and compressed
+blocks using raw/RLE literals and predefined FSE tables, carrying prior bytes
+and repeat offsets between blocks. Other modes and checksum-bearing frames
+are refused. Both supplied input range and output budget are capped at 16 MiB;
+this implementation allocates the output budget, so it is not streaming I/O.
+The full second frame of the pinned Forest fixture (offsets 68..1176, eight
+compressed blocks and an empty final raw block) produced 524,600 bytes and
+SHA-256 `f1d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba`,
+matching the reference. Tests also cover truncated frame, output limit,
+checksum refusal, known content-size mismatch, empty raw frame, and the next
+offset in a buffer containing trailing data. The pinned macOS Native gate
+passed its positive case and ten independently compiled controls; changing
+the expected full-frame digest returns 118. Exact-head CI remains separate.
+
+One-time reference on 2026-11-14 JST, same Clojure CLI 1.12.5.1654, Temurin
+21.0.1, reference source copies and pinned fixture as recorded above:
+
+```sh
+clojure -Sdeps '{:paths [".agent-output/zstd-oracle"]}' -M -e '(require (quote [zstd.core :as z])) (let [f (deref (var zstd.core/read-frame)) b (mapv #(bit-and 255 %) (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "/Users/junkawasaki/github/wt/codex/awai-532-streaming-pack/nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0)))) r (f b 68 {:max-output 1048576}) bytes (byte-array (map unchecked-byte (:bytes r))) hash (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes)] (prn {:size (count (:bytes r)) :end (:end r) :sha256 (apply str (map #(format "%02x" (bit-and 255 %)) hash)) :header (:header r)}))' > .agent-output/forest-frame-oracle-20261114.edn
+```
+
+`forest-frame-oracle.edn` SHA-256
+`4e0842604452c5e55b8589b1646bbff6841b8e7527ec6e9ee52bb8744edc3de2`;
+Native source SHA-256
+`0224a5ce9c064e0926257ad9e00207573991d38ad141104013b2ca3fa89db6a0`;
+test SHA-256
+`345de470b0848afca605f1c183cef3af59f13285dd83aa457e8b140ee2d7cec3`.
+The JVM is a local oracle only. This does not yet implement general Zstd,
+checksum verification, Forest indexing, Native I/O, GiB or production proof.
