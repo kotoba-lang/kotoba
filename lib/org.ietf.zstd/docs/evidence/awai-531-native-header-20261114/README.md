@@ -328,3 +328,49 @@ Native lookup source SHA-256
 `da259d44f443b04289a4737d79cf70e12a816592e7e64b4397f711a7cb0585bd`;
 test SHA-256
 `cde4536b9d016e616e429c6ae1cf204d72ebb7fc29bdcdbf0a20141cbd1cf319`.
+
+## Forest v1 index candidate to verified block
+
+The Native Awai index code admits a bounded Forest v1 footer and index,
+computes the Forest CID hash and unsigned bucket, and locates candidate frame
+extents. It connects each candidate to the limited Native Zstd frame decoder
+and selected-block CID verification. For the actual 1,767-byte fixture, the
+reference and Native both find `[68, 1177)` for the first CID. The decoded
+selected 65,536-byte block matches its SHA-256. A second real CID with a
+negative signed representation of the unsigned Forest hash also finds the
+same frame and its independently checked payload. Corrupted footer/index and
+modified selected content are refused. Changing the expected indexed payload
+digest causes the independently compiled Native control to return 137.
+
+The index is untrusted and is not checked against all archive blocks. A
+separate test changes the index entry for an actually present CID and obtains
+`:no-candidate`: this is deliberately **not** an archive-wide absence proof.
+The supported input is <=1 MiB, at most 4,096 index slots and 64 matching
+candidates, with a single index frame and the previously described limited
+Zstd modes. This works on in-memory bytes only; it does not establish
+positioned Native file I/O, authenticated archive identity, unread-frame
+integrity, generic Forest compatibility or production qualification. The
+pinned macOS Native gate passed the positive and twelve separately compiled
+controls; exact-head cross-platform CI is separate.
+
+The dated Otehon reference used Babashka 1.12.218, repo revision
+`a45818acee8c1e4b87824f290f874a107d851856`, `otehon/forest.clj` SHA-256
+`91ff621a04ea751690328edbc3ae3284aaff5fffdb6d00d3ca31b6df36edab2e`,
+and `awai/fs/car.cljc` SHA-256
+`b4233a14b1ffc22920223faaa451c9d99888d180519757cc4d30c86ddcd8553e`.
+Its output `forest-index-oracle.edn` SHA-256
+`c39439c7b6326c54a413e59bd295cdad3b6e979b2ef104978cde36611692c5f4`
+records hash, buckets, distance and extents; `forest-index-cids.edn` SHA-256
+`73b4c43b7a9b2e0a384bc1c3a586ee214b708fd8adc7dd254c1723e56833b6f0`
+records its block CIDs and signed hash values. Reference command, from the
+Awai OS repository, uses the pinned fixture and Otehon adapter:
+
+```sh
+bb --classpath nixos/otehon/storage/src:nixos/otehon/storage/vendor/apex/src:nixos/otehon/storage/vendor/apex-car/src -e '(require (quote [otehon.forest :as f])) (let [bytes (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0))) h (f/open bytes) cid [1 85 18 32 136 73 54 132 153 91 229 250 69 98 52 168 104 235 213 131 219 138 28 35 87 88 97 244 25 55 225 77 237 212 236 253] hash ((deref (var otehon.forest/hash-cid)) cid) offsets ((deref (var otehon.forest/candidates)) (:slots h) (:buckets h) (:distance h) hash)] (prn {:hash hash :buckets (:buckets h) :distance (:distance h) :index-pos (:index-pos h) :slots (count (:slots h)) :offsets offsets :ends (select-keys (:ends h) offsets)}))' > .agent-output/forest-index-oracle-20261114.edn
+bb --classpath nixos/otehon/storage/src:nixos/otehon/storage/vendor/apex/src:nixos/otehon/storage/vendor/apex-car/src -e '(require (quote [otehon.forest :as f]) (quote [awai.fs.car :as c])) (let [b (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0))) h (f/open b)] (doseq [x (:blocks (c/carv1-decode (:carv1 h)))] (let [cid (:cid x) hash ((deref (var otehon.forest/hash-cid)) cid)] (prn {:hash hash :cid cid :length (count (:bytes x))}))))' > .agent-output/forest-index-cids-20261114.edn
+```
+
+Native index source SHA-256
+`ac2a8fcdcde427e684b3b350bede8d8f9d0c73297b7700787aac82a89348c05f`;
+test SHA-256
+`2daac78251b458c9d61e8dffd7d75ac3dceeaafcf5be6bebfd661875dc0f6967`.
