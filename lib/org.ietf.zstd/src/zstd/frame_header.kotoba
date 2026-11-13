@@ -1,7 +1,7 @@
 ;; RFC 8878 sections 3.1.1.1 and 3.1.1.2: bounded frame and block headers.
 ;; Raw and RLE payloads are decoded; compressed payloads and checksums are not.
 (ns zstd.frame-header
-  (:export [parse parse-block decode-raw-rle decode-literals])
+  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read])
   (:schemas {:zstd/header [:record :zstd/header
                [[:error :keyword] [:header-size :i64] [:window-size :i64]
                 [:content-size :i64] [:checksum :i64]]]
@@ -9,7 +9,11 @@
                [[:error :keyword] [:last :i64] [:kind :i64]
                 [:size :i64] [:payload-size :i64]]]
              :zstd/literals [:record :zstd/literals
-               [[:error :keyword] [:next :i64] [:bytes :vector-i64]]]}))
+               [[:error :keyword] [:next :i64] [:bytes :vector-i64]]]
+             :zstd/sequences [:record :zstd/sequences
+               [[:error :keyword] [:next :i64] [:count :i64] [:ll :i64] [:offset :i64] [:match :i64]]]
+             :zstd/reverse [:record :zstd/reverse
+               [[:error :keyword] [:next :i64] [:value :i64]]]}))
 
 (defn- failure [reason :keyword] [:ref :zstd/header]
   (record-new [:ref :zstd/header] reason 0 0 -1 0))
@@ -19,6 +23,66 @@
 
 (defn- literals-failure [reason :keyword] [:ref :zstd/literals]
   (record-new [:ref :zstd/literals] reason 0 (vector-i64)))
+
+(defn- sequences-failure [reason :keyword] [:ref :zstd/sequences]
+  (record-new [:ref :zstd/sequences] reason 0 0 0 0 0))
+(defn- reverse-failure [reason :keyword] [:ref :zstd/reverse]
+  (record-new [:ref :zstd/reverse] reason 0 0))
+
+;; This parses the sequence section header only. Table modes and streams must
+;; still be decoded and checked against the containing compressed block.
+(defn parse-sequences [b :vector-i64 pos :i64 end :i64 cap :i64] [:ref :zstd/sequences]
+  (let [n (vector-count b)]
+    (cond (< cap 0) (sequences-failure :invalid-bound)
+          (or (< pos 0) (< end pos) (> end n) (= pos end)) (sequences-failure :truncated)
+          :else
+          (let [a (vector-at b pos) width (cond (< a 128) 1 (< a 255) 2 :else 3)]
+            (cond (or (< a 0) (> a 255)) (sequences-failure :invalid-byte)
+                  (< (- end pos) width) (sequences-failure :truncated)
+                  :else
+                  (let [c (if (> width 1) (vector-at b (+ pos 1)) 0)
+                        d (if (> width 2) (vector-at b (+ pos 2)) 0)
+                        count (cond (= width 1) a (= width 2) (+ (* (- a 128) 256) c)
+                                    :else (+ 32512 c (* d 256)))
+                        next (+ pos width)]
+                    (cond (or (< c 0) (> c 255) (< d 0) (> d 255)) (sequences-failure :invalid-byte)
+                          (> count cap) (sequences-failure :sequence-limit)
+                          (= count 0) (record-new [:ref :zstd/sequences] :none next 0 0 0 0)
+                          (= next end) (sequences-failure :truncated)
+                          :else (let [m (vector-at b next)]
+                                  (cond (or (< m 0) (> m 255)) (sequences-failure :invalid-byte)
+                                        (not= (bit-and m 3) 0) (sequences-failure :reserved-bits)
+                                        :else (record-new [:ref :zstd/sequences] :none (+ next 1) count
+                                               (bit-and (u64-shift-right m 6) 3)
+                                               (bit-and (u64-shift-right m 4) 3)
+                                               (bit-and (u64-shift-right m 2) 3)))))))))))
+
+;; Reverse bit position counts down from the end, including the marker and
+;; its leading padding. Zero-extension is visible in :next: the caller must
+;; apply the sequence/Huffman stream's own end-of-stream validity rules.
+(defn reverse-start [b :vector-i64 start :i64 end :i64] [:ref :zstd/reverse]
+  (cond (or (< start 0) (<= end start) (> end (vector-count b)) (> (- end start) 16777216))
+          (reverse-failure :invalid-range)
+        :else (let [last (vector-at b (- end 1))]
+          (cond (or (< last 0) (> last 255)) (reverse-failure :invalid-byte)
+                (= last 0) (reverse-failure :missing-marker)
+                :else (loop [i 7]
+                        (if (not= (bit-and last (i64-shift-left 1 i)) 0)
+                          (record-new [:ref :zstd/reverse] :none (- 8 i) 0)
+                          (recur (- i 1))))))))
+(defn reverse-read [b :vector-i64 start :i64 end :i64 pos :i64 width :i64] [:ref :zstd/reverse]
+  (cond (or (< start 0) (<= end start) (> end (vector-count b)) (> (- end start) 16777216))
+          (reverse-failure :invalid-range)
+        (or (< pos 0) (> pos (+ (* (- end start) 8) 32)) (< width 0) (> width 32))
+          (reverse-failure :invalid-bound)
+        :else (let [total (* (- end start) 8)]
+          (loop [i 0 value 0]
+            (if (= i width) (record-new [:ref :zstd/reverse] :none (+ pos width) value)
+              (let [p (+ pos i) bit-index (- total 1 p)]
+                (if (>= p total) (recur (+ i 1) (* value 2))
+                  (let [x (vector-at b (+ start (quot bit-index 8)))]
+                    (if (or (< x 0) (> x 255)) (reverse-failure :invalid-byte)
+                      (recur (+ i 1) (+ (* value 2) (bit-and (u64-shift-right x (rem bit-index 8)) 1))))))))))))
 
 ;; Parse one raw/RLE literal section inside a bounded compressed block. The
 ;; returned next offset starts the sequence section, not the end of the block.

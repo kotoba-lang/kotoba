@@ -129,3 +129,22 @@ Exact-head CI remains separate. Native source SHA-256
 `cff144c8b5452c480fe7cab02bb824db90b89d60dd0fc45859a0cf0f41d9567d`;
 test SHA-256
 `59cd525564e2467ceaff9d916310cf5f3fa0359489ca19bfb599f69132348743`.
+
+## Sequence header and reverse bit reader
+
+The second fixture frame's sequence section begins at absolute offset 374
+with bytes `10 00`: 16 sequences, all three modes predefined. The Native
+parser admits bounded sequence counts and modes, rejects truncated headers,
+reserved mode bits and caller count-limit excess, and supports all three
+sequence-count widths. A stateless reverse bit reader validates the marker
+and bounds, reports its bit position, and exposes zero extension to the caller
+rather than treating it as end-of-stream validation. Its fixture-derived last
+byte `a6` has initial bit position 1 and the next five bits produce 9.
+
+The local pinned macOS Native gate passed positive and five separately
+compiled controls, including changed sequence count (result 62). This is not
+an FSE table decoder or proof of sequence-stream termination, and does not yet
+produce a complete compressed block. Source SHA-256
+`570877357bb7c47e325499dcbbe82d9ab50a7497e139aa15ed7a0804ccf47fc7`;
+test SHA-256
+`243b2a2f4ebeacca2c6ad370b3bfc7888f4a44626a4d74885d399e64961de6da`.
