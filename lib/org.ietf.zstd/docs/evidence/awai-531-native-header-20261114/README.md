@@ -148,3 +148,35 @@ produce a complete compressed block. Source SHA-256
 `570877357bb7c47e325499dcbbe82d9ab50a7497e139aa15ed7a0804ccf47fc7`;
 test SHA-256
 `243b2a2f4ebeacca2c6ad370b3bfc7888f4a44626a4d74885d399e64961de6da`.
+
+## Native FSE table construction
+
+The Native builder takes bounded normalized counts and accuracy log 5..9,
+reserves low-probability states, spreads positive weights, and emits flat
+`[symbol, bits, new-state]` triples. It rejects invalid totals, counts and
+unfilled states. The test compares every state of the three RFC 8878
+predefined literal-length, match-length and offset tables (64, 64 and 32
+states) against the attached local oracle output. The first changed expected
+table entry produces result 78 in a separately compiled negative control.
+The macOS Native gate passed positive and all six controls; exact-head CI is
+separate. This does not validate arbitrary FSE table-description decoding,
+bitstream termination, sequence execution or full decompression.
+
+One-time reference on 2026-11-14 JST: Clojure CLI 1.12.5.1654, Temurin
+21.0.1; existing `zstd.fse` and `zstd.bits` bytes were copied unchanged as
+`.cljc` for the JVM reader, with respective SHA-256
+`990d77600b670b6e195f04273e320a97d0218761f073bb5cd295397a19effa92` and
+`21d9f604f6be16b64ae85ca83c084412fcd28ed9dd00962b94ef5976b9897ad`.
+Command, using the staging directory described above:
+
+```sh
+clojure -Sdeps '{:paths [".agent-output/zstd-oracle"]}' -M -e '(require (quote [zstd.fse :as f])) (doseq [x [f/literal-length-default f/match-length-default f/offset-default]] (prn (vec (mapcat (juxt :symbol :nb-bits :new-state) (f/build-table (:counts x) (:accuracy-log x))))))'
+```
+
+Output `fse-predefined-oracle.edn` SHA-256
+`2413c4cd468508f9b5d83e29476bc3af2a76bee5e9701a7691a551497303ff57`.
+This local oracle is neither a Native fallback nor a build dependency.
+Native source SHA-256
+`fb771feb8904b0c4835dc66907d39982b000fe4c96cbb704b9d8b222498f9a88`,
+test SHA-256
+`b70fc998a9c4387053280bff9ca928e46df5b04d938aa1968ae4b95bdc3ed9f5`.

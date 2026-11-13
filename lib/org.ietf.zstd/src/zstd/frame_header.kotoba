@@ -1,7 +1,7 @@
 ;; RFC 8878 sections 3.1.1.1 and 3.1.1.2: bounded frame and block headers.
 ;; Raw and RLE payloads are decoded; compressed payloads and checksums are not.
 (ns zstd.frame-header
-  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read])
+  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table])
   (:schemas {:zstd/header [:record :zstd/header
                [[:error :keyword] [:header-size :i64] [:window-size :i64]
                 [:content-size :i64] [:checksum :i64]]]
@@ -13,7 +13,9 @@
              :zstd/sequences [:record :zstd/sequences
                [[:error :keyword] [:next :i64] [:count :i64] [:ll :i64] [:offset :i64] [:match :i64]]]
              :zstd/reverse [:record :zstd/reverse
-               [[:error :keyword] [:next :i64] [:value :i64]]]}))
+               [[:error :keyword] [:next :i64] [:value :i64]]]
+             :zstd/placement [:record :zstd/placement
+               [[:position :i64] [:symbols :vector-i64]]]}))
 
 (defn- failure [reason :keyword] [:ref :zstd/header]
   (record-new [:ref :zstd/header] reason 0 0 -1 0))
@@ -28,6 +30,59 @@
   (record-new [:ref :zstd/sequences] reason 0 0 0 0 0))
 (defn- reverse-failure [reason :keyword] [:ref :zstd/reverse]
   (record-new [:ref :zstd/reverse] reason 0 0))
+
+;; FSE state table, flat triples [symbol number-of-bits new-state]. Counts
+;; are normalized weights; -1 occupies one low-probability state. The caller
+;; must validate mode-specific alphabet and accuracy limits before use.
+(defn fse-table [counts :vector-i64 log :i64] [:result :vector-i64 :keyword]
+  (let [n (vector-count counts)]
+    (if (or (< log 5) (> log 9) (< n 1) (> n 256))
+      (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+      (let [size (i64-shift-left 1 log)
+            total (loop [i 0 sum 0]
+                    (if (= i n) sum
+                      (let [c (vector-at counts i)]
+                        (if (or (< c -1) (> c size)) -1
+                          (recur (+ i 1) (+ sum (if (= c -1) 1 c)))))))]
+        (if (not= total size) (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+          (let [initial (loop [i 0 out (vector-alloc size)]
+                          (if (= i size) out (recur (+ i 1) (vector-assoc! out i -1))))
+                low (loop [i 0 high (- size 1) out initial]
+                      (if (= i n) (record-new [:ref :zstd/placement] high out)
+                        (if (= (vector-at counts i) -1)
+                          (recur (+ i 1) (- high 1) (vector-assoc! out high i))
+                          (recur (+ i 1) high out))))
+                high (record-get [:ref :zstd/placement] low :position)
+                step (+ (quot size 2) (quot size 8) 3) mask (- size 1)
+                placed (loop [s 0 pos 0 out (record-get [:ref :zstd/placement] low :symbols)]
+                         (if (= s n) (record-new [:ref :zstd/placement] pos out)
+                           (let [c (vector-at counts s)
+                                 p (loop [i 0 current pos v out]
+                                     (if (>= i c) (record-new [:ref :zstd/placement] current v)
+                                       (let [next-pos (loop [x (bit-and (+ current step) mask)]
+                                                        (if (> x high) (recur (bit-and (+ x step) mask)) x))]
+                                         (recur (+ i 1) next-pos (vector-assoc! v current s)))))]
+                             (recur (+ s 1) (record-get [:ref :zstd/placement] p :position)
+                                    (record-get [:ref :zstd/placement] p :symbols)))))
+                symbols (record-get [:ref :zstd/placement] placed :symbols)
+                nexts (loop [i 0 out (vector-alloc n)]
+                        (if (= i n) out
+                          (let [c (vector-at counts i)]
+                            (recur (+ i 1) (vector-assoc! out i (if (= c -1) 1 c))))))]
+            (if (not= (record-get [:ref :zstd/placement] placed :position) 0)
+              (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+              (loop [i 0 states nexts out (vector-alloc (* size 3))]
+                (if (= i size) (result-ok-of [:result :vector-i64 :keyword] out)
+                  (let [s (vector-at symbols i)]
+                    (if (or (< s 0) (>= s n)) (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+                      (let [state (vector-at states s)
+                            highbit (loop [v state k -1] (if (= v 0) k (recur (quot v 2) (+ k 1))))
+                            bits (- log highbit) new-state (- (* state (i64-shift-left 1 bits)) size)
+                            j (* i 3)]
+                        (if (or (< highbit 0) (< bits 0) (< new-state 0) (> new-state (- size 1)))
+                          (result-err-of [:result :vector-i64 :keyword] :invalid-table)
+                          (recur (+ i 1) (vector-assoc! states s (+ state 1))
+                            (vector-assoc! (vector-assoc! (vector-assoc! out j s) (+ j 1) bits) (+ j 2) new-state)))))))))))))))
 
 ;; This parses the sequence section header only. Table modes and streams must
 ;; still be decoded and checked against the containing compressed block.
