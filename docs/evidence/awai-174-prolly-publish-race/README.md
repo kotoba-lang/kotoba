@@ -25,6 +25,7 @@ The pre-existing v5 oracle classpath and its adaptations are documented in
 for this run. `inputs.json` records staged source hashes. Compile with
 `clojure -Sdeps '{:deps {org.clojure/clojurescript {:mvn/version "1.12.42"}} :paths [".agent-output/classpath"]}' -M -m cljs.main -co '{:target :nodejs :output-dir ".agent-output/cljs-out-fixed" :output-to ".agent-output/publish-race-fixed.js" :optimizations :none}' -c awai-oracle.publish-race`, then run `node .agent-output/publish-race-fixed.js`.
 
-The full library local-changes pin audit reports three pre-existing stale legacy
-configuration pins; they are unchanged from the base revision. The modified
-provider pin was separately verified.
+The full library local-changes pin audit initially found three stale legacy
+configuration pins. Their file bytes matched base revision 426ddd2; the ledger
+now records their actual hashes and retains the previous hashes in each reason.
+The complete source pin audit then passed.
