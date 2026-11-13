@@ -205,3 +205,34 @@ clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M .agent
 
 The second invocation returned `:denied #{}` and the expected one-row
 `:allowed` set, with `:pass true`.
+
+### 2026-11-13: Dango-signed basis-scoped request reference
+
+A separate JVM restored the policy fixture root above. The actual Dango oracle
+minted and verified an Ed25519-signed test credential granting
+`:datom/read-protected` for `kotoba://basis/<exact-root-CID>`. The driver
+mapped a granted decision to the existing policy capability string, then ran
+the actual Datalog join. The valid credential produced the expected row;
+a different basis, expiry at the boundary and an altered seal produced
+`:dango/not-covered`, `:dango/expired`, and `:dango/bad-seal` respectively,
+and each yielded an empty query result. Test keys, identity encryption and
+synthetic blinding were used. This is a harness mapping: it is not a signed
+commit/basis format, production capability mapping, authenticated server,
+receipt, or Native implementation.
+
+The v6 classpath starts from v5 and adds `lib/kotoba.dango/oracle/src` and
+`lib/org.ietf.ed25519/src/ed25519` at this revision. The original archived
+source hashes are in `dango-source-sha256.txt`; `.cljk` files were copied as
+`.cljc` and `:kotoba/export` vectors in copied ed25519 sources were quoted for
+the JVM host reader. The oracle `ed25519/sign.cljc` was used rather than the
+other source twin. No source adaptation was written into the product. Run
+`oracle/awai-174/prolly-dango-policy-oracle.clj` from the experiment worktree,
+with the prior helper under `.agent-output` and the policy disk fixture:
+
+```
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v6"]}' -M .agent-output/prolly-dango-policy-oracle.clj read .agent-output/prolly-policy-disk-20261113
+```
+
+Output: `:valid :granted`, `:wrong-basis :dango/not-covered`,
+`:expired :dango/expired`, `:tampered :dango/bad-seal`,
+`:denied-counts [0 0 0]`, `:pass true`.
