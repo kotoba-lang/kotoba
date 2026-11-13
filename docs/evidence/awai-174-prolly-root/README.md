@@ -170,3 +170,38 @@ Node script from the experiment worktree containing the fixture. Observed:
 `disk provider restore and current/as-of scans passed; block reads 8`.
 The first trial supplied a synchronous blind function and failed because the
 CLJS cursor requires a Promise; the final driver wraps it in a Promise.
+
+### 2026-11-13: persisted graph policy reference
+
+A copy of the disk fixture received a third transaction containing
+`kotobase.policy/read` with protected prefix `:chunk/`; a second JVM process
+restored the resulting root
+`bafyreic73cz5ww6pbthvvyz62szwjs25afgaqr2a6va4xwl344bmfw4iri`. The
+existing `kotobase-peer.policy/policy-of` read the persisted row, and its
+`visible-for` filtered the existing Datalog join. No capabilities returned an
+empty result; the test string `kotoba://can/datom:read-protected` returned the
+expected logical-root/chunk-CID pair. The policy CID was
+`bafyreidttvee6r2pduhuwto6ft4xmolglspprk4sseuhorsdpbchbswkuu`.
+
+The oracle converts engine keywords to the peer policy's string-attribute
+shape, and provides capabilities directly; it does not exercise peer/server
+integration, signature verification, a real issued credential, receipts, or
+Native code. Encryption/blinding are the fixture doubles described above.
+The policy, authority scope and information-flow sources came from this tree;
+only the `:kotoba/export` vector in the copied information-flow source was
+quoted for the host reader. Their oracle SHA-256 values, respectively, are
+`86365a879b23e938416274c0dab4d14957f7238b269bf4f2ee980cd38abfc47c`,
+`23ab9242c2415f72e153a72448c316c3b0c4be89dc05fea3ae11bfccafabc9f8`,
+`5824123cc1a75541dae02f0a9618cff3dbb88ba54620065588d5ee52f37955dd`.
+
+The `oracle/awai-174/prolly-policy-oracle.clj` driver uses the v5 oracle
+classpath and the prior `prolly-disk-oracle.clj` helper. Create a fresh copy
+of the earlier store and run separate JVM invocations with `write` and `read`:
+
+```
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M .agent-output/prolly-policy-oracle.clj write .agent-output/prolly-policy-disk-20261113
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M .agent-output/prolly-policy-oracle.clj read .agent-output/prolly-policy-disk-20261113
+```
+
+The second invocation returned `:denied #{}` and the expected one-row
+`:allowed` set, with `:pass true`.
