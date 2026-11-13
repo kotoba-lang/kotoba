@@ -69,3 +69,38 @@ source plus the recorded test/spec modules. Missing and corrupt test stores
 were made as separate copies; the original remains intact. These results do
 not show that signed commits, actual policy/receipt, Native, off-host recovery,
 or OS-cache loss have been implemented or verified.
+
+### 2026-11-13: nested Arrangement snapshot
+
+Starting from the v4 JVM oracle classpath described above, copy the candidate
+`arrangement/core.cljk`, `arrangement/source.cljk`, `arrangement/source_test.cljk`
+and existing `arrangement/core_test.cljk` as `.cljc` into a v5 copy. The other
+oracle adaptations and versions remain as recorded above. Candidate SHA-256:
+
+- core: `f3a63bcfeebcdc253ce656930ab7264c0510f597e86841bbc6e12d20f44797b5`
+- source: `8e49b842afc943384cb9df6bfd11376b16133b5f55325473481ba9ef2b063917`
+- source-test: `63afca33f364891a7f46c91e8795a88c7d85863e49aaa639f75e5794e4f07c56`
+
+On the same 12-block file store and pinned root as the earlier experiment, a
+copy of snapshot `bafyreic4fxqlzoq4emxpczfgdmf7wfvzrbvp23q7rmjjmrljdkmtgez5uq`
+was replaced at its original filename by a valid DAG-CBOR snapshot with a
+modified `prev` link. The old implementation restored and queried it. The v5
+candidate rejects it with `:ipld/cid-mismatch`; the untouched store still
+restores and produces the same join and temporal results. The focused JVM test
+calls restore, cursor root lookup, delta commit and mixed changes with missing
+and mismatching snapshot blocks; 1 test / 9 assertions passed and no writes
+occurred. The Prolly suite passed 11 tests / 32 assertions.
+
+Commands, from the experiment worktree:
+
+```
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M .agent-output/prolly-disk-oracle.clj read .agent-output/prolly-disk-20261113
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M .agent-output/prolly-disk-oracle.clj read .agent-output/prolly-disk-snapshot-corrupt
+clojure -Sdeps '{:paths [".agent-output/prolly-oracle-classpath-v5"]}' -M -e "(require '[arrangement.source-test] '[clojure.test :as t]) (binding [t/*report-counters* (ref t/*initial-report-counters*)] (t/test-vars [#'arrangement.source-test/snapshot-reads-reject-missing-and-mismatched-blocks]) (prn @t/*report-counters*))"
+```
+
+An attempted nbb 1.4.208 / Node 26.0.0 oracle load of the v5 classpath failed
+before the test at `multiformats/base32.cljc:107` (unresolved `drain-5`). The
+ClojureScript asynchronous test is added but not locally executed; neither
+this reference run nor CI proves Native Forest I/O, signed basis, real policy,
+or complete traversal integrity.
