@@ -104,3 +104,23 @@ before the test at `multiformats/base32.cljc:107` (unresolved `drain-5`). The
 ClojureScript asynchronous test is added but not locally executed; neither
 this reference run nor CI proves Native Forest I/O, signed basis, real policy,
 or complete traversal integrity.
+
+### 2026-11-13: ClojureScript asynchronous snapshot oracle
+
+Standard ClojureScript 1.12.42 and Node 26.0.0 compiled and ran the direct
+`oracle/awai-174/snapshot.cljs` driver against the v5 classpath described
+above. A valid snapshot was accepted and missing and CID-mismatched snapshots
+were rejected. This driver calls the product asynchronous snapshot reader; it
+is a local reference oracle, not a Native gate or a full provider/recovery
+integration test. The compiler downloaded Closure Compiler v20250402 from
+Maven Central; no dependency was added to the product or CI.
+
+```
+# copy oracle/awai-174/snapshot.cljs to the v5 classpath as awai_oracle/snapshot.cljs
+clojure -Sdeps '{:deps {org.clojure/clojurescript {:mvn/version "1.12.42"}} :paths [".agent-output/prolly-oracle-classpath-v5"]}' -M -m cljs.main -co '{:target :nodejs :output-dir ".agent-output/cljs-oracle-out" :output-to ".agent-output/cljs-oracle.js" :optimizations :none}' -c awai-oracle.snapshot
+node .agent-output/cljs-oracle.js
+```
+
+Output: `async snapshot valid accepted; missing and mismatch rejected`.
+The older nbb and test-namespace loading failures above remain separate facts;
+the direct driver avoids loading the incompatible test namespace.
