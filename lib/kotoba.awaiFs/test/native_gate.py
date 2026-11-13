@@ -59,7 +59,8 @@ def main(a):
     zstd_test=REPO/'lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba'
     forest_fixture=ROOT/'test/fixtures/forest-part0.car.zst'
     forest_fixture2=ROOT/'test/fixtures/forest-part1.car.zst'
-    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',forest_fixture,forest_fixture2,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
+    forest_large=ROOT/'test/fixtures/forest-large-index.car.zst'
+    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',forest_fixture,forest_fixture2,forest_large,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
     if io_compiler:watched.append(io_compiler)
     inputs={str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p):sha(p) for p in watched}
     initial={p:sha(p) for p in watched};results=[]
@@ -84,6 +85,14 @@ def main(a):
             if hashlib.sha256(second).hexdigest()!='33469df01bb4f837d655da9b232a366910ab4a575094235ffc875029f46ad206':raise ValueError('second Forest fixture pin mismatch')
             (directory/'fixture-second').write_bytes(second)
             if target!='macos-arm64':fixture=fixture.replace('"/fixture-second"',json.dumps(str(directory/'fixture-second')))
+            large=forest_large.read_bytes()
+            if hashlib.sha256(large).hexdigest()!='eea07036e8a76dd891f675a198a3da90afa4181f31794c910f376fe27b7bd39f':raise ValueError('large-index Forest fixture pin mismatch')
+            (directory/'fixture-large').write_bytes(large)
+            damaged=bytearray(large);damaged[1154951]^=1
+            (directory/'fixture-large-bad-index').write_bytes(damaged)
+            if target!='macos-arm64':
+                for file_name in ['fixture-large','fixture-large-bad-index']:
+                    fixture=fixture.replace('"/'+file_name+'"',json.dumps(str(directory/file_name)))
             for file_name,offset in [('fixture',None),('fixture-corrupt',119),('fixture-hidden',1639),('fixture-badfooter',1751)]:
                 contents=bytearray(original)
                 if offset is not None:contents[offset]^=1

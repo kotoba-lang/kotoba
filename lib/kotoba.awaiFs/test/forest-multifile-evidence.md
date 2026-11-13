@@ -51,3 +51,27 @@ the selected corruption test detects that regression. Positive source lock:
 Native executable SHA-256:
 `45ca739f184fdd845829db9e09a0353a8e8b8586542a9c772a2475da636b1aad`.
 Other hosts and exact-head CI remain separate.
+
+## Bounded tail index and larger positioned file
+
+The Native adapter reads the bounded index/footer tail instead of allocating a
+vector for the entire archive. `find-frames-tail` checks the tail's base,
+total length and absolute index and frame offsets, with a 32 MiB file bound;
+the previous in-memory `find-frames` still has its original 1 MiB bound.
+Selected compressed frames remain capped at 256 KiB, and selected bytes are
+CID-verified. This does not yet cover incompressible 1 MiB leaf frames.
+
+The 1,155,199-byte fixture was built from `forest-part0.car.zst` by prefixing
+one Zstd skippable frame and adjusting physical index offsets. Its SHA-256 is
+`eea07036e8a76dd891f675a198a3da90afa4181f31794c910f376fe27b7bd39f`.
+It is reproducible by passing a new task-owned output path to
+`generate_large_forest_fixture.py`; the script refuses to overwrite a file. The independent Otehon
+`forest/verify-file` accepted its archive, index, canonical Pack root and
+block CIDs; selected first frame starts at 1,153,500 and index at 1,154,951.
+The macOS arm64 Native gate read the selected block from that actual file and
+refused a changed index and a file size above 32 MiB. The existing Native
+Zstd, file, digest and error-fallback mutation controls also passed.
+
+This is a shifted small Pack, not 1 GiB of data or a full verification of the
+archive by Native. No authenticated catalog, concurrent truncation safety,
+Native writer, OS-cache-loss or power-loss conclusion follows.
