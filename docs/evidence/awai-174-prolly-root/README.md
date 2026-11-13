@@ -124,3 +124,29 @@ node .agent-output/cljs-oracle.js
 Output: `async snapshot valid accepted; missing and mismatch rejected`.
 The older nbb and test-namespace loading failures above remain separate facts;
 the direct driver avoids loading the incompatible test namespace.
+
+### 2026-11-13: asynchronous provider prefetch integrity
+
+`provider.cljs.cljk` now verifies fetched block bytes before caching, decoding,
+or following links. With ClojureScript 1.12.42 and Node 26.0.0, the direct
+`oracle/awai-174/provider.cljs` driver uses the actual provider and an async
+in-memory protocol backend. In two independent scenarios a valid-CBOR but
+CID-mismatched manifest or metadata block is rejected with `:ipld/cid-mismatch`,
+the corrupt block is not cached, and a link planted in it is not fetched.
+The previous provider, compiled against the same corpus, followed that link and
+failed instead with `:kotobase.engine/block-not-found`: a negative control.
+This is not a remote-store, power-loss or Native test. The v5 oracle source
+adaptations above still apply; `kotobase.storage.core` was additionally copied
+from this revision unchanged and `provider.cljs.cljk` was named `provider.cljs`
+for the standard host compiler. Candidate provider SHA-256:
+`d3887183769eaadcdbe04fe727b73301f10268268521142053115e4bfb546d38`.
+Driver SHA-256:
+`f33ce0cb065662507ad1338b3cc6644449de7096546a1350b890a8270200b4a7`.
+
+```
+# copy the driver, storage.core, and selected provider to the v5 oracle classpath
+clojure -Sdeps '{:deps {org.clojure/clojurescript {:mvn/version "1.12.42"}} :paths [".agent-output/prolly-oracle-classpath-v5"]}' -M -m cljs.main -co '{:target :nodejs :output-dir ".agent-output/cljs-provider-out" :output-to ".agent-output/cljs-provider.js" :optimizations :none}' -c awai-oracle.provider
+node .agent-output/cljs-provider.js
+```
+
+Candidate output: `provider corrupt head and metadata rejected before following links`.
