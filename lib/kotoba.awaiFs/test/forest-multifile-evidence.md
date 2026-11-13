@@ -75,3 +75,37 @@ Zstd, file, digest and error-fallback mutation controls also passed.
 This is a shifted small Pack, not 1 GiB of data or a full verification of the
 archive by Native. No authenticated catalog, concurrent truncation safety,
 Native writer, OS-cache-loss or power-loss conclusion follows.
+
+## Segmented positioned reads for a 1 MiB block
+
+The preceding 256 KiB selected-frame limit described the earlier revision.
+The current implementation retains 256 KiB as the maximum **single FS2
+request**, reads at most 2 MiB per selected frame in ordered segments, and
+limits decoded CAR sections to 2 MiB. It CID-verifies the returned complete
+selected block. The provider can still terminate on a concurrent short read;
+segmentation does not establish a file snapshot.
+
+The pinned `forest-megaframe.car.zst` (1,048,922 bytes, SHA-256
+`ee5c2c5c601e5f24cbf087ac73f8e9cfdd3bfa3002445e426b48a9756e6c0d50`)
+was generated locally by the AWAI-532 Otehon `put-file-large!` at Awai OS
+revision `f6d07f93652c70662005f86c44659b27b0a657dd` using the digest-pinned
+Forest tool `e5fb23076a46c055142b3dbf3efa1ad5a68532d14419ad9994785986719b205f`.
+The 1 MiB input was created with `java.util.Random` seed `53120261114` as a
+local fixture, not a security random source. Otehon's independent
+`forest/verify-file` identified the selected compressed frame at byte
+68..1,048,719 and its 1,048,576-byte raw block SHA-256
+`ef25f52bde3a24316912f2214e179ca2e56c21e78cd3ea76a06296e96ff2349e`.
+
+The pinned macOS arm64 Native gate read and CID-verified that full block.
+Flipping a byte inside the third requested segment caused `:cid-mismatch`.
+A separately compiled wrong expected digest returned 31, and existing two
+small-file digest and error-swallowing controls returned 3, 13 and 20. Positive
+source lock: `5deaba66a2596aa1a451879e611c74c167466be68f28821f549d64c34d9462d8`;
+Native executable SHA-256:
+`da0dcb0291c77df2a79ae802cb86dfc0987eb28440ab1056348fa3fb12eca844`.
+The earlier Native Zstd and index controls were rerun with the new reader.
+
+This exercises one seeded, essentially incompressible frame and does not prove
+all Zstd modes, stable concurrent file identity, Native publication, a 1 GiB
+Native read, cache-loss recovery or production qualification. Other platforms
+and exact-head CI require their own results.
