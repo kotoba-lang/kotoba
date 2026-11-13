@@ -67,3 +67,22 @@ The copied reference source SHA-256 values, in bits/core/fse/huff/xxhash order:
 8af5d6687fe47e0cb1acc69605547a42075776dc974598215a779be13e6a1103
 b604bb9e8ea01f851cc0c326ee6f0b187ffc36fdfe1d67237d5b1d40839c9748
 ```
+
+## Block header admission
+
+The Native module also parses the three-byte block header according to
+[RFC 8878 section 3.1.1.2](https://www.rfc-editor.org/rfc/rfc8878.html#section-3.1.1.2),
+rejecting invalid bytes, truncated headers, reserved type, negative window and
+a size exceeding `min(window, 131072)`. It reports the separate stored payload
+length for RLE. This is header admission only: it does not check payload
+availability, decode raw/RLE/compressed bytes, verify decoded size or verify a
+checksum. The caller must perform those checks before accepting output.
+
+The actual Forest fixture starts `28 b5 2f fd 00 58 d9 01 00`: at offset 6,
+the block parser reports last=1, raw type 0 and size 59. Native tests cover
+this vector and RLE, compressed, size/window refusal and malformed headers.
+The pinned macOS arm64 Awai gate passed the test (result 0), the existing wrong
+window control (12), and an independently compiled wrong block-size control
+(28). The updated three-platform CI must be checked on its own revision.
+Parser SHA-256 `d27e62dc4d1f2aaf77220dafc41384eccd046cb3f6dd405fab928dbffdcc97f3`;
+test SHA-256 `68363c1abf3a46a5e60087ca9bc548d17db6876bace5fc8f43489f960280fff6`.
