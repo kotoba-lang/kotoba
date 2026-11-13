@@ -229,3 +229,25 @@ The full gate is opt-in and has not been run on Linux or in exact-head CI.
 It does not establish a signature, authenticated location catalog, Native
 writer/atomic publication, restart after OS cache loss, concurrent mutation
 safety, device power-loss durability or production qualification.
+
+## Native GiB verification through the reusable chunk view
+
+On 2026-11-14 JST the opt-in GiB case above was changed to call
+`awai.fs.forest-view/read-chunk` for each of the 1,024 chunks. This exercises
+manifest canonical CID checking, index and length checks, file-backed Forest
+lookup and decoded block CID verification through the reusable Native API;
+the earlier low-level result above remains a historical measurement. The root
+and per-chunk Pack selection are supplied by the fixture. Each chunk has its
+own arena; the manifest is decoded and checked again per call.
+
+On Darwin 25.4.0 arm64 the positive case exited 0; independently corrupted
+Pack 31 and Pack 63 were rejected with exits 41 and 73. The source lock was
+`aaf30c39bc1d80238b406b10a56a5caf34aca942b84640dfd0a27a9b3733ca45`
+and the Native executable SHA-256 was
+`d58d849dc3a9eca2c92e372cba343cf3814e08b713f2e501968b217b9a90c3d8`.
+One `/usr/bin/time -l` measurement covering staging, compilation and all three
+runs took 146.80 seconds and reported maximum RSS 253,722,624 bytes. It is
+not an isolated I/O benchmark, and cache and concurrent load were uncontrolled.
+The compressed synthetic fixture, caller-supplied authority and mapping,
+whole-stream hash, opt-in platform coverage and durability limitations above
+still apply; this is not a Native writer or production qualification.

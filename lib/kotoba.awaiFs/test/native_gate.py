@@ -74,12 +74,12 @@ def main(a):
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
         file_case=case.get('name') in {'forest_file_io','forest_manifest_io','forest_gib_full'}
         for relative_name,original in source.items():
-            if relative_name=='awai/fs/forest_view.kotoba' and case.get('name')!='forest_manifest_io':continue
+            if relative_name=='awai/fs/forest_view.kotoba' and case.get('name') not in {'forest_manifest_io','forest_gib_full'}:continue
             if relative_name=='awai/fs/forest_file.kotoba' and not file_case:continue
             if relative_name in {'awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','zstd/frame_header.kotoba'} and case.get('name') not in {'zstd_header','forest_file_io','forest_manifest_io','forest_gib_full'}:continue
             if case.get('name') in {'zstd_header','forest_file_io'} and relative_name not in {'zstd/frame_header.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
             if case.get('name')=='forest_manifest_io' and relative_name not in {'awai/fs/logical_file.kotoba','ipld/dag_cbor_write.kotoba','zstd/frame_header.kotoba','awai/fs/forest_view.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
-            if case.get('name')=='forest_gib_full' and relative_name not in {'awai/fs/logical_file.kotoba','ipld/dag_cbor_write.kotoba','zstd/frame_header.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
+            if case.get('name')=='forest_gib_full' and relative_name not in {'awai/fs/logical_file.kotoba','ipld/dag_cbor_write.kotoba','zstd/frame_header.kotoba','awai/fs/forest_view.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
             if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
@@ -258,7 +258,8 @@ def main(a):
             if runtime and not virtual:
                 child_env.update(KEXE_ALLOW='35' if file_case else '-',KEXE_FUEL='off',KEXE_STRUCTURED_REPORT='1',KEXE_STRING_POOL='268435456')
                 if file_case:child_env['KEXE_CAP_RESOURCES_35']=str(directory)
-            r=subprocess.run(list(map(str,args)),cwd=directory,pass_fds=(3,),env=child_env,capture_output=True,timeout=300)
+            timeout=1800 if runtime and case.get('name')=='forest_gib_full' else 300
+            r=subprocess.run(list(map(str,args)),cwd=directory,pass_fds=(3,),env=child_env,capture_output=True,timeout=timeout)
             (directory/(label+'.stdout')).write_bytes(r.stdout);(directory/(label+'.stderr')).write_bytes(r.stderr)
             calls.append({'step':label,'exit':r.returncode})
             if check and (r.returncode or r.stderr):raise RuntimeError((name,label,r.returncode,r.stderr[-1200:]))
