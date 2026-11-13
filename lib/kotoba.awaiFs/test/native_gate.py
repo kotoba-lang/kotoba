@@ -38,6 +38,7 @@ def main(a):
     source={
         'awai/fs/logical_file.kotoba':ROOT/'src/awai/fs/logical_file.kotoba',
         'awai/fs/chunk_plan.kotoba':ROOT/'src/awai/fs/chunk_plan.kotoba',
+        'awai/fs/forest_blocks.kotoba':ROOT/'src/awai/fs/forest_blocks.kotoba',
         'ipld/car/pack.kotoba':REPO/'lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba',
         'ipld/dag_cbor_write.kotoba':REPO/'lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba',
         'zstd/frame_header.kotoba':REPO/'lib/org.ietf.zstd/src/zstd/frame_header.kotoba',
@@ -53,8 +54,9 @@ def main(a):
         name=f'{kind}-{index}'+('-'+control if control else '')
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
         for relative_name,original in source.items():
+            if relative_name=='awai/fs/forest_blocks.kotoba' and case.get('name')!='zstd_header':continue
             if relative_name=='zstd/frame_header.kotoba' and case.get('name')!='zstd_header':continue
-            if case.get('name')=='zstd_header' and relative_name not in {'zstd/frame_header.kotoba','multiformats/sha256.kotoba'}:continue
+            if case.get('name')=='zstd_header' and relative_name not in {'zstd/frame_header.kotoba','awai/fs/forest_blocks.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
             if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
@@ -104,6 +106,10 @@ def main(a):
         elif control=='wrong-zstd-frame-digest':
             needle='f1d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba'
             if fixture.count(needle)!=1:raise ValueError('native Zstd frame digest control anchor drift')
+            fixture=fixture.replace(needle,'0'+needle[1:])
+        elif control=='wrong-forest-block-digest':
+            needle='88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd'
+            if fixture.count(needle)!=1:raise ValueError('native Forest block digest control anchor drift')
             fixture=fixture.replace(needle,'0'+needle[1:])
         elif control=='allow-plan-overflow':
             p=src/'awai/fs/chunk_plan.kotoba';body=p.read_text()
@@ -168,7 +174,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -192,6 +198,7 @@ def main(a):
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-block-digest')
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-integrated-digest')
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-frame-digest')
+        run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-forest-block-digest')
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:

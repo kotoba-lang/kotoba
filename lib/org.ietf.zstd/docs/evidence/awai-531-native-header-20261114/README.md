@@ -296,3 +296,35 @@ test SHA-256
 `345de470b0848afca605f1c183cef3af59f13285dd83aa457e8b140ee2d7cec3`.
 The JVM is a local oracle only. This does not yet implement general Zstd,
 checksum verification, Forest indexing, Native I/O, GiB or production proof.
+
+## CID lookup in a decoded Forest frame
+
+The owning `awai.fs.forest-blocks` Native module walks bounded CAR block
+sections in a decoded Forest frame, checks canonical varint framing and the
+supported CIDv1 raw/DAG-CBOR SHA-256 shape, and verifies the selected payload
+against its CID before returning bytes. The fixture's first raw CID yields a
+65,536-byte block with SHA-256
+`88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd`.
+The same test refuses a modified selected byte, missing CID, truncated or
+noncanonical section and malformed target CID; a synthetic DAG-CBOR CID also
+passes. An independently compiled wrong expected block digest returns 128.
+The pinned macOS Native gate passed the positive case and eleven controls.
+Cross-platform exact-head CI is separate.
+
+Only traversed framing and the selected payload are checked: other payloads,
+the Forest index, stored-file identity and unread frames are not verified by
+this function. A `:not-found` result means absent from the supplied frame,
+not absent from the archive. No Native file I/O, checksum support or general
+Forest profile is claimed. The reference fixture, Clojure CLI and Temurin
+versions are recorded above; the one-time command was:
+
+```sh
+clojure -Sdeps '{:paths [".agent-output/zstd-oracle"]}' -M -e '(require (quote [zstd.core :as z])) (let [f (deref (var zstd.core/read-frame)) b (mapv #(bit-and 255 %) (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "/Users/junkawasaki/github/wt/codex/awai-532-streaming-pack/nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0)))) v (:bytes (f b 68 {:max-output 1048576})) payload (byte-array (map unchecked-byte (subvec v 39 65575))) d (.digest (java.security.MessageDigest/getInstance "SHA-256") payload)] (prn {:section-prefix (subvec v 0 39) :data-size (alength payload) :data-sha256 (apply str (map #(format "%02x" (bit-and 255 %)) d))}))' > .agent-output/forest-car-first-oracle-20261114.edn
+```
+
+Reference output `forest-car-first-oracle.edn` SHA-256
+`3fa59e5417051073075fe2bfdf96cca0ce1420ea3869c302cc0a854c45a8501f`;
+Native lookup source SHA-256
+`da259d44f443b04289a4737d79cf70e12a816592e7e64b4397f711a7cb0585bd`;
+test SHA-256
+`cde4536b9d016e616e429c6ae1cf204d72ebb7fc29bdcdbf0a20141cbd1cf319`.
