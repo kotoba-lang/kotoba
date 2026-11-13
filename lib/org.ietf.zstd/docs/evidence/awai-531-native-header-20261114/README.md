@@ -180,3 +180,33 @@ Native source SHA-256
 `fb771feb8904b0c4835dc66907d39982b000fe4c96cbb704b9d8b222498f9a88`,
 test SHA-256
 `b70fc998a9c4387053280bff9ca928e46df5b04d938aa1968ae4b95bdc3ed9f5`.
+
+## Predefined sequence decoding
+
+Native now connects the three predefined FSE tables to the bounded reverse
+bit reader and emits `[literal-length, match-length, offset-value]` triples.
+For the actual Forest fixture's second frame (sequence bytes 374..421), all
+16 triples match the one-time reference `forest-sequences-oracle.edn`, SHA-256
+`ecf19622cf55390d42d8182128cd6c37bc581e3fafce5c31517c50be9974ebbf`.
+The pinned macOS Native gate passed the positive case and seven independently
+compiled controls; changing the first expected triple yields result 85.
+Tests include truncation, count limits, invalid marker, trailing bits and
+explicit rejection of non-predefined modes. This is a conservative supported
+subset: it requires exact consumption of the bitstream and does not claim to
+accept every valid frame. It does not execute sequences, apply repeat offsets,
+verify checksums or implement I/O.
+
+Reference command on 2026-11-14 JST, Clojure CLI 1.12.5.1654 / Temurin 21.0.1,
+using the copied unchanged `.cljc` reference sources recorded above (the
+fixture is `part-0.forest.car.zst`, SHA-256
+`87a1d2773c099ef49af8fc7b9b00b43123a4e83ab1bc3f1f2b3fca0278fb62df`):
+
+```sh
+clojure -Sdeps '{:paths [".agent-output/zstd-oracle"]}' -M -e '(require (quote [zstd.core :as z])) (let [f (deref (var zstd.core/read-sequences)) b (mapv #(bit-and 255 %) (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "/Users/junkawasaki/github/wt/codex/awai-532-streaming-pack/nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0))))] (prn (vec (mapcat identity (:sequences (f b 374 422 {}))))))' > .agent-output/forest-sequences-oracle-20261114.edn
+```
+
+Native source SHA-256
+`0bedf2a9f1db277fa1dbc03a0a44d79b770d6a13e2b32aeb600ed19404c0e69e`;
+test SHA-256
+`0ac3e0eacd3b3907583d116683cb4bc8408161c1a6e466a42454adc8122d0b51`.
+This local reference is not a Native fallback or a CI dependency.
