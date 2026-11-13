@@ -210,3 +210,34 @@ Native source SHA-256
 test SHA-256
 `0ac3e0eacd3b3907583d116683cb4bc8408161c1a6e466a42454adc8122d0b51`.
 This local reference is not a Native fallback or a CI dependency.
+
+## Sequence execution for the actual compressed block
+
+Native now executes the decoded triples with bounded output, literal copy,
+overlapping match copy, window/history checks and repeat-offset updates. On
+the actual fixture's second frame, the extracted literals and 16 decoded
+sequences produce 65,575 bytes with SHA-256
+`3a3d9308758b3a794400d6d5c9e219ee38a15333bd83ddcf502ca65ef369e435`
+and repeat offsets `[8165 256 1]`, matching the local reference. The Native
+test hashes all output bytes with the repository's pure Native SHA-256 and
+checks overlapping copy, prior-block history, direct and repeat offsets,
+invalid history/offset and output limits. The pinned macOS Native gate passed
+the positive test plus eight independently compiled controls; changing the
+expected output digest returns 94. Exact-head CI remains separate.
+
+The one-time reference on 2026-11-14 JST used the same Clojure CLI 1.12.5.1654,
+Temurin 21.0.1, reference source copies and pinned fixture documented above:
+
+```sh
+clojure -Sdeps '{:paths [".agent-output/zstd-oracle"]}' -M -e '(require (quote [zstd.core :as z])) (let [f (deref (var zstd.core/decode-block!)) b (mapv #(bit-and 255 %) (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "/Users/junkawasaki/github/wt/codex/awai-532-streaming-pack/nixos/otehon/storage/test/fixtures/crosspack/part-0.forest.car.zst" (make-array String 0)))) out (volatile! []) reps (volatile! [1 4 8])] (f b 77 422 out {:huffman nil :tables {} :reps-v reps}) (let [bytes (byte-array (map unchecked-byte @out)) hash (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes)] (prn {:size (count @out) :sha256 (apply str (map #(format "%02x" (bit-and 255 %)) hash)) :reps @reps})))' > .agent-output/forest-block-oracle-20261114.edn
+```
+
+The recorded `forest-block-oracle.edn` SHA-256 is
+`511f1ad0d896b106847f97b08a10c821b1d6d5da714a3e2f4c8a2eb70592c604`.
+Native source SHA-256
+`873daa94115cc46d3ce25417bee9b4dfec891baf3f61400acfc4857c8da6c01b`;
+test SHA-256
+`308e2ab818c4c0ddf3d9e6bc003bae6fbfeb586bbe5010b5e025b9443d696954`.
+This is a single predefined-mode block with raw literals, not generic Zstd,
+whole-frame assembly, checksum validation, Forest index access or Native I/O.
+The JVM oracle remains a local reference, not a build or runtime dependency.

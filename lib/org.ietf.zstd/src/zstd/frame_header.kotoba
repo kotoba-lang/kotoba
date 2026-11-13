@@ -1,7 +1,7 @@
 ;; RFC 8878 sections 3.1.1.1 and 3.1.1.2: bounded frame and block headers.
-;; Raw and RLE payloads are decoded; compressed payloads and checksums are not.
+;; Raw/RLE and one compressed subset are supported; checksums are not.
 (ns zstd.frame-header
-  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table decode-predefined-sequences])
+  (:export [parse parse-block decode-raw-rle decode-literals parse-sequences reverse-start reverse-read fse-table decode-predefined-sequences execute-sequences])
   (:schemas {:zstd/header [:record :zstd/header
                [[:error :keyword] [:header-size :i64] [:window-size :i64]
                 [:content-size :i64] [:checksum :i64]]]
@@ -15,7 +15,11 @@
              :zstd/reverse [:record :zstd/reverse
                [[:error :keyword] [:next :i64] [:value :i64]]]
              :zstd/placement [:record :zstd/placement
-               [[:position :i64] [:symbols :vector-i64]]]}))
+               [[:position :i64] [:symbols :vector-i64]]]
+             :zstd/repeat [:record :zstd/repeat
+               [[:offset :i64] [:r1 :i64] [:r2 :i64] [:r3 :i64]]]
+             :zstd/execution [:record :zstd/execution
+               [[:error :keyword] [:bytes :vector-i64] [:reps :vector-i64]]]}))
 
 (defn- failure [reason :keyword] [:ref :zstd/header]
   (record-new [:ref :zstd/header] reason 0 0 -1 0))
@@ -30,6 +34,71 @@
   (record-new [:ref :zstd/sequences] reason 0 0 0 0 0))
 (defn- reverse-failure [reason :keyword] [:ref :zstd/reverse]
   (record-new [:ref :zstd/reverse] reason 0 0))
+(defn- execute-failure [reason :keyword] [:ref :zstd/execution]
+  (record-new [:ref :zstd/execution] reason (vector-i64) (vector-i64)))
+(defn- valid-input-bytes? [b :vector-i64] :bool
+  (loop [i 0]
+    (if (= i (vector-count b)) true
+      (let [x (vector-at b i)]
+        (if (or (< x 0) (> x 255)) false (recur (+ i 1)))))))
+
+(defn- repeat-offset [value :i64 literal-length :i64 r1 :i64 r2 :i64 r3 :i64] [:ref :zstd/repeat]
+  (if (> value 3) (record-new [:ref :zstd/repeat] (- value 3) (- value 3) r1 r2)
+    (let [v (+ value (if (= literal-length 0) 1 0))]
+      (cond (= v 1) (record-new [:ref :zstd/repeat] r1 r1 r2 r3)
+            (= v 2) (record-new [:ref :zstd/repeat] r2 r2 r1 r3)
+            (= v 3) (record-new [:ref :zstd/repeat] r3 r3 r1 r2)
+            (= v 4) (record-new [:ref :zstd/repeat] (- r1 1) (- r1 1) r1 r2)
+            :else (record-new [:ref :zstd/repeat] 0 r1 r2 r3)))))
+
+;; Execute decoded triples against already-verified preceding frame bytes.
+;; Returns only this block's bytes and the repeat offsets for the next block.
+(defn execute-sequences [history :vector-i64 literals :vector-i64 seqs :vector-i64 reps :vector-i64 window :i64 cap :i64] [:ref :zstd/execution]
+  (let [n (vector-count seqs) ln (vector-count literals) hn (vector-count history)
+        max-out (if (< window 131072) window 131072)]
+    (cond (or (< cap 0) (< window 0)) (execute-failure :invalid-bound)
+          (or (not= (rem n 3) 0) (not= (vector-count reps) 3)) (execute-failure :invalid-sequences)
+          (or (<= (vector-at reps 0) 0) (<= (vector-at reps 1) 0) (<= (vector-at reps 2) 0)) (execute-failure :invalid-offset)
+          (or (not (valid-input-bytes? history)) (not (valid-input-bytes? literals))) (execute-failure :invalid-byte)
+          :else
+          (let [bound (if (< cap max-out) cap max-out)
+                total (loop [i 0 lp 0 size 0]
+                        (if (= i n) (if (> (- ln lp) (- bound size)) -1 (+ size (- ln lp)))
+                          (let [ll (vector-at seqs i) ml (vector-at seqs (+ i 1)) ov (vector-at seqs (+ i 2))]
+                            (cond (or (< ll 0) (< ml 3) (< ov 1) (> ll (- ln lp))) -1
+                                  (> ll (- bound size)) -1
+                                  (> ml (- (- bound size) ll)) -1
+                                  :else (recur (+ i 3) (+ lp ll) (+ size ll ml))))))]
+            (if (< total 0) (execute-failure :invalid-sequences)
+              (loop [i 0 lp 0 p 0 r1 (vector-at reps 0) r2 (vector-at reps 1) r3 (vector-at reps 2)
+                     out (vector-alloc total)]
+                (if (= i n)
+                  (loop [j lp at p v out]
+                    (if (= j ln) (record-new [:ref :zstd/execution] :none v (vector-i64 r1 r2 r3))
+                      (let [x (vector-at literals j)]
+                        (if (or (< x 0) (> x 255)) (execute-failure :invalid-byte)
+                          (recur (+ j 1) (+ at 1) (vector-assoc! v at x))))))
+                  (let [ll (vector-at seqs i) ml (vector-at seqs (+ i 1)) ov (vector-at seqs (+ i 2))
+                        repeat (repeat-offset ov ll r1 r2 r3) off (record-get [:ref :zstd/repeat] repeat :offset)
+                        after (+ p ll)]
+                    (if (or (<= off 0) (> off window) (> (- off after) hn))
+                      (execute-failure :invalid-offset)
+                      (let [copied (loop [j 0 v out]
+                                     (if (= j ll) v
+                                       (recur (+ j 1) (vector-assoc! v (+ p j) (vector-at literals (+ lp j))))))
+                            ok (loop [j 0] (if (= j ll) true
+                                 (let [x (vector-at literals (+ lp j))]
+                                   (if (or (< x 0) (> x 255)) false (recur (+ j 1))))))]
+                        (if (not ok) (execute-failure :invalid-byte)
+                          (let [matched (loop [j 0 v copied]
+                                          (if (= j ml) v
+                                            (let [from (- (+ after j) off)
+                                                  x (if (< from 0) (vector-at history (+ hn from)) (vector-at v from))]
+                                              (recur (+ j 1) (vector-assoc! v (+ after j) x)))))]
+                            (recur (+ i 3) (+ lp ll) (+ after ml)
+                              (record-get [:ref :zstd/repeat] repeat :r1)
+                              (record-get [:ref :zstd/repeat] repeat :r2)
+                              (record-get [:ref :zstd/repeat] repeat :r3) matched)))))))))))))
 
 ;; FSE state table, flat triples [symbol number-of-bits new-state]. Counts
 ;; are normalized weights; -1 occupies one low-probability state. The caller
