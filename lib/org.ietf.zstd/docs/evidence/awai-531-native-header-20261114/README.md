@@ -374,3 +374,50 @@ Native index source SHA-256
 `ac2a8fcdcde427e684b3b350bede8d8f9d0c73297b7700787aac82a89348c05f`;
 test SHA-256
 `2daac78251b458c9d61e8dffd7d75ac3dceeaafcf5be6bebfd661875dc0f6967`.
+
+## Native scoped positioned file reads
+
+`awai.fs.forest-file/get-block` now uses the existing scoped FS2 binary range
+operation, after checking the provider's reported file size. For the pinned 1,767-byte real Forest fixture it reads a 16-byte
+footer, a 248-byte index/footer range, and the selected 1,109-byte compressed
+frame, then decodes and checks the selected 64 KiB block's CID. Those sizes are
+derived from the request paths and fixture layout, not an independent syscall
+trace or performance measurement. The source rejects malformed paths/CIDs,
+out-of-profile sizes, unframed/short replies when returned, unsupported frames,
+and selected CID mismatches; an index miss remains `:no-candidate`, not proof
+of archive absence. It uses no hosted filesystem fallback.
+
+The pinned macOS arm64 Native gate `--target macos-arm64 --only forest_file_io`
+passed on an actual task-owned fixture file: selected block digest, changed
+content refusal, missing or already-short file refusal, hidden-index
+no-candidate, bad footer, invalid path and CID.
+The independently compiled wrong digest control returned 3. The existing
+Native writer and in-memory Forest tests also passed in a separate run. The
+fixture bytes are checked in under `kotoba.awaiFs/test/fixtures`, copied from
+Awai OS revision `a45818acee8c1e4b87824f290f874a107d851856` with SHA-256
+`87a1d2773c099ef49af8fc7b9b00b43123a4e83ab1bc3f1f2b3fca0278fb62df`.
+The test is wired into the three-platform native gate; exact-head Linux/macOS
+CI is separate and must be checked. Current `forest_file.kotoba` SHA-256
+`03334ecd913aacc4c3894059ef4617619af9fa59b3e9115c664d9d84641a299b`;
+test SHA-256
+`99ecedb7b0c6f28557808444a4ee5f01b9525569c66e698ac9b5976ef59396a2`.
+
+**Known provider limitation:** before the size preflight was added, a separate
+local macOS process requested the same range from a one-byte-short file. The pinned provider terminated
+the process with SIGTRAP (Python return code -5), rather than returning the
+`:read-refused` result the probe expected. It did not return corrupted data,
+but a catchable short-read API and recovery are not qualified. Probe source
+`forest-file-short-probe.kotoba` SHA-256
+`f90b3d6a581ca1e7e56c236d5827b22337b8e01d9517864de00026132d9e4a57`;
+rerun against the then-current source with source lock SHA-256
+`16ad9a47a12bee51b678053fdfd4b7bc2bd0f0c917201eeec492f4b4e755cf17`,
+staged `forest_file.kotoba` SHA-256
+`1e2d323a1c0349f92c098341f825b3088d7246cbb742302ab9adf26f19542408`,
+and staged short fixture SHA-256
+`621e4523e0ddfbdbaeb275878a16b20e2acfb637474f81e31a81bd8b228bfc0f`.
+The current size preflight rejects the already-short case as
+`:file-size-mismatch`; it does not hold a file snapshot. Concurrent replacement
+or truncation after the stat can still refuse or terminate, and index misses do
+not prove absence. This is
+not a production-ready recovery boundary, general Forest/Zstd, writer, GiB,
+host-cache-loss or power-loss proof.

@@ -40,6 +40,7 @@ def main(a):
         'awai/fs/chunk_plan.kotoba':ROOT/'src/awai/fs/chunk_plan.kotoba',
         'awai/fs/forest_blocks.kotoba':ROOT/'src/awai/fs/forest_blocks.kotoba',
         'awai/fs/forest_index.kotoba':ROOT/'src/awai/fs/forest_index.kotoba',
+        'awai/fs/forest_file.kotoba':ROOT/'src/awai/fs/forest_file.kotoba',
         'ipld/car/pack.kotoba':REPO/'lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba',
         'ipld/dag_cbor_write.kotoba':REPO/'lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba',
         'zstd/frame_header.kotoba':REPO/'lib/org.ietf.zstd/src/zstd/frame_header.kotoba',
@@ -48,23 +49,35 @@ def main(a):
     stage=Path(__file__).with_name('stage_corpus.py')
     spec=importlib.util.spec_from_file_location('fixed_literals',stage);literal=importlib.util.module_from_spec(spec);spec.loader.exec_module(literal)
     zstd_test=REPO/'lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba'
-    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
+    forest_fixture=ROOT/'test/fixtures/forest-part0.car.zst'
+    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',forest_fixture,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
     inputs={str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p):sha(p) for p in watched}
     initial={p:sha(p) for p in watched};results=[]
     def run_case(kind,index,case,control=None):
         name=f'{kind}-{index}'+('-'+control if control else '')
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
+        file_case=case.get('name')=='forest_file_io'
         for relative_name,original in source.items():
-            if relative_name=='awai/fs/forest_blocks.kotoba' and case.get('name')!='zstd_header':continue
-            if relative_name=='awai/fs/forest_index.kotoba' and case.get('name')!='zstd_header':continue
-            if relative_name=='zstd/frame_header.kotoba' and case.get('name')!='zstd_header':continue
-            if case.get('name')=='zstd_header' and relative_name not in {'zstd/frame_header.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
+            if relative_name=='awai/fs/forest_file.kotoba' and not file_case:continue
+            if relative_name in {'awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','zstd/frame_header.kotoba'} and case.get('name') not in {'zstd_header','forest_file_io'}:continue
+            if case.get('name') in {'zstd_header','forest_file_io'} and relative_name not in {'zstd/frame_header.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
             if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
             if kind=='primitive' and case['name']=='pack_values' and relative_name=='awai/fs/logical_file.kotoba':continue
             p=src/relative_name;p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,p)
         fixture=(zstd_test if case['name']=='zstd_header' else ROOT/'test'/case['file']).read_text() if kind=='primitive' else literal.fixture(case,kind,index)
+        if file_case:
+            original=forest_fixture.read_bytes()
+            if hashlib.sha256(original).hexdigest()!='87a1d2773c099ef49af8fc7b9b00b43123a4e83ab1bc3f1f2b3fca0278fb62df':raise ValueError('Forest fixture pin mismatch')
+            for file_name,offset in [('fixture',None),('fixture-corrupt',119),('fixture-hidden',1639),('fixture-badfooter',1751)]:
+                contents=bytearray(original)
+                if offset is not None:contents[offset]^=1
+                (directory/file_name).write_bytes(contents)
+                if target!='macos-arm64':fixture=fixture.replace('"/'+file_name+'"',json.dumps(str(directory/file_name)))
+            (directory/'fixture-short').write_bytes(original[:-1])
+            if target!='macos-arm64':fixture=fixture.replace('"/fixture-short"',json.dumps(str(directory/'fixture-short')))
+            if target!='macos-arm64':fixture=fixture.replace('"/fixture-missing"',json.dumps(str(directory/'fixture-missing')))
         if control=='wrong-cid':
             old=json.dumps(case['cid']);new=json.dumps(case['cid'][:-1]+('a' if case['cid'][-1]!='a' else 'b'))
             if old not in fixture:raise ValueError('golden control anchor drift')
@@ -117,6 +130,10 @@ def main(a):
             needle='(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] indexed (vector-i64))) "88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"'
             if fixture.count(needle)!=1:raise ValueError('native Forest indexed digest control anchor drift')
             fixture=fixture.replace(needle,needle.replace('"8849','"0849'))
+        elif control=='wrong-forest-file-digest':
+            needle='88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd'
+            if fixture.count(needle)!=1:raise ValueError('native Forest file digest control anchor drift')
+            fixture=fixture.replace(needle,'0'+needle[1:])
         elif control=='allow-plan-overflow':
             p=src/'awai/fs/chunk_plan.kotoba';body=p.read_text()
             needle='(> count 1024)'
@@ -141,7 +158,9 @@ def main(a):
         if not virtual:env.update(KEXE_ALLOW='35,37,38,39',KEXE_CAP_RESOURCES_35=':'.join(map(str,[directory,amu])),KEXE_STACK_BYTES='8388608')
         def call(label,args,check=True,runtime=False):
             child_env=dict(env)
-            if runtime and not virtual:child_env.update(KEXE_ALLOW='-',KEXE_FUEL='off',KEXE_STRUCTURED_REPORT='1',KEXE_STRING_POOL='268435456')
+            if runtime and not virtual:
+                child_env.update(KEXE_ALLOW='35' if file_case else '-',KEXE_FUEL='off',KEXE_STRUCTURED_REPORT='1',KEXE_STRING_POOL='268435456')
+                if file_case:child_env['KEXE_CAP_RESOURCES_35']=str(directory)
             r=subprocess.run(list(map(str,args)),cwd=directory,pass_fds=(3,),env=child_env,capture_output=True,timeout=300)
             (directory/(label+'.stdout')).write_bytes(r.stdout);(directory/(label+'.stderr')).write_bytes(r.stderr)
             calls.append({'step':label,'exit':r.returncode})
@@ -172,7 +191,7 @@ def main(a):
                 m=re.fullmatch(rb'KX64V1 x86_64-linux sysv-ctx-v11 ([0-9]+) 0',header)
                 if not m or int(m[1])!=len(payload) or not payload or payload[0]!=0xe9:raise ValueError('invalid Native payload framing')
                 raw=directory/'program.bin';raw.write_bytes(payload)
-                r=call('execute',[runner,raw,'0','0','x86_64','-','--'],check=False,runtime=True)
+                r=call('execute',[runner,raw,'0','0','x86_64','35' if file_case else '-','--'],check=False,runtime=True)
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native runner refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
@@ -180,7 +199,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=3 if control=='wrong-forest-file-digest' else 137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -191,7 +210,7 @@ def main(a):
             if not a.only or case['name'] in a.only:run_case(kind,i,case)
     for i,case in enumerate(data['legacyPacks']['cases']):
         if not a.only or case['name'] in a.only:run_case('pack',i,dict(case,wireHex=case['carHex']))
-    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values','zstd_header']):
+    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values','zstd_header','forest_file_io']):
         if not a.only or name in a.only:run_case('primitive',i,{'name':name,'file':name+'.kotoba'})
     if not a.only or 'zstd_header' in a.only:
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-window')
@@ -206,6 +225,8 @@ def main(a):
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-frame-digest')
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-forest-block-digest')
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-forest-indexed-digest')
+    if not a.only or 'forest_file_io' in a.only:
+        run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'wrong-forest-file-digest')
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:
