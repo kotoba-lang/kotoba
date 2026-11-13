@@ -89,3 +89,21 @@ test SHA-256 `68363c1abf3a46a5e60087ca9bc548d17db6876bace5fc8f43489f960280fff6`.
 After correcting the source preamble to mention both header types, parser
 SHA-256 became `51f49522176b8442d1febe688897e34eb8c52c97d9860e8824d852409561d80d`;
 the same three macOS Native gate cases were rerun and passed.
+
+## Bounded raw and RLE payloads
+
+The Native module now expands a single admitted raw or RLE block with a
+caller-supplied output limit, refusing truncation, invalid input bytes and
+compressed blocks. It does not assemble frames, decode compressed blocks,
+verify frame checksums or perform I/O. In the actual Forest fixture, the
+first raw block expands to the 59 CAR header bytes; the Native test compares
+all bytes against the fixture. Additional tests cover RLE, truncated raw and
+RLE input, output limits, invalid bytes and compressed-type refusal.
+
+On macOS arm64 the pinned Native gate passed the positive case and separately
+compiled wrong-window, wrong-block-size and wrong-raw-byte controls (results
+0, 12, 28 and 42 respectively). Exact-head Linux and macOS CI remain to be
+checked. Parser SHA-256
+`f81baf23321de07b020c1ef9fc2aadf796dc1c94be76c52341a4dbea0e05e8fe`,
+test SHA-256
+`f97ef9e2a26c6f549a74b60cda64f2bcebcbc288929db13e80800e5775b097bb`.
