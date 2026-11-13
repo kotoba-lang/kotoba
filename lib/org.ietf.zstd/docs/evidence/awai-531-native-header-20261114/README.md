@@ -50,6 +50,14 @@ single-segment window/content 5; and `:dictionary-required` for the explicit
 zero dictionary field. The reference oracle is not a Native fallback or build
 dependency. The full compressed-block decoder and Native I/O remain open.
 
+The existing Awai native gate also ran locally on macOS arm64 with
+`--target macos-arm64 --only zstd_header` against the pinned compiler and
+packager. It compiled and ran the unmodified predicate (result 0) and the
+independently compiled wrong-window negative control (result 12). Its receipt
+covers only these two cases; it does not qualify the full corpus or Native
+I/O. The CI matrix is configured to run them on macOS arm64 and Linux arm64
+and x86-64; those platforms require their own CI results.
+
 The copied reference source SHA-256 values, in bits/core/fse/huff/xxhash order:
 
 ```text

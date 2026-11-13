@@ -40,27 +40,35 @@ def main(a):
         'awai/fs/chunk_plan.kotoba':ROOT/'src/awai/fs/chunk_plan.kotoba',
         'ipld/car/pack.kotoba':REPO/'lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba',
         'ipld/dag_cbor_write.kotoba':REPO/'lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba',
+        'zstd/frame_header.kotoba':REPO/'lib/org.ietf.zstd/src/zstd/frame_header.kotoba',
         **{f'multiformats/{name}.kotoba':REPO/f'lib/kotoba.ioMultiformats/src/multiformats/{name}.kotoba' for name in ['cid','byte_cid','sha256']}}
     corpus=ROOT/'corpus/v1.json';data=json.loads(corpus.read_text())
     stage=Path(__file__).with_name('stage_corpus.py')
     spec=importlib.util.spec_from_file_location('fixed_literals',stage);literal=importlib.util.module_from_spec(spec);spec.loader.exec_module(literal)
-    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',*source.values(),compiler,provider,corpus,stage,Path(__file__)]
+    zstd_test=REPO/'lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba'
+    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
     inputs={str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p):sha(p) for p in watched}
     initial={p:sha(p) for p in watched};results=[]
     def run_case(kind,index,case,control=None):
         name=f'{kind}-{index}'+('-'+control if control else '')
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
         for relative_name,original in source.items():
+            if relative_name=='zstd/frame_header.kotoba' and case.get('name')!='zstd_header':continue
+            if case.get('name')=='zstd_header' and relative_name!='zstd/frame_header.kotoba':continue
             if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
             if kind=='primitive' and case['name']=='pack_values' and relative_name=='awai/fs/logical_file.kotoba':continue
             p=src/relative_name;p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,p)
-        fixture=(ROOT/'test'/case['file']).read_text() if kind=='primitive' else literal.fixture(case,kind,index)
+        fixture=(zstd_test if case['name']=='zstd_header' else ROOT/'test'/case['file']).read_text() if kind=='primitive' else literal.fixture(case,kind,index)
         if control=='wrong-cid':
             old=json.dumps(case['cid']);new=json.dumps(case['cid'][:-1]+('a' if case['cid'][-1]!='a' else 'b'))
             if old not in fixture:raise ValueError('golden control anchor drift')
             fixture=fixture.replace(old,new)
+        elif control=='wrong-zstd-window':
+            needle='(not= (record-get [:ref :zstd/header] forest :window-size) 2097152)'
+            if fixture.count(needle)!=1:raise ValueError('native Zstd control anchor drift')
+            fixture=fixture.replace(needle,needle.replace('2097152','2097151'))
         elif control=='allow-plan-overflow':
             p=src/'awai/fs/chunk_plan.kotoba';body=p.read_text()
             needle='(> count 1024)'
@@ -124,7 +132,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -135,8 +143,10 @@ def main(a):
             if not a.only or case['name'] in a.only:run_case(kind,i,case)
     for i,case in enumerate(data['legacyPacks']['cases']):
         if not a.only or case['name'] in a.only:run_case('pack',i,dict(case,wireHex=case['carHex']))
-    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values']):
+    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values','zstd_header']):
         if not a.only or name in a.only:run_case('primitive',i,{'name':name,'file':name+'.kotoba'})
+    if not a.only or 'zstd_header' in a.only:
+        run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-window')
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:
