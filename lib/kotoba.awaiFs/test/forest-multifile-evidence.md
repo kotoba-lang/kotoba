@@ -191,3 +191,41 @@ Native executable SHA-256:
 This tests selected blocks, not Native full-file 1 GiB recovery, signed basis,
 atomic publication, or cache/power-loss recovery. Other platforms and
 exact-head CI remain separate.
+
+## Opt-in Native verification of all 1 GiB chunks
+
+`forest_gib_full.kotoba` reads and canonical-CID-checks the preserved Otehon
+1 GiB logical manifest, then checks all 1,024 1 MiB chunk CIDs against the
+actual 64 ordered Forest Packs. Each selected full block is decoded and
+CID-verified by Native; the checked length must match its manifest row. The
+loop uses a Native `arena-scope` for each chunk and returns success only after
+all rows. It chooses one explicitly staged Pack for each 16 rows; this
+mapping, the file locations and expected root are fixture inputs, not a
+Native-validated persistent catalog or a signed authority.
+
+`gib-packs.bin` concatenates the 64 compressed archive fixture bytes only for
+test transport; it is not a new storage format. Its SHA-256 is
+`64e67a69917f3a5daaaaff67b48c317878bf9090709a16552e271b062f597ad1`.
+`gib-packs.json` records the ordered byte extents and individual SHA-256s;
+the gate verifies every extent and digest before staging separate files.
+The input is the same highly compressible, marked sparse data as the earlier
+Otehon readback, not 1 GiB of physical I/O.
+
+On Darwin 25.4.0 arm64 with the pinned Amu selfhost compiler and Native scoped
+file provider, the opt-in `--only forest_gib_full` gate passed all 1,024 chunk
+checks. Independently staged one-byte corruptions in Pack 31 and Pack 63 were
+refused at those Packs (exit codes 41 and 73); all cases used the same Native
+executable. Positive source lock:
+`1bc87e2519dec2c3144a33bc317865c17e7e151e84db2a80fb1af42218f2a41f`;
+Native executable SHA-256:
+`33ea8fe7800b7cb87589e0e38d5993d86b6bd99010a3e73a4ca799a8f992cf8b`.
+A single `/usr/bin/time -l` run of staging, compiling and executing the
+positive plus both negative cases took 87.44 s, with reported maximum RSS
+181,141,504 bytes. This is not an isolated read benchmark; OS cache and other
+work were uncontrolled. It validates per-chunk CID and length; it does not
+emit a reconstructed byte stream or independently compute its whole-file hash.
+
+The full gate is opt-in and has not been run on Linux or in exact-head CI.
+It does not establish a signature, authenticated location catalog, Native
+writer/atomic publication, restart after OS cache loss, concurrent mutation
+safety, device power-loss durability or production qualification.
