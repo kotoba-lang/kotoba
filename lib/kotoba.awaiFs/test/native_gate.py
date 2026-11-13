@@ -62,18 +62,20 @@ def main(a):
     forest_large=ROOT/'test/fixtures/forest-large-index.car.zst'
     forest_mega=ROOT/'test/fixtures/forest-megaframe.car.zst'
     forest_gib=[ROOT/'test/fixtures/forest-gib-pack0.car.zst',ROOT/'test/fixtures/forest-gib-pack1.car.zst']
-    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',forest_fixture,forest_fixture2,forest_large,forest_mega,*forest_gib,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
+    gib_manifest=ROOT/'test/fixtures/gib-manifest.cbor'
+    watched=[ROOT/'schema/v1.json',ROOT/'native-inputs.json',ROOT/'test/writer.kotoba',ROOT/'test/values.kotoba',ROOT/'test/pack_values.kotoba',ROOT/'test/forest_file_io.kotoba',ROOT/'test/forest_manifest_io.kotoba',forest_fixture,forest_fixture2,forest_large,forest_mega,*forest_gib,gib_manifest,zstd_test,*source.values(),compiler,provider,corpus,stage,Path(__file__)]
     if io_compiler:watched.append(io_compiler)
     inputs={str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p):sha(p) for p in watched}
     initial={p:sha(p) for p in watched};results=[]
     def run_case(kind,index,case,control=None):
         name=f'{kind}-{index}'+('-'+control if control else '')
         directory=out/name;src=directory/'src';src.mkdir(parents=True)
-        file_case=case.get('name')=='forest_file_io'
+        file_case=case.get('name') in {'forest_file_io','forest_manifest_io'}
         for relative_name,original in source.items():
             if relative_name=='awai/fs/forest_file.kotoba' and not file_case:continue
-            if relative_name in {'awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','zstd/frame_header.kotoba'} and case.get('name') not in {'zstd_header','forest_file_io'}:continue
+            if relative_name in {'awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','zstd/frame_header.kotoba'} and case.get('name') not in {'zstd_header','forest_file_io','forest_manifest_io'}:continue
             if case.get('name') in {'zstd_header','forest_file_io'} and relative_name not in {'zstd/frame_header.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
+            if case.get('name')=='forest_manifest_io' and relative_name not in {'awai/fs/logical_file.kotoba','ipld/dag_cbor_write.kotoba','zstd/frame_header.kotoba','awai/fs/forest_file.kotoba','awai/fs/forest_blocks.kotoba','awai/fs/forest_index.kotoba','multiformats/sha256.kotoba','multiformats/cid.kotoba','multiformats/byte_cid.kotoba'}:continue
             if relative_name=='awai/fs/chunk_plan.kotoba' and case.get('name')!='chunk_plan_values':continue
             if kind=='primitive' and case['name']=='writer' and relative_name not in {'ipld/dag_cbor_write.kotoba','multiformats/cid.kotoba'}:continue
             if kind!='pack' and case.get('name')!='pack_values' and relative_name=='ipld/car/pack.kotoba':continue
@@ -81,6 +83,15 @@ def main(a):
             p=src/relative_name;p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,p)
         fixture=(zstd_test if case['name']=='zstd_header' else ROOT/'test'/case['file']).read_text() if kind=='primitive' else literal.fixture(case,kind,index)
         if file_case:
+            manifest_bytes=gib_manifest.read_bytes()
+            if hashlib.sha256(manifest_bytes).hexdigest()!='1760ba196e18e6b1ed18477b2a42ed7eee248c191000c41ef2629fc6ebf48d1e':raise ValueError('GiB manifest pin mismatch')
+            if control=='tampered-gib-manifest':
+                marker=bytes.fromhex('6ffb6ccd5ca18062fb3e6175f6682800e623056b77256e074f1fef9ceb10b900')
+                position=manifest_bytes.find(marker)
+                if position<0 or manifest_bytes.count(marker)!=1:raise ValueError('GiB manifest mutation anchor drift')
+                damaged=bytearray(manifest_bytes);damaged[position]^=1;manifest_bytes=bytes(damaged)
+            (directory/'gib-manifest').write_bytes(manifest_bytes)
+            if target!='macos-arm64':fixture=fixture.replace('"/gib-manifest"',json.dumps(str(directory/'gib-manifest')))
             original=forest_fixture.read_bytes()
             if hashlib.sha256(original).hexdigest()!='87a1d2773c099ef49af8fc7b9b00b43123a4e83ab1bc3f1f2b3fca0278fb62df':raise ValueError('Forest fixture pin mismatch')
             second=forest_fixture2.read_bytes()
@@ -185,6 +196,12 @@ def main(a):
             needle='ad1925fe80c09fb367e0a7b3630232403b03161c78f50e432b48dc723258f4c0'
             if fixture.count(needle)!=1:raise ValueError('GiB Pack digest control anchor drift')
             fixture=fixture.replace(needle,'0'+needle[1:])
+        elif control=='wrong-gib-manifest-cid':
+            needle='bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy'
+            if fixture.count(needle)!=1:raise ValueError('GiB manifest CID control anchor drift')
+            fixture=fixture.replace(needle,needle[:-1]+'a')
+        elif control=='tampered-gib-manifest':
+            pass  # The staged input file was mutated above.
         elif control=='allow-group-error-fallback':
             p=src/'awai/fs/forest_file.kotoba';body=p.read_text()
             needle='(recur (+ i 1)) r)'
@@ -262,7 +279,7 @@ def main(a):
                 m=re.search(rb':status :ok\s+:result (-?[0-9]+)\b',r.stdout)
                 if r.returncode or not m:raise RuntimeError(('native process refused',name,r.returncode,r.stdout[-500:]))
                 verdict=int(m[1])
-            expected_result=38 if control=='wrong-gib-pack-digest' else 31 if control=='wrong-megaframe-digest' else 20 if control=='allow-group-error-fallback' else 13 if control=='wrong-second-forest-digest' else 3 if control=='wrong-forest-file-digest' else 137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
+            expected_result=4 if control in {'wrong-gib-manifest-cid','tampered-gib-manifest'} else 38 if control=='wrong-gib-pack-digest' else 31 if control=='wrong-megaframe-digest' else 20 if control=='allow-group-error-fallback' else 13 if control=='wrong-second-forest-digest' else 3 if control=='wrong-forest-file-digest' else 137 if control=='wrong-forest-indexed-digest' else 128 if control=='wrong-forest-block-digest' else 118 if control=='wrong-zstd-frame-digest' else 108 if control=='wrong-zstd-integrated-digest' else 94 if control=='wrong-zstd-block-digest' else 85 if control=='wrong-zstd-sequence-value' else 78 if control=='wrong-zstd-fse-table' else 62 if control=='wrong-zstd-sequence-count' else 52 if control=='wrong-zstd-literal-byte' else 42 if control=='wrong-zstd-raw-byte' else 28 if control=='wrong-zstd-block-size' else 12 if control=='wrong-zstd-window' else 8 if control=='allow-plan-overflow' else 1 if control and control!='wrong-cid' else 5 if control=='wrong-cid' else 0
             if r.stderr or verdict!=expected_result:
                 raise RuntimeError((name,'native predicate mismatch',r.returncode,verdict,r.stdout[-200:],r.stderr[-500:]))
             result={'name':case['name'],'kind':kind,'control':control,'calls':calls,'sourceLock':sha(lock),'artifact':sha(binary),'fixture':sha(entry),'nativeResult':verdict}
@@ -273,7 +290,7 @@ def main(a):
             if not a.only or case['name'] in a.only:run_case(kind,i,case)
     for i,case in enumerate(data['legacyPacks']['cases']):
         if not a.only or case['name'] in a.only:run_case('pack',i,dict(case,wireHex=case['carHex']))
-    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values','zstd_header','forest_file_io']):
+    for i,name in enumerate(['writer','values','pack_values','chunk_plan_values','zstd_header','forest_file_io','forest_manifest_io']):
         if not a.only or name in a.only:run_case('primitive',i,{'name':name,'file':name+'.kotoba'})
     if not a.only or 'zstd_header' in a.only:
         run_case('primitive',4,{'name':'zstd_header','file':'zstd_header.kotoba'},'wrong-zstd-window')
@@ -294,6 +311,9 @@ def main(a):
         run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'wrong-megaframe-digest')
         run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'wrong-gib-pack-digest')
         run_case('primitive',5,{'name':'forest_file_io','file':'forest_file_io.kotoba'},'allow-group-error-fallback')
+    if not a.only or 'forest_manifest_io' in a.only:
+        run_case('primitive',6,{'name':'forest_manifest_io','file':'forest_manifest_io.kotoba'},'wrong-gib-manifest-cid')
+        run_case('primitive',6,{'name':'forest_manifest_io','file':'forest_manifest_io.kotoba'},'tampered-gib-manifest')
     if not a.only:
         run_case('positive',0,data['positive'][0],'wrong-cid')
         for control,name in [('allow-file-version','file-version'),('allow-link-codec','codec')]:

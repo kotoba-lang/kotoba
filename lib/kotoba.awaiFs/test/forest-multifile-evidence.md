@@ -138,3 +138,29 @@ Packs in Native. The Native caller receives the locations and CIDs as fixture
 inputs; the Otehon logical manifest or root is not authenticated by Native.
 OS cache loss, concurrent mutation, Native publication and other platforms
 remain separate evidence requirements.
+
+## Canonical 1 GiB manifest to Native Pack reads
+
+The pinned `gib-manifest.cbor` is the exact 71,783-byte canonical logical-file
+manifest recovered from the preceding Otehon 1 GiB fixture, SHA-256
+`1760ba196e18e6b1ed18477b2a42ed7eee248c191000c41ef2629fc6ebf48d1e`.
+A Native executable reads the file through scoped FS2, uses Kotoba's existing
+logical-file decoder and canonical CID routine, requires the expected manifest
+CID, checks the 1,024 rows and 1 GiB logical size, and takes the selected raw
+block CIDs from rows 0 and 16. It then obtains those blocks through the two
+actual Forest Pack files and checks their bytes/digests. File locations remain
+explicit test inputs, not a verified physical catalog.
+
+The pinned macOS arm64 Native gate passed the manifest-to-Pack path and all
+existing file controls. A separately compiled wrong expected manifest CID and
+a separately staged manifest with one chunk digest modified each exited 4 at
+the CID check before the Pack reads. The positive source lock is
+`e51984b1083d93856fcdc71b71591b33e8b47a71d0ad5c1e1fefa5cd6387dc41`;
+the Native executable SHA-256 is
+`0e6100b9857008294b4c280db4ce937b43bd8cc058dde3537ee531fcda5d97cc`.
+
+The expected CID is a pinned test input, not an authenticated signature or
+signed commit. The experiment reads two selected blocks, not the complete
+1 GiB. It does not prove a production Native catalog/writer, concurrent file
+snapshot, guest or host cache loss, or power-loss durability. Other platforms
+and exact-head CI are separate.
