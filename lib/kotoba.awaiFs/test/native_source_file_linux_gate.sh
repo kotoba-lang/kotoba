@@ -19,6 +19,9 @@ done
 mkdir -p "$out/src/awai/fs"
 cp "$repo/lib/kotoba.awaiFs/src/awai/fs/source_file.kotoba" "$out/src/awai/fs/"
 printf abcdef > "$out/input"
+dd if=/dev/zero bs=1 count=262138 status=none >> "$out/input"
+printf xyz >> "$out/input"
+printf abcdef > "$out/short-input"
 export KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608
 build() {
  label=$1; path=$2; count=$3
@@ -30,7 +33,7 @@ build() {
 }
 build positive "$out/input" 3
 build missing "$out/missing" 3
-build short "$out/input" 7
+build short "$out/short-input" 7
 export KEXE_ALLOW=35 KEXE_CAP_RESOURCES_35="$out" KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456
 "$out/positive.elf" > "$out/positive.stdout" 2> "$out/positive.stderr"
 grep -Eq ':status :ok[[:space:]]+:result 0([^0-9]|$)' "$out/positive.stdout"
