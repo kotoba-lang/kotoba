@@ -1,0 +1,108 @@
+#!/bin/sh
+# Native macOS arm64: Native FS2 write/read of Otehon random Forest files. No host decoder.
+set -eu
+[ "$#" -eq 3 ] || { echo 'usage: gate <pinned-amu> <extracted-input> <new-output>' >&2; exit 2; }
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || exit 2
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd -P)
+amu=$(CDPATH= cd -- "$1" && pwd -P)
+input=$(CDPATH= cd -- "$2" && pwd -P)
+parent=$(CDPATH= cd -- "$(dirname -- "$3")" && pwd -P)
+out="$parent/$(basename -- "$3")"
+mkdir "$out"
+sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+pins="$repo/lib/kotoba.awaiFs/native-inputs.json"
+compiler="$amu/seed/bootstrap/aarch64-macos/amu-full-root.macho"
+packager="$amu/seed/bootstrap/aarch64-macos/kotoba-packager-root.macho"
+for spec in 'seed/bootstrap/aarch64-macos/amu-full-root.macho' 'seed/bootstrap/aarch64-macos/kotoba-packager-root.macho'; do
+ p="$amu/$spec"; [ -f "$p" ] && [ ! -L "$p" ] || exit 1
+ [ "$(sha "$p")" = "$(jq -er --arg k "$spec" '.files[$k].sha256' "$pins")" ] || exit 1
+ codesign --verify --strict "$p"
+done
+[ "$(sha "$input/gib-manifest")" = '544e4bec081da2206e56b9a70bcca5298983acabb5e0969fbe4c33ea4a191254' ] || exit 1
+list="$repo/lib/kotoba.awaiFs/test/actual-random-2pack.tsv"
+[ "$(wc -l < "$list" | tr -d ' ')" = 2 ] || exit 1
+mkdir -p "$out/src/awai/fs" "$out/src/ipld" "$out/src/zstd" "$out/src/multiformats" "$out/gib-base" "$out/source" "$out/copy-src"
+for f in logical_file forest_view forest_file forest_blocks forest_index; do cp "$repo/lib/kotoba.awaiFs/src/awai/fs/$f.kotoba" "$out/src/awai/fs/$f.kotoba"; done
+cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$out/src/ipld/dag_cbor_write.kotoba"
+cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$out/src/zstd/frame_header.kotoba"
+for f in sha256 cid byte_cid; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$f.kotoba" "$out/src/multiformats/$f.kotoba"; done
+cp "$input/gib-manifest" "$out/gib-manifest"
+i=0
+while IFS="$(printf '\t')" read -r index size digest; do
+ [ "$index" = "$i" ] || exit 1
+ p="$input/pack-$i"; [ -f "$p" ] && [ ! -L "$p" ] || exit 1
+ [ "$(wc -c < "$p" | tr -d ' ')" = "$size" ] && [ "$(sha "$p")" = "$digest" ] || exit 1
+ cp "$p" "$out/source/pack-$i"
+ [ "$(sha "$out/source/pack-$i")" = "$digest" ] || exit 1
+ i=$((i+1))
+done < "$list"
+[ "$i" = 2 ] || exit 1
+# Native writes both archive files with bounded FS2 B/C requests. The output
+# directory starts empty; the shell does not copy the Forest bytes into it.
+cp "$repo/lib/kotoba.awaiFs/test/native_forest_copy.kotoba" "$out/copy-src/corpus.kotoba"
+{
+ printf 'KSL1\nentry /copy-src/corpus.kotoba\nroot /copy-src\n'
+ printf 'file %s /copy-src/corpus.kotoba\n' "$(sha "$out/copy-src/corpus.kotoba")"
+} > "$out/copy-source.ksl"
+copylock=$(sha "$out/copy-source.ksl")
+(
+ cd "$out"; exec 3<.
+ "$compiler" compile /copy-src/corpus.kotoba --target aarch64-macos --output copy.kseed --source-path /copy-src --source-lock copy-source.ksl --source-lock-sha256 "$copylock" > copy-compile.stdout 2> copy-compile.stderr
+ "$compiler" extract-native copy.kseed --symbol main --output copy.raw > copy-extract.stdout 2> copy-extract.stderr
+ offset=$(sed -n 's/.*:offset \([0-9][0-9]*\), :length \([0-9][0-9]*\), :arity 0}.*/\1/p' copy-extract.stdout)
+ length=$(sed -n 's/.*:offset \([0-9][0-9]*\), :length \([0-9][0-9]*\), :arity 0}.*/\2/p' copy-extract.stdout)
+ [ -n "$offset" ] && [ "$length" = "$(wc -c < copy.raw | tr -d ' ')" ] || exit 1
+ "$packager" copy-unsigned.macho copy.raw fs2-cli-stdio-general "$offset" > copy-pack.stdout 2> copy-pack.stderr
+ cp copy-unsigned.macho copy.macho; chmod 700 copy.macho; codesign --force --sign - copy.macho > copy-sign.stdout 2> copy-sign.stderr
+ ./copy.macho > copy.stdout 2> copy.stderr
+ printf '0\n' > copy.exit
+)
+while IFS="$(printf '\t')" read -r index size digest; do
+ p="$out/pack-$index"; [ -f "$p" ] && [ ! -L "$p" ] || exit 1
+ [ "$(wc -c < "$p" | tr -d ' ')" = "$size" ] && [ "$(sha "$p")" = "$digest" ] || exit 1
+done < "$list"
+mv "$out/pack-0" "$out/gib-base/pack-0"
+mv "$out/pack-1" "$out/gib-base/pack-1"
+sizes=$(awk '{printf "%s%s", (NR==1?"":" "), $2}' "$list")
+template="$repo/lib/kotoba.awaiFs/test/forest_gib_search.kotoba"
+[ "$(grep -c 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy' "$template")" = 2 ] || exit 1
+[ "$(grep -c 'dd4ec50fea8f5a68daf225da4945af367e25bb870a09346060fa9dc088c001b0' "$template")" = 1 ] || exit 1
+[ "$(grep -c 'sizes (vector-i64 ' "$template")" = 1 ] || exit 1
+sed -e 's/bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy/bafyreicujzf6yca5uiqg4vvzu4f4zjjjrgb2zk5v4clj7psmgpveugiskq/g' \
+    -e 's/dd4ec50fea8f5a68daf225da4945af367e25bb870a09346060fa9dc088c001b0/0f040d1cc79d7489ae4c4f001c758f77092afeb7c886408a8c12c058c56048f1/g' \
+    -e 's/(= j 64)/(= j 2)/g' \
+    -e 's/71783/1291/g' -e 's/71788/1296/g' \
+    -e 's/1073741824/17825792/g' -e 's/1024 38/17 38/g' -e 's/(= i 1024)/(= i 17)/g' \
+    -e "s/sizes (vector-i64 .*]/sizes (vector-i64 $sizes)]/" \
+    "$template" > "$out/src/corpus.kotoba"
+{
+ printf 'KSL1\nentry /src/corpus.kotoba\nroot /src\n'
+ find "$out/src" -type f -name '*.kotoba' -print | LC_ALL=C sort | while IFS= read -r p; do
+   rel=${p#"$out"}; printf 'file %s %s\n' "$(sha "$p")" "$rel"
+ done
+} > "$out/source.ksl"
+lock=$(sha "$out/source.ksl")
+(
+ cd "$out"; exec 3<.
+ "$compiler" compile /src/corpus.kotoba --target aarch64-macos --output program.kseed --source-path /src --source-lock source.ksl --source-lock-sha256 "$lock" > compile.stdout 2> compile.stderr
+ "$compiler" extract-native program.kseed --symbol main --output program.raw > extract.stdout 2> extract.stderr
+ offset=$(sed -n 's/.*:offset \([0-9][0-9]*\), :length \([0-9][0-9]*\), :arity 0}.*/\1/p' extract.stdout)
+ length=$(sed -n 's/.*:offset \([0-9][0-9]*\), :length \([0-9][0-9]*\), :arity 0}.*/\2/p' extract.stdout)
+ [ -n "$offset" ] && [ "$length" = "$(wc -c < program.raw | tr -d ' ')" ] || exit 1
+ "$packager" unsigned.macho program.raw fs2-cli-stdio-general "$offset" > pack.stdout 2> pack.stderr
+ cp unsigned.macho program.macho; chmod 700 program.macho; codesign --force --sign - program.macho > sign.stdout 2> sign.stderr
+ ./program.macho > positive.stdout 2> positive.stderr
+ printf '0\n' > positive.exit
+ # A distinct saved copy remains intact; corrupt only the staged Pack 1.
+ byte=$(od -An -tu1 -j 100 -N 1 gib-base/pack-1 | tr -d ' ')
+ if [ "$byte" = 0 ]; then printf '\001' | dd of=gib-base/pack-1 bs=1 seek=100 conv=notrunc 2>/dev/null; else printf '\000' | dd of=gib-base/pack-1 bs=1 seek=100 conv=notrunc 2>/dev/null; fi
+ status=0; ./program.macho > negative.stdout 2> negative.stderr || status=$?
+ printf '%s\n' "$status" > negative.exit
+ [ "$status" -eq 11 ]
+ cp "$input/pack-1" gib-base/pack-1
+ mv gib-base/pack-1 missing-pack-1.saved
+ status=0; ./program.macho > missing.stdout 2> missing.stderr || status=$?
+ printf '%s\n' "$status" > missing.exit
+ [ "$status" -eq 11 ]
+)
+printf 'Native FS2 copied Otehon 17 MiB and Native read: positive=0 corrupt-Pack-1=11 missing-Pack-1=11\n'
