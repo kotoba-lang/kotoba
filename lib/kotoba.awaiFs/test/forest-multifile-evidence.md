@@ -251,3 +251,11 @@ not an isolated I/O benchmark, and cache and concurrent load were uncontrolled.
 The compressed synthetic fixture, caller-supplied authority and mapping,
 whole-stream hash, opt-in platform coverage and durability limitations above
 still apply; this is not a Native writer or production qualification.
+
+## Native whole-stream digest across the 1 GiB chunk view
+
+On 2026-11-14 JST, `forest_gib_full.kotoba` was extended to feed every verified chunk, in manifest order, into the bounded Native streaming SHA-256 implementation. The accumulator is allocated outside per-chunk `arena-scope`s. After all 1,024 chunk CID and length checks, the program compares the complete stream digest with the independently measured Otehon source/readback value `dd4ec50fea8f5a68daf225da4945af367e25bb870a09346060fa9dc088c001b0` documented in `network-awai/awai-os` `README-forest-gib-readback.md`.
+
+On Darwin arm64, the pinned Native compiler and provider built the current sources under a KSL1 lock. The positive run exited 0. A separately compiled control with only the expected whole-stream digest changed exited 74; the positive binary on the separately corrupted Pack 31 fixture exited 41. The positive lock SHA-256 was `ee63a94a04e35c17081005e1cacd069f2795be40867d503affd2fe57d11ce47d`, and signed executable SHA-256 `c2e97ca0b4bcdf2459bbcb280342d98b9f745c2c732a70c0fcc5efa1e2738b69`. The digest-negative lock SHA-256 was `9261a68e3565fd4ace24942e36147bc427d9d1cc707ddb39e727d6f6fcf8d82d`. A single positive execution took 78.96 seconds and reported 253,689,856 bytes maximum RSS. This is an uncontrolled local observation, not an I/O benchmark; compilation of the negative control overlapped part of the run.
+
+The source remains the synthetic, highly compressible fixture; expected root, Pack locations and digest are fixture inputs. The execution computes a full logical hash but does not write a reconstructed file. It does not demonstrate physical GiB traffic, authenticated catalog, Native writer, Linux or exact-head CI, OS cache loss, power-loss durability or production qualification. The Native test and controls were compiled directly with the pinned compiler/packager and a source lock; no Python gate or host codec supplied the result.
