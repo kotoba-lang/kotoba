@@ -1,0 +1,87 @@
+;; Native Forest staging writer. Caller owns an exclusive empty destination and atomic publication.
+(ns awai.fs.forest-source-stage
+ (:capabilities #{:fs/app-data})
+ (:require [awai.fs.source-file :as source] [awai.fs.forest-stream :as stream] [awai.fs.forest-index-write :as index]
+           [awai.fs.logical-file :as logical] [multiformats.byte-cid :as hash] [multiformats.cid :as cid])
+ (:export [stage]))
+(defn- block-size [size :i64 i :i64] :i64
+ (let [left (- size (* i 1048576))] (if (> left 1048576) 1048576 left)))
+(defn- block [source-path :string size :i64 i :i64] :vector-i64
+ (let [r (source/read-chunk source-path (* i 1048576) (block-size size i))]
+  (if (result-ok?-of [:result :vector-i64 :keyword] r)
+   (result-value-of [:result :vector-i64 :keyword] r (vector-i64)) (vector-i64))))
+(defn- copy-at! [dst :vector-i64 at :i64 src :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count src)) 0
+  (let [v (vector-assoc! dst (+ at i) (vector-at src i))] (recur (+ i 1))))))
+(defn- emit! [name :string v :vector-i64 first :bool] :i64
+ (let [n (vector-count v)]
+  (loop [at 0]
+   (if (= at n) 0
+    (let [left (- n at) count (if (> left 262144) 262144 left)
+          status (arena-scope
+           (let [piece (loop [j 0 out (vector-alloc count)] (if (= j count) out
+                         (recur (+ j 1) (vector-assoc! out j (vector-at v (+ at j))))))
+                 head (string-to-utf8 (string-concat (if (and first (= at 0)) "\u0000FS2\u0000B" "\u0000FS2\u0000C") (string-concat name "\u0000")))
+                 reply (typed-cap-call :fs/app-data-bytes :bytes :bytes (bytes-concat head (bytes-from-vector-i64 piece)))]
+            (if (and (= (bytes-count reply) (+ count 5)) (= (bytes-at reply 0) 0)
+                     (= (bytes-at reply 1) 70) (= (bytes-at reply 2) 83)
+                     (= (bytes-at reply 3) 50) (= (bytes-at reply 4) 0)) 0 1)))]
+     (if (= status 0) (recur (+ at count)) status))))))
+(defn- compute-cid! [source-path :string size :i64 pack :i64 i :i64 ids :vector-i64 rows :vector-i64] :i64
+ (arena-scope
+  (let [ordinal (+ (* pack 16) i) length (block-size size ordinal) data (block source-path size ordinal) text (hash/cidv1-raw-bytes data) c (cid/cid->bytes text)
+        row (logical/chunk-row (* ordinal 1048576) length text)]
+   (if (and (= (vector-count data) length) (= (vector-count c) 36) (= (vector-count row) 38))
+    (let [a (copy-at! ids (* i 36) c) b (copy-at! rows (* ordinal 38) row)] (+ a b)) 1))))
+(defn- emit-leaf! [source-path :string size :i64 name :string ordinal :i64 i :i64 position :i64 offsets :vector-i64 ids :vector-i64] :i64
+ (arena-scope
+  (let [expected (loop [j 0 out (vector-alloc 36)]
+                  (if (= j 36) out (recur (+ j 1) (vector-assoc! out j (vector-at ids (+ (* i 36) j))))))
+        length (block-size size ordinal) data (block source-path size ordinal)
+        r (stream/checked-block-frame expected data)]
+   (if (or (not= (vector-count data) length) (not (result-ok?-of [:result :vector-i64 :keyword] r))) -1
+    (let [v (result-value-of [:result :vector-i64 :keyword] r []) saved (vector-assoc! offsets i position)]
+     (if (= (emit! name v false) 0) (vector-count v) -1))))))
+(defn- emit-pack! [source-path :string size :i64 prefix :string pack :i64 count :i64 rows :vector-i64] :i64
+ (arena-scope
+  (let [name (string-concat prefix (string-concat "pack-" (string-from-i64 pack))) ids (vector-alloc (* (+ count 1) 36)) offsets (vector-alloc (+ count 1))
+        ready (loop [i 0] (if (= i count) 0 (if (= (compute-cid! source-path size pack i ids rows) 0) (recur (+ i 1)) 1)))
+        leaf-ids (loop [i 0 out (vector-alloc (* count 36))]
+                   (if (= i (* count 36)) out (recur (+ i 1) (vector-assoc! out i (vector-at ids i)))))
+        root-result (stream/root-bytes leaf-ids)]
+   (if (or (not= ready 0) (not (result-ok?-of [:result :vector-i64 :keyword] root-result))) 1
+    (let [root (result-value-of [:result :vector-i64 :keyword] root-result [])
+          copied (copy-at! ids (* count 36) (cid/cid->bytes (hash/cidv1-dag-cbor-bytes root)))
+          header (stream/header-frame root) root-frame (stream/block-frame 113 root)]
+     (if (or (not= copied 0) (not (result-ok?-of [:result :vector-i64 :keyword] header))
+             (not (result-ok?-of [:result :vector-i64 :keyword] root-frame))) 2
+      (let [h (result-value-of [:result :vector-i64 :keyword] header [])
+            position (if (not= (emit! name h true) 0) -1
+                       (loop [i 0 pos (vector-count h)]
+                        (if (= i count) pos (let [n (emit-leaf! source-path size name (+ (* pack 16) i) i pos offsets ids)]
+                         (if (< n 0) -1 (recur (+ i 1) (+ pos n)))))))]
+       (if (< position 0) 3
+        (let [r (result-value-of [:result :vector-i64 :keyword] root-frame []) saved (vector-assoc! offsets count position)
+              code (emit! name r false) ix (index/encode-index ids offsets (+ position (vector-count r)))]
+         (if (or (not= code 0) (not (result-ok?-of [:result :vector-i64 :keyword] ix))) 4
+          (emit! name (result-value-of [:result :vector-i64 :keyword] ix []) false)))))))))))
+;; Caller must supply a private, empty, exclusive staging prefix ending in '/'.
+;; The supplied size is a contract; no source snapshot or durable root is created.
+(defn stage [source-path :string size :i64 prefix :string] :i64
+ (let [plen (string-length prefix)]
+  (if (or (< size 0) (> size 1073741824) (= plen 0)
+          (> (string-byte-length prefix) 3000)
+          (not= (string-code-point-at prefix (- plen 1)) 47)
+          (loop [i 0] (if (= i plen) false
+                       (if (= (string-code-point-at prefix i) 0) true (recur (+ i 1)))))) 1
+   (let [chunks (quot (+ size 1048575) 1048576) packs (quot (+ chunks 15) 16)
+         rows (vector-alloc (* chunks 38))
+         status (loop [p 0]
+          (if (= p packs) 0
+           (let [left (- chunks (* p 16)) n (if (> left 16) 16 left)]
+            (if (= (emit-pack! source-path size prefix p n rows) 0) (recur (+ p 1)) (+ 10 p)))))]
+    (if (not= status 0) status
+     (let [f (logical/file-new 1 size (logical/profile-new 1 "fixed" 1048576) rows)
+           manifest (logical/encode f)]
+      (if (not (result-ok?-of [:result :vector-i64 :keyword] manifest)) 90
+       (emit! (string-concat prefix "manifest") (result-value-of [:result :vector-i64 :keyword] manifest []) true))))))))
