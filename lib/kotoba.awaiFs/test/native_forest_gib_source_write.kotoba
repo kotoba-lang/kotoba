@@ -1,0 +1,79 @@
+;; Test-only file-backed 1 GiB / 64 Pack Native writer. No atomic root or durability.
+(ns awai.fs.native-forest-gib-stream-write
+ (:capabilities #{:fs/app-data})
+ (:require [awai.fs.source-file :as source] [awai.fs.forest-stream :as stream] [awai.fs.forest-index-write :as index]
+           [awai.fs.logical-file :as logical] [multiformats.byte-cid :as hash] [multiformats.cid :as cid])
+ (:export [main]))
+;; Test-only: the source path is supplied by the gate; the fixture remains bounded.
+(defn- block [i :i64] :vector-i64
+ (let [out (vector-alloc 1048576)]
+  (loop [part 0]
+   (if (= part 4) out
+    (let [r (source/read-range "SOURCE_INPUT_PATH" (+ (* i 1048576) (* part 262144)) 262144)]
+     (if (not (result-ok?-of [:result :vector-i64 :keyword] r)) (vector-i64)
+      (let [v (result-value-of [:result :vector-i64 :keyword] r (vector-i64))
+            copied (loop [j 0] (if (= j 262144) 0
+                     (let [ignored (vector-assoc! out (+ (* part 262144) j) (vector-at v j))]
+                      (recur (+ j 1)))))]
+       (recur (+ part 1)))))))))
+(defn- copy-at! [dst :vector-i64 at :i64 src :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count src)) 0
+  (let [v (vector-assoc! dst (+ at i) (vector-at src i))] (recur (+ i 1))))))
+(defn- emit! [name :string v :vector-i64 first :bool] :i64
+ (let [n (vector-count v)]
+  (loop [at 0]
+   (if (= at n) 0
+    (let [left (- n at) count (if (> left 262144) 262144 left)
+          status (arena-scope
+           (let [piece (loop [j 0 out (vector-alloc count)] (if (= j count) out
+                         (recur (+ j 1) (vector-assoc! out j (vector-at v (+ at j))))))
+                 head (string-to-utf8 (string-concat (if (and first (= at 0)) "\u0000FS2\u0000B" "\u0000FS2\u0000C") (string-concat name "\u0000")))
+                 reply (typed-cap-call :fs/app-data-bytes :bytes :bytes (bytes-concat head (bytes-from-vector-i64 piece)))]
+            (if (= (bytes-count reply) (+ count 5)) 0 1)))]
+     (if (= status 0) (recur (+ at count)) status))))))
+(defn- compute-cid! [pack :i64 i :i64 ids :vector-i64 rows :vector-i64] :i64
+ (arena-scope
+  (let [ordinal (+ (* pack 16) i) data (block ordinal) text (hash/cidv1-raw-bytes data) c (cid/cid->bytes text)
+        row (logical/chunk-row (* ordinal 1048576) 1048576 text)]
+   (if (and (= (vector-count data) 1048576) (= (vector-count c) 36) (= (vector-count row) 38))
+    (let [a (copy-at! ids (* i 36) c) b (copy-at! rows (* ordinal 38) row)] (+ a b)) 1))))
+(defn- emit-leaf! [name :string ordinal :i64 i :i64 position :i64 offsets :vector-i64 ids :vector-i64] :i64
+ (arena-scope
+  (let [expected (loop [j 0 out (vector-alloc 36)]
+                  (if (= j 36) out (recur (+ j 1) (vector-assoc! out j (vector-at ids (+ (* i 36) j))))))
+        data (block ordinal)
+        r (stream/checked-block-frame expected data)]
+   (if (or (not= (vector-count data) 1048576) (not (result-ok?-of [:result :vector-i64 :keyword] r))) -1
+    (let [v (result-value-of [:result :vector-i64 :keyword] r []) saved (vector-assoc! offsets i position)]
+     (if (= (emit! name v false) 0) (vector-count v) -1))))))
+(defn- emit-pack! [pack :i64 rows :vector-i64] :i64
+ (arena-scope
+  (let [name (string-concat "pack-" (string-from-i64 pack)) ids (vector-alloc (* 17 36)) offsets (vector-alloc 17)
+        ready (loop [i 0] (if (= i 16) 0 (if (= (compute-cid! pack i ids rows) 0) (recur (+ i 1)) 1)))
+        leaf-ids (loop [i 0 out (vector-alloc (* 16 36))]
+                   (if (= i (* 16 36)) out (recur (+ i 1) (vector-assoc! out i (vector-at ids i)))))
+        root-result (stream/root-bytes leaf-ids)]
+   (if (or (not= ready 0) (not (result-ok?-of [:result :vector-i64 :keyword] root-result))) 1
+    (let [root (result-value-of [:result :vector-i64 :keyword] root-result [])
+          copied (copy-at! ids (* 16 36) (cid/cid->bytes (hash/cidv1-dag-cbor-bytes root)))
+          header (stream/header-frame root) root-frame (stream/block-frame 113 root)]
+     (if (or (not= copied 0) (not (result-ok?-of [:result :vector-i64 :keyword] header))
+             (not (result-ok?-of [:result :vector-i64 :keyword] root-frame))) 2
+      (let [h (result-value-of [:result :vector-i64 :keyword] header [])
+            position (if (not= (emit! name h true) 0) -1
+                       (loop [i 0 pos (vector-count h)]
+                        (if (= i 16) pos (let [n (emit-leaf! name (+ (* pack 16) i) i pos offsets ids)]
+                         (if (< n 0) -1 (recur (+ i 1) (+ pos n)))))))]
+       (if (< position 0) 3
+        (let [r (result-value-of [:result :vector-i64 :keyword] root-frame []) saved (vector-assoc! offsets 16 position)
+              code (emit! name r false) ix (index/encode-index ids offsets (+ position (vector-count r)))]
+         (if (or (not= code 0) (not (result-ok?-of [:result :vector-i64 :keyword] ix))) 4
+          (emit! name (result-value-of [:result :vector-i64 :keyword] ix []) false)))))))))))
+(defn main [] :i64
+ (let [rows (vector-alloc (* 1024 38)) status (loop [p 0]
+          (if (= p 64) 0 (if (= (emit-pack! p rows) 0) (recur (+ p 1)) (+ 10 p))))]
+  (if (not= status 0) status
+   (let [f (logical/file-new 1 1073741824 (logical/profile-new 1 "fixed" 1048576) rows)
+         manifest (logical/encode f)]
+    (if (not (result-ok?-of [:result :vector-i64 :keyword] manifest)) 90
+     (emit! "manifest" (result-value-of [:result :vector-i64 :keyword] manifest []) true))))))
