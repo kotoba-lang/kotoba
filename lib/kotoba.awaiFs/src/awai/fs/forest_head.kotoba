@@ -1,0 +1,97 @@
+;; Cooperative single-host HEAD transition; management bytes are not content IDs.
+;; Every writer must hold the same stable lock inode; no signed authority or WAL.
+(ns awai.fs.forest-head
+ (:capabilities #{:fs/app-data})
+ (:require [awai.fs.source-file :as source] [awai.fs.logical-file :as logical]
+           [awai.fs.forest-generation-verify :as generation] [multiformats.cid :as cid])
+ (:export [advance]))
+(defn- valid-parent? [p :string] :bool
+ (let [n (string-length p)]
+  (and (>= n 2) (<= (string-byte-length p) 2800) (= (string-code-point-at p 0) 47)
+       (not= (string-code-point-at p (- n 1)) 47)
+       (loop [i 0] (if (= i n) true (if (= (string-code-point-at p i) 0) false (recur (+ i 1))))))))
+(defn- valid-name? [s :string] :bool
+ (let [n (string-length s)]
+  (and (>= n 5) (<= n 80) (string=? (string-substring s 0 4) "gen-")
+       (loop [i 4] (if (= i n) true
+        (let [c (string-code-point-at s i)]
+         (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 122)) (= c 45))
+          (recur (+ i 1)) false)))))))
+(defn- valid-cid? [s :string] :bool
+ (let [p (cid/cid->parts s)]
+  (and (= (record-get [:ref :multiformats.cid/parts] p :error) :none)
+       (= (record-get [:ref :multiformats.cid/parts] p :codec) 113)
+       (= (record-get [:ref :multiformats.cid/parts] p :hash-code) 18)
+       (= (record-get [:ref :multiformats.cid/parts] p :digest-size) 32))))
+(defn- body [name :string cid :string] :string
+ (string-concat "awai-head-v1\n" (string-concat name (string-concat "\n" (string-concat cid "\n")))))
+(defn- framed-true? [r :string] :bool
+ (and (= (string-length r) 6) (= (string-code-point-at r 0) 0)
+      (= (string-code-point-at r 1) 70) (= (string-code-point-at r 2) 83)
+      (= (string-code-point-at r 3) 50) (= (string-code-point-at r 4) 0)
+      (= (string-code-point-at r 5) 49)))
+(defn- sync? [path :string] :bool
+ (framed-true? (typed-cap-call :fs/app-data :string :string
+  (string-concat "\u0000FS2\u0000M" (string-concat path "\u0000")))))
+(defn- exists? [path :string] :i64
+ (let [r (typed-cap-call :fs/app-data :string :string
+            (string-concat "\u0000FS2\u0000D" (string-concat path "\u0000")))]
+  (cond (framed-true? r) 1
+        (and (= (string-length r) 6) (= (string-code-point-at r 0) 0)
+             (= (string-code-point-at r 1) 70) (= (string-code-point-at r 2) 83)
+             (= (string-code-point-at r 3) 50) (= (string-code-point-at r 4) 0)
+             (= (string-code-point-at r 5) 48)) 0 :else -1)))
+(defn- equal-head? [path :string expected :string] :bool
+ (let [st (source/regular-size path) n (string-byte-length expected)]
+  (if (or (not (result-ok?-of [:result :i64 :keyword] st))
+          (not= (result-value-of [:result :i64 :keyword] st -1) n)) false
+   (let [r (source/read-chunk path 0 n)]
+    (and (result-ok?-of [:result :vector-i64 :keyword] r)
+         (logical/same-bytes? (result-value-of [:result :vector-i64 :keyword] r (vector-i64))
+                              (vector-i64-from-bytes (string-to-utf8 expected))))))))
+(defn- create-temp [parent :string] :string
+ (let [r (typed-cap-call :fs/app-data :string :string
+           (string-concat "\u0000FS2\u0000N" (string-concat parent "\u0000awai-head-")))
+       n (string-length r) base (string-concat parent "/awai-head-") k (string-length base)]
+  (if (and (= n (+ 5 k 6)) (= (string-code-point-at r 0) 0) (= (string-code-point-at r 1) 70)
+           (= (string-code-point-at r 2) 83) (= (string-code-point-at r 3) 50) (= (string-code-point-at r 4) 0)
+           (string=? (string-substring r 5 (+ 5 k)) base)
+           (loop [i (+ 5 k)] (if (= i n) true
+            (let [c (string-code-point-at r i)]
+             (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 122))) (recur (+ i 1)) false)))))
+   (string-substring r 5 n) "")))
+(defn- write-head [parent :string expected-absent :bool text :string] :i64
+ (let [temp (create-temp parent)]
+  (if (= (string-length temp) 0) 108
+   (let [path (string-concat temp "/head") target (string-concat parent "/HEAD")
+         written (typed-cap-call :fs/app-data :string :string
+                   (string-concat "\u0000FS2\u0000B" (string-concat path (string-concat "\u0000" text))))]
+    (if (not (string=? written (string-concat "\u0000FS2\u0000" text))) 108
+     (if (or (not (sync? path)) (not (sync? temp))) 108
+      (let [r (typed-cap-call :fs/app-data :string :string
+                (string-concat (if expected-absent "\u0000FS2\u0000T" "\u0000FS2\u0000L")
+                  (string-concat path (string-concat "\u0000" target))))]
+       (if (not (framed-true? r)) 108
+        (if (or (not (sync? temp)) (not (sync? parent))) 109 0)))))))))
+;; Status 0: acknowledged; 1 invalid input; 104 busy; 105 stale/missing HEAD;
+;; 106 old generation invalid; 107 new generation invalid; 108 pre-commit or
+;; rename refusal (inspect state if response malformed); 109 post-rename sync
+;; failure (target may be visible); 102 unlock failure (outcome uncertain).
+;; The caller supplies and authenticates both CIDs. No signed root, rollback
+;; protection, WAL, hostile-writer protection, or recovery scan is implied.
+(defn advance [parent :string old-name :string old-cid :string new-name :string new-cid :string] :i64
+ (let [initial (and (string=? old-name "") (string=? old-cid ""))]
+  (if (or (not (valid-parent? parent)) (not (valid-name? new-name)) (not (valid-cid? new-cid))
+          (and (not initial) (or (not (valid-name? old-name)) (not (valid-cid? old-cid))))) 1
+   (let [lock (string-concat parent "/.awai-writer.lock")
+         acquired (typed-cap-call :fs/app-data :string :string (string-concat lock "FLOCK_SEP"))]
+    (if (not (string=? acquired "1")) 104
+     (let [head (string-concat parent "/HEAD") exists (exists? head)
+           current-ok (if initial (= exists 0)
+                        (and (= exists 1) (equal-head? head (body old-name old-cid))))
+           result (cond (not current-ok) 105
+                        (and (not initial) (not= (generation/verify (string-concat parent (string-concat "/" old-name)) old-cid) 0)) 106
+                        (not= (generation/verify (string-concat parent (string-concat "/" new-name)) new-cid) 0) 107
+                        :else (write-head parent initial (body new-name new-cid)))
+           released (typed-cap-call :fs/app-data :string :string (string-concat lock "UNLOCK_SEP"))]
+      (if (string=? released "1") result 102)))))))
