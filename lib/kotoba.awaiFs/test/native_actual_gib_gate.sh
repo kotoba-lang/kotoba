@@ -38,7 +38,11 @@ while IFS="$(printf '\t')" read -r index size digest; do
 done < "$list"
 [ "$i" = 64 ] || exit 1
 sizes=$(awk '{printf "%s%s", (NR==1?"":" "), $2}' "$list")
-template="$repo/lib/kotoba.awaiFs/test/forest_gib_full.kotoba"
+case "${NATIVE_GIB_SEARCH_ALL:-0}" in
+  0) template="$repo/lib/kotoba.awaiFs/test/forest_gib_full.kotoba" ;;
+  1) template="$repo/lib/kotoba.awaiFs/test/forest_gib_search.kotoba" ;;
+  *) echo 'NATIVE_GIB_SEARCH_ALL must be 0 or 1' >&2; exit 2 ;;
+esac
 [ "$(grep -c 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy' "$template")" = 2 ] || exit 1
 [ "$(grep -c 'dd4ec50fea8f5a68daf225da4945af367e25bb870a09346060fa9dc088c001b0' "$template")" = 1 ] || exit 1
 [ "$(grep -c 'sizes (vector-i64 ' "$template")" = 1 ] || exit 1
