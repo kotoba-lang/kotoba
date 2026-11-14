@@ -4,7 +4,8 @@
  (:capabilities #{:fs/app-data})
  (:require [awai.fs.source-file :as source] [awai.fs.logical-file :as logical]
            [awai.fs.forest-generation-verify :as generation] [multiformats.cid :as cid])
- (:export [advance]))
+ (:export [advance recover])
+ (:schemas {:awai.fs/head-result [:record :awai.fs/head-result [[:name :string] [:cid :string] [:status :i64]]]}))
 (defn- valid-parent? [p :string] :bool
  (let [n (string-length p)]
   (and (>= n 2) (<= (string-byte-length p) 2800) (= (string-code-point-at p 0) 47)
@@ -95,3 +96,43 @@
                         :else (write-head parent initial (body new-name new-cid)))
            released (typed-cap-call :fs/app-data :string :string (string-concat lock "UNLOCK_SEP"))]
       (if (string=? released "1") result 102)))))))
+
+;; Recovery accepts the expected CID from a separately authenticated caller.
+;; It holds the cooperative lock only while reading and verifying.
+(defn- recover-locked [parent :string expected-cid :string] [:ref :awai.fs/head-result]
+ (let [path (string-concat parent "/HEAD") st (source/regular-size path)]
+  (if (not (result-ok?-of [:result :i64 :keyword] st)) (record-new [:ref :awai.fs/head-result] "" "" 105)
+   (let [n (result-value-of [:result :i64 :keyword] st -1)]
+    (if (or (< n 20) (> n 256)) (record-new [:ref :awai.fs/head-result] "" "" 105)
+     (let [r (source/read-chunk path 0 n)]
+      (if (not (result-ok?-of [:result :vector-i64 :keyword] r)) (record-new [:ref :awai.fs/head-result] "" "" 105)
+       (let [v (result-value-of [:result :vector-i64 :keyword] r (vector-i64))
+             ascii (loop [i 0] (if (= i n) true
+                      (let [c (vector-at v i)]
+                       (if (or (= c 10) (and (>= c 32) (<= c 126))) (recur (+ i 1)) false))))]
+        (if (not ascii) (record-new [:ref :awai.fs/head-result] "" "" 105)
+         (let [text (string-from-utf8 (bytes-from-vector-i64 v))
+               sep (loop [i 13] (cond (>= i n) -1 (= (string-code-point-at text i) 10) i :else (recur (+ i 1))))]
+          (if (or (not (string=? (string-substring text 0 13) "awai-head-v1\n")) (< sep 18) (>= (+ sep 1) (- n 1))
+                  (not= (string-code-point-at text (- n 1)) 10))
+           (record-new [:ref :awai.fs/head-result] "" "" 105)
+           (let [name (string-substring text 13 sep) cid-text (string-substring text (+ sep 1) (- n 1))]
+            (cond (or (not (valid-name? name)) (not (valid-cid? cid-text))
+                      (not (string=? cid-text expected-cid)) (not (string=? text (body name cid-text))))
+                   (record-new [:ref :awai.fs/head-result] "" "" 105)
+                  (not= (generation/verify (string-concat parent (string-concat "/" name)) cid-text) 0)
+                   (record-new [:ref :awai.fs/head-result] "" "" 106)
+                  :else (record-new [:ref :awai.fs/head-result] name cid-text 0))))))))))))))
+;; 0 verified, 1 invalid input, 104 busy, 105 missing/malformed/unexpected
+;; HEAD, 106 damaged generation, 102 unlock refused (outcome uncertain).
+;; This does not authenticate the expected CID, prevent rollback of the trusted
+;; input, retain a snapshot after unlock, or provide WAL recovery.
+(defn recover [parent :string expected-cid :string] [:ref :awai.fs/head-result]
+ (if (or (not (valid-parent? parent)) (not (valid-cid? expected-cid)))
+  (record-new [:ref :awai.fs/head-result] "" "" 1)
+  (let [lock (string-concat parent "/.awai-writer.lock")
+        acquired (typed-cap-call :fs/app-data :string :string (string-concat lock "FLOCK_SEP"))]
+   (if (not (string=? acquired "1")) (record-new [:ref :awai.fs/head-result] "" "" 104)
+    (let [r (recover-locked parent expected-cid)
+          released (typed-cap-call :fs/app-data :string :string (string-concat lock "UNLOCK_SEP"))]
+     (if (string=? released "1") r (record-new [:ref :awai.fs/head-result] "" "" 102)))))))
