@@ -1,0 +1,5 @@
+# Native bounded source read, 2026-11-14
+
+`native_source_file_linux_gate.sh PINNED_AMU NEW_OUTPUT` is a local Linux aarch64 selfhost test of `awai.fs.source-file/read-range`. In a dedicated Ubuntu 26.10 VZ guest it compiled the source-locked Native fixture with Amu revision `ce982703375bedc0039b61b1a821407d228ea98a` and verified the `native-inputs.json` compiler/provider hashes. It read bytes `cde` at offset 2 from the actual file `abcdef`, rejected negative offset, a request exceeding 262144 bytes, arithmetic overflow, and an embedded-NUL path. The process returned `:status :ok :result 0`.
+
+Separate processes requested a missing path and a range extending past the end of the file. Both exited 126 with `KEXE_TRAP` and `:fs/range-unavailable`. This is provider-level refusal, not a recoverable adapter result; a concurrent truncate can have the same effect. No source snapshot, file mutation detection, content-addressed publication, atomic root, WAL, or production ingestion is established. The adapter is not yet wired to the multi-Pack writer. All data and gate outputs were retained in the task-owned guest.
