@@ -178,6 +178,7 @@ run_case() {
   fi
  fi
  case "$control" in
+  wrong-snapshot-schema) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(= (value/number schema) 2)' '(= (value/number schema) 3)';;
   wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
   wrong-logical-root) replace_once "$src/corpus.kotoba" '1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e' '0fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e';;
   wrong-basis-issuer) replace_once "$src/corpus.kotoba" 'good (verify/verify (proof) "did:key:fixture-issuer" "fixture-key" pub)' 'good (verify/verify (proof) "did:key:wrong" "fixture-key" pub)';;
@@ -303,6 +304,7 @@ run_case primitive zstd_header wrong-forest-block-digest 128
 run_case primitive zstd_header wrong-forest-indexed-digest 137
 run_case primitive native_prolly_checkpoint_io none 0
 run_case primitive native_prolly_checkpoint_io wrong-prolly-checkpoint 2
+run_case primitive native_prolly_checkpoint_io wrong-snapshot-schema 7
 run_case primitive forest_file_io none 0
 run_case primitive forest_file_io wrong-forest-file-digest 3
 run_case primitive forest_file_io wrong-second-forest-digest 13
@@ -318,8 +320,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 101 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 102 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 16 primitives + 31 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 16 primitives + 32 negative controls passed on %s\n' "$target"

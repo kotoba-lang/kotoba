@@ -34,3 +34,16 @@ and its source lock SHA-256 was
 `dbfc0b1604379a5f1ec8479523903189e30e778a8de7b47bcb12c4ae3c234b3f`.
 This updates the earlier statement that the snapshot test is opt-in only. It
 still does not authenticate the physical-root field, issuer's key, or catalog.
+
+## Arrangement schema version admission
+
+The arrangement source selects a decoding codec by snapshot schema version.
+The Native checkpoint path implements only the version 2 tagged component
+profile, so it now requires integer `schema-version` 2 and refuses version 1,
+unknown versions and non-integer values instead of interpreting them as v2.
+Version 1 remains unsupported, not invalid under the owning arrangement
+contract. The real version 2 fixture succeeds; value-level version 1, 3 and
+text controls refuse, and a gate mutation accepting 3 instead of 2 returns the
+expected failure. The full 102-case local macOS arm64 corpus passed. Positive
+artifact SHA-256 `cef2b8b7c76b20ad7b1241f5b0dacc63890cd8c025a3c9b84c3a3f7fdf73a5f8`;
+source lock `273556b888bda7693879b3adf7b94fc2042b82a64862eab0936e279514c05bb3`.
