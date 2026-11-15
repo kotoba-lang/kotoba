@@ -47,7 +47,7 @@ for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotob
 {
  printf '%s\n' "$pins" "$lib/schema/v1.json" "$lib/corpus/v1.json" "$lib/test/native_corpus_gate.sh" "$lib/test/stage_corpus.sh" "$lib/test/stage_corpus.jq" "$lib/test/stage_corpus.sha256" "$repo/scripts/check-library-local-changes-pins.sh" "$amu/$compiler_key" "$amu/$provider_key" "$compiler" "$provider"
  for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do printf '%s\n' "$repo/$d/local-changes.json"; done
- for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/*.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
+ for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/*.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
  if [ "$target" = linux-x86_64 ]; then printf '%s\n' "$io_amu/$io_path" "$io_compiler"; fi
 } | LC_ALL=C sort -u > "$out/input-paths.txt"
 while IFS= read -r watched_path; do
@@ -128,6 +128,15 @@ run_case() {
    *) exit 1;;
   esac
   for mod in $modules; do cp "$repo/lib/org.ietf.deflate/src/deflate/$mod.kotoba" "$src/deflate/"; done
+ elif [ "$kind" = primitive ] && { [ "$index" = native_logical_signature ] || [ "$index" = native_logical_commit_test ] || [ "$index" = native_one_parent_basis ]; }; then
+  case "$index" in
+   native_logical_signature) modules='logical_signature';;
+   native_logical_commit_test) modules='logical_commit';;
+   native_one_parent_basis) modules='basis_edn logical_commit logical_signature basis_verify';;
+  esac
+  for mod in $modules; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  if [ "$index" != native_logical_signature ]; then cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/sha256.kotoba" "$src/multiformats/"; fi
+  if [ "$index" != native_logical_commit_test ]; then mkdir "$src/ed25519"; cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"; fi
  elif [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
   cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/cid.kotoba" "$src/multiformats/"
@@ -157,6 +166,9 @@ run_case() {
   fi
  fi
  case "$control" in
+  wrong-logical-root) replace_once "$src/corpus.kotoba" '1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e' '0fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e';;
+  wrong-basis-issuer) replace_once "$src/corpus.kotoba" 'good (verify/verify (proof) "did:key:fixture-issuer" "fixture-key" pub)' 'good (verify/verify (proof) "did:key:wrong" "fixture-key" pub)';;
+  wrong-signature-payload) replace_once "$src/corpus.kotoba" '[:domain :signature] [:value [:map' '[:domain :wrong] [:value [:map';;
   wrong-deflate-bit) replace_once "$src/corpus.kotoba" ':value) 2) 2' ':value) 3) 2';;
   wrong-deflate-huffman) replace_once "$src/corpus.kotoba" ':symbol) 1) 2' ':symbol) 2) 2';;
   wrong-deflate-zlib) replace_once "$src/corpus.kotoba" ':invalid-header) 2' ':invalid-byte) 2';;
@@ -255,6 +267,10 @@ run_case positive 0 wrong-cid 5
 run_case negative 0 allow-file-version 1
 run_case negative 23 allow-link-codec 1
 for primitive in writer values pack_values chunk_plan_values zstd_header; do run_case primitive "$primitive" none 0; done
+for primitive in native_logical_signature native_logical_commit_test native_one_parent_basis; do run_case primitive "$primitive" none 0; done
+run_case primitive native_logical_signature wrong-signature-payload 2
+run_case primitive native_logical_commit_test wrong-logical-root 2
+run_case primitive native_one_parent_basis wrong-basis-issuer 1
 for primitive in deflate_bit_reader deflate_huffman_reader deflate_dynamic_tables deflate_huffman_block deflate_zlib_single; do run_case primitive "$primitive" none 0; done
 run_case primitive deflate_bit_reader wrong-deflate-bit 2
 run_case primitive deflate_huffman_reader wrong-deflate-huffman 2
@@ -287,8 +303,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 93 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 99 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 12 primitives + 27 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 15 primitives + 30 negative controls passed on %s\n' "$target"
