@@ -47,7 +47,7 @@ for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotob
 {
  printf '%s\n' "$pins" "$lib/schema/v1.json" "$lib/corpus/v1.json" "$lib/test/native_corpus_gate.sh" "$lib/test/stage_corpus.sh" "$lib/test/stage_corpus.jq" "$lib/test/stage_corpus.sha256" "$repo/scripts/check-library-local-changes-pins.sh" "$amu/$compiler_key" "$amu/$provider_key" "$compiler" "$provider"
  for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do printf '%s\n' "$repo/$d/local-changes.json"; done
- for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.cbor/src/cbor/*.kotoba "$repo"/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/*.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
+ for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/kotoba.ioIpld/src/kotoba/value/*.kotoba "$repo"/lib/org.ietf.cbor/src/cbor/*.kotoba "$repo"/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/*.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
  if [ "$target" = linux-x86_64 ]; then printf '%s\n' "$io_amu/$io_path" "$io_compiler"; fi
 } | LC_ALL=C sort -u > "$out/input-paths.txt"
 while IFS= read -r watched_path; do
@@ -137,6 +137,10 @@ run_case() {
   for mod in $modules; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   if [ "$index" != native_logical_signature ]; then cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/sha256.kotoba" "$src/multiformats/"; fi
   if [ "$index" != native_logical_commit_test ]; then mkdir "$src/ed25519"; cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"; fi
+ elif [ "$kind" = primitive ] && [ "$index" = native_value_validate ]; then
+  mkdir -p "$src/cbor" "$src/kotoba/value"
+  for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
+  cp "$repo/lib/kotoba.ioIpld/src/kotoba/value/native_validate.kotoba" "$src/kotoba/value/"
  elif [ "$kind" = primitive ] && [ "$index" = native_prolly_checkpoint_io ]; then
   mkdir "$src/cbor" "$src/zstd" "$src/ed25519"
   cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
@@ -185,6 +189,7 @@ run_case() {
   allow-physical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 18' ':invalid-publication) 18';;
   allow-logical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 19' ':invalid-publication) 19';;
   allow-untrusted-publication) replace_once "$src/corpus.kotoba" ':untrusted-publication) 16' ':invalid-publication) 16';;
+  allow-unsorted-values) replace_once "$src/corpus.kotoba" ':noncanonical-order) 3' ':invalid-form) 3';;
   wrong-snapshot-schema) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(= (value/number schema) 2)' '(= (value/number schema) 3)';;
   wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
   wrong-logical-root) replace_once "$src/corpus.kotoba" '1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e' '0fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e';;
@@ -309,6 +314,8 @@ run_case primitive zstd_header wrong-zstd-integrated-digest 108
 run_case primitive zstd_header wrong-zstd-frame-digest 118
 run_case primitive zstd_header wrong-forest-block-digest 128
 run_case primitive zstd_header wrong-forest-indexed-digest 137
+run_case primitive native_value_validate none 0
+run_case primitive native_value_validate allow-unsorted-values 3
 run_case primitive native_prolly_checkpoint_io none 0
 run_case primitive native_prolly_checkpoint_io wrong-prolly-checkpoint 2
 run_case primitive native_prolly_checkpoint_io wrong-snapshot-schema 7
@@ -334,8 +341,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 109 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 111 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 16 primitives + 39 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 17 primitives + 40 negative controls passed on %s\n' "$target"
