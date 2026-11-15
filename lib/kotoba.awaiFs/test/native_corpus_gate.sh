@@ -40,18 +40,33 @@ fi
 # Replace exactly one literal anchor; source mutation is confined to test output.
 replace_once() {
  file=$1 needle=$2 replacement=$3
- awk -v needle="$needle" -v repl="$replacement" 'BEGIN {n=0} {p=index($0,needle); if(p){n++; $0=substr($0,1,p-1) repl substr($0,p+length(needle))} print} END {if(n!=1) exit 1}' "$file" > "$file.changed"
+ awk -v needle="$needle" -v repl="$replacement" 'BEGIN {n=0} {p=index($0,needle); if(p){n++; rest=substr($0,p+length(needle)); if(index(rest,needle)) n++; $0=substr($0,1,p-1) repl rest} print} END {if(n!=1) exit 1}' "$file" > "$file.changed"
  mv "$file.changed" "$file"
 }
 run_case() {
  kind=$1 index=$2 control=$3 expected=$4
  name="$kind-$index"; [ "$control" = none ] || name="$name-$control"
  dir="$out/$name"; src="$dir/src"; mkdir -p "$src/awai/fs" "$src/ipld" "$src/multiformats"
- cp "$out/fixtures/$kind-$index.kotoba" "$src/corpus.kotoba"
- cp "$lib/src/awai/fs/logical_file.kotoba" "$src/awai/fs/"
- cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
- for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
- if [ "$kind" = pack ]; then mkdir "$src/ipld/car"; cp "$repo/lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba" "$src/ipld/car/"; fi
+ if [ "$kind" = primitive ]; then
+  if [ "$index" = zstd_header ]; then
+   cp "$repo/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba" "$src/corpus.kotoba"
+  else cp "$lib/test/$index.kotoba" "$src/corpus.kotoba"; fi
+ else cp "$out/fixtures/$kind-$index.kotoba" "$src/corpus.kotoba"; fi
+ if [ "$kind" = primitive ] && [ "$index" = writer ]; then
+  cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
+  cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/cid.kotoba" "$src/multiformats/"
+ elif [ "$kind" = primitive ] && [ "$index" = zstd_header ]; then
+  mkdir "$src/zstd"
+  cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$src/zstd/"
+  for mod in forest_blocks forest_index; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
+ else
+  if [ "$index" != pack_values ]; then cp "$lib/src/awai/fs/logical_file.kotoba" "$src/awai/fs/"; fi
+  if [ "$index" = chunk_plan_values ]; then cp "$lib/src/awai/fs/chunk_plan.kotoba" "$src/awai/fs/"; fi
+  cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
+  for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
+  if [ "$kind" = pack ] || [ "$index" = pack_values ]; then mkdir "$src/ipld/car"; cp "$repo/lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba" "$src/ipld/car/"; fi
+ fi
  case "$control" in
   wrong-cid)
    old=$(jq -er '.positive[0].cid' "$lib/corpus/v1.json"); suffix=${old#"${old%?}"}; if [ "$suffix" = a ]; then new="${old%?}b"; else new="${old%?}a"; fi
@@ -60,6 +75,19 @@ run_case() {
    sed "s/$old/$new/g" "$src/corpus.kotoba" > "$dir/mutated"; mv "$dir/mutated" "$src/corpus.kotoba";;
   allow-file-version) replace_once "$src/awai/fs/logical_file.kotoba" '(not= (record-get [:ref :awai.fs/file] f :version) 1)' false;;
   allow-link-codec) replace_once "$src/awai/fs/logical_file.kotoba" '(= (record-get [:ref :multiformats.cid/parts] p :codec) 85)' true;;
+  allow-plan-overflow) replace_once "$src/awai/fs/chunk_plan.kotoba" '(> count 1024)' false;;
+  wrong-zstd-window) replace_once "$src/corpus.kotoba" '(not= (record-get [:ref :zstd/header] forest :window-size) 2097152)' '(not= (record-get [:ref :zstd/header] forest :window-size) 2097151)';;
+  wrong-zstd-block-size) replace_once "$src/corpus.kotoba" '(not= (record-get [:ref :zstd/block-header] first-block :size) 59)' '(not= (record-get [:ref :zstd/block-header] first-block :size) 58)';;
+  wrong-zstd-raw-byte) replace_once "$src/corpus.kotoba" '(vector-i64 58 162 101 114 111 111 116 115' '(vector-i64 57 162 101 114 111 111 116 115';;
+  wrong-zstd-literal-byte) replace_once "$src/corpus.kotoba" '(vector-i64 164 128 4 1 85 18 32 136' '(vector-i64 165 128 4 1 85 18 32 136';;
+  wrong-zstd-sequence-count) replace_once "$src/corpus.kotoba" '(not= (record-get [:ref :zstd/sequences] sequences :count) 16)' '(not= (record-get [:ref :zstd/sequences] sequences :count) 15)';;
+  wrong-zstd-fse-table) replace_once "$src/corpus.kotoba" '(vector-i64 0 4 0 0 4 16 1 5 32 3 5 0 4 5 0 6 5 0' '(vector-i64 0 4 1 0 4 16 1 5 32 3 5 0 4 5 0 6 5 0';;
+  wrong-zstd-sequence-value) replace_once "$src/corpus.kotoba" '(vector-i64 295 7935 259 0 8165 8168' '(vector-i64 294 7935 259 0 8165 8168';;
+  wrong-zstd-block-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (record-get [:ref :zstd/execution] executed :bytes)) "3a3d9308758b3a794400d6d5c9e219ee38a15333bd83ddcf502ca65ef369e435"' '(sha/digest-hex (record-get [:ref :zstd/execution] executed :bytes)) "0a3d9308758b3a794400d6d5c9e219ee38a15333bd83ddcf502ca65ef369e435"';;
+  wrong-zstd-integrated-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (record-get [:ref :zstd/decoded-block] integrated :bytes)) "3a3d9308758b3a794400d6d5c9e219ee38a15333bd83ddcf502ca65ef369e435"' '(sha/digest-hex (record-get [:ref :zstd/decoded-block] integrated :bytes)) "0a3d9308758b3a794400d6d5c9e219ee38a15333bd83ddcf502ca65ef369e435"';;
+  wrong-zstd-frame-digest) replace_once "$src/corpus.kotoba" 'f1d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba' '01d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba';;
+  wrong-forest-block-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] found (vector-i64))) "88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"' '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] found (vector-i64))) "08493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"';;
+  wrong-forest-indexed-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] indexed (vector-i64))) "88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"' '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] indexed (vector-i64))) "08493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"';;
   none) :;; *) exit 2;;
  esac
  if [ "$target" = macos-arm64 ]; then entry=/src/corpus.kotoba; source_root=/src; else entry="$src/corpus.kotoba"; source_root="$src"; fi
@@ -113,5 +141,19 @@ done
 run_case positive 0 wrong-cid 5
 run_case negative 0 allow-file-version 1
 run_case negative 23 allow-link-codec 1
+for primitive in writer values pack_values chunk_plan_values zstd_header; do run_case primitive "$primitive" none 0; done
+run_case primitive chunk_plan_values allow-plan-overflow 8
+run_case primitive zstd_header wrong-zstd-window 12
+run_case primitive zstd_header wrong-zstd-block-size 28
+run_case primitive zstd_header wrong-zstd-raw-byte 42
+run_case primitive zstd_header wrong-zstd-literal-byte 52
+run_case primitive zstd_header wrong-zstd-sequence-count 62
+run_case primitive zstd_header wrong-zstd-fse-table 78
+run_case primitive zstd_header wrong-zstd-sequence-value 85
+run_case primitive zstd_header wrong-zstd-block-digest 94
+run_case primitive zstd_header wrong-zstd-integrated-digest 108
+run_case primitive zstd_header wrong-zstd-frame-digest 118
+run_case primitive zstd_header wrong-forest-block-digest 128
+run_case primitive zstd_header wrong-forest-indexed-digest 137
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-printf 'Native frozen corpus 53 + 3 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 5 primitives + 16 negative controls passed on %s\n' "$target"
