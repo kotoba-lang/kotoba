@@ -35,3 +35,36 @@ does not parse the manifest fields in Native, check the signature, validate
 its issuer registry, bind its location, evaluate policy or establish durable
 publication. The receipt is persisted in Prolly datoms and has not yet been
 independently decoded by this Native test.
+
+## Native fixture signature verification
+
+The Native `awai.fs.execution-manifest/verify` validates the bounded canonical
+value and exact nine-field execution-manifest shape for the observed raw
+64-integer signature profile. It removes `:signature`, re-encodes the value,
+computes its DAG-CBOR CID and checks Ed25519 over the UTF-8 CID string. It
+also requires the caller's expected data root, policy CID and authority epoch.
+The actual stored fixture yields payload CID
+`bafyreihygobs4lf6sjtx64ausw5ywi3j7nnsbdhb6sjhqjyflzscmjb6nq`. Babashka
+1.12.218 independently reconstructed the unsigned bytes; Node 26.0.0 verified
+the same stored signature with the fixture public key independently derived
+from the known fixture seed. They are local references, not Native/CI runtime
+dependencies. The source execution identity and contract at Kotobase revision
+`c194a7d` have SHA-256
+`9f7a05874e427f305c4d9d2cfc8679ead86f67d1e79ac423a2e8c8e488c0fe04` and
+`06eed9b0601ea8d82570523c52f30005b3dc05bb1ffb5071f16749a3e9ef6510`;
+the Otehon fixture signing source SHA-256 is
+`b396c68621caf109c500bdb307e216b082b70e170475f1b20f048975ae220896`.
+
+Changed signature, a different valid key, policy, data root and epoch were
+refused, with separate negative controls. The full 118-case local macOS arm64
+Native corpus passed. Positive executable SHA-256
+`4f89a7983c6f80544bfd17413c0b9413e78051ee25f86142f94ab8d26b0014d2`;
+source lock `d62c1bd1377533b3aa9a0915b6c7d205a518eb16f031260210b85af0ab52794d`.
+
+This supersedes the earlier statement that the fixture signature had not been
+checked in Native. It does not authenticate the caller's key, tenant, epoch,
+policy or root; establish registry membership, freshness, rollback protection,
+location binding or policy evaluation; or decode the separate receipt datoms.
+The current registry-key signature envelope is a different profile and is
+not supported by this raw-vector fixture verifier. Generic value parser
+resource behavior remains unqualified for hostile production input.

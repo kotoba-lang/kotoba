@@ -147,7 +147,7 @@ run_case() {
   cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
-  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree basis_snapshot basis_publication; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree basis_snapshot basis_publication execution_manifest; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
  elif [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
@@ -191,6 +191,11 @@ run_case() {
   allow-wrong-publication-format) replace_once "$src/corpus.kotoba" ':publication-format-mismatch) 17' ':unsupported-manifest) 17';;
   allow-physical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 18' ':invalid-publication) 18';;
   allow-logical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 19' ':invalid-publication) 19';;
+  allow-execution-bad-signature) replace_once "$src/corpus.kotoba" ':invalid-signature) 28' ':invalid-key) 28';;
+  allow-execution-wrong-key) replace_once "$src/corpus.kotoba" ':invalid-signature) 24' ':invalid-key) 24';;
+  allow-execution-wrong-root) replace_once "$src/corpus.kotoba" ':scope-mismatch) 26' ':invalid-manifest) 26';;
+  allow-execution-wrong-epoch) replace_once "$src/corpus.kotoba" ':invalid-manifest) 27' ':scope-mismatch) 27';;
+  allow-execution-wrong-policy) replace_once "$src/corpus.kotoba" ':scope-mismatch) 25' ':invalid-manifest) 25';;
   allow-untrusted-publication) replace_once "$src/corpus.kotoba" ':untrusted-publication) 16' ':invalid-publication) 16';;
   refuse-execution-value) replace_once "$src/corpus.kotoba" 'manifest-valid (native-value/validate manifest)' 'manifest-valid (native-value/validate [])';;
   allow-unsorted-values) replace_once "$src/corpus.kotoba" ':noncanonical-order) 3' ':invalid-form) 3';;
@@ -323,6 +328,11 @@ run_case primitive native_value_validate allow-unsorted-values 3
 run_case primitive native_prolly_checkpoint_io none 0
 run_case primitive native_prolly_checkpoint_io tamper-execution-manifest 20
 run_case primitive native_prolly_checkpoint_io refuse-execution-value 21
+run_case primitive native_prolly_checkpoint_io allow-execution-bad-signature 28
+run_case primitive native_prolly_checkpoint_io allow-execution-wrong-key 24
+run_case primitive native_prolly_checkpoint_io allow-execution-wrong-policy 25
+run_case primitive native_prolly_checkpoint_io allow-execution-wrong-root 26
+run_case primitive native_prolly_checkpoint_io allow-execution-wrong-epoch 27
 run_case primitive native_prolly_checkpoint_io wrong-prolly-checkpoint 2
 run_case primitive native_prolly_checkpoint_io wrong-snapshot-schema 7
 run_case primitive native_prolly_checkpoint_io wrong-manifest-database 7
@@ -347,8 +357,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 113 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 118 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 17 primitives + 42 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 17 primitives + 47 negative controls passed on %s\n' "$target"
