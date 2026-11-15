@@ -1,0 +1,13 @@
+# Native reading of Otehon receipt transaction quads — 2026-11-15
+
+The pinned Otehon fixture from `native-otehon-receipt-entry-20261115.md` stores the receipt transaction as a compressed quad node. The Native fixture test now follows the verified commit and novelty links through the actual Forest files, checks the transaction CID, validates and expands its zlib frame, and decodes the resulting CBOR with `cbor.codec`. It verifies the root has one `quads` array containing eight three-field string quads, the first receipt subject and `kotobase.causal/format` value, and the last `kotobase.causal/payload-edn` record subject and allow-decision prefix. The already-pinned complete decoded bytes have SHA-256 `7d76da0b56ddaf680b6a5f0d5cac3f575c2b50a1be808959e313ac3e39558157`.
+
+For a one-time hosted reference on 2026-11-15, Temurin JVM 21.0.1 loaded `ipld.core` from the existing Otehon frozen fixture bundle and decoded `.agent-output/native-deflate-block-20261115/oracle-quad.cbor`. The reference reported one root key `quads`, eight records, the same first format quad and last payload-edn quad. The exact command below ran from the awai-os task worktree; it was a local oracle, not part of Native runtime or CI. The earlier Node zlib oracle command and pinned source are in `native-huffman-block-20261115.md`.
+
+```sh
+b="$PWD/.agent-output/product-ports-gib-host-20261115/bundle" && java -cp "$b/cp0:$b/cp1:$b/cp2:$b/cp3:$b/cp4:$b/cp5:$b/cp6:$b/cp7:$b/jars/*" clojure.main -e '(require (quote [ipld.core :as ipld])) (let [n (ipld/decode (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get "/Users/junkawasaki/github/wt/codex/awai-531-native-recovery/.agent-output/native-deflate-block-20261115/oracle-quad.cbor" (make-array String 0)))) q (get n "quads")] (prn {:root-keys (keys n) :count (count q) :first (first q) :last (last q)}))'
+```
+
+The macOS arm64 Native artifact SHA-256 was `e80f7fa86665b6f1a550a8504b6a939a64612f40b1d34d7e8caad74ff5a05332`, with KSL1 lock `e3fb3c5db9a862c97713cb7c5cc45d73f9a37fe9b92c572428ccd6bbc1eb06ce`. The positive fixture exited 0; a separately compiled test expecting nine quads instead of eight returned exit 19, and the missing-Pack control returned 7. Local fixtures, source lock and output remain in `.agent-output/native-otehon-quads-20261115/` and its negative directory. This test is not yet in CI.
+
+This reads the immutable transaction payload for one fixture; it does not execute a Datalog query, reconstruct the receipt with its query semantics, parse its embedded EDN as trusted authority, validate a signature, authenticate a root, or decrypt production ciphertext. The fixture uses identity encryption. Host OS cache loss, real-device power loss and production qualification remain open.
