@@ -1,0 +1,9 @@
+# Native logical commit v1 with one parent, 2026-11-15
+
+The fixed-field-order, safe-ASCII Native v1 logical-commit profile now accepts zero or one nonempty parent. It canonicalizes the parent as a tagged string in the vector; two parents, an empty parent and epoch values above 2^53-1 are refused. This expands the earlier zero-parent profile only. General EDN order/escaping, non-ASCII values and merge v2 remain unsupported.
+
+A one-time Babashka 1.12.218 run of the pinned Kotobase `logical-commit-string` used the stored fixture commit with epoch 2 and one synthetic parent, producing root `1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e`. Native reproduces this root and the original zero-parent root. Changing the parent changes the root; invalid parent vectors and an out-of-range epoch are rejected. Standalone Native macOS test artifact SHA-256 `0199c7884b905e5bf1d33a797bd901da73eea9b1c41729424fa06c47935f626e`; source lock `b64837d6e5c39746fdf50bca106d89397a6d3137998ee43d27e0cfe7624f11a4`.
+
+A separate synthetic proof was signed with the known fixture test seed using Node 26.0.0; Native verifies the complete proof using the fixture public key and rejects parent mutation and wrong key ID. This is not a persisted proof or parent-chain validation. Its Native artifact SHA-256 is `9a5003ed4f449e636248184932164d618f69440be421bd7e5e53b6c215c55f40`, source lock `afa770b8de2abf069435f27a635a6fbb2a31e89052975edb1a3acc4e567780d7`. The original real zero-parent FS2 fixture also passed with the updated parser. Oracle input, generation scripts and outputs are under `.agent-output/native-one-parent-20261115/` and the paired basis/fixture directories; focused tests are not in CI.
+
+This verifies bytes and a fixture signature, not parent availability, parent signatures, epoch continuity, key authorization, physical/catalog binding, actual policy/receipt or OS-cache-loss recovery.
