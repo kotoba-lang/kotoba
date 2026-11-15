@@ -47,7 +47,7 @@ for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotob
 {
  printf '%s\n' "$pins" "$lib/schema/v1.json" "$lib/corpus/v1.json" "$lib/test/native_corpus_gate.sh" "$lib/test/stage_corpus.sh" "$lib/test/stage_corpus.jq" "$lib/test/stage_corpus.sha256" "$repo/scripts/check-library-local-changes-pins.sh" "$amu/$compiler_key" "$amu/$provider_key" "$compiler" "$provider"
  for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do printf '%s\n' "$repo/$d/local-changes.json"; done
- for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/frame_header.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
+ for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/*.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba "$repo"/lib/org.ietf.deflate/src/deflate/*.kotoba "$repo"/lib/org.ietf.deflate/test/deflate/*_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
  if [ "$target" = linux-x86_64 ]; then printf '%s\n' "$io_amu/$io_path" "$io_compiler"; fi
 } | LC_ALL=C sort -u > "$out/input-paths.txt"
 while IFS= read -r watched_path; do
@@ -133,7 +133,7 @@ run_case() {
   cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/cid.kotoba" "$src/multiformats/"
  elif [ "$kind" = primitive ] && { [ "$index" = zstd_header ] || [ "$index" = forest_file_io ]; }; then
   mkdir "$src/zstd"
-  cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$src/zstd/"
+  for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
   for mod in forest_blocks forest_index; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
   if [ "$index" = forest_file_io ]; then cp "$lib/src/awai/fs/forest_file.kotoba" "$src/awai/fs/"; fi
@@ -144,7 +144,7 @@ run_case() {
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
   if [ "$kind" = pack ] || [ "$index" = pack_values ]; then mkdir "$src/ipld/car"; cp "$repo/lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba" "$src/ipld/car/"; fi
   if [ "$index" = forest_manifest_io ]; then
-   mkdir "$src/zstd"; cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$src/zstd/"
+   mkdir "$src/zstd"; for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
    for mod in forest_blocks forest_index forest_file forest_view; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   fi
  fi

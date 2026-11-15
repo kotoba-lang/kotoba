@@ -1,0 +1,9 @@
+# Native Forest Huffman frame path, 2026-11-15
+
+`zstd.forest-frame/decode-frame` preserves the existing bounded decoder and adds a bounded FSE-weight, four-stream Huffman path for a single compressed block, optionally followed by an empty final raw block. Other Huffman layouts fail closed. Both indexed in-memory and FS2 Forest reads use it and continue to verify frame extent and block CID.
+
+For the real Otehon Prolly leaf, FS2 reads the selected Forest frame, decodes its 270 literals and stops with `:table-mode-unsupported` at its compressed offset sequence table. The leaf itself is not yet returned. A synthetic frame built from those literal bytes with zero sequences completes and yields the reference literal SHA-256 `f40a73a2e57d7e14c07c03a28777d8bf1fcb007c67dddd6933b29b8a959c9c13`. The Native fixture also exercises invalid jump, missing marker, malformed tree, truncated weights and missing Pack. Executable SHA-256 `f206788396230a26f02c6c03649236fc64fbd89861ddf9e7ef2dbcc347e7f3ed`; KSL1 lock `62fbd01eaaa2239c873a9312ed363de393c1d3d8e2011740e1738b2f6c0e419b`. Outputs are retained in `.agent-output/native-forest-huffman-20261115/`.
+
+The Python-free macOS Native corpus passed 53 corpus cases, 12 primitives and 27 negative controls, including Forest FS2 and manifest cases. The first integration gate failed with compiler E6015 because the KSL1 source lock included an unused `frame_write` source. The gate now stages exactly the seven transitive Zstd modules and passes; it still hashes the broader Zstd source set for before/after integrity. Full gate output is retained in `.agent-output/native-forest-huffman-corpus3-20261115/`.
+
+The real-leaf fixture test is not yet part of CI. No Native signature authentication, actual policy evaluation, query, or OS-cache-loss recovery is shown here.
