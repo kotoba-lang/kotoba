@@ -1,0 +1,9 @@
+# Native FSE table description, 2026-11-15
+
+The bounded Native parser reads the forward normalized-count description for an FSE-compressed Zstandard Huffman weight stream. It accepts accuracy logs 5–6 and returns the normalized counts and the first byte after the description; it does not decode the weight stream or Huffman literals. The Forest decoder still rejects this leaf with `:huffman-unsupported`.
+
+A pinned macOS Native compiler and packager ran `fse_description_test.kotoba`: the real description `[80 197 166 13]` yielded accuracy 5, counts `[20 1 5 2 1 2 1]`, and four bytes consumed. Synthetic bit-packed distributions `[16 16]` and `[-1 0 0 31]` cover the two count widths, low-probability symbols and zero runs. Truncation, excess accuracy and an invalid input bound were rejected. Artifact SHA-256: `20546220e957cf89a3ad4a87be1446ca28a84b56021b42ea9624c54778f67a0b`.
+
+The separate Otehon fixture test verified the existing root and snapshot links and the selected frame SHA-256, parsed the real description at frame bytes 13–16, and constructed the 32-entry FSE table. Its missing-Pack control exited 1. Native artifact SHA-256: `4cc614a624c7270db7a8c4bffea43c9402bf68a6ae6db12fe068cea285a7d8aa`; source lock SHA-256: `40f889f69b8a30f1d4718516f9c1c9c3d9fe0c462ee4018c064f4b7116700eba`. Outputs and fixtures remain under `.agent-output/native-zstd-fse-description-20261115/` and `.agent-output/native-otehon-fse-description-20261115/`. These focused tests are not yet part of CI.
+
+The expected real counts were derived with a separate local bit parser from the RFC description, not an independent production decoder. Native Huffman weights, leaf decoding, authenticated basis, real policy and query remain unverified; this result is not evidence of OS-cache-loss recovery or production readiness.
