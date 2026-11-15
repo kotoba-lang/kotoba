@@ -142,7 +142,8 @@ run_case() {
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   cp "$repo/lib/kotoba.ioIpld/src/kotoba/value/native_validate.kotoba" "$src/kotoba/value/"
  elif [ "$kind" = primitive ] && [ "$index" = native_prolly_checkpoint_io ]; then
-  mkdir "$src/cbor" "$src/zstd" "$src/ed25519"
+  mkdir -p "$src/cbor" "$src/zstd" "$src/ed25519" "$src/kotoba/value"
+  cp "$repo/lib/kotoba.ioIpld/src/kotoba/value/native_validate.kotoba" "$src/kotoba/value/"
   cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
@@ -171,12 +172,14 @@ run_case() {
  if [ "$file_case" = true ]; then
   stage_io_fixtures "$dir" "$control"
   if [ "$index" = native_prolly_checkpoint_io ]; then
+   copy_fixture "$lib/test/fixtures/native-execution-manifest.value" "$dir/fixture-execution" 6d2aae91a0149616d57c700967227e94586ffd32621dbed49cd728bdb5958371
+   if [ "$control" = tamper-execution-manifest ]; then flip_byte "$dir/fixture-execution" 25; fi
    copy_fixture "$lib/test/fixtures/native-snapshot-pack.forest" "$dir/fixture-snapshot" 5fefcde7d85a4a6a24b526856b2fa7d65561478b839f6ea9161d15608a1fe0b8
    copy_fixture "$lib/test/fixtures/native-two-leaf.forest" "$dir/fixture-prolly" 7f1b770465aec12793110b30cc38b1705137ae863db1f4109bfc9a28e356ddf8
    copy_fixture "$lib/test/fixtures/native-two-leaf-bad-range.forest" "$dir/fixture-prolly-bad" 811e65afc12e358e1cc8a9c5e4b9f938ce7f330ff41d3232c5ad12d3821749ee
   fi
   if [ "$target" != macos-arm64 ]; then
-   for fixture in fixture-snapshot fixture-prolly-bad fixture-prolly gib-manifest fixture fixture-second fixture-large fixture-large-bad-index fixture-mega fixture-mega-corrupt fixture-gib-0 fixture-gib-1 fixture-corrupt fixture-hidden fixture-badfooter fixture-short fixture-missing; do
+   for fixture in fixture-execution fixture-snapshot fixture-prolly-bad fixture-prolly gib-manifest fixture fixture-second fixture-large fixture-large-bad-index fixture-mega fixture-mega-corrupt fixture-gib-0 fixture-gib-1 fixture-corrupt fixture-hidden fixture-badfooter fixture-short fixture-missing; do
     sed "s@\"/$fixture\"@\"$dir/$fixture\"@g" "$src/corpus.kotoba" > "$dir/paths.tmp"; mv "$dir/paths.tmp" "$src/corpus.kotoba"
    done
   fi
@@ -189,6 +192,7 @@ run_case() {
   allow-physical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 18' ':invalid-publication) 18';;
   allow-logical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 19' ':invalid-publication) 19';;
   allow-untrusted-publication) replace_once "$src/corpus.kotoba" ':untrusted-publication) 16' ':invalid-publication) 16';;
+  refuse-execution-value) replace_once "$src/corpus.kotoba" 'manifest-valid (native-value/validate manifest)' 'manifest-valid (native-value/validate [])';;
   allow-unsorted-values) replace_once "$src/corpus.kotoba" ':noncanonical-order) 3' ':invalid-form) 3';;
   wrong-snapshot-schema) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(= (value/number schema) 2)' '(= (value/number schema) 3)';;
   wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
@@ -226,7 +230,7 @@ run_case() {
   wrong-gib-manifest-cid) replace_once "$src/corpus.kotoba" 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy' 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5enda';;
   tampered-gib-manifest) :;;
   ignore-view-manifest-cid) replace_once "$src/awai/fs/forest_view.kotoba" '(not (string=? expected-cid (hash/cidv1-dag-cbor-bytes wire)))' false;;
-  none) :;; *) exit 2;;
+  tamper-execution-manifest|none) :;; *) exit 2;;
  esac
  if [ "$target" = macos-arm64 ]; then entry=/src/corpus.kotoba; source_root=/src; else entry="$src/corpus.kotoba"; source_root="$src"; fi
  { printf 'KSL1\nentry %s\nroot %s\n' "$entry" "$source_root"
@@ -317,6 +321,8 @@ run_case primitive zstd_header wrong-forest-indexed-digest 137
 run_case primitive native_value_validate none 0
 run_case primitive native_value_validate allow-unsorted-values 3
 run_case primitive native_prolly_checkpoint_io none 0
+run_case primitive native_prolly_checkpoint_io tamper-execution-manifest 20
+run_case primitive native_prolly_checkpoint_io refuse-execution-value 21
 run_case primitive native_prolly_checkpoint_io wrong-prolly-checkpoint 2
 run_case primitive native_prolly_checkpoint_io wrong-snapshot-schema 7
 run_case primitive native_prolly_checkpoint_io wrong-manifest-database 7
@@ -341,8 +347,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 111 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 113 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 17 primitives + 40 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 17 primitives + 42 negative controls passed on %s\n' "$target"
