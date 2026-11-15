@@ -1,0 +1,15 @@
+# Native bounded DEFLATE Huffman block — 2026-11-15
+
+`deflate.huffman-block/inflate-block` consumes already-admitted literal and distance length tables and a bit offset. It handles literals, end-of-block and length/distance matches, including overlapping copies, and rejects truncated input, invalid distance/length symbols, backward distances outside produced output, output beyond an explicit cap and invalid bounds. The API expects the caller to validate the alphabets and enclosing zlib frame. Its present recursive executor additionally rejects after 4,096 symbols (`:work-limit`) and caps output at 1 MiB; these are explicit temporary limitations. It does not yet handle stored blocks, multiple blocks, a zlib header, trailing data or Adler-32.
+
+A pinned macOS arm64 Native unit artifact decoded a literal followed by an overlapping distance-one match to `AAAA`, checked the final offset, and refused insufficient output capacity, a back-reference before the start, truncation, an excessive requested limit and the 4,096-symbol work limit. Artifact SHA-256 was `0074d79f2e410489c66a37ffc7bf56a17bf3c643f6d6536b2cd77cfe4ff233bb`, source lock `17c437151efefd49cbadb65ddc393bc21a8066339eaf16ea140e8c76cfb10280`.
+
+On the Otehon fixture in `native-otehon-receipt-entry-20261115.md`, Native traversed and CID-verified the saved commit and novelty blocks, read the transaction's 648-byte `ct` field, parsed its dynamic table and inflated its one Huffman block. The output was 1,618 bytes with SHA-256 `7d76da0b56ddaf680b6a5f0d5cac3f575c2b50a1be808959e313ac3e39558157`. A separate one-time local Node v26.0.0 `zlib.inflateSync` reference on the extracted fixture field gave the same length and SHA-256; the reference is not a Native dependency, fallback or CI gate. Reducing the Native output limit to 1,000 caused the fixture test to refuse (exit 19); the existing missing-Pack control returned 7. Passing Native artifact SHA-256 was `03db95976f571e4b94caea12b978ff6b06033b6b550f0b522630e466bd705f9d`, KSL1 lock `0357ab3a6dba9f051e0d77ea175d5551c073509ea36d4990d375ecbb3e12ecb0`. Inputs and outputs remain under `.agent-output/native-deflate-block-20261115/`, `.agent-output/native-otehon-inflate-20261115/` and a separate negative directory.
+
+The fixture uses identity encryption. The block decoder does not authenticate a root, validate actual encryption, decode quads, answer Datalog, or prove host cache loss or production performance. The new test is local and not yet integrated into CI.
+
+The reference command, run from this worktree on 2026-11-15 with the 648-byte `fixture-ct.bin` extracted by the Otehon hosted oracle, was:
+
+```sh
+node -e 'const f=require("fs"),z=require("zlib"),c=require("crypto"); const b=f.readFileSync(".agent-output/native-deflate-block-20261115/fixture-ct.bin"); if(b[0]!==1) process.exit(1); const x=z.inflateSync(b.subarray(1)); f.writeFileSync(".agent-output/native-deflate-block-20261115/oracle-quad.cbor",x); process.stdout.write(JSON.stringify({node:process.version,length:x.length,sha256:c.createHash("sha256").update(x).digest("hex")})+"\n")'
+```
