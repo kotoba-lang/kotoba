@@ -58,3 +58,16 @@ mutation that treats the missing Pack as accepted is caught. The complete
 lock `01acb1e4b30cf208f52efbe96df10faf6221c5e49009a500376f8c81aaec6281`.
 This demonstrates rejection for the fixture; it does not supply an issuer key
 registry or authenticate the caller-provided physical root.
+
+## Logical and physical basis identity
+
+The checkpoint contract includes database ID and epoch. Native snapshot
+verification now checks the signed logical commit's database ID and epoch
+against the caller-trusted physical manifest's database ID and basis-t before
+using its snapshot. A mismatch returns `:basis-mismatch`. The actual fixture
+passes; separate gate mutations of the manifest database and epoch each fail.
+The complete 105-case local macOS arm64 corpus passed. Positive executable
+SHA-256 `031513e797e805a8d5533094e113718840f14d5ac9ed022db63113f498275a7f`;
+source lock `8f2fe37b71f91e2293d6d115753b9fd838ee52e70cdcbf7246591e49538e101d`.
+Physical-root authentication, authority enrollment and rollback protection are
+still independent requirements; this matching does not provide them.
