@@ -1,0 +1,9 @@
+# Native exact Prolly leaf lookup, 2026-11-15
+
+`awai.fs.prolly-leaf/lookup` validates a DAG-CBOR leaf and scans at most 4096 entries for one exact opaque key. It returns the stored bytes, rejects duplicate target keys and malformed entries, and reports a missing key. The caller must authenticate the root, verify the leaf CID, enforce policy and decrypt payloads independently. It is not a general Prolly traversal or a Datalog query.
+
+The local macOS Native FS2 fixture retrieves and CID-checks the actual 637-byte Otehon `spo` leaf, then uses this lookup to find both entries and rejects a missing key. The first stored payload is decoded under the fixture's identity-encryption assumption and its tagged subject, predicate and logical-file CID are verified against the fixture. The second entry and payload are checked as opaque bytes, not interpreted as authorization. Synthetic duplicate-target and wrong-value-type leaves are rejected. A missing first Pack remains rejected.
+
+As an independent local observation, the preinstalled Zstandard CLI 1.5.7 decompressed the selected fixture frame, and a scratch Node CBOR inspector produced key digests `9d381bc540bc1cb589fad692ce9d140c4fdc319bf9ccd67ab304f2cb0857205c` and `85863af80d7d7b4466cfdfd9eac13af9403c1f2ce5bab2660a434a502262e0cf`; scripts and outputs remain under `.agent-output/native-prolly-lookup-20261115/`. These observations are not in the Native runtime or CI. Native executable SHA-256 `4bfc3cc510ae6b9308fe4e9fa8c7632bfce0d8597f3c3af63a12aeb45c392d01`, KSL1 source lock `d17cfa2f3202b140c9f83d69cb4c8092a149fe952f1fb28932228f21e4626053`.
+
+The fixture uses identity encryption and fixture blinding. Signature verification, authenticated basis, actual policy/receipt, multi-node guarantees, OS-cache-loss recovery and general query semantics remain unverified; the focused fixture is not in CI.
