@@ -42,6 +42,19 @@ if [ "$target" = linux-x86_64 ]; then
  [ "$(sha "$io_compiler")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]; chmod 700 "$io_compiler"
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-before.jsonl"
+# Keep an independent before/after record of every source and fixture consumed
+# by this gate, including the compiler copies, not just the library ledgers.
+{
+ printf '%s\n' "$pins" "$lib/schema/v1.json" "$lib/corpus/v1.json" "$lib/test/native_corpus_gate.sh" "$lib/test/stage_corpus.sh" "$lib/test/stage_corpus.jq" "$lib/test/stage_corpus.sha256" "$repo/scripts/check-library-local-changes-pins.sh" "$amu/$compiler_key" "$amu/$provider_key" "$compiler" "$provider"
+ for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do printf '%s\n' "$repo/$d/local-changes.json"; done
+ for f in "$lib"/src/awai/fs/*.kotoba "$lib"/test/*.kotoba "$lib"/test/fixtures/* "$repo"/lib/kotoba.ioIpld/src/ipld/*.kotoba "$repo"/lib/kotoba.ioIpldCar/src/ipld/car/*.kotoba "$repo"/lib/kotoba.ioMultiformats/src/multiformats/*.kotoba "$repo"/lib/org.ietf.zstd/src/zstd/frame_header.kotoba "$repo"/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba; do [ -f "$f" ] && printf '%s\n' "$f"; done
+ if [ "$target" = linux-x86_64 ]; then printf '%s\n' "$io_amu/$io_path" "$io_compiler"; fi
+} | LC_ALL=C sort -u > "$out/input-paths.txt"
+while IFS= read -r watched_path; do
+ [ -f "$watched_path" ] && [ ! -L "$watched_path" ] || { echo 'missing or linked input' >&2; exit 1; }
+ printf '%s %s\n' "$(sha "$watched_path")" "$watched_path"
+done < "$out/input-paths.txt" > "$out/input-sha256.txt"
+printf 'case\tresult\tsource_lock_sha256\tartifact_sha256\n' > "$out/results.tsv"
 sh "$lib/test/stage_corpus.sh" "$lib/corpus/v1.json" "$out/fixtures" > "$out/stage.stdout"
 jq -e '(.positive|length)==11 and (.negative|length)==36 and (.legacyPacks.cases|length)==6' "$lib/corpus/v1.json" >/dev/null
 if command -v sha256sum >/dev/null 2>&1; then (cd "$out/fixtures" && sha256sum -c "$lib/test/stage_corpus.sha256") > "$out/goldens.stdout"
@@ -213,7 +226,9 @@ run_case() {
   grep -Eq ":status :ok[[:space:]]+:result $expected([^0-9]|$)" "$dir/run.stdout"
   [ ! -s "$dir/run.stderr" ]
  fi
- [ ! -s "$dir/compile.stderr" ] && [ ! -s "$dir/pack.stderr" ] || { echo "$name compiler diagnostics" >&2; exit 1; }
+ [ ! -s "$dir/compile.stderr" ] && [ ! -s "$dir/pack.stderr" ] && [ ! -s "$dir/extract.stderr" ] || { echo "$name compiler diagnostics" >&2; exit 1; }
+ case "$target" in macos-arm64) artifact="$dir/program.macho";; linux-arm64) artifact="$dir/program.elf";; linux-x86_64) artifact="$dir/program.kx64";; esac
+ printf '%s\t%s\t%s\t%s\n' "$name" "$expected" "$lock" "$(sha "$artifact")" >> "$out/results.tsv"
  printf 'PASS %s native-result=%s\n' "$name" "$expected"
 }
 for kind in positive negative pack; do
@@ -252,4 +267,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 85 ] || { echo 'result count mismatch' >&2; exit 1; }
+while IFS=' ' read -r expected_hash watched_path; do
+ [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
+done < "$out/input-sha256.txt"
 printf 'Native frozen corpus 53 + 7 primitives + 24 negative controls passed on %s\n' "$target"
