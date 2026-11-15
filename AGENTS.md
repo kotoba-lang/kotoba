@@ -22,8 +22,16 @@ AWAI-43, AWAI-48 and JUN-290. Workspace architecture and authority rules apply.
 
 Use Amu selfhost and canonical Kotoba only. Do not restore CLJK/CLJC, NBB,
 KBB, Clojure, JVM/Java, GraalVM, Node or a C compiler/loader as a CI prerequisite
-or fallback. Python scripts may stage/hash bytes and observe native processes;
-they must not implement language resolution, compilation or verdicts.
+or fallback. Python is a one-time local reference oracle only; it is not a
+CI, gate, build, packaging, runtime or fallback dependency.
+
+The Awai file workflow replaced its Python corpus orchestrator with the
+Python-free Native frozen corpus gate. The shell gate covers the 53 frozen
+cases, Native primitives and mutation controls; it produces TSV/source-lock
+evidence instead of the Python gate's JSON receipt. Exact equivalence of the
+two orchestrators' environmental controls has not been established. The
+optional full-GiB Python test was not run by the old default workflow and is
+not covered by this replacement; GiB recovery remains a separate open gate.
 
 The 2026-10-24 replacement removes the JVM/Node launcher job and the macOS C
 loader toolchain. Original definitions/scripts are byte-preserved as inert
