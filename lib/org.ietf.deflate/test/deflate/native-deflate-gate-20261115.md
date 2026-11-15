@@ -1,0 +1,7 @@
+# Native DEFLATE unit gate — 2026-11-15
+
+The existing `native_corpus_gate.sh` now stages and runs the Native bit reader, canonical Huffman reader, dynamic-table parser, Huffman-block expander and single-dynamic-block zlib reader unit tests. It also runs three independent changed-expectation negative controls, checks each source lock and output artifact, and includes DEFLATE sources and test inputs in its before/after SHA-256 drift inventory. This adds five positive and three negative cases; the existing workflow already invokes the gate on macOS arm64, Linux arm64 and Linux x86_64.
+
+On macOS arm64 the pinned Native compiler/packager completed the full gate locally: 53 frozen corpus cases, 12 primitive cases and 27 negative controls (92 cases, plus a result header). All five DEFLATE positives returned 0 and the three altered-expectation controls returned 2. The output table, locks, artifacts and before/after inventory are retained under `.agent-output/native-corpus-deflate-ci-v2-20261115/`. The initial attempt failed because the changed gate's local-changes source pin was stale; updating the pin preceded the successful run. `native_corpus_gate.sh` SHA-256 is `d3ac556918d34bb087f3ba68913d38f619364baddf775f9d242b4b4ab29549d0`.
+
+The actual Otehon 61-Pack integration fixture remains a separate local test and is not included in this CI gate. Linux and remote CI results must be observed for the exact PR head. This gate does not claim complete zlib support, Native Datalog/authority, host-cache loss, physical durability or production qualification.
