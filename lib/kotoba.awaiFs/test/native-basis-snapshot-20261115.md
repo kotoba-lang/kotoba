@@ -47,3 +47,14 @@ text controls refuse, and a gate mutation accepting 3 instead of 2 returns the
 expected failure. The full 102-case local macOS arm64 corpus passed. Positive
 artifact SHA-256 `cef2b8b7c76b20ad7b1241f5b0dacc63890cd8c025a3c9b84c3a3f7fdf73a5f8`;
 source lock `273556b888bda7693879b3adf7b94fc2042b82a64862eab0936e279514c05bb3`.
+
+## Missing Pack and wrong public key controls
+
+The combined stored snapshot verification now checks a missing Pack is refused
+and a different valid Ed25519 public key returns `:invalid-signature`. A gate
+mutation that treats the missing Pack as accepted is caught. The complete
+103-case local macOS arm64 Native corpus passed; positive executable SHA-256
+`5f9ebc17b62b5d7504fb7fb59c685c0caf85e1da4e551f58de77d5bdaa3b280e`, source
+lock `01acb1e4b30cf208f52efbe96df10faf6221c5e49009a500376f8c81aaec6281`.
+This demonstrates rejection for the fixture; it does not supply an issuer key
+registry or authenticate the caller-provided physical root.
