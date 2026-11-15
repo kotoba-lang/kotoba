@@ -142,7 +142,7 @@ run_case() {
   cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
-  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree basis_snapshot; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
  elif [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
@@ -167,11 +167,12 @@ run_case() {
  if [ "$file_case" = true ]; then
   stage_io_fixtures "$dir" "$control"
   if [ "$index" = native_prolly_checkpoint_io ]; then
+   copy_fixture "$lib/test/fixtures/native-snapshot-pack.forest" "$dir/fixture-snapshot" 5fefcde7d85a4a6a24b526856b2fa7d65561478b839f6ea9161d15608a1fe0b8
    copy_fixture "$lib/test/fixtures/native-two-leaf.forest" "$dir/fixture-prolly" 7f1b770465aec12793110b30cc38b1705137ae863db1f4109bfc9a28e356ddf8
    copy_fixture "$lib/test/fixtures/native-two-leaf-bad-range.forest" "$dir/fixture-prolly-bad" 811e65afc12e358e1cc8a9c5e4b9f938ce7f330ff41d3232c5ad12d3821749ee
   fi
   if [ "$target" != macos-arm64 ]; then
-   for fixture in fixture-prolly-bad fixture-prolly gib-manifest fixture fixture-second fixture-large fixture-large-bad-index fixture-mega fixture-mega-corrupt fixture-gib-0 fixture-gib-1 fixture-corrupt fixture-hidden fixture-badfooter fixture-short fixture-missing; do
+   for fixture in fixture-snapshot fixture-prolly-bad fixture-prolly gib-manifest fixture fixture-second fixture-large fixture-large-bad-index fixture-mega fixture-mega-corrupt fixture-gib-0 fixture-gib-1 fixture-corrupt fixture-hidden fixture-badfooter fixture-short fixture-missing; do
     sed "s@\"/$fixture\"@\"$dir/$fixture\"@g" "$src/corpus.kotoba" > "$dir/paths.tmp"; mv "$dir/paths.tmp" "$src/corpus.kotoba"
    done
   fi

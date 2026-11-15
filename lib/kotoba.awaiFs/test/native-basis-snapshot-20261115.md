@@ -19,3 +19,18 @@ sign the physical-root field; the supplied physical root must be authenticated
 by an independent publication/authority mechanism. Caller also owns key
 binding and immutable archive access. This is not proof of production
 publication, encrypted query, policy/receipt or OS-cache-loss recovery.
+
+## Native corpus gate
+
+The original fixture's Pack 0 contains the manifest, snapshot and single SPO
+leaf required for this verification. Its pinned 41,181-byte Forest archive
+is now included as `test/fixtures/native-snapshot-pack.forest` (SHA-256
+`5fefcde7d85a4a6a24b526856b2fa7d65561478b839f6ea9161d15608a1fe0b8`).
+The existing Native corpus gate tests the real proof and this Pack together,
+including rejection of a different caller-trusted physical root. All 101 cases
+passed locally on macOS arm64; the positive executable SHA-256 was
+`4850b2879512024b6362125c7923db41cee215b016cc452e96b07c3bf4b249d0`
+and its source lock SHA-256 was
+`dbfc0b1604379a5f1ec8479523903189e30e778a8de7b47bcb12c4ae3c234b3f`.
+This updates the earlier statement that the snapshot test is opt-in only. It
+still does not authenticate the physical-root field, issuer's key, or catalog.
