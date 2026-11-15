@@ -25,3 +25,14 @@ The publication contract specifies canonical data, not a mandated hash or
 signature. The digest and issuer key must be authenticated independently by
 the caller; this fixture uses a test key and plaintext and does not establish
 production authority, rollback resistance, policy/receipt or durable storage.
+
+## Independent root mutation controls
+
+The Native gate now mutates the physical CID and logical commit root separately
+inside the stored proof, keeping the independently trusted publication digest
+fixed. Each change returns `:untrusted-publication`; mutations of the expected
+refusals are detected by two additional gate controls. The complete 109-case
+local macOS arm64 corpus passed. Positive artifact SHA-256
+`fd6c82efcb016e5028937035086c4b57f4c84cc66b3e936bcfc9c1bd2717c744`;
+source lock `290193a938fbed2cd76f2e1db186c11cff4e4ed8d49d49edb6cbe869cf9b5caa`.
+These checks do not authenticate the supplied publication digest or key.

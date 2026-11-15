@@ -182,6 +182,8 @@ run_case() {
   wrong-manifest-database) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(value/text database)' '"different/database"';;
   wrong-manifest-epoch) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(string-from-i64 (value/number basis-t))' '"999"';;
   allow-wrong-publication-format) replace_once "$src/corpus.kotoba" ':publication-format-mismatch) 17' ':unsupported-manifest) 17';;
+  allow-physical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 18' ':invalid-publication) 18';;
+  allow-logical-change) replace_once "$src/corpus.kotoba" ':untrusted-publication) 19' ':invalid-publication) 19';;
   allow-untrusted-publication) replace_once "$src/corpus.kotoba" ':untrusted-publication) 16' ':invalid-publication) 16';;
   wrong-snapshot-schema) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(= (value/number schema) 2)' '(= (value/number schema) 3)';;
   wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
@@ -314,6 +316,8 @@ run_case primitive native_prolly_checkpoint_io wrong-manifest-database 7
 run_case primitive native_prolly_checkpoint_io wrong-manifest-epoch 7
 run_case primitive native_prolly_checkpoint_io allow-missing-snapshot 13
 run_case primitive native_prolly_checkpoint_io allow-untrusted-publication 16
+run_case primitive native_prolly_checkpoint_io allow-physical-change 18
+run_case primitive native_prolly_checkpoint_io allow-logical-change 19
 run_case primitive native_prolly_checkpoint_io allow-wrong-publication-format 17
 run_case primitive forest_file_io none 0
 run_case primitive forest_file_io wrong-forest-file-digest 3
@@ -330,8 +334,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 107 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 109 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 16 primitives + 37 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 16 primitives + 39 negative controls passed on %s\n' "$target"
