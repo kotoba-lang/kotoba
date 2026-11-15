@@ -67,3 +67,21 @@ corpus gate, including a changed-checkpoint negative control. The complete
 results and must be assessed on the actual commit. This gate exercises the
 plaintext checkpoint with a fixed expected root; it does not verify a
 signature or establish trusted basis, production publication or decryption.
+
+## Signed logical basis and Forest traversal
+
+The Native corpus gate now verifies the stored fixture proof's Ed25519
+signature and logical commit root, then computes the checkpoint by traversing
+the two-leaf Forest fixture and compares it to the signed checkpoint. Wrong
+issuer and a modified commit are rejected, as are an invalid key boundary and
+an altered expected checkpoint. All 101 corpus cases passed locally on macOS
+arm64 on 2026-11-15. The positive executable SHA-256 is
+`a770e0568af944d02910a9e31e7a88be54cb39e955159947384c295a4b30d1f0`;
+source lock SHA-256
+`3645c686ace99da5dbe9cfb534391f150c490832fb26674985d6a1f7ab083f05`.
+
+The root of the synthetic two-leaf tree is caller-supplied and is not the
+physical root in the proof. The logical signature authenticates the checkpoint
+under the supplied fixture key, not this physical tree or the caller's key
+selection. Trusted key binding, root-to-snapshot publication, encrypted
+values, real policy and receipt remain separate unverified requirements.

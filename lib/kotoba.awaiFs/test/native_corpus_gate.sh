@@ -138,10 +138,11 @@ run_case() {
   if [ "$index" != native_logical_signature ]; then cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/sha256.kotoba" "$src/multiformats/"; fi
   if [ "$index" != native_logical_commit_test ]; then mkdir "$src/ed25519"; cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"; fi
  elif [ "$kind" = primitive ] && [ "$index" = native_prolly_checkpoint_io ]; then
-  mkdir "$src/cbor" "$src/zstd"
+  mkdir "$src/cbor" "$src/zstd" "$src/ed25519"
+  cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
-  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
  elif [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
@@ -176,7 +177,7 @@ run_case() {
   fi
  fi
  case "$control" in
-  wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" 994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9 094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9;;
+  wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
   wrong-logical-root) replace_once "$src/corpus.kotoba" '1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e' '0fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e';;
   wrong-basis-issuer) replace_once "$src/corpus.kotoba" 'good (verify/verify (proof) "did:key:fixture-issuer" "fixture-key" pub)' 'good (verify/verify (proof) "did:key:wrong" "fixture-key" pub)';;
   wrong-signature-payload) replace_once "$src/corpus.kotoba" '[:domain :signature] [:value [:map' '[:domain :wrong] [:value [:map';;
