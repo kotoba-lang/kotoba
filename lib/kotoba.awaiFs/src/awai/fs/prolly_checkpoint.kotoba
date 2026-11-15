@@ -1,0 +1,79 @@
+;; Compute a checkpoint from one complete, plaintext Prolly leaf.
+;; Caller must supply a CID-verified root leaf and establish decryption policy.
+(ns awai.fs.prolly-checkpoint
+ (:require [cbor.codec :as cbor] [cbor.value :as value] [multiformats.sha256 :as sha])
+ (:export [root])
+ (:schemas {:awai.fs/check-row [:record :awai.fs/check-row [[:key :string] [:fragment :string]]]
+            :awai.fs/check-rows [:record :awai.fs/check-rows [[:keys [:list :string]] [:fragments [:list :string]]]]}))
+(defn- child [v [:ref :cbor/value] i :i64] [:ref :cbor/value]
+ (if (and (= (value/kind v) :array) (>= i 0) (< i (vector-count (value/children v)))) (typed-list-nth [:list [:ref :cbor/value]] (value/children v) i) (value/null-value)))
+(defn- field [m [:ref :cbor/value] key :string] [:ref :cbor/value]
+ (if (not= (value/kind m) :map) (value/null-value)
+  (let [xs (value/children m) n (vector-count xs)]
+   (loop [i 0] (if (>= i n) (value/null-value)
+    (let [k (typed-list-nth [:list [:ref :cbor/value]] xs i)]
+     (if (and (= (value/kind k) :text) (string=? (value/text k) key)) (typed-list-nth [:list [:ref :cbor/value]] xs (+ i 1)) (recur (+ i 2)))))))))
+(defn- prefix? [s :string p :string] :bool
+ (and (>= (string-length s) (string-length p)) (string=? (string-substring s 0 (string-length p)) p)))
+;; Validate a canonical EDN quoted string with printable ASCII and only the
+;; quote/backslash escapes emitted for this profile; return index after quote.
+(defn- quoted [s :string p :i64] :i64
+ (let [n (string-length s)]
+  (if (or (>= p n) (not= (string-code-point-at s p) 34)) (throw :unsupported-component)
+   (loop [i (+ p 1)] (if (>= i n) (throw :unsupported-component)
+    (let [c (string-code-point-at s i)]
+     (cond (= c 34) (+ i 1)
+           (= c 92) (if (>= (+ i 1) n) (throw :unsupported-component)
+                      (let [x (string-code-point-at s (+ i 1))] (if (or (= x 34) (= x 92)) (recur (+ i 2)) (throw :unsupported-component))))
+           (or (< c 32) (> c 126)) (throw :unsupported-component)
+           :else (recur (+ i 1)))))))))
+(defn- component? [s :string] :bool
+ (let [n (string-length s)]
+  (if (> n 4096) false
+   (cond (prefix? s "[:string ") (let [p (quoted s 9)] (and (= (+ p 1) n) (= (string-code-point-at s p) 93)))
+         (prefix? s "[:keyword ") (let [p (quoted s 10)]
+          (if (or (>= p n) (not= (string-code-point-at s p) 32)) false
+           (let [q (quoted s (+ p 1))] (and (= (+ q 1) n) (= (string-code-point-at s q) 93)))))
+         :else false))))
+(defn- tagged [v [:ref :cbor/value]] :string
+ (let [a (child v 0) b (child v 1)]
+  (if (or (not= (value/kind v) :array) (not= (vector-count (value/children v)) 2) (not= (value/kind a) :int) (not= (value/number a) 4) (not= (value/kind b) :text)) (throw :invalid-row)
+   (let [x (value/text b)] (if (component? x) x (throw :unsupported-component))))))
+(defn- row [entry [:ref :cbor/value]] [:ref :awai.fs/check-row]
+ (let [k (child entry 0) payload (child entry 1)]
+  (if (or (not= (value/kind entry) :array) (not= (vector-count (value/children entry)) 2) (not= (value/kind k) :text) (not= (value/kind payload) :bytes)) (throw :invalid-row)
+   (let [d (cbor/decode-checked (value/data payload))]
+    (if (not (result-ok?-of [:result [:ref :cbor/value] :keyword] d)) (throw :invalid-row)
+     (let [v (result-value-of [:result [:ref :cbor/value] :keyword] d (value/null-value)) tag (child v 0) xs (child v 1)]
+      (if (or (not= (value/kind v) :array) (not= (vector-count (value/children v)) 2) (not= (value/kind tag) :int) (not= (value/number tag) 16) (not= (value/kind xs) :array) (not= (vector-count (value/children xs)) 3)) (throw :invalid-row)
+       (let [e (tagged (child xs 0)) a (tagged (child xs 1)) v (tagged (child xs 2))
+             key (string-concat "[:vector [" (string-concat e (string-concat " " (string-concat a (string-concat " " (string-concat v "]]"))))))
+             frag (string-concat "[:map [[[:keyword nil \"a\"] " (string-concat a (string-concat "] [[:keyword nil \"e\"] " (string-concat e (string-concat "] [[:keyword nil \"v\"] " (string-concat v "]]]"))))))]
+        (record-new [:ref :awai.fs/check-row] key frag)))))))))
+(defn- cmp [a :string b :string] :i64
+ (let [na (string-length a) nb (string-length b)]
+  (loop [i 0] (cond (and (= i na) (= i nb)) 0 (= i na) -1 (= i nb) 1 (< (string-code-point-at a i) (string-code-point-at b i)) -1 (> (string-code-point-at a i) (string-code-point-at b i)) 1 :else (recur (+ i 1))))))
+(defn- collect [xs [:list [:ref :cbor/value]] i :i64 keys [:list :string] fragments [:list :string]] [:ref :awai.fs/check-rows]
+ (if (= i (vector-count xs)) (record-new [:ref :awai.fs/check-rows] keys fragments)
+  (let [r (row (typed-list-nth [:list [:ref :cbor/value]] xs i))]
+   (collect xs (+ i 1) (typed-list-conj [:list :string] keys (record-get [:ref :awai.fs/check-row] r :key)) (typed-list-conj [:list :string] fragments (record-get [:ref :awai.fs/check-row] r :fragment))))))
+(defn- minimum [keys [:list :string] seen :vector-i64] :i64
+ (loop [i 0 best -1] (if (= i (vector-count keys)) best
+  (if (= (vector-at seen i) 1) (recur (+ i 1) best)
+   (if (or (= best -1) (< (cmp (typed-list-nth [:list :string] keys i) (typed-list-nth [:list :string] keys best)) 0)) (recur (+ i 1) i) (recur (+ i 1) best))))))
+(defn- assemble [keys [:list :string] fragments [:list :string] seen :vector-i64 i :i64 prev :string out :string] :string
+ (if (= i (vector-count keys)) (string-concat out "]]]]")
+  (let [j (minimum keys seen) k (typed-list-nth [:list :string] keys j)]
+   (if (and (> i 0) (= (cmp prev k) 0)) (throw :duplicate-datom)
+    (assemble keys fragments (vector-assoc! seen j 1) (+ i 1) k (string-concat (if (= i 0) out (string-concat out " ")) (typed-list-nth [:list :string] fragments j)))))))
+(defn- root! [wire :vector-i64] :string
+ (let [d (cbor/decode-checked wire)]
+  (if (not (result-ok?-of [:result [:ref :cbor/value] :keyword] d)) (throw :invalid-leaf)
+   (let [node (result-value-of [:result [:ref :cbor/value] :keyword] d (value/null-value)) kind (field node "kind") entries (field node "entries")]
+    (if (or (not= (value/kind kind) :text) (not (string=? (value/text kind) "leaf")) (not= (value/kind entries) :array) (> (vector-count (value/children entries)) 256)) (throw :unsupported-tree)
+     (let [r (collect (value/children entries) 0 (typed-list-new [:list :string]) (typed-list-new [:list :string]))
+           keys (record-get [:ref :awai.fs/check-rows] r :keys) frags (record-get [:ref :awai.fs/check-rows] r :fragments)
+           text (assemble keys frags (vector-alloc (vector-count keys)) 0 "" "[:kotobase.logical/envelope [:format \"kotobase.logical/v1\"] [:domain :checkpoint] [:value [:vector [")]
+      (sha/digest-hex (vector-i64-from-bytes (string-to-utf8 text)))))))))
+(defn root [wire :vector-i64] [:result :string :keyword]
+ (try (result-ok-of [:result :string :keyword] (root! wire)) (catch :keyword e (result-err-of [:result :string :keyword] e))))
