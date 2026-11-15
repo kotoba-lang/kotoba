@@ -133,7 +133,7 @@ run_case() {
   cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/cid.kotoba" "$src/multiformats/"
  elif [ "$kind" = primitive ] && { [ "$index" = zstd_header ] || [ "$index" = forest_file_io ]; }; then
   mkdir "$src/zstd"
-  for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
+  for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
   for mod in forest_blocks forest_index; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
   if [ "$index" = forest_file_io ]; then cp "$lib/src/awai/fs/forest_file.kotoba" "$src/awai/fs/"; fi
@@ -144,7 +144,7 @@ run_case() {
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
   if [ "$kind" = pack ] || [ "$index" = pack_values ]; then mkdir "$src/ipld/car"; cp "$repo/lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba" "$src/ipld/car/"; fi
   if [ "$index" = forest_manifest_io ]; then
-   mkdir "$src/zstd"; for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
+   mkdir "$src/zstd"; for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
    for mod in forest_blocks forest_index forest_file forest_view; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   fi
  fi

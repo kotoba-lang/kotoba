@@ -1,0 +1,80 @@
+;; Predefined literals/matches and compressed offset FSE sequences.
+(ns zstd.sequence-offset (:require [zstd.frame-header :as h] [zstd.fse-description :as d]) (:export [decode]))
+(defn- read-widths [b :vector-i64 start :i64 end :i64 pos :i64 widths :vector-i64] [:result :vector-i64 :keyword]
+  (let [n (vector-count widths) total (* (- end start) 8)]
+    (loop [i 0 p pos out (vector-alloc (+ n 1))]
+      (if (= i n) (result-ok-of [:result :vector-i64 :keyword] (vector-assoc! out 0 p))
+        (let [width (vector-at widths i)]
+          (if (> (+ p width) total) (result-err-of [:result :vector-i64 :keyword] :truncated)
+            (let [r (h/reverse-read b start end p width) e (record-get [:ref :zstd/reverse] r :error)]
+              (if (not= e :none) (result-err-of [:result :vector-i64 :keyword] e)
+                (recur (+ i 1) (record-get [:ref :zstd/reverse] r :next)
+                       (vector-assoc! out (+ i 1) (record-get [:ref :zstd/reverse] r :value)))))))))))
+
+(defn- length-code [code :i64 match :bool] :vector-i64
+  (let [direct (if match 32 16)
+        extras (if match (vector-i64 1 1 1 1 2 2 3 3 4 4 5 7 8 9 10 11 12 13 14 15 16)
+                         (vector-i64 1 1 1 1 2 2 3 3 4 6 7 8 9 10 11 12 13 14 15 16))]
+    (if (< code direct) (vector-i64 (+ code (if match 3 0)) 0)
+      (let [idx (- code direct)]
+        (loop [i 0 base (if match 35 16)]
+          (if (= i idx) (vector-i64 base (vector-at extras i))
+            (recur (+ i 1) (+ base (i64-shift-left 1 (vector-at extras i))))))))))
+
+;; Decode sequence triples [literal-length match-length offset-value] in
+;; predefined mode. Dynamic/RLE/repeat table modes are refused explicitly.
+(defn decode [b :vector-i64 pos :i64 end :i64 cap :i64] [:result :vector-i64 :keyword]
+  (let [h (h/parse-sequences b pos end cap) e (record-get [:ref :zstd/sequences] h :error)
+        count (record-get [:ref :zstd/sequences] h :count) pos0 (record-get [:ref :zstd/sequences] h :next)
+        description (d/parse-offsets b pos0 end)
+        parsed (result-value-of [:result [:ref :zstd/fse-description] :keyword] description (record-new [:ref :zstd/fse-description] [] 0 0))
+        start (record-get [:ref :zstd/fse-description] parsed :next-byte)
+        log (record-get [:ref :zstd/fse-description] parsed :accuracy)]
+    (cond (not= e :none) (result-err-of [:result :vector-i64 :keyword] e)
+          (= count 0) (h/decode-predefined-sequences b pos end cap)
+          (not (result-ok?-of [:result [:ref :zstd/fse-description] :keyword] description))
+            (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result [:ref :zstd/fse-description] :keyword] description :invalid-description))
+          (or (not= (record-get [:ref :zstd/sequences] h :ll) 0)
+              (not= (record-get [:ref :zstd/sequences] h :offset) 2)
+              (not= (record-get [:ref :zstd/sequences] h :match) 0))
+            (result-err-of [:result :vector-i64 :keyword] :table-mode-unsupported)
+          :else
+          (let [ll (result-value-of [:result :vector-i64 :keyword]
+                     (h/fse-table (vector-i64 4 3 2 2 2 2 2 2 2 2 2 2 2 1 1 1 2 2 2 2 2 2 2 2 2 3 2 1 1 1 1 1 -1 -1 -1 -1) 6) (vector-i64))
+                ml (result-value-of [:result :vector-i64 :keyword]
+                     (h/fse-table (vector-i64 1 4 3 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1) 6) (vector-i64))
+                of (result-value-of [:result :vector-i64 :keyword]
+                     (h/fse-table (record-get [:ref :zstd/fse-description] parsed :counts) log) (vector-i64))
+                marker (h/reverse-start b start end)]
+            (if (or (not= (vector-count of) (* 3 (i64-shift-left 1 log))) (not= (record-get [:ref :zstd/reverse] marker :error) :none))
+              (result-err-of [:result :vector-i64 :keyword] (if (not= (vector-count of) (* 3 (i64-shift-left 1 log))) :invalid-table (record-get [:ref :zstd/reverse] marker :error)))
+              (let [init (read-widths b start end (record-get [:ref :zstd/reverse] marker :next) (vector-i64 6 log 6))]
+                (if (not (result-ok?-of [:result :vector-i64 :keyword] init))
+                  (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result :vector-i64 :keyword] init :truncated))
+                  (let [v (result-value-of [:result :vector-i64 :keyword] init (vector-i64))]
+                    (loop [i 0 p (vector-at v 0) ls (vector-at v 1) os (vector-at v 2) ms (vector-at v 3)
+                           out (vector-alloc (* count 3))]
+                      (if (= i count)
+                        (if (= p (* (- end start) 8)) (result-ok-of [:result :vector-i64 :keyword] out)
+                          (result-err-of [:result :vector-i64 :keyword] :trailing-bits))
+                        (if (or (< ls 0) (>= ls 64) (< os 0) (>= os (i64-shift-left 1 log)) (< ms 0) (>= ms 64))
+                          (result-err-of [:result :vector-i64 :keyword] :invalid-state)
+                          (let [li (* ls 3) oi (* os 3) mi (* ms 3)
+                                lc (vector-at ll li) oc (vector-at of oi) mc (vector-at ml mi)
+                                l (length-code lc false) m (length-code mc true) last (= (+ i 1) count)
+                                widths (vector-i64 oc (vector-at m 1) (vector-at l 1)
+                                         (if last 0 (vector-at ll (+ li 1)))
+                                         (if last 0 (vector-at ml (+ mi 1)))
+                                         (if last 0 (vector-at of (+ oi 1))))
+                                r (read-widths b start end p widths)]
+                            (if (not (result-ok?-of [:result :vector-i64 :keyword] r))
+                              (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result :vector-i64 :keyword] r :truncated))
+                              (let [x (result-value-of [:result :vector-i64 :keyword] r (vector-i64)) j (* i 3)]
+                                (recur (+ i 1) (vector-at x 0)
+                                  (+ (vector-at ll (+ li 2)) (vector-at x 4))
+                                  (+ (vector-at of (+ oi 2)) (vector-at x 6))
+                                  (+ (vector-at ml (+ mi 2)) (vector-at x 5))
+                                  (vector-assoc! (vector-assoc! (vector-assoc! out j (+ (vector-at l 0) (vector-at x 3)))
+                                                 (+ j 1) (+ (vector-at m 0) (vector-at x 2)))
+                                                 (+ j 2) (+ (i64-shift-left 1 oc) (vector-at x 1))))))))))))))))))
+
