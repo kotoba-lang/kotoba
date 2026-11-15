@@ -1,0 +1,5 @@
+# Linux Native export gate source staging, 2026-11-15
+
+PR #1338 head `f7be28836` Linux arm64 format job failed in the cooperative Forest commit/export step with `E6002`, because the gate staged only `zstd.frame-header` and `frame-write` while `forest-file` now also imports the bounded Huffman Forest frame decoder. CI job 132785369162 uploaded the failing source lock and compiler stderr.
+
+The gate now stages the eight Zstd modules needed by that decoder along with the existing writer. A local aarch64 Linux Lima guest ran the exact shell gate with pinned compiler/provider and passed commit/export plus negative controls. Source-lock SHA-256 `402299a2a93f4f5135926f1e0a5482cf6b51645fb7a2a857c153313f9b6508ad`; native artifact SHA-256 `854d3bc882acee7100c278d5bf14cde94aa9a467d3eac6fdeb6091988d440a41`. Inputs and copied guest outputs remain in `.agent-output/ci-export-linux-20261115/`; the guest run is not an OS cache loss or hardware power-loss test. Source pin audit passed. The remote CI must run again on the fixed head.

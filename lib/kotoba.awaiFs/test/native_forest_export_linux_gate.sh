@@ -22,7 +22,9 @@ for file in forest_blocks forest_commit forest_export forest_file forest_generat
 done
 cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$out/src/ipld/"
 for file in byte_cid cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$file.kotoba" "$out/src/multiformats/"; done
-for file in frame_header frame_write; do cp "$repo/lib/org.ietf.zstd/src/zstd/$file.kotoba" "$out/src/zstd/"; done
+for file in frame_header frame_write forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do
+ cp "$repo/lib/org.ietf.zstd/src/zstd/$file.kotoba" "$out/src/zstd/"
+done
 printf '\255' > "$out/input"
 sed -e "s@PARENT@$out/store@g" -e "s@OUT@$out/exports@g" -e "s@INPUT@$out/input@g" "$repo/lib/kotoba.awaiFs/test/native_forest_export_gate.kotoba" > "$out/src/main.kotoba"
 { printf 'KSL1\nentry %s/src/main.kotoba\nroot %s/src\n' "$out" "$out"; find "$out/src" -name '*.kotoba' -type f | LC_ALL=C sort | while IFS= read -r p; do printf 'file %s %s\n' "$(sha256sum "$p" | cut -d' ' -f1)" "$p"; done; } > "$out/source.ksl"
