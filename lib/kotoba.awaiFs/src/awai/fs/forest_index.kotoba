@@ -1,0 +1,102 @@
+;; Bounded Forest v1 index candidate selection. Index bytes are untrusted:
+;; candidates are hints and absence is not proof of archive-wide absence.
+(ns awai.fs.forest-index
+  (:require [awai.fs.forest-blocks :as blocks] [zstd.frame-header :as z])
+  (:export [find-frames get-indexed-block cid-valid?]))
+
+(defn- bytes-valid? [b :vector-i64] :bool
+  (loop [i 0] (if (= i (vector-count b)) true
+    (let [x (vector-at b i)] (if (or (< x 0) (> x 255)) false (recur (+ i 1)))))))
+(defn cid-valid? [c :vector-i64] :bool
+  (and (= (vector-count c) 36) (= (vector-at c 0) 1)
+       (or (= (vector-at c 1) 85) (= (vector-at c 1) 113))
+       (= (vector-at c 2) 18) (= (vector-at c 3) 32) (bytes-valid? c)))
+(defn- le [b :vector-i64 p :i64 n :i64] :i64
+  (loop [i 0 v 0] (if (= i n) v
+    (recur (+ i 1) (bit-or v (i64-shift-left (vector-at b (+ p i)) (* 8 i)))))))
+(defn- magic? [b :vector-i64 p :i64] :bool
+  (and (= (vector-at b p) 80) (= (vector-at b (+ p 1)) 42)
+       (= (vector-at b (+ p 2)) 77) (= (vector-at b (+ p 3)) 24)))
+(defn- cid-hash [c :vector-i64] :i64
+  (let [h (bit-xor (bit-xor (bit-xor (bit-xor (bit-xor (vector-at c 1) 18)
+                                          (le c 4 8)) (le c 12 8)) (le c 20 8)) (le c 28 8))
+        min-i64 (- (- 0 9223372036854775807) 1)]
+    (cond (= h 0) 0 (= h min-i64) 9223372036854775807 :else (- h 1))))
+;; Exact high 64 bits of unsigned hash * small nonnegative bucket count.
+(defn- bucket [h :i64 buckets :i64] :i64
+  (let [hi (u64-shift-right h 32) lo (bit-and h 4294967295)]
+    (quot (+ (* hi buckets) (quot (* lo buckets) 4294967296)) 4294967296)))
+(defn- frame-end [b :vector-i64 table :i64 slots :i64 at :i64 index-pos :i64] :i64
+  (loop [i 0 best index-pos]
+    (if (= i slots) best
+      (let [h (le b (+ table (* i 16)) 8) p (le b (+ table (* i 16) 8) 8)]
+        (recur (+ i 1) (if (and (not= h -1) (> p at) (< p best)) p best))))))
+
+;; Returns flat [frame-start frame-end ...] index candidates. Even :no-candidate
+;; is only an untrusted-index result. Callers must check selected frame bytes.
+(defn find-frames [b :vector-i64 target :vector-i64] [:result :vector-i64 :keyword]
+  (let [n (vector-count b)]
+    (cond (or (< n 64) (> n 1048576)) (result-err-of [:result :vector-i64 :keyword] :archive-limit)
+          (not (cid-valid? target)) (result-err-of [:result :vector-i64 :keyword] :invalid-cid)
+          (not (bytes-valid? b)) (result-err-of [:result :vector-i64 :keyword] :invalid-byte)
+          :else
+          (let [footer (- n 16)]
+            (if (or (not (magic? b footer)) (not= (le b (+ footer 4) 4) 8))
+              (result-err-of [:result :vector-i64 :keyword] :invalid-footer)
+              (let [pointer (le b (+ footer 8) 8)]
+                (if (or (< pointer 9) (> pointer (- footer 32)))
+                  (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                  (let [index-pos (- pointer 8)]
+                    (if (or (not (magic? b index-pos))
+                            (not= (le b (+ index-pos 4) 4) (- footer (+ index-pos 8))))
+                      (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                      (let [start (+ index-pos 8) version (le b start 8) distance (le b (+ start 8) 8)
+                            buckets (le b (+ start 24) 8) table (+ start 32) bytes (- footer table)
+                            slots (quot bytes 16)]
+                        (cond (or (not= version 3735928560) (< bytes 16) (not= (rem bytes 16) 0)
+                                  (> slots 4096) (<= buckets 0) (> buckets slots) (< distance 0) (> distance slots))
+                                (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                              :else
+                              (let [valid (loop [i 0 present false]
+                                            (if (= i slots) present
+                                              (let [h (le b (+ table (* i 16)) 8) p (le b (+ table (* i 16) 8) 8)]
+                                                (cond (and (= h -1) (= p -1)) (recur (+ i 1) present)
+                                                      (or (= h -1) (<= p 0) (>= p index-pos)) false
+                                                      :else (recur (+ i 1) true)))))
+                                    last-h (le b (+ table (* (- slots 1) 16)) 8)
+                                    last-p (le b (+ table (* (- slots 1) 16) 8) 8)]
+                                (if (or (not valid) (not= last-h -1) (not= last-p -1))
+                                  (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                                  (let [want (cid-hash target) first (bucket want buckets)]
+                                    (loop [i first remaining distance used 0 out (vector-alloc (* slots 2))]
+                                      (if (>= i slots) (result-err-of [:result :vector-i64 :keyword] :invalid-index)
+                                        (let [h (le b (+ table (* i 16)) 8) p (le b (+ table (* i 16) 8) 8)]
+                                          (cond (= h -1) (if (= used 0) (result-err-of [:result :vector-i64 :keyword] :no-candidate)
+                                                          (result-ok-of [:result :vector-i64 :keyword] (vector-take out used)))
+                                                (= h want) (if (>= used 128)
+                                                            (result-err-of [:result :vector-i64 :keyword] :candidate-limit)
+                                                            (recur (+ i 1) remaining (+ used 2)
+                                                              (vector-assoc! (vector-assoc! out used p) (+ used 1)
+                                                                (frame-end b table slots p index-pos))))
+                                                (> used 0) (result-ok-of [:result :vector-i64 :keyword] (vector-take out used))
+                                                (= remaining 0) (result-err-of [:result :vector-i64 :keyword] :no-candidate)
+                                                :else (recur (+ i 1) (- remaining 1) used out)))))))))))))))))))
+
+;; Decode only candidate frames and verify the requested CID before returning.
+;; The supplied archive is not authenticated as a whole. Candidate misses
+;; are not a proof that a CID is absent from an untrusted archive.
+(defn get-indexed-block [b :vector-i64 target :vector-i64 max-window :i64 max-output :i64] [:result :vector-i64 :keyword]
+  (let [r (find-frames b target)]
+    (if (not (result-ok?-of [:result :vector-i64 :keyword] r))
+      (result-err-of [:result :vector-i64 :keyword] (result-error-of [:result :vector-i64 :keyword] r :invalid-index))
+      (let [spans (result-value-of [:result :vector-i64 :keyword] r (vector-i64))]
+        (loop [i 0]
+          (if (= i (vector-count spans)) (result-err-of [:result :vector-i64 :keyword] :no-candidate)
+            (let [start (vector-at spans i) end (vector-at spans (+ i 1)) f (z/decode-frame b start end max-window max-output)
+                  e (record-get [:ref :zstd/frame-output] f :error)]
+              (cond (not= e :none) (result-err-of [:result :vector-i64 :keyword] e)
+                    (not= (record-get [:ref :zstd/frame-output] f :next) end) (result-err-of [:result :vector-i64 :keyword] :frame-extent)
+                    :else (let [v (blocks/get-block (record-get [:ref :zstd/frame-output] f :bytes) target)]
+                            (if (result-ok?-of [:result :vector-i64 :keyword] v) v
+                              (let [why (result-error-of [:result :vector-i64 :keyword] v :invalid-section)]
+                                (if (= why :not-found) (recur (+ i 2)) (result-err-of [:result :vector-i64 :keyword] why)))))))))))))
