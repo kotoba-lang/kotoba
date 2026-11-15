@@ -40,3 +40,21 @@ no multi-leaf success had been observed. Native executable SHA-256
 `b14f76df1aea8a2510f64ebe60b2f1b8225ca9c9824c6cf31e012fec1acfa4d1`,
 source lock SHA-256
 `5a5661b3fb5acdc19af0ef59cd68de7301c87317c10e351e1f737bf3a5d911ff`.
+
+## Child maximum and key-range validation, later on 2026-11-15
+
+The source-owned Prolly builder stores each child's maximum key. The Native
+walk now checks each internal node's sorted child keys, the inherited exclusive
+lower bound and exact upper maximum, plus ordered leaf keys and exact leaf
+maximum. The positive two-leaf fixture now uses the actual blinded leaf keys
+as child maxima; its root is
+`bafyreiboajpomf4kvfh5pv4wx3xzoesvokcki3ekgorkhwvuhzqz3s44le`, size 1,438,
+SHA-256 `7f1b770465aec12793110b30cc38b1705137ae863db1f4109bfc9a28e356ddf8`.
+The former arbitrary-boundary fixture is retained as a negative control and
+is refused with `:key-range-mismatch`. Local Native executable SHA-256
+`dd8c7dd01eed82620b3ea76df64c0d4b862c5ac52559d7a72c26801de891ed49`;
+source lock `8b76c8e2c77097a5206c63d6af01b7a08c5862accd9b54aeceaba1ae8f4b1f01`.
+This validates the stated ASCII key-order profile only; encrypted values,
+blind-key authenticity, trusted basis/publication binding and a real
+multi-level production-generated tree remain unverified. Earlier descriptions
+of the positive fixture's arbitrary separators are historical.
