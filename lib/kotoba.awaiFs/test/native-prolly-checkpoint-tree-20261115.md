@@ -58,3 +58,12 @@ This validates the stated ASCII key-order profile only; encrypted values,
 blind-key authenticity, trusted basis/publication binding and a real
 multi-level production-generated tree remain unverified. Earlier descriptions
 of the positive fixture's arbitrary separators are historical.
+
+## Native corpus gate
+
+The pinned two-leaf and bad-range Forest fixtures run in the existing Native
+corpus gate, including a changed-checkpoint negative control. The complete
+101-case macOS arm64 corpus passed locally on 2026-11-15. Linux runs are CI
+results and must be assessed on the actual commit. This gate exercises the
+plaintext checkpoint with a fixed expected root; it does not verify a
+signature or establish trusted basis, production publication or decryption.
