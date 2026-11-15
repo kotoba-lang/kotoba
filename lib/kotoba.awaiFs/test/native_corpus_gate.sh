@@ -142,7 +142,7 @@ run_case() {
   cp "$repo/lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba" "$src/ed25519/"
   for mod in codec value fragment; do cp "$repo/lib/org.ietf.cbor/src/cbor/$mod.kotoba" "$src/cbor/"; done
   for mod in frame_header forest_frame literal_header fse_description fse_weights huffman_tree huffman_literals sequence_offset; do cp "$repo/lib/org.ietf.zstd/src/zstd/$mod.kotoba" "$src/zstd/"; done
-  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree basis_snapshot; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  for mod in forest_blocks forest_index forest_file prolly_branch prolly_leaf prolly_checkpoint prolly_checkpoint_tree basis_edn logical_commit logical_signature basis_verify basis_checkpoint_tree basis_snapshot basis_publication; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
  elif [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
@@ -181,6 +181,8 @@ run_case() {
   allow-missing-snapshot) replace_once "$src/corpus.kotoba" '(result-ok?-of [:result :bool :keyword] snapshot-missing)' '(not (result-ok?-of [:result :bool :keyword] snapshot-missing))';;
   wrong-manifest-database) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(value/text database)' '"different/database"';;
   wrong-manifest-epoch) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(string-from-i64 (value/number basis-t))' '"999"';;
+  allow-wrong-publication-format) replace_once "$src/corpus.kotoba" ':publication-format-mismatch) 17' ':unsupported-manifest) 17';;
+  allow-untrusted-publication) replace_once "$src/corpus.kotoba" ':untrusted-publication) 16' ':invalid-publication) 16';;
   wrong-snapshot-schema) replace_once "$src/awai/fs/basis_snapshot.kotoba" '(= (value/number schema) 2)' '(= (value/number schema) 3)';;
   wrong-prolly-checkpoint) replace_once "$src/corpus.kotoba" '(result-value-of [:result :string :keyword] good "") "994bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"' '(result-value-of [:result :string :keyword] good "") "094bf8778ef21d93f873dd5cfc759a543c0c1fea1066558419933bed649749a9"';;
   wrong-logical-root) replace_once "$src/corpus.kotoba" '1fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e' '0fb3a3396ad238892be6df1e12f59a4e6866efdcc43ea5c243a6c07db1ee612e';;
@@ -311,6 +313,8 @@ run_case primitive native_prolly_checkpoint_io wrong-snapshot-schema 7
 run_case primitive native_prolly_checkpoint_io wrong-manifest-database 7
 run_case primitive native_prolly_checkpoint_io wrong-manifest-epoch 7
 run_case primitive native_prolly_checkpoint_io allow-missing-snapshot 13
+run_case primitive native_prolly_checkpoint_io allow-untrusted-publication 16
+run_case primitive native_prolly_checkpoint_io allow-wrong-publication-format 17
 run_case primitive forest_file_io none 0
 run_case primitive forest_file_io wrong-forest-file-digest 3
 run_case primitive forest_file_io wrong-second-forest-digest 13
@@ -326,8 +330,8 @@ if [ "$target" = linux-x86_64 ]; then
  [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
 fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 105 ] || { echo 'result count mismatch' >&2; exit 1; }
+[ "$(wc -l < "$out/results.tsv" | tr -d ' ')" = 107 ] || { echo 'result count mismatch' >&2; exit 1; }
 while IFS=' ' read -r expected_hash watched_path; do
  [ -f "$watched_path" ] && [ ! -L "$watched_path" ] && [ "$(sha "$watched_path")" = "$expected_hash" ] || { echo "input drift: $watched_path" >&2; exit 1; }
 done < "$out/input-sha256.txt"
-printf 'Native frozen corpus 53 + 16 primitives + 35 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 16 primitives + 37 negative controls passed on %s\n' "$target"
