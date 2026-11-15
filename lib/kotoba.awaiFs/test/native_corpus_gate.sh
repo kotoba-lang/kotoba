@@ -1,11 +1,12 @@
 #!/bin/sh
 # Python-free frozen corpus gate. Native artifacts decide every case verdict.
 set -eu
-[ "$#" -eq 3 ] || { echo 'usage: native_corpus_gate.sh TARGET PINNED_AMU NEW_OUTPUT' >&2; exit 2; }
+[ "$#" -ge 3 ] && [ "$#" -le 4 ] || { echo 'usage: native_corpus_gate.sh TARGET PINNED_AMU NEW_OUTPUT [PINNED_X86_IO_AMU]' >&2; exit 2; }
 target=$1
 amu=$(CDPATH= cd -- "$2" && pwd -P)
 parent=$(CDPATH= cd -- "$(dirname -- "$3")" && pwd -P)
 out="$parent/$(basename -- "$3")"
+case "$out" in *[!a-zA-Z0-9_./-]*) echo 'unsupported output path' >&2; exit 2;; esac
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd -P)
 lib="$repo/lib/kotoba.awaiFs" pins="$lib/native-inputs.json"
 case "$target:$(uname -s):$(uname -m)" in
@@ -28,6 +29,18 @@ if [ "$target" = macos-arm64 ]; then provider="$out/provider"; fi
 cp "$amu/$compiler_key" "$compiler"; cp "$amu/$provider_key" "$provider"
 check_pin "$compiler" "$compiler_key"; check_pin "$provider" "$provider_key"; chmod 700 "$compiler"
 if [ "$target" = macos-arm64 ]; then chmod 700 "$provider"; fi
+if [ "$target" = linux-x86_64 ]; then
+ [ "$#" -eq 4 ] || { echo 'x86 I/O compiler checkout required' >&2; exit 2; }
+ io_amu=$(CDPATH= cd -- "$4" && pwd -P)
+ io_revision=$(jq -er '.x86FileCompiler.revision' "$pins")
+ io_path=$(jq -er '.x86FileCompiler.path' "$pins")
+ [ "$(git -C "$io_amu" rev-parse HEAD)" = "$io_revision" ]
+ [ -f "$io_amu/$io_path" ] && [ ! -L "$io_amu/$io_path" ]
+ [ "$(wc -c < "$io_amu/$io_path" | tr -d ' ')" = "$(jq -er '.x86FileCompiler.bytes' "$pins")" ]
+ [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
+ io_compiler="$out/io-compiler"; cp "$io_amu/$io_path" "$io_compiler"
+ [ "$(sha "$io_compiler")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]; chmod 700 "$io_compiler"
+fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-before.jsonl"
 sh "$lib/test/stage_corpus.sh" "$lib/corpus/v1.json" "$out/fixtures" > "$out/stage.stdout"
 jq -e '(.positive|length)==11 and (.negative|length)==36 and (.legacyPacks.cases|length)==6' "$lib/corpus/v1.json" >/dev/null
@@ -43,10 +56,47 @@ replace_once() {
  awk -v needle="$needle" -v repl="$replacement" 'BEGIN {n=0} {p=index($0,needle); if(p){n++; rest=substr($0,p+length(needle)); if(index(rest,needle)) n++; $0=substr($0,1,p-1) repl rest} print} END {if(n!=1) exit 1}' "$file" > "$file.changed"
  mv "$file.changed" "$file"
 }
+copy_fixture() {
+ cf_source=$1 cf_dest=$2 cf_expected=$3
+ [ -f "$cf_source" ] && [ ! -L "$cf_source" ] && [ "$(sha "$cf_source")" = "$cf_expected" ] || { echo 'fixture pin mismatch' >&2; exit 1; }
+ cp "$cf_source" "$cf_dest"
+ [ "$(sha "$cf_dest")" = "$cf_expected" ] || { echo 'fixture changed while copying' >&2; exit 1; }
+}
+flip_byte() {
+ file=$1 offset=$2
+ value=$(od -An -tu1 -j "$offset" -N 1 "$file" | tr -d ' ')
+ [ -n "$value" ] || { echo 'mutation outside fixture' >&2; exit 1; }
+ printf "\\$(printf '%03o' "$((value ^ 1))")" | dd of="$file" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+}
+stage_io_fixtures() {
+ dir=$1 control=$2 base="$lib/test/fixtures"
+ copy_fixture "$base/forest-part0.car.zst" "$dir/fixture" 87a1d2773c099ef49af8fc7b9b00b43123a4e83ab1bc3f1f2b3fca0278fb62df
+ copy_fixture "$base/forest-part1.car.zst" "$dir/fixture-second" 33469df01bb4f837d655da9b232a366910ab4a575094235ffc875029f46ad206
+ copy_fixture "$base/forest-large-index.car.zst" "$dir/fixture-large" eea07036e8a76dd891f675a198a3da90afa4181f31794c910f376fe27b7bd39f
+ copy_fixture "$base/forest-megaframe.car.zst" "$dir/fixture-mega" ee5c2c5c601e5f24cbf087ac73f8e9cfdd3bfa3002445e426b48a9756e6c0d50
+ copy_fixture "$base/forest-gib-pack0.car.zst" "$dir/fixture-gib-0" 932d89b5e28f61bba5a2fd644b04e8201186218afa90ae5194d8434dbabe6b4f
+ copy_fixture "$base/forest-gib-pack1.car.zst" "$dir/fixture-gib-1" aa2f7daab2da7bc8f145e439748589e64d7ea1c72b716de0532738a40627bdfc
+ copy_fixture "$base/gib-manifest.cbor" "$dir/gib-manifest" 1760ba196e18e6b1ed18477b2a42ed7eee248c191000c41ef2629fc6ebf48d1e
+ cp "$dir/fixture" "$dir/fixture-corrupt"; flip_byte "$dir/fixture-corrupt" 119
+ cp "$dir/fixture" "$dir/fixture-hidden"; flip_byte "$dir/fixture-hidden" 1639
+ cp "$dir/fixture" "$dir/fixture-badfooter"; flip_byte "$dir/fixture-badfooter" 1751
+ head -c 1766 "$dir/fixture" > "$dir/fixture-short"
+ cp "$dir/fixture-large" "$dir/fixture-large-bad-index"; flip_byte "$dir/fixture-large-bad-index" 1154951
+ cp "$dir/fixture-mega" "$dir/fixture-mega-corrupt"; flip_byte "$dir/fixture-mega-corrupt" 524288
+ if [ "$control" = tampered-gib-manifest ]; then
+  marker=6ffb6ccd5ca18062fb3e6175f6682800e623056b77256e074f1fef9ceb10b900
+  hex=$(od -An -v -tx1 "$dir/gib-manifest" | tr -d ' \n')
+  before=${hex%%"$marker"*}; rest=${hex#*"$marker"}
+  [ "$before" != "$hex" ] && [ "${rest#*"$marker"}" = "$rest" ] || { echo 'manifest mutation anchor differs' >&2; exit 1; }
+  [ $((${#before} % 2)) -eq 0 ]; flip_byte "$dir/gib-manifest" $((${#before}/2))
+ fi
+}
 run_case() {
  kind=$1 index=$2 control=$3 expected=$4
  name="$kind-$index"; [ "$control" = none ] || name="$name-$control"
  dir="$out/$name"; src="$dir/src"; mkdir -p "$src/awai/fs" "$src/ipld" "$src/multiformats"
+ file_case=false
+ if [ "$kind" = primitive ] && { [ "$index" = forest_file_io ] || [ "$index" = forest_manifest_io ]; }; then file_case=true; fi
  if [ "$kind" = primitive ]; then
   if [ "$index" = zstd_header ]; then
    cp "$repo/lib/org.ietf.zstd/test/zstd/frame_header_test.kotoba" "$src/corpus.kotoba"
@@ -55,17 +105,30 @@ run_case() {
  if [ "$kind" = primitive ] && [ "$index" = writer ]; then
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
   cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/cid.kotoba" "$src/multiformats/"
- elif [ "$kind" = primitive ] && [ "$index" = zstd_header ]; then
+ elif [ "$kind" = primitive ] && { [ "$index" = zstd_header ] || [ "$index" = forest_file_io ]; }; then
   mkdir "$src/zstd"
   cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$src/zstd/"
   for mod in forest_blocks forest_index; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
+  if [ "$index" = forest_file_io ]; then cp "$lib/src/awai/fs/forest_file.kotoba" "$src/awai/fs/"; fi
  else
   if [ "$index" != pack_values ]; then cp "$lib/src/awai/fs/logical_file.kotoba" "$src/awai/fs/"; fi
   if [ "$index" = chunk_plan_values ]; then cp "$lib/src/awai/fs/chunk_plan.kotoba" "$src/awai/fs/"; fi
   cp "$repo/lib/kotoba.ioIpld/src/ipld/dag_cbor_write.kotoba" "$src/ipld/"
   for mod in cid byte_cid sha256; do cp "$repo/lib/kotoba.ioMultiformats/src/multiformats/$mod.kotoba" "$src/multiformats/"; done
   if [ "$kind" = pack ] || [ "$index" = pack_values ]; then mkdir "$src/ipld/car"; cp "$repo/lib/kotoba.ioIpldCar/src/ipld/car/pack.kotoba" "$src/ipld/car/"; fi
+  if [ "$index" = forest_manifest_io ]; then
+   mkdir "$src/zstd"; cp "$repo/lib/org.ietf.zstd/src/zstd/frame_header.kotoba" "$src/zstd/"
+   for mod in forest_blocks forest_index forest_file forest_view; do cp "$lib/src/awai/fs/$mod.kotoba" "$src/awai/fs/"; done
+  fi
+ fi
+ if [ "$file_case" = true ]; then
+  stage_io_fixtures "$dir" "$control"
+  if [ "$target" != macos-arm64 ]; then
+   for fixture in gib-manifest fixture fixture-second fixture-large fixture-large-bad-index fixture-mega fixture-mega-corrupt fixture-gib-0 fixture-gib-1 fixture-corrupt fixture-hidden fixture-badfooter fixture-short fixture-missing; do
+    sed "s@\"/$fixture\"@\"$dir/$fixture\"@g" "$src/corpus.kotoba" > "$dir/paths.tmp"; mv "$dir/paths.tmp" "$src/corpus.kotoba"
+   done
+  fi
  fi
  case "$control" in
   wrong-cid)
@@ -88,6 +151,14 @@ run_case() {
   wrong-zstd-frame-digest) replace_once "$src/corpus.kotoba" 'f1d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba' '01d148ea23e71ce7a3578d639382ba4d491a57b9d131409f6ce881c19bb576ba';;
   wrong-forest-block-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] found (vector-i64))) "88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"' '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] found (vector-i64))) "08493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"';;
   wrong-forest-indexed-digest) replace_once "$src/corpus.kotoba" '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] indexed (vector-i64))) "88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"' '(sha/digest-hex (result-value-of [:result :vector-i64 :keyword] indexed (vector-i64))) "08493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd"';;
+  wrong-forest-file-digest) replace_once "$src/corpus.kotoba" '88493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd' '08493684995be5fa456234a868ebd583db8a1c23575861f41937e14dedd4ecfd';;
+  wrong-second-forest-digest) replace_once "$src/corpus.kotoba" '7786c19371f6b8a948e551624e0dd2993ca6c21439bf876f67a14821807b8c88' '0786c19371f6b8a948e551624e0dd2993ca6c21439bf876f67a14821807b8c88';;
+  wrong-megaframe-digest) replace_once "$src/corpus.kotoba" 'ef25f52bde3a24316912f2214e179ca2e56c21e78cd3ea76a06296e96ff2349e' '0f25f52bde3a24316912f2214e179ca2e56c21e78cd3ea76a06296e96ff2349e';;
+  wrong-gib-pack-digest) replace_once "$src/corpus.kotoba" 'ad1925fe80c09fb367e0a7b3630232403b03161c78f50e432b48dc723258f4c0' '0d1925fe80c09fb367e0a7b3630232403b03161c78f50e432b48dc723258f4c0';;
+  allow-group-error-fallback) replace_once "$src/awai/fs/forest_file.kotoba" '(recur (+ i 1)) r)' '(recur (+ i 1)) (recur (+ i 1)))';;
+  wrong-gib-manifest-cid) replace_once "$src/corpus.kotoba" 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5endy' 'bafyreiaxmc5bs3qy42y62gchpmvef3l65ysiygiqadcb54tct7dox5enda';;
+  tampered-gib-manifest) :;;
+  ignore-view-manifest-cid) replace_once "$src/awai/fs/forest_view.kotoba" '(not (string=? expected-cid (hash/cidv1-dag-cbor-bytes wire)))' false;;
   none) :;; *) exit 2;;
  esac
  if [ "$target" = macos-arm64 ]; then entry=/src/corpus.kotoba; source_root=/src; else entry="$src/corpus.kotoba"; source_root="$src"; fi
@@ -116,18 +187,29 @@ run_case() {
   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$compiler" compile "$entry" --target aarch64-macos --output "$dir/program.kseed" --source-path "$source_root" --source-lock "$dir/source.ksl" --source-lock-sha256 "$lock" > "$dir/compile.stdout" 2> "$dir/compile.stderr"
   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$compiler" compile "$provider" --target aarch64-linux --output "$dir/program.elf" --format packed --payload "$dir/program.kseed" > "$dir/pack.stdout" 2> "$dir/pack.stderr"
   chmod 700 "$dir/program.elf"
-  env -i PATH=/nonexistent LANG=C KEXE_ALLOW=- KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$dir/program.elf" > "$dir/run.stdout" 2> "$dir/run.stderr"
+  if [ "$file_case" = true ]; then
+   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35 KEXE_CAP_RESOURCES_35="$dir" KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$dir/program.elf" > "$dir/run.stdout" 2> "$dir/run.stderr"
+  else env -i PATH=/nonexistent LANG=C KEXE_ALLOW=- KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$dir/program.elf" > "$dir/run.stdout" 2> "$dir/run.stderr"; fi
   grep -Eq ":status :ok[[:space:]]+:result $expected([^0-9]|$)" "$dir/run.stdout"
   [ ! -s "$dir/run.stderr" ]
  else
-  env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$compiler" compile "$entry" --target x86_64-linux --output "$dir/program.kx64" --format kx64-v1 --source-path "$source_root" --source-lock "$dir/source.ksl" --source-lock-sha256 "$lock" > "$dir/compile.stdout" 2> "$dir/compile.stderr"
+  if [ "$file_case" = true ]; then
+   if env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$io_compiler" compile "$entry" --target x86_64-linux --output "$dir/program.kx64" --format kx64-v1 --source-path "$source_root" --source-lock "$dir/source.ksl" --source-lock-sha256 "$lock" > "$dir/compile-denied.stdout" 2> "$dir/compile-denied.stderr"; then echo 'x86 missing-capability control accepted' >&2; exit 1; fi
+   cat "$dir/compile-denied.stdout" "$dir/compile-denied.stderr" | grep -q E7101
+   [ ! -e "$dir/program.kx64" ]
+   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$io_compiler" compile "$entry" --target x86_64-linux --output "$dir/program.kx64" --format kx64-v1 --source-path "$source_root" --source-lock "$dir/source.ksl" --source-lock-sha256 "$lock" --project-capabilities 35 > "$dir/compile.stdout" 2> "$dir/compile.stderr"
+  else
+   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35,37,38,39 KEXE_CAP_RESOURCES_35="$out:$amu" KEXE_STACK_BYTES=8388608 "$compiler" compile "$entry" --target x86_64-linux --output "$dir/program.kx64" --format kx64-v1 --source-path "$source_root" --source-lock "$dir/source.ksl" --source-lock-sha256 "$lock" > "$dir/compile.stdout" 2> "$dir/compile.stderr"
+  fi
   header=$(head -n 1 "$dir/program.kx64")
   printf '%s\n' "$header" | grep -Eq '^KX64V1 x86_64-linux sysv-ctx-v11 [0-9]+ 0$'
   size=$(printf '%s\n' "$header" | awk '{print $4}'); skip=$((${#header}+2))
   tail -c "+$((skip+1))" "$dir/program.kx64" > "$dir/program.bin"
   [ "$(wc -c < "$dir/program.bin" | tr -d ' ')" = "$size" ]
   [ "$(od -An -tu1 -N1 "$dir/program.bin" | tr -d ' ')" = 233 ]
-  env -i PATH=/nonexistent LANG=C KEXE_ALLOW=- KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$out/runner.elf" "$dir/program.bin" 0 0 x86_64 - -- > "$dir/run.stdout" 2> "$dir/run.stderr"
+  if [ "$file_case" = true ]; then
+   env -i PATH=/nonexistent LANG=C KEXE_ALLOW=35 KEXE_CAP_RESOURCES_35="$dir" KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$out/runner.elf" "$dir/program.bin" 0 0 x86_64 35 -- > "$dir/run.stdout" 2> "$dir/run.stderr"
+  else env -i PATH=/nonexistent LANG=C KEXE_ALLOW=- KEXE_FUEL=off KEXE_STRUCTURED_REPORT=1 KEXE_STRING_POOL=268435456 "$out/runner.elf" "$dir/program.bin" 0 0 x86_64 - -- > "$dir/run.stdout" 2> "$dir/run.stderr"; fi
   grep -Eq ":status :ok[[:space:]]+:result $expected([^0-9]|$)" "$dir/run.stdout"
   [ ! -s "$dir/run.stderr" ]
  fi
@@ -155,5 +237,19 @@ run_case primitive zstd_header wrong-zstd-integrated-digest 108
 run_case primitive zstd_header wrong-zstd-frame-digest 118
 run_case primitive zstd_header wrong-forest-block-digest 128
 run_case primitive zstd_header wrong-forest-indexed-digest 137
+run_case primitive forest_file_io none 0
+run_case primitive forest_file_io wrong-forest-file-digest 3
+run_case primitive forest_file_io wrong-second-forest-digest 13
+run_case primitive forest_file_io wrong-megaframe-digest 31
+run_case primitive forest_file_io wrong-gib-pack-digest 38
+run_case primitive forest_file_io allow-group-error-fallback 20
+run_case primitive forest_manifest_io none 0
+run_case primitive forest_manifest_io wrong-gib-manifest-cid 4
+run_case primitive forest_manifest_io tampered-gib-manifest 4
+run_case primitive forest_manifest_io ignore-view-manifest-cid 10
+if [ "$target" = linux-x86_64 ]; then
+ [ "$(git -C "$io_amu" rev-parse HEAD)" = "$io_revision" ]
+ [ ! -L "$io_amu/$io_path" ] && [ "$(sha "$io_amu/$io_path")" = "$(jq -er '.x86FileCompiler.sha256' "$pins")" ]
+fi
 for d in lib/kotoba.awaiFs lib/kotoba.ioIpld lib/kotoba.ioMultiformats lib/kotoba.ioIpldCar; do sh "$repo/scripts/check-library-local-changes-pins.sh" --root "$repo/$d"; done > "$out/pin-audit-after.jsonl"
-printf 'Native frozen corpus 53 + 5 primitives + 16 negative controls passed on %s\n' "$target"
+printf 'Native frozen corpus 53 + 7 primitives + 24 negative controls passed on %s\n' "$target"
