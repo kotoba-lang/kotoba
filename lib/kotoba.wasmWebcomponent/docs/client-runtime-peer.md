@@ -50,7 +50,9 @@ this quota independently; response-message limits do not cover network traffic.
 
 `receive-snapshot` additionally requires exact `listen-address` (literal IPv4
 TCP/QUIC or one selected relay circuit, no unspecified address/port zero) and
-`receive-ms` (1..21600000, at most six hours). Its `addresses` may be empty; the
+`receive-ms` (1..21600000, at most six hours) and an explicit boolean
+`allow-read-back`. False permits receiving/pin/query metadata only; true also
+allows that same peer to fetch the same snapshot within the byte/time budget. Its `addresses` may be empty; the
 endpoint PeerID identifies the only authorized incoming peer. The canonical
 trusted dialog shows the full immutable scope before fresh approval. Starting a
 receive operation creates one named, bounded host session; the operation deadline
