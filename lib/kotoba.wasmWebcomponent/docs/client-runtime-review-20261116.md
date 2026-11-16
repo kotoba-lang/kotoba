@@ -1,7 +1,8 @@
 # kotoba-client-runtime.js: second independent review (KOTOBA-159, 2026-11-16)
 
-Reviewed file: `lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js` at `kotoba-lang/kotoba` main
+Reviewed file: `lib/kotoba.wasmWebcomponent/src/kotoba-client-runtime.js`. The review started at `kotoba-lang/kotoba` main
 `2a40111e21179eda1d82e1478cf65891444fff58` (49,211 bytes, 966 lines, sha256 `5a950051c484a992caba0ad9edff780938648f9cade0b18f2d016812742ee6fb`).
+Main then advanced to `d6cbbc70` (AWAI-325 peer operations, +83 lines in the runtime). This document covers that revision too.
 
 Reviewer: Claude (claude-sonnet-5-5) in Claude Code. The reviewer wrote none of the reviewed code. It read the
 record of the first review (KOTOBA-159 comments) before it read the code, so this is a re-verification of that
@@ -15,6 +16,8 @@ not a human security audit and not a product qualification.
 - Compared with the revision of the first review (`6f74fe21`, sha256 `4e6ef6ee...b693`): 65 lines added, 23 removed.
   The change is PR #1178 (abort signal, guest close, host-DOM observation, second-load invalidation, body-read
   cancellation) plus the `memory` local-state adapter. Everything else is byte-identical.
+- Read the AWAI-325 peer extension (`clientPeerEndpointProblems`, the peer branch of the broker, the consent lines for
+  peers) after it landed. `verify-client-peer` passes.
 - Ran every existing client-runtime test on `2a40111e` (all pass): `verify-client-consent-host`,
   `verify-client-broker-review`, `verify-client-memory-state`, `verify-client-mount-navigation`, and
   `verify-client-fetch-cancel` (needs a local certificate directory, see the test header).
@@ -31,11 +34,47 @@ not a human security audit and not a product qualification.
 | 3 | Allow clickable in the tick the dialog opens | Medium | Fixed earlier. Re-verified in a real browser (below). |
 | 7, 8, 9 | Generic-network refusal by name only; private and loopback origins accepted; payload and body not shown in the dialog | Low | **Open, owner decisions.** Unchanged. |
 | KOTOBA-158 | Late `close` event auto-denies the next operation | Medium | Fixed earlier. Re-verified in a real browser (below). |
+| R6 | A restricted guest can send bytes to any host through WebRTC; `connect-src 'none'` does not stop it | High | **Mitigated here for Chromium; not closeable by CSP.** |
+| P1 | Peer endpoints accept loopback, private, link-local and CGNAT addresses | Low | Open, owner decision (extends finding 8). |
 | R1 | The approved request loses `referrerPolicy: 'no-referrer'` | Low | **Fixed here.** |
 | R2 | A refused response is left open | Low | **Fixed here.** |
 | R3 | A guest can make the host buffer many large bodies before the busy check | Low | Open, owner decision. |
 | R4 | `mountRestrictedClientApp` accepts any object with `invoke` as its broker | Low | Open, owner decision. |
 | R5 | A long query hides the data categories in the consent dialog | Low | Open, owner decision. |
+
+### R6: WebRTC egress from a restricted guest (mitigated)
+
+CSP has no directive for WebRTC. A guest in the sandbox and CSP that `mountRestrictedClientApp` builds can create an
+`RTCPeerConnection` with an ICE server of its choice. Chromium then sends UDP to that host, and the TURN `USERNAME`
+attribute carries a string the guest chose. The earlier egress tests (fetch, sendBeacon, image, WebSocket, Worker
+fetch) did not include WebRTC.
+
+Observed in Chromium 156 with the real `mountRestrictedClientApp` (`test/browser/webrtc-egress-probe.mjs`): on main
+`d6cbbc70` a local UDP listener received `USERNAME="EXFIL-c3ludGhldGljLXVzZXItZGF0"` five times, while a `fetch` to
+the same host in the same guest was blocked. In the same sandbox the nested about:blank iframe, blob Worker, link
+hints (preconnect, prefetch, prerender, modulepreload), anchor click with `ping`, and image requests sent nothing.
+A host `Content-Security-Policy: frame-src 'none'` did not change the WebRTC result.
+
+Mitigation applied: the guest document now starts with a script, before any guest script, that removes
+`RTCPeerConnection` and `webkitRTCPeerConnection` from the guest realm. A nested about:blank frame of an
+opaque-origin sandbox is cross-origin (SecurityError when reading its window), and workers do not expose the
+constructors, so no fresh copy was reachable in Chromium 156. With the fix the same probe received nothing. Test:
+`verify-client-review-20261116.mjs` (R6 block; fails without the neutralizer) and the browser probe.
+
+This is defense in depth for one browser version. It does not apply to `trusted-page-v1` (the app shares the host
+document), it does not cover a future constructor or another way to reach ICE, and it does not restrict the host
+realm, where peer handlers may use WebRTC by design. Recommendation for the owner: do not describe the restricted
+guest as having no network egress until this has been run in the other target browsers.
+
+### P1: peer endpoints accept internal addresses (open)
+
+`clientPeerEndpointProblems` refuses only `0.0.0.0` and addresses with a first octet of 224 or more. Checked: `8.8.8.8`,
+`127.0.0.1`, `10.0.0.5`, `192.168.1.1`, `172.16.0.9`, `169.254.169.254`, `100.64.0.1` and `0.1.2.3` are accepted. A signed
+descriptor can therefore make the host dial the user's loopback or local network after consent, and error text goes
+back to the guest. The remote must still prove the declared PeerID, so this is a reachability probe, not a data
+read. Same class as finding 8. Recommendation: refuse these ranges unless the endpoint carries an explicit
+`scope: lan` that the dialog prints. The peer payload is not displayed either (finding 9). The response budget is
+checked after the handler returns, as the peer note says.
 
 ### R1: `referrerPolicy` lost on every approved HTTP call (fixed)
 
@@ -101,6 +140,7 @@ fields (data categories, redirects) before `Action`, and show the length of the 
 |---|---|
 | Allow clicked after the dialog had shown for over a second | Enabled 601 ms after open; click approved; fetch attempted (`Failed to fetch`). |
 | Double click with a start button placed exactly over where Allow appears (finding 3) | The dialog stayed open and pending; Allow was enabled 602 ms after open; Deny then ended it with `not approved`. |
+| Guest in the real mount sends WebRTC (R6), current main vs this change | main: `USERNAME` string received over UDP. This change: nothing received. |
 | Approve A, B starts 5 ms later (KOTOBA-158) | B's dialog stayed pending for more than 3 s; no stale `close` denied it. |
 | `fetch(request, { signal })` and `Referer` (R1) | Referer sent. Not sent without a signal, with the signal in the Request, or with `referrerPolicy` repeated in the init. |
 | 900-character query (R5) | Data categories cut off in the scroll area. |
@@ -114,6 +154,6 @@ reviewed. The CI of this repository does not run Node, so these tests run locall
 
 ## Reviewed revision
 
-This change fixes R1 and R2 only. The reviewed revision for vendoring is the file as merged by this change; its
-sha256 is recorded in `local-changes.json` and its commit in KOTOBA-159. Findings 1, 7, 8, 9, R3, R4 and R5 remain
+This change fixes R1 and R2 and mitigates R6. The reviewed revision for vendoring is the file as merged by this change; its
+sha256 is recorded in `local-changes.json` and its commit in KOTOBA-159. Findings 1, 7, 8, 9, P1, R3, R4 and R5 remain
 open, so consent is guaranteed only for `restricted-wasm-v1` apps whose host ships the static CSP.
