@@ -6,11 +6,11 @@ bytes and must not represent native peers with fabricated HTTPS origins.
 
 Required endpoint keys: `transport`, `peer-id`, `addresses`, `protocol`, `action`,
 `max-request-bytes`, `max-response-bytes`, `timeout-ms`. This first profile
-accepts 1–4 unique literal IPv4/UDP QUIC-v1 or WebRTC Direct multiaddresses, each ending in the
+accepts 1–4 unique literal IPv4 QUIC-v1, WebRTC Direct or TCP multiaddresses, each ending in the
 same declared base58 PeerID. Port zero, unspecified/multicast addresses, DNS,
 gateways and other transports are refused. WebRTC Direct requires an explicit
-base64url multibase certificate hash. Hosts must also parse and validate the
-PeerID and multiaddress with libp2p and verify authenticated remote identity.
+base64url multibase certificate hash. Hosts must parse the PeerID and multiaddress with libp2p, verify authenticated
+remote identity, and use Noise/TLS for TCP; plaintext TCP is not supported.
 
 Requests and JSON-compatible responses are capped at 1 MiB; deadlines at
 60 seconds. The canonical consent host displays exact PeerID, addresses,
