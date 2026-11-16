@@ -37,3 +37,31 @@ Native QUIC authenticates transport identity; this does not establish account
 identity, dango authorization, publisher admission, private-data E2EE or the
 post-quantum envelope. Aozora's initial adapter is public-block connectivity
 only. No private-data or Native/selfhost qualification is conferred.
+
+## AWAI-3001 bounded snapshot and receive profile
+
+A literal-IP address may explicitly name one authenticated relay PeerID and
+`/p2p-circuit/p2p/<targetPeerID>`; target and relay must differ. No relay or
+provider is selected implicitly. A new optional `scope` is admitted only with
+`/awai/yataverse/1.0.0` and `sync-push`, `sync-pull`, `pin-query` or
+`receive-snapshot`. It requires exact `snapshot-cid` (CIDv1 base32 syntax) and
+`max-transfer-bytes` (1..256 MiB). Native hosts must parse/verify CIDs and enforce
+this quota independently; response-message limits do not cover network traffic.
+
+`receive-snapshot` additionally requires exact `listen-address` (literal IPv4
+TCP/QUIC or one selected relay circuit, no unspecified address/port zero) and
+`receive-ms` (1..21600000, at most six hours) and an explicit boolean
+`allow-read-back`. False permits receiving/pin/query metadata only; true also
+allows that same peer to fetch the same snapshot within the byte/time budget. Its `addresses` may be empty; the
+endpoint PeerID identifies the only authorized incoming peer. The canonical
+trusted dialog shows the full immutable scope before fresh approval. Starting a
+receive operation creates one named, bounded host session; the operation deadline
+bounds startup. The native host owns its separate timer, byte admission and
+explicit Stop command after startup has returned. No automatic restart, renewal,
+peer change, new snapshot or provider enrollment follows from that approval.
+
+Android must show the active receive service and stop on notification Stop,
+expiry, OS foreground-service timeout or host failure. This is not guaranteed
+indefinite/background execution. Provider-side approval and sender-side approval
+remain independent; a sender does not grant remote storage. Receipt signatures
+are transport observations, not account/PQ/publication authority.
