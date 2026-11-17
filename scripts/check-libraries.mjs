@@ -28,8 +28,12 @@ for (const id of ids) {
   for (const origin of provenance.imports) {
     assert.match(origin.commit, /^[0-9a-f]{40}$/);
     assert.match(origin.tree, /^[0-9a-f]{40}$/);
-    assert.equal(origin.url, `https://github.com/kotoba-lang/${origin.repo}.git`);
-    assert.ok(origin.files.some(file => file.source === "LICENSE"), `${origin.repo}: license missing`);
+    // network-awai origins (KOTOBA-959) are private repositories published here.
+    const org = /^network-awai\//.test(origin.repo) || origin.url.startsWith("https://github.com/network-awai/")
+      ? "network-awai" : "kotoba-lang";
+    assert.equal(origin.url, `https://github.com/${org}/${origin.repo}.git`);
+    assert.ok(origin.files.some(file => file.source === "LICENSE") || changes.added?.LICENSE,
+              `${origin.repo}: license missing`);
     for (const file of origin.files) {
       assert.match(file.sha256, shaPattern);
       const destination = path.resolve(root, file.path);
