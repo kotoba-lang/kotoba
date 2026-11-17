@@ -63,8 +63,9 @@ reported, not forced to agree.
   `.cljc`-capable language above may run in CI as separate oracle jobs, named and
   reported as oracle. Native build, gates, packaging and runtime do not depend on
   them, nothing falls back to them, and an oracle job is not a required check
-  until the owner decides. Any other CI use of JVM, nbb, Babashka and GraalVM
-  stays banned (JUN-290). The oracle languages that do not read `.cljc` (C,
+  until the owner decides. The workspace-wide ban on JVM and nbb in CI (JUN-290)
+  was withdrawn on 2026-11-17; this repository's CDCI above stays native-only by
+  its own rule. The oracle languages that do not read `.cljc` (C,
   Python, Fennel) run on a developer machine, one-off.
 - CLJK stays as a reference oracle source and is treated as CLJC-equivalent
   for oracle runs: `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
