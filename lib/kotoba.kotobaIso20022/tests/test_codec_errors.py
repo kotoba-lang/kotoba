@@ -123,7 +123,7 @@ def test_camt054_ntfctn_missing_acct() -> None:
 
 def test_pacs002_with_original_tx_id() -> None:
     msg = FIToFIPaymentStatusReport(
-        group_header=GroupHeader("STS", "t", 0),
+        group_header=GroupHeader("STS", "2026-06-08T09:30:00Z", 0),
         original_message_id="M", original_message_name_id="pacs.008.001.08",
         statuses=(TransactionStatus(status_id="S", original_tx_id="TX-9",
                                     transaction_status="ACSC"),),
@@ -132,34 +132,64 @@ def test_pacs002_with_original_tx_id() -> None:
     assert back.statuses[0].original_tx_id == "TX-9"
 
 
-def test_pain002_with_original_tx_id() -> None:
-    msg = CustomerPaymentStatusReport(
-        group_header=GroupHeader("STS", "t", 0),
+def _pain002(**status: object) -> CustomerPaymentStatusReport:
+    return CustomerPaymentStatusReport(
+        group_header=GroupHeader("STS", "2026-06-08T09:30:00Z", 0),
         original_message_id="M", original_message_name_id="pain.001.001.09",
         payment_statuses=(
             OriginalPaymentStatus(
                 original_payment_info_id="P",
-                statuses=(TransactionStatus(status_id="S", original_tx_id="TX-7",
-                                            transaction_status="ACSP"),),
+                statuses=(TransactionStatus(status_id="S", transaction_status="ACSP",
+                                            **status),),  # type: ignore[arg-type]
             ),
         ),
     )
-    back = parse_pain002(build_pain002(msg))
-    assert back.payment_statuses[0].statuses[0].original_tx_id == "TX-7"
+
+
+def test_pain002_refuses_original_tx_id() -> None:
+    # pain.002.001.10 TxInfAndSts has no OrgnlTxId (pacs.002 does).
+    with pytest.raises(Iso20022CodecError, match="OrgnlTxId"):
+        build_pain002(_pain002(original_tx_id="TX-7"))
+
+
+def test_pain002_carries_original_uetr() -> None:
+    uetr = "eb6305c4-3e7a-4b29-9a1f-8d2ce5a71b30"
+    back = parse_pain002(build_pain002(_pain002(original_uetr=uetr)))
+    assert back.payment_statuses[0].statuses[0].original_uetr == uetr
 
 
 def test_camt053_entry_with_bank_transaction_code() -> None:
     entry = StatementEntry(
         amount=Amount(Decimal("1.00"), "EUR"), credit_debit="CRDT", status="BOOK",
         end_to_end_id="E", bank_transaction_code="PMNT",
+        bank_transaction_family="RCDT", bank_transaction_subfamily="ESCT",
     )
     msg = BankToCustomerStatement(
-        group_header=GroupHeader("CS", "t", 0),
-        statements=(AccountStatement("S", "t", Account(iban="DE89370400440532013000"),
+        group_header=GroupHeader("CS", "2026-06-08T09:30:00Z", 0),
+        statements=(AccountStatement("S", "2026-06-08T09:30:00Z", Account(iban="DE89370400440532013000"),
                                      (CashBalance("OPBD", Amount(Decimal("0"), "EUR"),
                                                   "CRDT", "2026-06-08"),), (entry,)),),
     )
     xml = build_camt053(msg)
     assert "<BkTxCd>" in xml
+    assert "<SubFmlyCd>ESCT</SubFmlyCd>" in xml
     back = parse_camt053(xml)
-    assert back.statements[0].entries[0].bank_transaction_code == "PMNT"
+    e = back.statements[0].entries[0]
+    assert (e.bank_transaction_code, e.bank_transaction_family, e.bank_transaction_subfamily) == (
+        "PMNT", "RCDT", "ESCT")
+
+
+def test_camt053_refuses_domain_code_without_family() -> None:
+    # BkTxCd/Domn needs Fmly/Cd and Fmly/SubFmlyCd as well as Domn/Cd.
+    entry = StatementEntry(
+        amount=Amount(Decimal("1.00"), "EUR"), credit_debit="CRDT", status="BOOK",
+        bank_transaction_code="PMNT",
+    )
+    msg = BankToCustomerStatement(
+        group_header=GroupHeader("CS", "2026-06-08T09:30:00Z", 0),
+        statements=(AccountStatement("S", "2026-06-08T09:30:00Z", Account(iban="DE89370400440532013000"),
+                                     (CashBalance("OPBD", Amount(Decimal("0"), "EUR"),
+                                                  "CRDT", "2026-06-08"),), (entry,)),),
+    )
+    with pytest.raises(Iso20022CodecError, match="family"):
+        build_camt053(msg)

@@ -17,7 +17,13 @@ fixed. Its four sample documents (single and multi-transaction pain.001.001.09
 and pacs.008.001.08) now validate against the pinned XSDs; see
 `results-20261118-after-awai-3228.json` and "Re-run after AWAI-3228" below.
 That is L1 for the element subset `kotoba.swift` emits, not for the whole
-message definition. The Python findings P1 to P6 are open (AWAI-3229).
+message definition.
+
+**Update, AWAI-3229 (2026-11-18):** the Python findings P1 to P6 are fixed.
+Every document the `kotoba.kotobaIso20022` test suite builds (now 259 tests)
+validates against the pinned XSDs, except the two envelopes, for which no
+public XSD is pinned; see `results-20261118-after-awai-3229.json` and
+"Re-run after AWAI-3229" below.
 
 ## How to run
 
@@ -35,6 +41,7 @@ lib/kotoba.swift/conformance/check.sh
 | `summarize.py` | Validates every recorded document with `xmllint --schema` and groups the errors |
 | `results-20261118.json` | The summary of the first run below |
 | `results-20261118-after-awai-3228.json` | The summary after the `kotoba.swift` fixes |
+| `results-20261118-after-awai-3229.json` | The summary of the Python suite after its fixes |
 
 This is a local evidence run, not a CI gate. The monorepo CI runs the native
 qualification jobs only and does not run library tests; adding a job for this
@@ -128,6 +135,33 @@ for every ordinary input.
 
 The CBPR+ rules in `conformance.py` (CBPR-001 to CBPR-011) are level L2. They
 were not checked here: their source documents are subject to ADR 0042 O3.
+
+### Re-run after AWAI-3229
+
+| Change | Where |
+|---|---|
+| P1: `ReqdExctnDt` holds a `Dt` child; `InitgPty` (mandatory) is always emitted | `build_pain001`, `_build_group_header` |
+| P2: a pacs.008 transaction without `ChrgBr`, `Dbtr`, `DbtrAgt`, `CdtrAgt` or `Cdtr` raises | `build_pacs008` |
+| P3: `Ntry/Sts` is emitted as `Sts/Cd` | `_build_entry` |
+| P4: `Ntry/BkTxCd` is always emitted; `Domn` carries `Fmly/Cd` and `Fmly/SubFmlyCd` (new `StatementEntry` fields) and a domain code alone raises; a camt.053 `Stmt` without `Bal` raises | `_build_entry`, `build_camt053` |
+| P5: pain.002 emits `OrgnlUETR` and raises on `OrgnlTxId` | `_build_tx_status` |
+| P6: every builder checks the XSD value facets of the leaves it emits and raises `Iso20022CodecError` instead of writing an invalid value | `_check_xsd_facets` in `_serialize` |
+
+Python 3.14.6, pytest 9.0.3: 259 passed. `ruff` and `mypy --strict` clean.
+The fixtures that relied on the old, invalid output now supply the required
+elements; the property tests no longer leave `ChrgBr` unset.
+
+| Message | Documents | XSD-valid |
+|---|---|---|
+| pain.001.001.09 | 255 | 255 |
+| pacs.008.001.08 | 265 | 265 |
+| pacs.002.001.10 | 3 | 3 |
+| pacs.004.001.09 | 2 | 2 |
+| pain.002.001.10 | 2 | 2 |
+| camt.053.001.08 | 3 | 3 |
+| camt.054.001.08 | 253 | 253 |
+| head.001.001.02 | 2 | 2 |
+| Envelope (AppHdr + Document) | 2 | not checked: no public XSD pinned |
 
 ## MT103 ↔ pacs.008.001.08 mapping (`kotoba.swift`)
 

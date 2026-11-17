@@ -249,6 +249,8 @@ class StatementEntry:
     value_date: str | None = None  # ValDt/Dt
     account_servicer_reference: str | None = None  # AcctSvcrRef
     bank_transaction_code: str | None = None  # BkTxCd/Domn/Cd (kept opaque)
+    bank_transaction_family: str | None = None  # BkTxCd/Domn/Fmly/Cd
+    bank_transaction_subfamily: str | None = None  # BkTxCd/Domn/Fmly/SubFmlyCd
     end_to_end_id: str | None = None  # NtryDtls/TxDtls/Refs/EndToEndId
     remittance_info: RemittanceInfo | None = None
 

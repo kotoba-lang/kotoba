@@ -21,7 +21,10 @@ Supported message definitions (version-parameterised; CBPR+/SEPA defaults):
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
+from datetime import date
 from decimal import Decimal
 
 from .model import (
@@ -149,8 +152,154 @@ def _root(ns: str, container_tag: str) -> tuple[ET.Element, ET.Element]:
 
 
 def _serialize(doc: ET.Element) -> str:
+    _check_xsd_facets(doc)
     ET.indent(doc, space="  ")
     return ET.tostring(doc, encoding="unicode", xml_declaration=True)
+
+
+# --------------------------------------------------------------------------
+# XSD value facets, checked before any document is emitted (AWAI-3229)
+#
+# Every builder ends in _serialize, so a value that the published XSD would
+# reject (a malformed date, BIC, IBAN or UETR, an over-long identifier, a
+# code outside its enumeration, an amount with too many digits) raises
+# Iso20022CodecError instead of being written. Only leaf elements are
+# checked, keyed by their local name; element order and occurrence come from
+# the builders themselves. The lexical forms accepted are the ones this codec
+# emits, which is a subset of what xs:decimal / xs:dateTime allow.
+# --------------------------------------------------------------------------
+
+_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(Z|[+-]\d{2}:\d{2})?")
+_DATETIME_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?"
+)
+_DECIMAL_RE = re.compile(r"(-?)(\d+)(?:\.(\d+))?")
+
+
+def _calendar_ok(y: str, m: str, d: str) -> bool:
+    try:
+        date(int(y), int(m), int(d))
+    except ValueError:
+        return False
+    return True
+
+
+def _tz_ok(tz: str | None) -> bool:
+    if tz is None or tz == "Z":
+        return True
+    hh, mm = int(tz[1:3]), int(tz[4:6])
+    return mm < 60 and (hh < 14 or (hh == 14 and mm == 0))
+
+
+def _is_date(v: str) -> bool:
+    m = _DATE_RE.fullmatch(v)
+    if m is None:
+        return False
+    return _calendar_ok(*m.group(1, 2, 3)) and _tz_ok(m.group(4))
+
+
+def _is_datetime(v: str) -> bool:
+    m = _DATETIME_RE.fullmatch(v)
+    if m is None:
+        return False
+    return (
+        _calendar_ok(*m.group(1, 2, 3))
+        and int(m.group(4)) < 24
+        and int(m.group(5)) < 60
+        and int(m.group(6)) < 60
+        and _tz_ok(m.group(8))
+    )
+
+
+def _decimal_ok(v: str, total: int, frac: int, non_negative: bool) -> bool:
+    m = _DECIMAL_RE.fullmatch(v)
+    if not m:
+        return False
+    sign, whole, fraction = m.group(1), m.group(2), m.group(3) or ""
+    int_digits = whole.lstrip("0")
+    frac_digits = fraction.rstrip("0")
+    if non_negative and sign and (int_digits or frac_digits):
+        return False
+    return len(frac_digits) <= frac and len(int_digits) + len(frac_digits) <= total
+
+
+_Check = Callable[[str], bool]
+
+
+def _max_text(n: int) -> _Check:
+    return lambda v: 1 <= len(v) <= n
+
+
+def _pattern(regex: str) -> _Check:
+    rx = re.compile(regex)
+    return lambda v: rx.fullmatch(v) is not None
+
+
+def _one_of(*codes: str) -> _Check:
+    return lambda v: v in codes
+
+
+_MAX35: tuple[str, _Check] = ("Max35Text", _max_text(35))
+_ISO_DATE: tuple[str, _Check] = ("ISODate", _is_date)
+_UETR: tuple[str, _Check] = (
+    "UUIDv4Identifier",
+    _pattern(r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}"),
+)
+
+_LEAF_FACETS: dict[str, tuple[str, _Check]] = {
+    **dict.fromkeys(
+        (
+            "MsgId", "PmtInfId", "InstrId", "EndToEndId", "TxId", "StsId", "OrgnlMsgId",
+            "OrgnlPmtInfId", "OrgnlInstrId", "OrgnlEndToEndId", "OrgnlTxId", "RtrId",
+            "AcctSvcrRef", "OrgnlMsgNmId", "BizMsgIdr", "MsgDefIdr",
+        ),
+        _MAX35,
+    ),
+    "Nm": ("Max140Text", _max_text(140)),
+    "Ustrd": ("Max140Text", _max_text(140)),
+    "AdrLine": ("Max70Text", _max_text(70)),
+    "AddtlInf": ("Max105Text", _max_text(105)),
+    "CreDtTm": ("ISODateTime", _is_datetime),
+    "Dt": _ISO_DATE,
+    "IntrBkSttlmDt": _ISO_DATE,
+    "NbOfTxs": ("Max15NumericText", _pattern(r"[0-9]{1,15}")),
+    "CtrlSum": ("DecimalNumber", lambda v: _decimal_ok(v, 18, 17, False)),
+    "BICFI": ("BICFIDec2014Identifier",
+              _pattern(r"[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?")),
+    "IBAN": ("IBAN2007Identifier", _pattern(r"[A-Z]{2}[0-9]{2}[a-zA-Z0-9]{1,30}")),
+    "UETR": _UETR,
+    "OrgnlUETR": _UETR,
+    "Ccy": ("ActiveOrHistoricCurrencyCode", _pattern(r"[A-Z]{3}")),
+    "Ctry": ("CountryCode", _pattern(r"[A-Z]{2}")),
+    "ChrgBr": ("ChargeBearerType1Code", _one_of("DEBT", "CRED", "SHAR", "SLEV")),
+    "SttlmMtd": ("SettlementMethod1Code", _one_of("INDA", "INGA", "COVE", "CLRG")),
+    "PmtMtd": ("PaymentMethod3Code", _one_of("CHK", "TRF", "TRA")),
+    "CdtDbtInd": ("CreditDebitCode", _one_of("CRDT", "DBIT")),
+}
+
+
+def _check_xsd_facets(doc: ET.Element) -> None:
+    def walk(el: ET.Element, path: str) -> None:
+        tag = el.tag.rsplit("}", 1)[-1]
+        here = f"{path}/{tag}"
+        ccy = el.get("Ccy")
+        if ccy is not None:
+            if not re.fullmatch(r"[A-Z]{3}", ccy):
+                raise Iso20022CodecError(f"{here}/@Ccy: {ccy!r} is not a valid currency code")
+            if not _decimal_ok(el.text or "", 18, 5, True):
+                raise Iso20022CodecError(
+                    f"{here}: {el.text!r} is not a valid ActiveOrHistoricCurrencyAndAmount"
+                )
+        children = list(el)
+        if not children and ccy is None and tag in _LEAF_FACETS:
+            type_name, ok = _LEAF_FACETS[tag]
+            value = el.text or ""
+            if not ok(value):
+                raise Iso20022CodecError(f"{here}: {value!r} is not a valid {type_name}")
+        for child in children:
+            walk(child, here)
+
+    walk(doc, "")
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +319,9 @@ def _build_group_header(parent: ET.Element, ns: str, gh: GroupHeader, *, is_pacs
         _sub(sttlm, ns, "SttlmMtd", gh.settlement_method or "CLRG")
     elif gh.initiating_party is not None:
         _build_party(grp, ns, "InitgPty", gh.initiating_party)
+    else:
+        # InitgPty is mandatory in pain.001; every child of it is optional.
+        _sub(grp, ns, "InitgPty")
 
 
 def _build_party(parent: ET.Element, ns: str, tag: str, party: Party) -> None:
@@ -323,7 +475,8 @@ def build_pain001(msg: CustomerCreditTransferInitiation, version: str | None = N
         pinf = _sub(root, ns, "PmtInf")
         _sub(pinf, ns, "PmtInfId", pmt.payment_info_id)
         _sub(pinf, ns, "PmtMtd", pmt.payment_method)
-        _sub(pinf, ns, "ReqdExctnDt", pmt.requested_execution_date)
+        # DateAndDateTime2Choice in pain.001.001.09: the date goes in a Dt child.
+        _sub(_sub(pinf, ns, "ReqdExctnDt"), ns, "Dt", pmt.requested_execution_date)
         _build_party(pinf, ns, "Dbtr", pmt.debtor)
         _build_account(pinf, ns, "DbtrAcct", pmt.debtor_account)
         _build_agent(pinf, ns, "DbtrAgt", pmt.debtor_agent)
@@ -380,7 +533,9 @@ def parse_pain001(xml: str, version: str | None = None) -> CustomerCreditTransfe
         payments.append(
             PaymentInstruction(
                 payment_info_id=_text(pinf, ns, "PmtInfId") or "",
-                requested_execution_date=_text(pinf, ns, "ReqdExctnDt") or "",
+                requested_execution_date=(
+                    _text(pinf, ns, "ReqdExctnDt/Dt") or _text(pinf, ns, "ReqdExctnDt/DtTm") or ""
+                ),
                 debtor=debtor,
                 debtor_account=debtor_acct,
                 debtor_agent=debtor_agt,
@@ -415,18 +570,30 @@ def build_pacs008(msg: FIToFICustomerCreditTransfer, version: str | None = None)
         amt.set("Ccy", validate_currency(tx.interbank_amount.currency, require_active=False))
         if tx.interbank_settlement_date:
             _sub(cdt, ns, "IntrBkSttlmDt", tx.interbank_settlement_date)
-        if tx.charge_bearer:
-            _sub(cdt, ns, "ChrgBr", tx.charge_bearer)
-        if tx.debtor:
-            _build_party(cdt, ns, "Dbtr", tx.debtor)
+        missing = [
+            name
+            for name, value in (
+                ("ChrgBr", tx.charge_bearer),
+                ("Dbtr", tx.debtor),
+                ("DbtrAgt", tx.debtor_agent),
+                ("CdtrAgt", tx.creditor_agent),
+                ("Cdtr", tx.creditor),
+            )
+            if not value
+        ]
+        if missing:
+            raise Iso20022CodecError(
+                f"pacs.008 CdtTrfTxInf {tx.end_to_end_id!r} requires {', '.join(missing)}"
+            )
+        assert tx.charge_bearer and tx.debtor and tx.debtor_agent  # checked above
+        assert tx.creditor_agent and tx.creditor
+        _sub(cdt, ns, "ChrgBr", tx.charge_bearer)
+        _build_party(cdt, ns, "Dbtr", tx.debtor)
         if tx.debtor_account:
             _build_account(cdt, ns, "DbtrAcct", tx.debtor_account)
-        if tx.debtor_agent:
-            _build_agent(cdt, ns, "DbtrAgt", tx.debtor_agent)
-        if tx.creditor_agent:
-            _build_agent(cdt, ns, "CdtrAgt", tx.creditor_agent)
-        if tx.creditor:
-            _build_party(cdt, ns, "Cdtr", tx.creditor)
+        _build_agent(cdt, ns, "DbtrAgt", tx.debtor_agent)
+        _build_agent(cdt, ns, "CdtrAgt", tx.creditor_agent)
+        _build_party(cdt, ns, "Cdtr", tx.creditor)
         if tx.creditor_account:
             _build_account(cdt, ns, "CdtrAcct", tx.creditor_account)
         if tx.remittance_info:
@@ -552,7 +719,7 @@ def _build_entry(parent: ET.Element, ns: str, entry: StatementEntry) -> None:
     el = _sub(parent, ns, "Ntry")
     _build_amt(el, ns, "Amt", entry.amount)
     _sub(el, ns, "CdtDbtInd", entry.credit_debit)
-    _sub(el, ns, "Sts", entry.status)
+    _sub(_sub(el, ns, "Sts"), ns, "Cd", entry.status)
     if entry.booking_date:
         bd = _sub(el, ns, "BookgDt")
         _sub(bd, ns, "Dt", entry.booking_date)
@@ -561,10 +728,19 @@ def _build_entry(parent: ET.Element, ns: str, entry: StatementEntry) -> None:
         _sub(vd, ns, "Dt", entry.value_date)
     if entry.account_servicer_reference:
         _sub(el, ns, "AcctSvcrRef", entry.account_servicer_reference)
+    # BkTxCd is mandatory in ReportEntry10; all of its children are optional.
+    # Domn needs Cd and Fmly(Cd, SubFmlyCd), so a domain code alone is refused.
+    btc = _sub(el, ns, "BkTxCd")
     if entry.bank_transaction_code:
-        btc = _sub(el, ns, "BkTxCd")
+        if not (entry.bank_transaction_family and entry.bank_transaction_subfamily):
+            raise Iso20022CodecError(
+                "BkTxCd/Domn requires the family and sub-family codes as well as the domain"
+            )
         domn = _sub(btc, ns, "Domn")
         _sub(domn, ns, "Cd", entry.bank_transaction_code)
+        fmly = _sub(domn, ns, "Fmly")
+        _sub(fmly, ns, "Cd", entry.bank_transaction_family)
+        _sub(fmly, ns, "SubFmlyCd", entry.bank_transaction_subfamily)
     if entry.end_to_end_id or entry.remittance_info:
         dtls = _sub(el, ns, "NtryDtls")
         txd = _sub(dtls, ns, "TxDtls")
@@ -595,11 +771,13 @@ def _parse_entry(el: ET.Element, ns: str) -> StatementEntry:
     return StatementEntry(
         amount=amt,
         credit_debit=_text(el, ns, "CdtDbtInd") or "CRDT",  # type: ignore[arg-type]
-        status=_text(el, ns, "Sts") or "BOOK",  # type: ignore[arg-type]
+        status=_text(el, ns, "Sts/Cd") or "BOOK",  # type: ignore[arg-type]
         booking_date=_text(el, ns, "BookgDt/Dt"),
         value_date=_text(el, ns, "ValDt/Dt"),
         account_servicer_reference=_text(el, ns, "AcctSvcrRef"),
         bank_transaction_code=_text(el, ns, "BkTxCd/Domn/Cd"),
+        bank_transaction_family=_text(el, ns, "BkTxCd/Domn/Fmly/Cd"),
+        bank_transaction_subfamily=_text(el, ns, "BkTxCd/Domn/Fmly/SubFmlyCd"),
         end_to_end_id=_text(txd, ns, "Refs/EndToEndId") if txd is not None else None,
         remittance_info=(
             _parse_remittance(_find(txd, ns, "RmtInf"), ns) if txd is not None else None
@@ -627,6 +805,10 @@ def build_camt053(msg: BankToCustomerStatement, version: str | None = None) -> s
         _sub(s, ns, "Id", stmt.statement_id)
         _sub(s, ns, "CreDtTm", stmt.creation_datetime)
         _build_account(s, ns, "Acct", stmt.account)
+        if not stmt.balances:
+            raise Iso20022CodecError(
+                f"camt.053 Stmt {stmt.statement_id!r} requires at least one Bal"
+            )
         for bal in stmt.balances:
             _build_balance(s, ns, bal)
         for entry in stmt.entries:
@@ -712,10 +894,13 @@ def parse_camt054(xml: str, version: str | None = None) -> BankToCustomerDebitCr
 def _build_tx_status(parent: ET.Element, ns: str, sts: TransactionStatus) -> None:
     ts = _sub(parent, ns, "TxInfAndSts")
     _sub(ts, ns, "StsId", sts.status_id)
+    if sts.original_tx_id:
+        # pain.002 has no OrgnlTxId (it exists in pacs.002); refuse rather than drop it.
+        raise Iso20022CodecError("pain.002 TxInfAndSts has no OrgnlTxId; use pacs.002")
     if sts.original_end_to_end_id:
         _sub(ts, ns, "OrgnlEndToEndId", sts.original_end_to_end_id)
-    if sts.original_tx_id:
-        _sub(ts, ns, "OrgnlTxId", sts.original_tx_id)
+    if sts.original_uetr:
+        _sub(ts, ns, "OrgnlUETR", sts.original_uetr)
     _sub(ts, ns, "TxSts", sts.transaction_status)
     if sts.status_reason_code or sts.additional_info:
         rsn = _sub(ts, ns, "StsRsnInf")
@@ -730,7 +915,7 @@ def _parse_tx_status(ts: ET.Element, ns: str) -> TransactionStatus:
     return TransactionStatus(
         status_id=_text(ts, ns, "StsId") or "",
         original_end_to_end_id=_text(ts, ns, "OrgnlEndToEndId"),
-        original_tx_id=_text(ts, ns, "OrgnlTxId"),
+        original_uetr=_text(ts, ns, "OrgnlUETR"),
         transaction_status=_text(ts, ns, "TxSts") or "ACSP",  # type: ignore[arg-type]
         status_reason_code=_text(ts, ns, "StsRsnInf/Rsn/Cd"),
         additional_info=tuple(

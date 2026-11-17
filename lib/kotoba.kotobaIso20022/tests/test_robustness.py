@@ -77,7 +77,7 @@ _CURRENCY_CASES = [
 def test_pacs008_amount_roundtrip(ccy: str, amount: str) -> None:
     tx = CreditTransferTransaction(
         end_to_end_id="E2E",
-        interbank_amount=Amount(Decimal(amount), ccy),
+        interbank_amount=Amount(Decimal(amount), ccy), charge_bearer="SHAR",
         debtor=Party("A"), debtor_agent=Agent(bicfi="DEUTDEFF"),
         creditor=Party("B"), creditor_agent=Agent(bicfi="NWBKGB2L"),
     )
@@ -108,7 +108,7 @@ def test_many_transactions_in_one_message() -> None:
     txs = tuple(
         CreditTransferTransaction(
             end_to_end_id=f"E2E-{i}",
-            interbank_amount=Amount(Decimal("1.00"), "EUR"),
+            interbank_amount=Amount(Decimal("1.00"), "EUR"), charge_bearer="SHAR",
             debtor=Party("A"), debtor_agent=Agent(bicfi="DEUTDEFF"),
             creditor=Party(f"C{i}"), creditor_agent=Agent(bicfi="NWBKGB2L"),
         )

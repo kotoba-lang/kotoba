@@ -41,6 +41,13 @@ Every wire detail comes from the **open published standard**, not vendor code:
 - **Message structure** — `GrpHdr` / `PmtInf` / `CdtTrfTxInf` / `PmtId` /
   `IntrBkSttlmAmt` / `OrgnlGrpInfAndSts` … from the ISO 20022 message
   components.
+- **XSD facets at build time** — every builder refuses, with
+  `Iso20022CodecError`, a value the published XSD would reject (calendar
+  dates and date-times, BIC, IBAN, UETR, identifier and name lengths, code
+  enumerations, amount digits) and the structural omissions it would reject
+  (pacs.008 `ChrgBr`/`Dbtr`/`DbtrAgt`/`CdtrAgt`/`Cdtr`, a camt.053 `Stmt`
+  without `Bal`, a `BkTxCd/Domn` without family and sub-family, a pain.002
+  `OrgnlTxId`). See `lib/kotoba.swift/conformance/README.md`.
 - **Namespace** — the official URN scheme
   `urn:iso:std:iso:20022:tech:xsd:<msgdef>` (e.g.
   `urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08`), emitted as the
@@ -210,7 +217,7 @@ kotoba_iso20022/
 ├── bridge.py       # message → com.etzhayyim.iso20022.ingressAttestation records
 ├── helpers.py      # new_uetr() + auto NbOfTxs/CtrlSum group-header builders
 └── __init__.py     # public surface
-tests/              # 231 tests · 97% branch / 99% line · mypy --strict + ruff clean
+tests/              # 259 tests (2026-11-18); coverage, mypy and ruff not re-measured
 ```
 
 ## Construction helpers
@@ -229,7 +236,7 @@ gh = pacs008_group_header("MSG-1", "2026-06-08T09:30:00Z", (tx,))  # NbOfTxs+Ctr
 ```bash
 cd 40-engine/kotoba_iso20022
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python3 -m pytest tests/ -q
-# → 207 passed
+# → 259 passed (2026-11-18, AWAI-3229)
 
 # with coverage (pip install coverage):
 PYTHONPATH=. coverage run -m pytest tests/ -q && coverage report
@@ -270,8 +277,10 @@ full surface.
   **shipped** (`bridge.py` + Lexicon).
 - A gated `kawase` ingress cell that calls `ingress_attestations` +
   `to_datoms` and transacts under G2/G13 (Council-ratified, post-RFP).
-- ISO 20022 XSD conformance harness (optional dev-time check against the
-  official schema files; runtime stays schema-file-free).
+- ✅ ISO 20022 XSD conformance harness — **shipped** as a dev-time check in
+  `lib/kotoba.swift/conformance/` (AWAI-3153). Every document this codec
+  builds in its test suite validates against the digest-pinned official XSDs
+  since AWAI-3229; the runtime stays schema-file-free.
 - ✅ `pain.002` customer payment-status report — **shipped**.
 - ✅ `head.001` Business Application Header + CBPR+ envelope — **shipped**.
 
