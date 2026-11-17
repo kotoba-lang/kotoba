@@ -1,0 +1,243 @@
+(ns kotobase.object-store.b2-s3
+  "Backblaze B2's S3-compatible object-store capability.
+
+  Owns configuration validation, SigV4 request construction, and byte/JSON
+  transport only. It does not own tenant identity, graph semantics, physical
+  indexes, API routing, or billing. ClojureScript async functions return JS
+  Promises."
+  (:require [kotoba.lang.text :as str]
+            [sigv4.crypto :as sigv4-crypto]
+            [sigv4.request :as sigv4]))
+
+(defn- env-get [env k] (aget env k))
+
+(defn- configured-prefix [env]
+  (-> (or (env-get env "KOTOBASE_B2_PREFIX") "kotobase/worker-archive")
+      (str/replace #"^/+|/+$" "")))
+
+(defn- configured-region [env]
+  (or (env-get env "KOTOBASE_B2_REGION")
+      (let [host (if-let [endpoint (env-get env "KOTOBASE_B2_ENDPOINT")]
+                   (.-host (js/URL. endpoint))
+                   "")
+            match (re-find #"^s3\.([^.]+)\.backblazeb2\.com$" host)]
+        (if match (second match) "us-west-004"))))
+
+(defn- secret-like? [value]
+  (or (re-find #"(?i)(?:secret|token|password|api[_-]?key|access[_-]?key)\s*[:=]" value)
+      (re-find #"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+" value)))
+
+(defn- assert-safe-endpoint [raw]
+  (let [url (try (js/URL. (str/replace raw #"/+$" ""))
+                 (catch :default _
+                   (throw (js/Error. "KOTOBASE_B2_ENDPOINT must be a valid https URL"))))]
+    (when (not= (.-protocol url) "https:")
+      (throw (js/Error. "KOTOBASE_B2_ENDPOINT must be a valid https URL")))
+    (when (or (not= (.-username url) "") (not= (.-password url) "")
+              (not= (.-search url) "") (not= (.-hash url) "")
+              (and (not= (.-pathname url) "") (not= (.-pathname url) "/")))
+      (throw (js/Error. "KOTOBASE_B2_ENDPOINT must be an origin-only https URL without credentials, path, query, or fragment")))
+    (when-not (re-find #"(?i)^s3\.[a-z0-9-]+\.backblazeb2\.com$" (.-hostname url))
+      (throw (js/Error. "KOTOBASE_B2_ENDPOINT host must be a Backblaze B2 S3 endpoint")))))
+
+(defn- assert-safe-bucket [value]
+  (when-not (re-find #"^[a-z0-9][a-z0-9.-]{4,61}[a-z0-9]$" value)
+    (throw (js/Error. "KOTOBASE_B2_BUCKET must be a 6-63 character S3-compatible bucket name using lowercase letters, digits, dots, or hyphens")))
+  (when (str/includes? value "..")
+    (throw (js/Error. "KOTOBASE_B2_BUCKET must not contain adjacent dots")))
+  (when (re-find #"^\d{1,3}(?:\.\d{1,3}){3}$" value)
+    (throw (js/Error. "KOTOBASE_B2_BUCKET must not be formatted as an IPv4 address")))
+  (when (re-find #"^(?:b2-|xn--|sthree-|amzn-s3-demo-)" value)
+    (throw (js/Error. "KOTOBASE_B2_BUCKET must not use a reserved bucket-name prefix")))
+  (when (re-find #"(?:-s3alias|--ol-s3|\.mrap|--x-s3|--table-s3)$" value)
+    (throw (js/Error. "KOTOBASE_B2_BUCKET must not use a reserved bucket-name suffix"))))
+
+(defn- assert-safe-credentials [env]
+  (when (re-find #"[\x00-\x20\x7F,\\/]" (env-get env "KOTOBASE_B2_KEY_ID"))
+    (throw (js/Error. "KOTOBASE_B2_KEY_ID must be a single-token printable credential id without whitespace, commas, or slashes")))
+  (when (re-find #"[\x00-\x1f\x7f]" (env-get env "KOTOBASE_B2_APP_KEY"))
+    (throw (js/Error. "KOTOBASE_B2_APP_KEY must be a single-line printable credential secret"))))
+
+(defn- assert-safe-prefix [value]
+  (when (or (= value "") (re-find #"[\x00-\x1f\x7f]" value))
+    (throw (js/Error. "KOTOBASE_B2_PREFIX must be a printable slash-separated key prefix")))
+  (when (> (.-length value) 120)
+    (throw (js/Error. "KOTOBASE_B2_PREFIX must be at most 120 characters")))
+  (let [parts (.split value "/")]
+    (when (some #(or (= % "") (= % ".") (= % "..")) parts)
+      (throw (js/Error. "KOTOBASE_B2_PREFIX must not contain empty, dot, or dot-dot path segments")))
+    (when (some #(str/includes? % "\\") parts)
+      (throw (js/Error. "KOTOBASE_B2_PREFIX must not contain backslash characters")))
+    (when (some #(not (re-find #"^[A-Za-z0-9._=-]+$" %)) parts)
+      (throw (js/Error. "KOTOBASE_B2_PREFIX segments must contain only letters, digits, dot, underscore, equals, or hyphen")))
+    (when (some secret-like? parts)
+      (throw (js/Error. "KOTOBASE_B2_PREFIX must not contain secret-like values")))))
+
+(defn- assert-safe-region [value]
+  (when (and value (not (re-find #"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$" value)))
+    (throw (js/Error. "KOTOBASE_B2_REGION must be 1-32 lowercase letters, digits, or hyphens, starting and ending with a letter or digit"))))
+
+(defn configured? [env]
+  (every? #(env-get env %)
+          ["KOTOBASE_B2_ENDPOINT" "KOTOBASE_B2_BUCKET"
+           "KOTOBASE_B2_KEY_ID" "KOTOBASE_B2_APP_KEY"]))
+
+(defn require-config [env]
+  (let [missing (filter #(not (env-get env %))
+                        ["KOTOBASE_B2_ENDPOINT" "KOTOBASE_B2_BUCKET"
+                         "KOTOBASE_B2_KEY_ID" "KOTOBASE_B2_APP_KEY"])]
+    (when (seq missing)
+      (throw (js/Error. (str "B2 archive mode missing env: " (str/join ", " missing))))))
+  (assert-safe-endpoint (env-get env "KOTOBASE_B2_ENDPOINT"))
+  (assert-safe-bucket (env-get env "KOTOBASE_B2_BUCKET"))
+  (assert-safe-credentials env)
+  (assert-safe-prefix (configured-prefix env))
+  (assert-safe-region (env-get env "KOTOBASE_B2_REGION")))
+
+(def ^:private signer-crypto (sigv4-crypto/crypto))
+
+(defn signed-request
+  "Sign one B2 S3 request. Returns a Promise of method, URL, headers, and body."
+  [env method key body & [query extra-headers]]
+  (require-config env)
+  (sigv4/signed signer-crypto
+                {:endpoint (str/replace (env-get env "KOTOBASE_B2_ENDPOINT") #"/+$" "")
+                 :bucket (env-get env "KOTOBASE_B2_BUCKET")
+                 :region (configured-region env)
+                 :access-key (env-get env "KOTOBASE_B2_KEY_ID")
+                 :secret-key (env-get env "KOTOBASE_B2_APP_KEY")
+                 :method method :key key :query (js->clj query)
+                 :headers (or extra-headers {}) :now (.toISOString (js/Date.))
+                 :body (or body "")}))
+
+(defn presign
+  "A presigned URL for one object, plus the headers the client must send.
+
+  This is what lets a large object skip the Worker entirely: the client PUTs
+  or GETs straight to B2, so a gigabyte never enters a process with a memory
+  budget. The 4 MiB ceiling on `PUT /ipfs/:cid` is a property of standing in
+  the path, not of B2.
+
+  **Anything in `:headers` is signed**, and a PUT grant must bind
+  `content-length` there. Listing the header without signing it binds nothing:
+  the URL would accept a body of any length under a CID whose digest the
+  holder never had to know. `sigv4.request/presigned-request` returns the
+  header set it actually signed, so a caller can check rather than trust —
+  `kotobase.storage.object/bound-put-grant?` is the predicate for that."
+  [env method key {:keys [headers expires-seconds] :or {expires-seconds 900}}]
+  (require-config env)
+  (sigv4/presigned-request
+   signer-crypto
+   {:endpoint (str/replace (env-get env "KOTOBASE_B2_ENDPOINT") #"/+$" "")
+    :bucket (env-get env "KOTOBASE_B2_BUCKET")
+    :region (configured-region env)
+    :access-key (env-get env "KOTOBASE_B2_KEY_ID")
+    :secret-key (env-get env "KOTOBASE_B2_APP_KEY")
+    :method method :key key :headers (or headers {})
+    :expires-seconds expires-seconds}))
+
+(defn fetch
+  "Execute a signed B2 S3 request and return Promise<Response>."
+  [env method key body & [query extra-headers]]
+  (-> (signed-request env method key body query extra-headers)
+      (.then (fn [{:keys [url headers]}]
+               (js/fetch url #js {:method method :headers (clj->js headers)
+                                  :body (if (or (= method "GET") (= method "HEAD"))
+                                          js/undefined body)})))))
+
+(defn prefix [env] (configured-prefix env))
+
+(defn get-json [env key]
+  (-> (fetch env "GET" key nil)
+      (.then (fn [response]
+               (cond (= (.-status response) 404) nil
+                     (not (.-ok response))
+                     (throw (js/Error. (str "B2 GET " key " failed: " (.-status response))))
+                     :else (.json response))))))
+
+(defn get-bytes [env key]
+  (-> (fetch env "GET" key nil)
+      (.then (fn [response]
+               (cond (= (.-status response) 404) nil
+                     (not (.-ok response))
+                     (throw (js/Error. (str "B2 GET " key " failed: " (.-status response))))
+                     :else response)))))
+
+(defn put-json [env key value]
+  (-> (fetch env "PUT" key (js/JSON.stringify (clj->js value)))
+      (.then (fn [response]
+               (when-not (.-ok response)
+                 (throw (js/Error. (str "B2 PUT " key " failed: " (.-status response)))))))))
+
+(defn- assert-range! [start end]
+  (when-not (and (int? start) (int? end) (<= 0 start) (< start end))
+    (throw (js/Error. (str "B2 range must be 0 <= start < end (half-open), got "
+                           (pr-str start) "-" (pr-str end))))))
+
+(defn- content-range-start
+  "The first byte offset B2 says it sent, or nil when the header is absent or
+  malformed. `Content-Range: bytes 512-1023/4096`."
+  [response]
+  (some-> (.get (.-headers response) "content-range")
+          (->> (re-find #"^bytes\s+(\d+)-\d+/"))
+          second
+          js/parseInt))
+
+(defn get-range
+  "Fetch the bytes of `[START, END)` — **half-open, like `subs`** — of one
+  object. Resolves to a Uint8Array, or nil when the object is absent.
+
+  Half-open because that is what `kotobase.storage.object/IRangeRead`
+  specifies, and the one place the two conventions meet is the `Range`
+  header built below, which is inclusive and therefore asks for `end - 1`.
+  Keeping the conversion in a single expression is deliberate: the protocol
+  docstring points out that being one byte off makes a CAR frame's varint
+  parse and the block behind it fail, which is a decoding error nobody would
+  trace back to a range.
+
+  A short object yields the overlap, exactly as HTTP 206 does; a caller
+  needing the full width checks the length it got.
+
+  The Range header is part of the signed request, so B2 authenticates the
+  window rather than trusting a header the signature did not cover.
+
+  **A 200 fails closed.** 200 to a ranged GET means the server ignored the
+  Range and sent the whole object. Handing those bytes back as the requested
+  window would put every offset the caller computed off by START — and the
+  caller here is a pack reader whose frames still carry their own CIDs, so
+  each block it managed to parse would verify and the failure would surface
+  as a wrong answer wearing a right answer's face. Same reason the returned
+  window may never be longer than the one asked for."
+  [env key start end]
+  (assert-range! start end)
+  (let [wanted (- end start)]
+    (-> (fetch env "GET" key nil nil {"range" (str "bytes=" start "-" (dec end))})
+        (.then
+         (fn [response]
+           (cond
+             (= (.-status response) 404) nil
+
+             (= (.-status response) 200)
+             (throw (js/Error.
+                     (str "B2 ranged GET " key " returned 200: the endpoint "
+                          "ignored the signed Range header and sent the whole "
+                          "object. Refusing to treat it as bytes [" start ", " end ").")))
+
+             (not= (.-status response) 206)
+             (throw (js/Error. (str "B2 ranged GET " key " failed: "
+                                    (.-status response))))
+
+             :else
+             (let [claimed (content-range-start response)]
+               (when (and (some? claimed) (not= claimed start))
+                 (throw (js/Error. (str "B2 ranged GET " key " returned bytes from "
+                                        claimed ", not the requested " start))))
+               (-> (.arrayBuffer response)
+                   (.then (fn [buffer]
+                            (let [bytes (js/Uint8Array. buffer)]
+                              (when (> (.-length bytes) wanted)
+                                (throw (js/Error.
+                                        (str "B2 ranged GET " key " returned "
+                                             (.-length bytes) " bytes for a "
+                                             wanted "-byte window"))))
+                              bytes)))))))))))
