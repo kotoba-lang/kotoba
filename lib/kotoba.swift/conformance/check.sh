@@ -48,7 +48,7 @@ trap 'rm -rf "$kbb_dir"' EXIT
 echo '{:paths []}' > "$kbb_dir/deps.edn"
 cp "$here/samples.cljk" "$kbb_dir/samples.cljk"
 cp_dirs=""
-for lib in swift xml html css text test spec error io coll; do
+for lib in swift securities xml html css text test spec error io coll; do
   cp_dirs="$cp_dirs$repo/lib/kotoba.$lib/src:"
 done
 (cd "$kbb_dir" && kbb --backend sci --classpath "${cp_dirs%:}" samples.cljk "$out/xml")

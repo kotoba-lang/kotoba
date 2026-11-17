@@ -42,6 +42,7 @@ lib/kotoba.swift/conformance/check.sh
 | `results-20261118.json` | The summary of the first run below |
 | `results-20261118-after-awai-3228.json` | The summary after the `kotoba.swift` fixes |
 | `results-20261118-after-awai-3229.json` | The summary of the Python suite after its fixes |
+| `results-20261118-after-awai-3154.json` | The summary after adding the securities messages |
 
 This is a local evidence run, not a CI gate. The monorepo CI runs the native
 qualification jobs only and does not run library tests; adding a job for this
@@ -163,6 +164,30 @@ elements; the property tests no longer leave `ChrgBr` unset.
 | head.001.001.02 | 2 | 2 |
 | Envelope (AppHdr + Document) | 2 | not checked: no public XSD pinned |
 
+### Securities messages (AWAI-3154)
+
+`kotoba.swift.securities` builds, reads and validates sese.023.001.09
+(settlement instruction), sese.024.001.10 (status advice), sese.025.001.09
+(settlement confirmation) and semt.002.001.10 (custody statement). Their four
+XSDs are pinned in `xsd-pins.edn`; `samples.cljk` emits six documents
+(against-payment receipt, free delivery, confirmation, positive and negative
+status, a two-balance statement). All six validate against the pinned XSDs
+(`results-20261118-after-awai-3154.json`), and the earlier pain.001/pacs.008
+samples and the Python suite still validate.
+
+The validator engine now looks rules up by path suffix as well as by tag, so
+one message can give the same tag different rules (semt.002's three nested
+`Qty`, a `Dt` that is a date or a date choice). ISINs are checked for shape
+and ISO 6166 check digit (`kotoba.securities.isin`).
+
+No public sese/semt sample messages were used: the published usage samples
+(SMPG, CBPR+-style MyStandards guidelines) are subject to ADR 0042 O3. The
+samples are this library's own, validated against the public XSDs.
+
+`kotoba.swift.mt5xx` builds and reads MT540-MT548 and checks the modeled
+sequence layout and field formats. That is **not** checked against the SWIFT
+Standards MT and is not named L1 (ADR 0042 O3); see its namespace docstring.
+
 ## MT103 ↔ pacs.008.001.08 mapping (`kotoba.swift`)
 
 The library has no conversion function between MT and MX. This table compares
@@ -197,7 +222,7 @@ where data would be lost.
 - The `Envelope` documents built by `build_business_message`, which wrap
   `AppHdr` and `Document`. No public XSD for the wrapper is pinned.
 - Messages the libraries do not build (pacs.009, camt.053 variants beyond the
-  test suite, securities messages; the latter are AWAI-3154).
+  test suite, other sese/semt versions and elements outside the modeled subset).
 - CI. The monorepo CI runs native qualification jobs only. Running this
   check in CI would need a separate oracle job (Python and xmllint); whether
   to add one is an owner decision.

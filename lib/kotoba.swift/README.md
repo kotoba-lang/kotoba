@@ -146,6 +146,18 @@ for a document it rejects. The emitted samples validate against the
 published XSDs (`conformance/README.md`). Level L1 (syntax) only: usage
 guidelines such as CBPR+ and acceptance by a bank are not checked.
 
+### Securities settlement (AWAI-3154)
+
+`kotoba.swift.securities` builds, reads and validates ISO 20022
+sese.023.001.09, sese.024.001.10, sese.025.001.09 and semt.002.001.10 for a
+modeled subset (one ISIN, unit quantity, safekeeping account, transaction
+type, counterparty place of settlement and agent, settlement amount; status
+without reason codes; one statement page). The emitted samples validate
+against the published XSDs (`conformance/README.md`). `kotoba.swift.mt5xx`
+builds and reads MT540-MT548 records for `mt->wire` / `parse-mt-wire` and
+checks the modeled sequence and field layout; it is not checked against the
+SWIFT Standards MT and is not an L1 claim (network-awai-apex ADR 0042 O3).
+
 ## Operator console (UI/UX)
 
 A read-only HTML dashboard renders BIC validation, the **real MT wire
