@@ -137,6 +137,15 @@ for the full source list against each specific field/element claim.
 (iso/validate-iso20022 doc)                       ; => {:swift/valid? true :swift/message-type "pain.001.001.09"}
 ```
 
+`xml->str` emits compact XML: each value sits directly between its tags,
+because the XSD simple types reject surrounding whitespace.
+`validate-iso20022` checks the XSD constraints of the element subset this
+library models and returns `{:swift/valid? false :swift/error
+:schema-violation :swift/errors [...]}` otherwise; the builders return nil
+for a document it rejects. The emitted samples validate against the
+published XSDs (`conformance/README.md`). Level L1 (syntax) only: usage
+guidelines such as CBPR+ and acceptance by a bank are not checked.
+
 ## Operator console (UI/UX)
 
 A read-only HTML dashboard renders BIC validation, the **real MT wire

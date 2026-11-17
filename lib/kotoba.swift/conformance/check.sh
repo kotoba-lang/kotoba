@@ -22,6 +22,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 out="${1:-$repo/.agent-output/iso20022-conformance}"
 mkdir -p "$out/xsd" "$out/xml"
+# Absolute, because kbb runs from a temporary directory below.
+out="$(cd "$out" && pwd)"
 
 echo "# 1. pinned XSDs"
 grep -o '{:message "[^"]*" :url "[^"]*" :sha256 "[^"]*"}' "$here/xsd-pins.edn" |

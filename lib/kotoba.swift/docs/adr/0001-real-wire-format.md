@@ -146,9 +146,12 @@ validates only what was verified, rather than guessing at the rest.
   catalogue (no camt.05x statements, no pacs.002/004/009, etc.). Within
   those two, no `PstlAdr`, no ultimate debtor/creditor, no payment
   purpose/category-purpose codes, no structured remittance.
-- No XSD schema validation — `validate-iso20022` checks the structural
-  presence of the elements this library itself models, not conformance to
-  the real published XSD.
+- No XSD loading at run time. Since AWAI-3228 (2026-11-18),
+  `validate-iso20022` checks the XSD constraints of the element subset this
+  library models (sequence order, occurrence, value facets, `Ccy`) and
+  rejects elements outside that subset; it does not cover the rest of the
+  message definition. Conformance against the real, digest-pinned XSDs is
+  checked locally by `conformance/check.sh` (see `conformance/README.md`).
 - No connection to SWIFTNet, FIN, or any bank. This library never will
   connect to a live banking network from this codebase; that step requires
   a licensed financial institution.

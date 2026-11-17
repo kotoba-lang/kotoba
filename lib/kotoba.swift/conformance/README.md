@@ -9,9 +9,15 @@ emit against the public ISO 20022 XSDs (level **L1, syntax**). It records what
 was found. **Nothing was fixed in this change**; each mismatch below is a
 separate follow-up.
 
-**Result: neither library emits schema-valid documents for the messages it
-claims, except `head.001.001.02` (Python). No ISO 20022 message from these
-libraries may be described as L1-conformant yet.**
+**Result of the first run: neither library emitted schema-valid documents
+for the messages it claims, except `head.001.001.02` (Python).**
+
+**Update, AWAI-3228 (2026-11-18):** `kotoba.swift` findings K1 to K4 are
+fixed. Its four sample documents (single and multi-transaction pain.001.001.09
+and pacs.008.001.08) now validate against the pinned XSDs; see
+`results-20261118-after-awai-3228.json` and "Re-run after AWAI-3228" below.
+That is L1 for the element subset `kotoba.swift` emits, not for the whole
+message definition. The Python findings P1 to P6 are open (AWAI-3229).
 
 ## How to run
 
@@ -27,7 +33,8 @@ lib/kotoba.swift/conformance/check.sh
 | `samples.cljk` | Builds one pain.001.001.09 and one pacs.008.001.08 with `kotoba.swift.iso20022` |
 | `dump_plugin.py` | pytest plugin: records every document the Python codec builds while its own test suite runs |
 | `summarize.py` | Validates every recorded document with `xmllint --schema` and groups the errors |
-| `results-20261118.json` | The summary of the run below |
+| `results-20261118.json` | The summary of the first run below |
+| `results-20261118-after-awai-3228.json` | The summary after the `kotoba.swift` fixes |
 
 This is a local evidence run, not a CI gate. The monorepo CI runs the native
 qualification jobs only and does not run library tests; adding a job for this
@@ -65,8 +72,9 @@ with ordinary inputs.
 
 ## Findings — `kotoba.swift` (`lib/kotoba.swift/src/kotoba/swift/iso20022.cljk`)
 
-Both documents parse back to the same tree (`parse-xml` round-trip holds),
-and `validate-iso20022` accepts them, yet both fail the XSD.
+At the first run, both documents parsed back to the same tree (`parse-xml`
+round-trip held) and `validate-iso20022` accepted them, yet both failed the
+XSD. Fixed in AWAI-3228; see the re-run section below.
 
 | # | Message | Mismatch | Effect |
 |---|---|---|---|
@@ -78,6 +86,31 @@ and `validate-iso20022` accepts them, yet both fail the XSD.
 With whitespace removed and K2 and K3 corrected by hand, both sample
 documents validated against their XSDs. No other mismatch was found for the
 element subset these builders emit.
+
+### Re-run after AWAI-3228
+
+| Change | Where |
+|---|---|
+| K1: `xml->str` uses `xml.core/compact`, which inserts no whitespace. `parse-xml` keeps value text byte for byte (whitespace-only text between elements is still dropped), so a padded value is no longer silently repaired | `iso20022.cljk` |
+| K2: `ReqdExctnDt` holds a `Dt` child | `pain001-tree` |
+| K3: `CdtTrfTxInf` emits `Dbtr`, `DbtrAcct`, `DbtrAgt`, `CdtrAgt` in XSD order | `pacs008-tree` |
+| K4: `validate-iso20022` checks element order and occurrence, value facets (calendar dates, codes, counts, decimal digits, BIC, IBAN, UETR, Ccy) and rejects elements outside the modeled subset. It returns `:schema-violation` with a list of errors. `pain001-doc` and `pacs008-doc` return nil for a document it rejects | `validate-iso20022` |
+
+Same XSD digests and tools as above. Unit tests: 62 tests, 235 assertions,
+0 failures (`kotoba.swift-test`, `kotoba.swift.iso20022-test`,
+`kotoba.swift.export-test`, `kotoba.swift.ui-test`, kbb SCI backend).
+
+| `kotoba.swift` sample | XSD |
+|---|---|
+| pain.001.001.09, one transaction | valid |
+| pain.001.001.09, two transactions, JPY with 0 decimals, escaped name, leap day | valid |
+| pacs.008.001.08, one transaction | valid |
+| pacs.008.001.08, two transactions, DEBT and CRED, CLRG | valid |
+
+`validate-iso20022` covers only the element subset the builders emit. A
+document that is valid by the real XSD but uses other elements (for example
+`PstlAdr`, `Purp`, `IntrBkSttlmDt`) is rejected, and its value checks do not
+accept a leading `+` or a decimal without an integer digit.
 
 ## Findings — `kotoba.kotobaIso20022` (Python)
 
