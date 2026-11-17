@@ -65,3 +65,33 @@ expiry, OS foreground-service timeout or host failure. This is not guaranteed
 indefinite/background execution. Provider-side approval and sender-side approval
 remain independent; a sender does not grant remote storage. Receipt signatures
 are transport observations, not account/PQ/publication authority.
+
+## AWAI-3059 nearby discovery profile
+
+`transport: nearby` declares the separate discovery profile for reaching a
+device before its identity or address is known (first pairing on a LAN, over
+Bluetooth or Wi-Fi). Required keys: `transport`, `action`, `bearers`,
+`max-request-bytes`, `max-response-bytes`, `timeout-ms`. `action` is
+`advertise`, `browse`, `connect` or `send`. `bearers` is a non-empty, unique
+subset of `nsd`, `ble`, `wifi-direct` and `wifi-aware`; Google Nearby
+Connections is not a bearer. The endpoint carries no PeerID, address or origin.
+Budgets are 1 byte to 1 MiB; the deadline is at most 120 seconds, the longest an
+Awai pairing screen announces.
+
+The payload is plain JSON with exactly one declared `bearer`. `connect` and
+`send` add a `peer` token from this session's discovery (8–64 lowercase letters
+or digits, never an address); only `send` adds `data`. Any other key, an
+undeclared bearer or a malformed token is refused before the modal. The modal
+shows the action, bearer, peer, limits and data categories and asks again for
+every invocation. Nearby operations share the `peerAdapters` capture, deadline,
+abort signal and response budget of the libp2p path, and never enter
+`connect-src`.
+
+The host adapter owns discovery, radios and sockets. It must map a peer token
+only to a device it discovered in the current session, keep connections on
+link-local, private (RFC 1918 / ULA) or P2P/BLE group addresses, stop
+advertising, browsing or connecting when the signal aborts, and not expose
+stable device identifiers in what it advertises. Discovery is not identity: the
+app must still authenticate the device by its own pairing (for example a
+confirmation code compared on both screens and a signed link). After pairing, a
+known device can be declared as an explicit `libp2p` peer instead.
