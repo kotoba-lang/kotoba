@@ -1,0 +1,95 @@
+(ns kotoba.swift.securities-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.swift.iso20022 :as iso]
+            [kotoba.swift.securities :as s]))
+
+;; Fictional accounts and references; the ISINs and BICs are published identifiers.
+(def instruction
+  {:tx-id "AWAI-SEC-0001" :direction :receive :payment-type :against-payment :settlement-date "2026-11-20"
+   :isin "US0378331005" :description "Example equity" :quantity "100" :safekeeping-account "SAFE-0001"
+   :transaction-type "TRAD" :place-of-settlement "DTCYUS33XXX" :agent "CHASUS33XXX"
+   :amount {:currency "USD" :value "18950.00"}})
+
+(def confirmation
+  (-> instruction (dissoc :tx-id :settlement-date)
+      (assoc :account-owner-tx-id "AWAI-SEC-0001" :account-servicer-tx-id "SVCR-0001"
+             :effective-settlement-date "2026-11-20")))
+
+(def advice {:account-owner-tx-id "AWAI-SEC-0001" :processing :acknowledged :matching :matched :settlement :pending})
+
+(def statement
+  {:statement-date "2026-11-20" :frequency "DAIL" :update-type "COMP" :basis "SETT" :activity? true
+   :safekeeping-account "SAFE-0001"
+   :balances [{:isin "US0378331005" :quantity "100" :short? false} {:isin "JP3633400001" :quantity "2.5" :short? true}]})
+
+(defn- round-trip [doc] (iso/parse-xml (iso/xml->str doc)))
+
+(deftest build-read-round-trip-test
+  (doseq [[label build data message] [["sese.023" s/settlement-instruction instruction "sese.023.001.09"]
+                                       ["sese.025" s/settlement-confirmation confirmation "sese.025.001.09"]
+                                       ["sese.024" s/status-advice advice "sese.024.001.10"]
+                                       ["semt.002" s/custody-statement statement "semt.002.001.10"]]]
+    (testing label
+      (let [doc (build data)]
+        (is (vector? doc))
+        (is (= {:swift/valid? true :swift/message-type message} (s/validate doc)))
+        (is (= doc (round-trip doc)) "parse-xml(xml->str doc) = doc")
+        (is (= {:message message :data data} (s/read-message (round-trip doc))) "reading gives the builder's data back")))))
+
+(deftest variants-test
+  (testing "free of payment carries no amount, and a delivery uses the receiving side"
+    (let [d (s/settlement-instruction (-> instruction (assoc :direction :deliver :payment-type :free) (dissoc :amount)))
+          body (iso/xml-find d :SctiesSttlmTxInstr)]
+      (is (iso/xml-find body :RcvgSttlmPties))
+      (is (nil? (iso/xml-find body :DlvrgSttlmPties)))
+      (is (nil? (iso/xml-find body :SttlmAmt)))))
+  (testing "receiving against payment debits cash, delivering credits it"
+    (is (str/includes? (iso/xml->str (s/settlement-instruction instruction)) "<CdtDbtInd>DBIT</CdtDbtInd>"))
+    (is (str/includes? (iso/xml->str (s/settlement-instruction (assoc instruction :direction :deliver))) "<CdtDbtInd>CRDT</CdtDbtInd>")))
+  (testing "a matched status has no reason element"
+    (is (str/includes? (iso/xml->str (s/status-advice advice)) "<MtchgSts><Mtchd/></MtchgSts>")))
+  (testing "a single status is enough"
+    (is (s/status-advice {:account-owner-tx-id "X" :settlement :failing}))))
+
+(deftest builders-refuse-bad-input-test
+  (doseq [[label doc] [["bad ISIN check digit" (s/settlement-instruction (assoc instruction :isin "US0378331006"))]
+                       ["zero quantity" (s/settlement-instruction (assoc instruction :quantity "0"))]
+                       ["negative quantity" (s/settlement-instruction (assoc instruction :quantity "-1"))]
+                       ["amount on a free settlement" (s/settlement-instruction (assoc instruction :payment-type :free))]
+                       ["no amount against payment" (s/settlement-instruction (dissoc instruction :amount))]
+                       ["unknown transaction type" (s/settlement-instruction (assoc instruction :transaction-type "XXXX"))]
+                       ["impossible date" (s/settlement-instruction (assoc instruction :settlement-date "2026-02-30"))]
+                       ["36-character TxId" (s/settlement-instruction (assoc instruction :tx-id (apply str (repeat 36 "T"))))]
+                       ["bad BIC" (s/settlement-instruction (assoc instruction :agent "CHASE"))]
+                       ["no status" (s/status-advice {:account-owner-tx-id "X"})]
+                       ["unknown status" (s/status-advice {:account-owner-tx-id "X" :processing :maybe})]
+                       ["bad frequency" (s/custody-statement (assoc statement :frequency "HOUR"))]
+                       ["bad balance ISIN" (s/custody-statement (assoc-in statement [:balances 0 :isin] "XX"))]]]
+    (testing label (is (nil? doc)))))
+
+(defn- kinds [r] (set (map (juxt :error :tag) (:swift/errors r))))
+
+(deftest validate-rejects-what-the-xsd-rejects-test
+  (let [xml (iso/xml->str (s/settlement-instruction instruction))
+        bad (fn [from to] (s/validate (iso/parse-xml (str/replace xml from to))))]
+    (testing "element order"
+      (let [qty (re-find #"<QtyAndAcctDtls>.*?</QtyAndAcctDtls>" xml)
+            r (s/validate (iso/parse-xml (-> xml (str/replace qty "") (str/replace "<FinInstrmId>" (str qty "<FinInstrmId>")))))]
+        (is (contains? (kinds r) [:out-of-order-element :FinInstrmId]))))
+    (testing "values"
+      (is (false? (:swift/valid? (bad "<ISIN>US0378331005</ISIN>" "<ISIN>US0378331006</ISIN>"))))
+      (is (false? (:swift/valid? (bad "<Cd>TRAD</Cd>" "<Cd>XXXX</Cd>"))))
+      (is (false? (:swift/valid? (bad "<Unit>100</Unit>" "<Unit>\n100\n</Unit>"))) "whitespace in a value")
+      (is (false? (:swift/valid? (bad "Ccy=\"USD\"" "Ccy=\"usd\"")))))
+    (testing "unmodeled and missing elements"
+      (is (contains? (kinds (bad "<SttlmParams>" "<FinInstrmAttrbts/><SttlmParams>")) [:unexpected-element :FinInstrmAttrbts]))
+      (is (contains? (kinds (bad #"<SfkpgAcct>.*?</SfkpgAcct>" "")) [:missing-element :SfkpgAcct])))
+    (testing "path-specific rules: a Dt that should be a choice cannot hold a date"
+      (is (false? (:swift/valid? (bad "<SttlmDt><Dt><Dt>2026-11-20</Dt></Dt></SttlmDt>" "<SttlmDt><Dt>2026-11-20</Dt></SttlmDt>")))))
+    (testing "semt.002 nested Qty levels"
+      (let [x (iso/xml->str (s/custody-statement statement))]
+        (is (false? (:swift/valid? (s/validate (iso/parse-xml (str/replace x "<Qty><Qty><Qty><Unit>100</Unit></Qty></Qty></Qty>" "<Qty><Qty><Unit>100</Unit></Qty></Qty>"))))))))
+    (testing "other documents"
+      (is (= :unsupported-namespace (:swift/error (s/validate [:Document {:xmlns "urn:iso:std:iso:20022:tech:xsd:sese.023.001.11"}]))))
+      (is (= :not-xml (:swift/error (s/validate "x")))))))
