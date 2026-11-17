@@ -21,12 +21,14 @@ from kotoba_iso20022 import (
 )
 from kotoba_iso20022.bah import DEFAULT_BAH_VERSION
 from kotoba_iso20022.model import (
+    Agent,
     Amount,
     BusinessApplicationHeader,
     CreditTransferTransaction,
     FIToFICustomerCreditTransfer,
     GroupHeader,
     OriginalPaymentStatus,
+    Party,
     TransactionStatus,
 )
 
@@ -44,7 +46,9 @@ def _bah(msgdef: str = "pacs.008.001.08") -> BusinessApplicationHeader:
 
 def _pacs008_xml() -> str:
     tx = CreditTransferTransaction(
-        end_to_end_id="E2E-0001", interbank_amount=Amount(Decimal("1000.00"), "EUR")
+        end_to_end_id="E2E-0001", interbank_amount=Amount(Decimal("1000.00"), "EUR"),
+        charge_bearer="SHAR", debtor=Party("A"), debtor_agent=Agent(bicfi="DEUTDEFF"),
+        creditor=Party("B"), creditor_agent=Agent(bicfi="NWBKGB2L"),
     )
     msg = FIToFICustomerCreditTransfer(
         group_header=GroupHeader("M", "2026-06-08T09:30:00Z", 1, settlement_method="CLRG"),

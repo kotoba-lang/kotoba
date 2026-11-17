@@ -149,6 +149,8 @@ class TestPacs008:
         tx = CreditTransferTransaction(
             end_to_end_id="E2E-JPY",
             interbank_amount=Amount(Decimal("500000"), "JPY"),
+            charge_bearer="SHAR", debtor=Party("A"), debtor_agent=Agent(bicfi="DEUTDEFF"),
+            creditor=Party("B"), creditor_agent=Agent(bicfi="NWBKGB2L"),
         )
         msg = FIToFICustomerCreditTransfer(
             group_header=_group_header(pacs=True), transactions=(tx,)
