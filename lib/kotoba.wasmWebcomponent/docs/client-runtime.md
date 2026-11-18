@@ -85,6 +85,30 @@ validates the descriptor. The installer establishes pins independently of
 guest assertions. Ephemeral fixture keys are not production trust roots.
 Model download consent never grants remote inference.
 
+An in-memory artifact is limited to 512 MiB, because its whole body is held as one
+snapshot before the digest. A model file is larger, so an artifact may instead declare
+`delivery: 'host-stream'` (AWAI-3307), with `max-bytes` up to 64 GiB.
+
+- **Host sink:** the trusted host supplies `artifactSinks[service][operation]` when it creates
+  the broker. The sink is captured at creation, like browser adapters. An operation without a
+  sink is refused before consent and before any request.
+- **Consent:** the dialog adds the artifact revision, SHA-256, byte budget and delivery.
+  Denial sends nothing.
+- **Streaming:** after the final response origin passes the declared redirect origins, the
+  broker reads the body chunk by chunk:
+  - it hashes it incrementally (`createSha256`, FIPS 180-4; WebCrypto has no streaming digest);
+  - it enforces the byte budget and a 60-second idle deadline;
+  - it gives the sink byte copies through `write`.
+- **Outcome:** only an exact digest match calls `close({sha256, bytes, revision})`. Its plain-data
+  result is returned with `verified: true`. A mismatch, overrun, idle timeout, cancellation or read
+  error calls `abort(reason)` and never `close`.
+- **The host's own duty:** the host must discard aborted bytes and admit the file only after `close`.
+  `verifyClientArtifact` refuses a host-stream declaration.
+
+`test/browser/verify-artifact-stream.mjs` qualifies this path in a real headless Chromium. The
+artifact host and its CDN redirect are faked with the DevTools Fetch domain, and consent is answered
+with trusted input.
+
 `mountRestrictedClientApp` accepts only branded verified self-contained HTML,
 uses an opaque-origin `sandbox="allow-scripts"` iframe, restricting child CSP
 and a MessageChannel. Eligibility / handlers stay in the trusted host.
