@@ -152,3 +152,8 @@ Real provider APIs, live redirect delivery, product builders, publisher pin
 distribution, complete static headers, production browser consent, node / Cell
 execution and deployment remain separate acceptance gates. No production route
 cutover or stopping of an existing service is authorized by these fixtures.
+
+## Proposals
+
+- [Bounded batch consent](client-runtime-batch-consent-proposal.md) (AWAI-3276): one consent for a bounded set of
+  requests of one operation. Proposal only; not implemented, with open owner decisions.
