@@ -1,0 +1,144 @@
+#!/usr/bin/env kbb
+;; G1 evidence for network-awai-apex ADR 0044 (D3): bonsai <-> standard git.
+;;
+;;   A. bonsai writes loose objects and a ref into a fresh `git init` repo;
+;;      the real `git` must `fsck --strict` it, read it, clone it over the
+;;      pack protocol (`--no-local`) and fetch a second bonsai commit.
+;;   B. the real `git` makes a commit; bonsai must decode every loose object,
+;;      recompute each OID, and decode the commit and tree bodies. After
+;;      `git gc` bonsai must decode the pack and find the same OIDs.
+;;
+;; Run on the portable host from lib/kotoba.bonsai:
+;;   kbb --backend sci --classpath "src:test:<deps>" test/g1_git_roundtrip.cljk
+;; It prints one EDN result map and exits 1 when any check fails. It writes
+;; only under a fresh temporary directory.
+(require '["node:child_process" :as cp]
+         '["node:fs" :as fs]
+         '["node:os" :as os]
+         '["node:path" :as path]
+         '[bonsai.git-codec :as codec]
+         '[bonsai.git-object :as gobj]
+         '[bonsai.loose-object :as loose]
+         '[bonsai.pack :as pack]
+         '[clojure.string :as str])
+
+(def checks (atom []))
+
+(defn check! [label ok & [detail]]
+  (swap! checks conj (cond-> {:check label :ok (boolean ok)} detail (assoc :detail detail)))
+  ok)
+
+(def env (js/Object.assign #js {} (.-env js/process)
+                           #js {"GIT_AUTHOR_DATE" "1700000000 +0000"
+                                "GIT_COMMITTER_DATE" "1700000000 +0000"
+                                "GIT_CONFIG_NOSYSTEM" "1"
+                                "GIT_CONFIG_GLOBAL" "/dev/null"
+                                "HOME" (.tmpdir os)}))
+
+(defn git [dir & args]
+  (str/trim (str (cp/execFileSync "git" (clj->js (concat ["-C" dir] args))
+                                  #js {:env env :encoding "utf8"
+                                       :stdio #js ["pipe" "pipe" "pipe"]}))))
+
+(defn git-ok? [dir & args]
+  (try (apply git dir args) true (catch :default _ false)))
+
+(defn utf8 [s] (.encode (js/TextEncoder.) s))
+
+(defn write-loose! [repo type body]
+  (let [file (loose/encode type body)
+        oid (gobj/object-oid type body)
+        dir (path/join repo ".git" "objects" (subs oid 0 2))]
+    (fs/mkdirSync dir #js {:recursive true})
+    (fs/writeFileSync (path/join dir (subs oid 2)) file)
+    oid))
+
+(def ident "Bonsai Test <bonsai@example.invalid> 1700000000 +0000")
+
+(defn bonsai-commit! [repo text parents message]
+  (let [blob (write-loose! repo "blob" (utf8 text))
+        tree (write-loose! repo "tree" (codec/encode-tree [{:mode "100644" :name "README" :oid blob}]))]
+    (write-loose! repo "commit" (codec/encode-commit {:tree tree :parents parents
+                                                      :author ident :committer ident
+                                                      :message message}))))
+
+(def tmp (fs/mkdtempSync (path/join (.tmpdir os) "bonsai-g1-")))
+
+;; --- A. bonsai -> git -------------------------------------------------------
+
+(let [src (path/join tmp "a-src")
+      clone (path/join tmp "a-clone")]
+  (fs/mkdirSync src)
+  (git src "init" "-q" "-b" "main")
+  (let [c1 (bonsai-commit! src "hello from bonsai\n" [] "first\n")]
+    (fs/writeFileSync (path/join src ".git" "refs" "heads" "main") (str c1 "\n"))
+    (check! :a/fsck-strict (git-ok? src "fsck" "--strict" "--no-dangling"))
+    (check! :a/rev-parse-matches (= c1 (git src "rev-parse" "HEAD")) {:bonsai c1})
+    (check! :a/cat-file-reads-blob (= "hello from bonsai" (git src "show" "HEAD:README")))
+    (git tmp "clone" "-q" "--no-local" src clone)
+    (check! :a/clone-no-local (= c1 (git clone "rev-parse" "HEAD")))
+    (check! :a/clone-fsck (git-ok? clone "fsck" "--strict"))
+    (let [c2 (bonsai-commit! src "second version\n" [c1] "second\n")]
+      (fs/writeFileSync (path/join src ".git" "refs" "heads" "main") (str c2 "\n"))
+      (check! :a/fsck-after-second (git-ok? src "fsck" "--strict" "--no-dangling"))
+      (git clone "fetch" "-q" "origin")
+      (check! :a/fetch-gets-second (= c2 (git clone "rev-parse" "origin/main")) {:bonsai c2})
+      (check! :a/parent-link (= c1 (git clone "rev-parse" "origin/main^"))))))
+
+;; --- B. git -> bonsai -------------------------------------------------------
+
+(defn loose-files [repo]
+  (let [root (path/join repo ".git" "objects")]
+    (for [d (js->clj (fs/readdirSync root))
+          :when (re-matches #"[0-9a-f]{2}" d)
+          f (js->clj (fs/readdirSync (path/join root d)))]
+      {:oid (str d f) :bytes (fs/readFileSync (path/join root d f))})))
+
+(let [repo (path/join tmp "b-git")]
+  (fs/mkdirSync repo)
+  (git repo "init" "-q" "-b" "main")
+  (fs/writeFileSync (path/join repo "a.txt") "alpha\n")
+  (fs/mkdirSync (path/join repo "dir"))
+  (fs/writeFileSync (path/join repo "dir" "b.txt") "beta\n")
+  (git repo "add" "-A")
+  (git repo "-c" "user.name=Git Test" "-c" "user.email=git@example.invalid"
+       "commit" "-q" "-m" "made by git")
+  (let [head (git repo "rev-parse" "HEAD")
+        tree (git repo "rev-parse" "HEAD^{tree}")
+        objs (loose-files repo)
+        decoded (map (fn [{:keys [oid bytes]}]
+                       (let [d (loose/decode (js/Uint8Array. bytes))]
+                         {:path-oid oid :oid (:oid d) :type (:type d) :body (:body d)}))
+                     objs)
+        by-oid (into {} (map (juxt :oid identity) decoded))]
+    (check! :b/all-loose-oids-recompute (every? #(= (:path-oid %) (:oid %)) decoded)
+            {:objects (count decoded)})
+    (let [c (codec/decode-commit (:body (by-oid head)))]
+      (check! :b/commit-decodes (= tree (:tree c)) {:head head})
+      (check! :b/commit-message (= "made by git\n" (:message c))))
+    (let [entries (codec/decode-tree (:body (by-oid tree)))]
+      (check! :b/tree-decodes (= ["a.txt" "dir"] (mapv :name entries)))
+      (check! :b/tree-reencodes-byte-exact
+              (= tree (gobj/object-oid "tree" (codec/encode-tree entries)))))
+    ;; pack the same objects with real git and decode the pack with bonsai
+    (git repo "gc" "-q" "--aggressive" "--prune=now")
+    (let [pack-dir (path/join repo ".git" "objects" "pack")
+          pack-file (first (filter #(str/ends-with? % ".pack") (js->clj (fs/readdirSync pack-dir))))
+          bytes (js/Uint8Array. (fs/readFileSync (path/join pack-dir pack-file)))
+          result (try (pack/decode bytes) (catch :default e {:error (ex-message e)}))
+          oids (cond
+                 (:error result) #{}
+                 (map? result) (set (map :oid (or (:objects result) (vals result))))
+                 :else (set (map :oid result)))]
+      (check! :b/pack-decodes (not (:error result)) (select-keys result [:error]))
+      (check! :b/pack-has-all-objects (= (set (keys by-oid)) oids)
+              {:expected (count by-oid) :got (count oids)}))))
+
+(def result {:git-version (git tmp "--version")
+             :node (.-version js/process)
+             :tmp tmp
+             :checks @checks
+             :pass (every? :ok @checks)})
+
+(prn result)
+(when-not (:pass result) (set! (.-exitCode js/process) 1))
