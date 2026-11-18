@@ -72,6 +72,19 @@ permission does not approve a subsequent service request. The fixture's local
 counter handler is not a PushManager implementation or permission test.
 Do not represent local node control using a fake HTTPS origin.
 
+A hand-off whose receiver the user picks in the operating system, such as a
+share sheet, has no service origin. It uses `endpoint: {'browser-action':
+'share/text', recipient: 'user-selected-app'}` (AWAI-3336). `recipient` has only
+that one value, and no origin is fabricated. Everything else is the same as a
+browser-native service effect: the operation names its service, operation and
+data categories, needs `each-operation` consent and a host adapter, takes plain
+bounded JSON copied before the modal, and never enters connect-src. The consent
+dialog says that the receiving app is chosen by the user and handles the data
+under its own rules. The host adapter only opens the system picker with the
+approved payload: it must not pick, prefill or remember a receiver. Choosing an
+app in that picker is the user's own step and is not a second approval by this
+runtime.
+
 ## Artifact admission and guest boundary
 
 `artifact: {revision: '<40 lowercase hex Git SHA>', sha256: '<64 lowercase hex>',
