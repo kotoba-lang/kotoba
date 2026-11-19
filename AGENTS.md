@@ -67,6 +67,13 @@ reported, not forced to agree.
   was withdrawn on 2026-11-17; this repository's CDCI above stays native-only by
   its own rule. The oracle languages that do not read `.cljc` (C,
   Python, Fennel) run on a developer machine, one-off.
+- Basilisp outside the oracle role (owner decision 2026-11-19, JUN-974; canonical text in
+  `com-junkawasaki/root/AGENTS.md`, CDCI section): Basilisp may run `.cljc` scripts as hosted CI tooling in any
+  job, including native-workflow check, gate-support and diagnostic scripts. Such a script may orchestrate or
+  inspect but must not replace a native check; artifacts and gate verdicts are still produced and verified by
+  Kotoba / Amu native tools. Basilisp is not part of the native compile, build, packaging or runtime closure, and
+  a native result must not silently fall back to it. A Basilisp job is not a required check until the owner
+  decides. No other language's rules change.
 - CLJK stays as a reference oracle source and is treated as CLJC-equivalent
   for oracle runs: `#?(:kotoba …)` selects the Kotoba branch, `#?@` is not
   read, and an oracle is handed the source as `.cljc`. The route stays
