@@ -1,0 +1,235 @@
+(ns nekko.cob-test
+  (:require [kotoba.test :refer [deftest is]]
+            [nekko.bytes :as nb]
+            [ed25519.core :as ed]
+            [nekko.cob :as cob]
+            [nekko.sigref :as sigref]))
+
+(defn- seed [n] (nb/->ba (map #(mod (+ % n) 256) (range 32))))
+
+(def owner-seed (seed 0))
+(def alice-seed (seed 11))
+(def bob-seed (seed 23))
+(def owner (ed/did-key-from-seed owner-seed))
+(def alice (ed/did-key-from-seed alice-seed))
+(def bob (ed/did-key-from-seed bob-seed))
+
+(def rid "rid-test")
+(def ctx {:rid rid :delegates #{owner}})
+
+(defn- new-store []
+  (let [store (atom {})]
+    {:store store
+     :put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))}))
+
+(defn- open-issue [put! signer title]
+  (cob/create! put! signer {:type cob/issue-type :rid rid :ts 1
+                            :actions [{"type" "open" "title" title "body" "steps"}]}))
+
+(defn- add [put! signer id parents ts actions & [type]]
+  (cob/append! put! signer {:type (or type cob/issue-type) :rid rid :cob id
+                            :parents parents :actions actions :ts ts}))
+
+(defn- reasons [result] (mapv :reason (:rejected result)))
+
+;; --- changes ---------------------------------------------------------------
+
+(deftest signed-change-verifies-and-tampering-fails
+  (let [c (cob/sign-change alice-seed {:type cob/issue-type :rid rid :parents []
+                                       :actions [{"type" "open" "title" "t"}] :ts 1})]
+    (is (true? (cob/change-valid? c)))
+    (is (false? (cob/change-valid? (assoc c "rid" "other"))))
+    (is (false? (cob/change-valid? (assoc c "actions" [{"type" "open" "title" "x"}]))))
+    (is (false? (cob/change-valid? (assoc c "signer" bob))))
+    (is (false? (cob/change-valid? (dissoc c "sig"))))))
+
+(deftest root-must-open
+  (let [{:keys [put!]} (new-store)]
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (cob/create! put! alice-seed {:type cob/issue-type :rid rid :ts 1
+                                               :actions [{"type" "comment" "body" "x"}]})))
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (cob/create! put! alice-seed {:type "unknown/1" :rid rid :ts 1
+                                               :actions [{"type" "open" "title" "x"}]})))))
+
+;; --- issues ----------------------------------------------------------------
+
+(deftest issue-open-comment-label-close
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "crash on start")
+        c1 (add put! bob-seed id [id] 2 [{"type" "comment" "body" "same here"}])
+        c2 (add put! alice-seed id [c1] 3 [{"type" "comment" "body" "thanks" "reply-to" c1}])
+        c3 (add put! owner-seed id [c2] 4 [{"type" "label" "add" ["bug" "p1"]}
+                                           {"type" "state" "state" "closed"}])
+        {:keys [type state applied rejected]} (cob/fold get-fn ctx id [c3])]
+    (is (= cob/issue-type type))
+    (is (= [id c1 c2 c3] applied))
+    (is (= [] rejected))
+    (is (= "crash on start" (get state "title")))
+    (is (= alice (get state "author")))
+    (is (= "closed" (get state "state")))
+    (is (= ["bug" "p1"] (get state "labels")))
+    (is (= [bob alice] (mapv #(get % "author") (get state "comments"))))
+    (is (= c1 (get-in state ["comments" 1 "reply-to"])))))
+
+(deftest non-maintainer-cannot-close-or-label
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        c1 (add put! bob-seed id [id] 2 [{"type" "state" "state" "closed"}])
+        c2 (add put! bob-seed id [id] 2 [{"type" "label" "add" ["wontfix"]}])
+        c3 (add put! alice-seed id [id] 3 [{"type" "edit" "title" "better title"}])
+        result (cob/fold get-fn ctx id [c1 c2 c3])]
+    (is (= "open" (get-in result [:state "state"])))
+    (is (= [] (get-in result [:state "labels"])))
+    (is (= "better title" (get-in result [:state "title"])))
+    (is (= #{:unauthorized} (set (reasons result))))
+    (is (= 2 (count (:rejected result))))))
+
+(deftest actions-in-one-change-are-atomic
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        ;; the comment is fine, the label is not: neither may apply
+        c1 (add put! bob-seed id [id] 2 [{"type" "comment" "body" "hi"}
+                                         {"type" "label" "add" ["x"]}])
+        result (cob/fold get-fn ctx id [c1])]
+    (is (= [] (get-in result [:state "comments"])))
+    (is (= [{:cid c1 :reason :unauthorized}] (:rejected result)))))
+
+(deftest rejected-change-rejects-descendants
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        bad (add put! bob-seed id [id] 2 [{"type" "state" "state" "closed"}])
+        child (add put! bob-seed id [bad] 3 [{"type" "comment" "body" "after"}])
+        result (cob/fold get-fn ctx id [child])]
+    (is (= [:unauthorized :parent-rejected] (reasons result)))
+    (is (= [id] (:applied result)))))
+
+(deftest forged-change-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        ;; bob signs, then claims to be the owner without re-signing
+        forged (-> (cob/sign-change bob-seed {:type cob/issue-type :rid rid :cob id :parents [id]
+                                              :actions [{"type" "state" "state" "closed"}] :ts 2})
+                   (assoc "signer" owner))
+        fcid (cob/put-change! put! forged)
+        result (cob/fold get-fn ctx id [fcid])]
+    (is (= "open" (get-in result [:state "state"])))
+    (is (= [{:cid fcid :reason :invalid-signature-or-shape}] (:rejected result)))))
+
+(deftest change-for-another-rid-or-object-is-rejected
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        other (open-issue put! alice-seed "other")
+        wrong-rid (cob/append! put! bob-seed {:type cob/issue-type :rid "rid-other" :cob id
+                                              :parents [id] :ts 2
+                                              :actions [{"type" "comment" "body" "x"}]})
+        wrong-obj (cob/append! put! bob-seed {:type cob/issue-type :rid rid :cob other
+                                              :parents [id] :ts 2
+                                              :actions [{"type" "comment" "body" "y"}]})
+        result (cob/fold get-fn ctx id [wrong-rid wrong-obj])]
+    (is (= #{:wrong-rid :wrong-object} (set (reasons result))))
+    (is (= [] (get-in result [:state "comments"])))))
+
+(deftest concurrent-changes-merge-deterministically
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        a (add put! alice-seed id [id] 2 [{"type" "comment" "body" "from alice"}])
+        b (add put! bob-seed id [id] 2 [{"type" "comment" "body" "from bob"}])
+        m (add put! owner-seed id [a b] 3 [{"type" "comment" "body" "merged view"}])
+        r1 (cob/fold get-fn ctx id [m])
+        r2 (cob/fold get-fn ctx id [a b])
+        r3 (cob/fold get-fn ctx id [b a])]
+    (is (= 3 (count (get-in r1 [:state "comments"]))))
+    (is (= (:state r2) (:state r3)))
+    (is (= (:applied r2) (:applied r3)))
+    (is (= (sort [a b]) (subvec (:applied r2) 1)))))
+
+(deftest missing-block-fails-closed
+  (let [{:keys [store put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        c1 (add put! bob-seed id [id] 2 [{"type" "comment" "body" "x"}])
+        c2 (add put! bob-seed id [c1] 3 [{"type" "comment" "body" "y"}])]
+    (swap! store dissoc c1)
+    (is (thrown? #?(:clj Exception :cljs :default) (cob/fold get-fn ctx id [c2])))))
+
+(deftest comment-reply-to-must-exist
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        c1 (add put! bob-seed id [id] 2 [{"type" "comment" "body" "x" "reply-to" "nope"}])]
+    (is (= [:unknown-reply-to] (reasons (cob/fold get-fn ctx id [c1]))))))
+
+;; --- patches and reviews ---------------------------------------------------
+
+(defn- open-patch [put!]
+  (cob/create! put! alice-seed {:type cob/patch-type :rid rid :ts 1
+                                :actions [{"type" "open" "title" "fix crash" "body" ""
+                                           "target" "refs/heads/main"
+                                           "base" "commit-base" "head" "commit-v1"}]}))
+
+(deftest patch-revise-review-merge
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-patch put!)
+        r2 (add put! alice-seed id [id] 2 [{"type" "revise" "base" "commit-base" "head" "commit-v2"}]
+                cob/patch-type)
+        rv (add put! bob-seed id [r2] 3 [{"type" "review" "revision" r2 "verdict" "accept"
+                                          "body" "lgtm"}] cob/patch-type)
+        mg (add put! owner-seed id [rv] 4 [{"type" "merge" "revision" r2 "commit" "commit-merged"}]
+                cob/patch-type)
+        {:keys [state rejected]} (cob/fold get-fn ctx id [mg])]
+    (is (= [] rejected))
+    (is (= "merged" (get state "state")))
+    (is (= [id r2] (mapv #(get % "id") (get state "revisions"))))
+    (is (= "commit-v2" (get-in state ["revisions" 1 "head"])))
+    (is (= "accept" (get-in state ["reviews" r2 bob "verdict"])))
+    (is (= {"revision" r2 "commit" "commit-merged" "by" owner "ts" 4} (get state "merge")))))
+
+(deftest only-author-revises-only-delegate-merges
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-patch put!)
+        rv (add put! bob-seed id [id] 2 [{"type" "revise" "base" "b" "head" "h"}] cob/patch-type)
+        mg (add put! alice-seed id [id] 2 [{"type" "merge" "revision" id "commit" "c"}]
+                cob/patch-type)
+        result (cob/fold get-fn ctx id [rv mg])]
+    (is (= "open" (get-in result [:state "state"])))
+    (is (= 1 (count (get-in result [:state "revisions"]))))
+    (is (= [:unauthorized :unauthorized] (reasons result)))))
+
+(deftest review-needs-known-revision-and-valid-verdict
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-patch put!)
+        r1 (add put! bob-seed id [id] 2 [{"type" "review" "revision" "nope" "verdict" "accept"}]
+                cob/patch-type)
+        r2 (add put! bob-seed id [id] 2 [{"type" "review" "revision" id "verdict" "maybe"}]
+                cob/patch-type)
+        result (cob/fold get-fn ctx id [r1 r2])]
+    (is (= #{:unknown-revision :invalid-verdict} (set (reasons result))))
+    (is (= {} (get-in result [:state "reviews"])))))
+
+(deftest merged-patch-cannot-be-reopened
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-patch put!)
+        mg (add put! owner-seed id [id] 2 [{"type" "merge" "revision" id "commit" "c"}]
+                cob/patch-type)
+        re (add put! alice-seed id [mg] 3 [{"type" "state" "state" "open"}] cob/patch-type)
+        result (cob/fold get-fn ctx id [re])]
+    (is (= "merged" (get-in result [:state "state"])))
+    (is (= [:already-merged] (reasons result)))))
+
+;; --- tips through sigrefs --------------------------------------------------
+
+(deftest tips-come-from-valid-sigrefs-for-the-object-ref
+  (let [{:keys [put! get-fn]} (new-store)
+        id (open-issue put! alice-seed "t")
+        a (add put! alice-seed id [id] 2 [{"type" "comment" "body" "a"}])
+        b (add put! bob-seed id [id] 2 [{"type" "comment" "body" "b"}])
+        sa (cob/sign-tip alice-seed rid cob/issue-type id a 10)
+        sb (cob/sign-tip bob-seed rid cob/issue-type id b 10)
+        stale-other-ref (sigref/sign bob-seed rid "refs/heads/main" "commit-x" 10)
+        tampered (assoc sb "commit" id)
+        all [sa sb stale-other-ref tampered]]
+    (is (= "refs/cobs/awai.cob.issue/1/" (subs (cob/cob-ref cob/issue-type id) 0 27)))
+    (is (= (vec (sort [a b])) (cob/tips rid cob/issue-type id all)))
+    (is (= [a] (cob/tips rid cob/issue-type id all #{alice})))
+    (is (= 2 (count (get-in (cob/fold get-fn ctx id (cob/tips rid cob/issue-type id all))
+                            [:state "comments"]))))))

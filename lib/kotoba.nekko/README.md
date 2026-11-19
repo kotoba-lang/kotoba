@@ -180,6 +180,17 @@ kotobase-peer`, superproject `90-docs/adr/`). `kotoba-git` is the sibling
   peer namespaces and delegate threshold. Canonical, unresolved, and split-
   quorum outcomes produce deterministic IPLD receipts containing every input
   event CID; network arrival order is never a tie-breaker.
+- **`nekko.cob`** — collaborative objects, the Radicle COB equivalent
+  (network-awai-apex ADR 0044). An issue (`awai.cob.issue/1`) or patch
+  (`awai.cob.patch/1`, with revisions and reviews) is a DAG of signed changes
+  stored as DAG-CBOR blocks; the root change CID is the object id. `fold`
+  replays the DAG in topological order (ties by CID), verifies every
+  signature, checks per-action authorization against the author and the
+  RID's delegates, and returns the state plus each rejected change and its
+  reason; a rejected change rejects its descendants. Peers publish tips with
+  `sign-tip` under `refs/cobs/<type>/<id>`. The mapping to Radicle (and what
+  does not match) is in `docs/r1-radicle-mapping.md`; Git round-trip evidence
+  for bonsai is in `docs/g1-git-roundtrip-20261118.md`.
 
 `kotoba-rad` only ever deals in plain CID strings for refs/commits (never a
 `kotoba-git` object directly), so the two repos stay decoupled — either can

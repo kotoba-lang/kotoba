@@ -1,0 +1,364 @@
+(ns nekko.cob
+  "Collaborative objects (issues, patches with reviews) for a nekko RID --
+   the Radicle COB equivalent named in network-awai-apex ADR 0044 (D2, D3).
+
+   A collaborative object is a DAG of signed changes. The root change opens
+   the object and its CID is the object id. Every later change names the
+   object id and the change CIDs it extends (`parents`), so concurrent
+   changes from different peers merge by having a later change list both as
+   parents. Each change carries one or more actions that apply atomically.
+
+   Changes are stored as DAG-CBOR blocks through the same storage port as
+   nekko.identity (`(put! cid bytes)` / `(get-fn cid) -> bytes`). Parents are
+   plain CID strings, not ipld Links, so folding never walks a kotoba.chain
+   and runs on the portable (sci) host.
+
+   `fold` replays the DAG in a deterministic topological order (ties broken
+   by CID string), verifies every signature, checks authorization per action
+   against the author and the RID's delegate set, and returns the folded
+   state plus every rejected change with its reason. A rejected change also
+   rejects its descendants, so a forged or unauthorized change cannot be
+   laundered by building on it.
+
+   A peer publishes the tip it has adopted under `cob-ref` with a sigref
+   (nekko.sigref), exactly like a Git ref. This namespace does not claim
+   byte compatibility with Radicle's COB storage (`refs/cobs/...` commits,
+   change graph encoding); ADR 0044 O5 keeps that an owner decision and R1
+   records the mapping."
+  (:require [cbor.core :as cbor]
+            [ed25519.core :as ed]
+            [ipld.core :as ipld]
+            [nekko.sigref :as sigref]))
+
+(def version 1)
+(def issue-type "awai.cob.issue/1")
+(def patch-type "awai.cob.patch/1")
+(def types #{issue-type patch-type})
+
+(def ^:private signed-keys ["v" "type" "rid" "cob" "parents" "actions" "ts"])
+
+;; ---------------------------------------------------------------------------
+;; Changes
+
+(defn- payload [{:keys [type rid cob parents actions ts]}]
+  (cond-> {"v" version
+           "type" type
+           "rid" rid
+           "parents" (vec (sort (distinct parents)))
+           "actions" (vec actions)
+           "ts" ts}
+    cob (assoc "cob" cob)))
+
+(defn sign-change
+  "Sign one change. `cob` is nil for the root change. Returns the
+   string-keyed wire map."
+  [signer-seed change]
+  (let [p (payload change)]
+    (assoc p
+           "signer" (ed/did-key-from-seed signer-seed)
+           "sig" (ed/hexify (ed/sign signer-seed (cbor/encode p))))))
+
+(defn change-valid?
+  "Shape and Ed25519 signature of one change. Does not check authorization
+   or that its parents exist; `fold` does that."
+  [change]
+  (boolean
+   (and (map? change)
+        (= version (get change "v"))
+        (contains? types (get change "type"))
+        (string? (get change "rid"))
+        (or (nil? (get change "cob")) (string? (get change "cob")))
+        (vector? (get change "parents"))
+        (every? string? (get change "parents"))
+        (= (get change "parents") (vec (sort (distinct (get change "parents")))))
+        (vector? (get change "actions"))
+        (seq (get change "actions"))
+        (every? #(and (map? %) (string? (get % "type"))) (get change "actions"))
+        (int? (get change "ts"))
+        (string? (get change "signer"))
+        (string? (get change "sig"))
+        (ed/verify-did (get change "signer")
+                       (cbor/encode (select-keys change signed-keys))
+                       (ed/unhex (get change "sig"))))))
+
+(defn put-change!
+  "Store a signed change, returning its CID string."
+  [put! change]
+  (ipld/put-node! put! change))
+
+(defn create!
+  "Open a new collaborative object. `actions` must start with an \"open\"
+   action. Returns the object id (the root change CID)."
+  [put! signer-seed {:keys [type rid actions ts]}]
+  (when-not (contains? types type)
+    (throw (ex-info "nekko.cob: unknown object type" {:reason :unknown-type :type type})))
+  (when-not (= "open" (get (first actions) "type"))
+    (throw (ex-info "nekko.cob: the root change must open the object"
+                    {:reason :root-not-open})))
+  (put-change! put! (sign-change signer-seed {:type type :rid rid :parents []
+                                              :actions actions :ts ts})))
+
+(defn append!
+  "Add a change extending `parents` (non-empty change CIDs of the same
+   object). Returns the new change CID, which is the signer's new tip."
+  [put! signer-seed {:keys [type rid cob parents actions ts]}]
+  (when (empty? parents)
+    (throw (ex-info "nekko.cob: a non-root change needs parents" {:reason :no-parents})))
+  (put-change! put! (sign-change signer-seed {:type type :rid rid :cob cob :parents parents
+                                              :actions actions :ts ts})))
+
+;; ---------------------------------------------------------------------------
+;; Tips and sigrefs
+
+(defn cob-ref
+  "Ref name under which a peer publishes its tip for one object."
+  [type cob-id]
+  (str "refs/cobs/" type "/" cob-id))
+
+(defn sign-tip
+  "Sigref attesting that, for rid, the signer's tip of this object is tip."
+  [signer-seed rid type cob-id tip ts]
+  (sigref/sign signer-seed rid (cob-ref type cob-id) tip ts))
+
+(defn tips
+  "Distinct tips from the valid sigrefs for this object's ref. When
+   `signers` is given, only sigrefs from those DIDs count (for example the
+   peers the reader follows)."
+  ([rid type cob-id sigrefs] (tips rid type cob-id sigrefs nil))
+  ([rid type cob-id sigrefs signers]
+   (let [ref-name (cob-ref type cob-id)]
+     (->> sigrefs
+          (filter #(and (= rid (get % "rid"))
+                        (= ref-name (get % "ref"))
+                        (or (nil? signers) (contains? signers (get % "signer")))
+                        (sigref/valid? %)))
+          (map #(get % "commit"))
+          distinct sort vec))))
+
+;; ---------------------------------------------------------------------------
+;; Loading the DAG
+
+(defn- load-changes
+  "Every change reachable from cob-id and tips, as {cid change}. Throws when a
+   referenced block is missing, since folding a partial history would
+   silently change the result."
+  [get-fn cob-id tip-cids]
+  (loop [todo (vec (distinct (cons cob-id tip-cids))) seen {}]
+    (if-let [cid (peek todo)]
+      (let [todo (pop todo)]
+        (if (contains? seen cid)
+          (recur todo seen)
+          (let [change (ipld/get-node get-fn cid)]
+            (when-not (map? change)
+              (throw (ex-info "nekko.cob: change block is missing"
+                              {:reason :missing-change :cid cid})))
+            (let [parents (get change "parents")]
+              (recur (into todo (when (vector? parents) (filter string? parents)))
+                     (assoc seen cid change))))))
+      seen)))
+
+(defn- topo-order
+  "Kahn's algorithm with the ready set ordered by CID string."
+  [changes]
+  (let [parents-of (fn [cid] (filter #(contains? changes %) (get-in changes [cid "parents"])))
+        children (reduce (fn [m cid]
+                           (reduce #(update %1 %2 (fnil conj []) cid) m (parents-of cid)))
+                         {} (keys changes))
+        indeg (into {} (map (fn [cid] [cid (count (parents-of cid))]) (keys changes)))]
+    (loop [ready (into (sorted-set) (filter #(zero? (indeg %)) (keys changes)))
+           indeg indeg
+           out []]
+      (if-let [cid (first ready)]
+        (let [[ready indeg] (reduce (fn [[r d] child]
+                                      (let [n (dec (d child))]
+                                        [(if (zero? n) (conj r child) r) (assoc d child n)]))
+                                    [(disj ready cid) indeg]
+                                    (get children cid))]
+          (recur ready indeg (conj out cid)))
+        out))))
+
+;; ---------------------------------------------------------------------------
+;; Actions
+
+(defn- fail [reason & {:as data}]
+  (throw (ex-info "nekko.cob: action rejected" (assoc data :cob/reason reason))))
+
+(defn- non-blank? [s] (and (string? s) (re-find #"\S" s)))
+
+(defn- maintainer? [ctx state signer]
+  (or (= signer (get state "author")) (contains? (:delegates ctx) signer)))
+
+(defn- add-comment [state {:keys [cid signer ts]} action]
+  (let [body (get action "body")
+        reply-to (get action "reply-to")]
+    (when-not (non-blank? body) (fail :invalid-comment))
+    (when (some #(= cid (get % "id")) (get state "comments"))
+      (fail :one-comment-per-change))
+    (when (and reply-to (not (some #(= reply-to (get % "id")) (get state "comments"))))
+      (fail :unknown-reply-to :reply-to reply-to))
+    (update state "comments" conj
+            (cond-> {"id" cid "author" signer "body" body "ts" ts}
+              reply-to (assoc "reply-to" reply-to)))))
+
+(defn- edit [ctx state {:keys [signer]} action]
+  (when-not (maintainer? ctx state signer) (fail :unauthorized :action "edit"))
+  (let [title (get action "title") body (get action "body")]
+    (when (and (nil? title) (nil? body)) (fail :empty-edit))
+    (when (and (some? title) (not (non-blank? title))) (fail :invalid-title))
+    (when (and (some? body) (not (string? body))) (fail :invalid-body))
+    (cond-> state
+      title (assoc "title" title)
+      (some? body) (assoc "body" body))))
+
+(defmulti ^:private apply-action (fn [_ctx type _state _change action] [type (get action "type")]))
+
+(defmethod apply-action :default [_ _ _ _ action]
+  (fail :unknown-action :action (get action "type")))
+
+(defmethod apply-action [issue-type "open"] [_ _ state {:keys [root? signer ts]} action]
+  (when-not (and root? (nil? state)) (fail :open-not-root))
+  (when-not (non-blank? (get action "title")) (fail :invalid-title))
+  {"title" (get action "title")
+   "body" (or (get action "body") "")
+   "author" signer
+   "state" "open"
+   "labels" (sorted-set)
+   "comments" []
+   "opened" ts})
+
+(defmethod apply-action [issue-type "comment"] [_ _ state change action]
+  (add-comment state change action))
+
+(defmethod apply-action [issue-type "edit"] [ctx _ state change action]
+  (edit ctx state change action))
+
+(defmethod apply-action [issue-type "label"] [ctx _ state {:keys [signer]} action]
+  (when-not (maintainer? ctx state signer) (fail :unauthorized :action "label"))
+  (let [add (get action "add" []) remove (get action "remove" [])]
+    (when-not (and (vector? add) (vector? remove) (every? non-blank? (concat add remove)))
+      (fail :invalid-labels))
+    (update state "labels" #(apply disj (into % add) remove))))
+
+(defmethod apply-action [issue-type "state"] [ctx _ state {:keys [signer]} action]
+  (when-not (maintainer? ctx state signer) (fail :unauthorized :action "state"))
+  (when-not (contains? #{"open" "closed"} (get action "state")) (fail :invalid-state))
+  (assoc state "state" (get action "state")))
+
+(defn- revision-ids [state] (set (map #(get % "id") (get state "revisions"))))
+
+(defmethod apply-action [patch-type "open"] [_ _ state {:keys [root? cid signer ts]} action]
+  (when-not (and root? (nil? state)) (fail :open-not-root))
+  (when-not (non-blank? (get action "title")) (fail :invalid-title))
+  (when-not (every? #(non-blank? (get action %)) ["target" "base" "head"])
+    (fail :invalid-revision))
+  {"title" (get action "title")
+   "body" (or (get action "body") "")
+   "author" signer
+   "target" (get action "target")
+   "state" "open"
+   "revisions" [{"id" cid "author" signer "base" (get action "base")
+                 "head" (get action "head") "ts" ts}]
+   "reviews" {}
+   "comments" []
+   "opened" ts})
+
+(defmethod apply-action [patch-type "revise"] [_ _ state {:keys [cid signer ts]} action]
+  (when-not (= signer (get state "author")) (fail :unauthorized :action "revise"))
+  (when-not (= "open" (get state "state")) (fail :not-open))
+  (when-not (every? #(non-blank? (get action %)) ["base" "head"]) (fail :invalid-revision))
+  (when ((revision-ids state) cid) (fail :one-revision-per-change))
+  (update state "revisions" conj {"id" cid "author" signer "base" (get action "base")
+                                  "head" (get action "head") "ts" ts}))
+
+(defmethod apply-action [patch-type "comment"] [_ _ state change action]
+  (add-comment state change action))
+
+(defmethod apply-action [patch-type "edit"] [ctx _ state change action]
+  (edit ctx state change action))
+
+(defmethod apply-action [patch-type "review"] [_ _ state {:keys [signer ts]} action]
+  (let [rev (get action "revision") verdict (get action "verdict")]
+    (when-not ((revision-ids state) rev) (fail :unknown-revision :revision rev))
+    (when-not (contains? #{"accept" "reject" "comment"} verdict) (fail :invalid-verdict))
+    (when-not (= "open" (get state "state")) (fail :not-open))
+    (assoc-in state ["reviews" rev signer]
+              {"verdict" verdict "body" (or (get action "body") "") "ts" ts})))
+
+(defmethod apply-action [patch-type "merge"] [ctx _ state {:keys [signer ts]} action]
+  (let [rev (get action "revision") commit (get action "commit")]
+    (when-not (contains? (:delegates ctx) signer) (fail :unauthorized :action "merge"))
+    (when-not (= "open" (get state "state")) (fail :not-open))
+    (when-not ((revision-ids state) rev) (fail :unknown-revision :revision rev))
+    (when-not (non-blank? commit) (fail :invalid-commit))
+    (assoc state "state" "merged"
+           "merge" {"revision" rev "commit" commit "by" signer "ts" ts})))
+
+(defmethod apply-action [patch-type "state"] [ctx _ state {:keys [signer]} action]
+  (when-not (maintainer? ctx state signer) (fail :unauthorized :action "state"))
+  (when (= "merged" (get state "state")) (fail :already-merged))
+  (when-not (contains? #{"open" "closed"} (get action "state")) (fail :invalid-state))
+  (assoc state "state" (get action "state")))
+
+;; ---------------------------------------------------------------------------
+;; Fold
+
+(defn- check-change [{:keys [rid]} cob-id type cid change rejected-cids]
+  (let [root? (= cid cob-id)]
+    (cond
+      (not (change-valid? change)) :invalid-signature-or-shape
+      (not= rid (get change "rid")) :wrong-rid
+      (not= type (get change "type")) :wrong-type
+      (and root? (or (seq (get change "parents")) (get change "cob"))) :invalid-root
+      (and (not root?) (not= cob-id (get change "cob"))) :wrong-object
+      (and (not root?) (empty? (get change "parents"))) :detached-change
+      (some rejected-cids (get change "parents")) :parent-rejected
+      :else nil)))
+
+(defn- finish [state]
+  (cond-> state
+    (get state "labels") (update "labels" vec)))
+
+(defn fold
+  "Replay the object `cob-id` from `tips` (change CIDs, for example from
+   `tips`) and return
+
+     {:type t :state s :applied [cid ...] :rejected [{:cid c :reason r} ...]}
+
+   `ctx` is `{:rid rid :delegates #{did ...}}`, the delegate set of the RID
+   (nekko.delegate/delegates). Throws when the root change itself is
+   rejected or a referenced block is missing."
+  [get-fn ctx cob-id tips]
+  (let [changes (load-changes get-fn cob-id tips)
+        type (get-in changes [cob-id "type"])]
+    (loop [[cid & more] (topo-order changes)
+           state nil applied [] rejected [] rejected-cids #{}]
+      (if-not cid
+        {:type type :state (finish state) :applied applied :rejected rejected}
+        (let [change (changes cid)
+              root? (= cid cob-id)
+              reason (check-change ctx cob-id type cid change rejected-cids)
+              [state' reason]
+              (if reason
+                [state reason]
+                (try
+                  [(reduce (fn [s action]
+                             (apply-action ctx type s
+                                           {:root? root? :cid cid
+                                            :signer (get change "signer")
+                                            :ts (get change "ts")}
+                                           action))
+                           state (get change "actions"))
+                   nil]
+                  (catch #?(:clj Exception :cljs :default) e
+                    (if-let [r (:cob/reason (ex-data e))]
+                      [state r]
+                      (throw e)))))]
+          (cond
+            (and reason root?)
+            (throw (ex-info "nekko.cob: root change is invalid"
+                            {:reason :invalid-root-change :cause reason :cob cob-id}))
+            reason
+            (recur more state applied (conj rejected {:cid cid :reason reason})
+                   (conj rejected-cids cid))
+            :else
+            (recur more state' (conj applied cid) rejected rejected-cids)))))))
