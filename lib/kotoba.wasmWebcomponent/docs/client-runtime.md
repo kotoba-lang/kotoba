@@ -5,6 +5,8 @@ Source: `src/kotoba-client-runtime.js`; styling: `src/kotoba-client-consent.css`
 Products import / copy these exact browser assets and pin revision / digest.
 No build step or Node / JVM / NBB runtime is required. Product-local validators
 and approval brokers are not substitutes for this implementation.
+The architecture contract this host implements is
+[app-environment-contract.md](app-environment-contract.md).
 
 ## Local-state declarations
 
