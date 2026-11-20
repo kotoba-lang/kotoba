@@ -76,6 +76,7 @@ class TestCodecOptionalBranches:
         tx = CreditTransferTransaction(
             end_to_end_id="E2E",
             interbank_amount=Amount(Decimal("10.00"), "USD"),
+            charge_bearer="DEBT",
             debtor=Party("Acme", postal_address=PostalAddress("US", ("1 Main St",)),
                          identifier="LEI123"),
             debtor_account=Account(other_id="ACCT-1", currency="USD"),

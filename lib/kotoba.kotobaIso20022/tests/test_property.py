@@ -82,7 +82,8 @@ def _gen_pacs008(rng: random.Random) -> FIToFICustomerCreditTransfer:
             uetr=_uetr(rng),
             interbank_amount=_amount(rng),
             interbank_settlement_date="2026-06-08" if rng.random() < 0.7 else None,
-            charge_bearer=rng.choice(["DEBT", "CRED", "SHAR"]) if rng.random() < 0.7 else None,
+            # ChrgBr is mandatory in every pacs.008 CdtTrfTxInf
+            charge_bearer=rng.choice(["DEBT", "CRED", "SHAR"]),
             debtor=_party(rng),
             debtor_account=Account(iban=_iban(rng)) if rng.random() < 0.6 else None,
             debtor_agent=Agent(bicfi=rng.choice(_BICS)),
@@ -141,7 +142,11 @@ def _gen_camt054(rng: random.Random) -> BankToCustomerDebitCreditNotification:
             value_date="2026-06-09" if rng.random() < 0.6 else None,
             account_servicer_reference=f"SVCR-{rng.randint(0, 10**6)}" if rng.random() < 0.5 else None,
             end_to_end_id=f"E2E-{rng.randint(0, 10**6)}" if rng.random() < 0.7 else None,
-            bank_transaction_code="PMNT" if rng.random() < 0.3 else None,
+            **(
+                {"bank_transaction_code": "PMNT", "bank_transaction_family": "RCDT",
+                 "bank_transaction_subfamily": "ESCT"}
+                if rng.random() < 0.3 else {}
+            ),
         )
         for _ in range(rng.randint(1, 3))
     )

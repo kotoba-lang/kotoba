@@ -84,7 +84,12 @@ class TestCamt053:
         msg = BankToCustomerStatement(
             group_header=_GH,
             statements=(
-                AccountStatement("S", "2026-06-08T23:00:00Z", _ACCT, (), (_entry(),)),
+                # Bal is mandatory (1..n) in a camt.053 Stmt
+                AccountStatement(
+                    "S", "2026-06-08T23:00:00Z", _ACCT,
+                    (CashBalance("OPBD", Amount(Decimal("0"), "EUR"), "CRDT", "2026-06-08"),),
+                    (_entry(),),
+                ),
             ),
         )
         root = ET.fromstring(build_camt053(msg))

@@ -9,6 +9,11 @@
 brokerage, 6630 fund management): equity-position, trade, fund-share/NAV,
 and investment-mandate records.
 
+`kotoba.securities.isin` validates ISINs (ISO 6166): the ISO 20022
+`ISINOct2015Identifier` shape and the check digit (AWAI-3154). The
+securities settlement messages themselves (ISO 20022 sese/semt, MT540-MT548)
+are built in `kotoba.swift.securities` and `kotoba.swift.mt5xx`.
+
 No network, no I/O, and **no real market data or custody integration** --
 an operator supplies their own licensed price feed/custodian; this
 library only combines supplied facts (quantity, price, net assets,

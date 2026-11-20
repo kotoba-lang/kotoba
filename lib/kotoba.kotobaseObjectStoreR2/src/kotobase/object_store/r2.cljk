@@ -1,0 +1,251 @@
+(ns kotobase.object-store.r2
+  "Validated Cloudflare R2 **binding** object transport.
+
+  The sibling of `kotobase.object-store.b2-s3`, presenting the identical
+  surface — `configured?`, `require-config`, `prefix`, `fetch`, `get-json`,
+  `get-bytes`, `put-json` — so a consumer switches transports by choosing a
+  namespace, not by changing call sites.
+
+  ## Why this exists
+
+  Two reasons, and the second is the one that matters.
+
+  **It needs no credentials.** An R2 bucket reaches a Worker as a *binding*,
+  not as a key pair. `kotobase.object-store.b2-s3` requires
+  KOTOBASE_B2_KEY_ID and KOTOBASE_B2_APP_KEY, and Cloudflare Worker secrets
+  are per-script and write-only: a Worker that cannot re-supply them cannot
+  be renamed or split, because the new script starts with none. That is what
+  blocked `kotobase-cf-wasm-staging` from becoming `net-kotobase-engine`
+  (superproject ADR-2608051000). A binding has nothing to re-supply.
+
+  R2 has conditional object operations that B2 lacks, but this adapter does
+  not expose them as a graph-head authority. Per ADR-2608082200, both R2 and
+  B2 are object transports behind the content-addressed BlockStore boundary;
+  neither owns sequencing, transaction coordination, or current-head truth.
+  A provider-neutral HeadStore performs linearizable read/CAS separately.
+
+  ## What this does NOT provide
+
+  `presign`. An R2 binding cannot mint a presigned URL — that is an S3-API
+  capability and needs credentials again. No consumer of this namespace uses
+  it (measured 2026-08-05: `kotobase-graph-database` uses exactly `get-json`,
+  `get-bytes`, `fetch` and `put-json`), and a caller that needs presigned
+  transfer should say so and use the S3 transport deliberately rather than
+  discover the gap at runtime."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:private bucket-binding "KOTOBASE_R2")
+(def ^:private prefix-var "KOTOBASE_R2_PREFIX")
+
+(defn- env-get [env k]
+  (when env
+    (let [v (aget env k)]
+      (when (and (string? v) (not= "" v)) v))))
+
+(defn- bucket [env]
+  (when env (aget env bucket-binding)))
+
+(defn configured-prefix [env]
+  (or (env-get env prefix-var) ""))
+
+(defn prefix [env] (configured-prefix env))
+
+(defn assert-safe-prefix
+  "A prefix is a key namespace, not a path to traverse out of."
+  [p]
+  (when (and p (not= "" p))
+    (when (or (str/starts-with? p "/")
+              (str/includes? p "..")
+              (re-find #"[\r\n]" p))
+      (throw (js/Error. (str "unsafe R2 prefix: " (pr-str p))))))
+  p)
+
+(defn configured?
+  "True when the bucket binding is present. There is no credential to check —
+  that absence is the point."
+  [env]
+  (some? (bucket env)))
+
+(defn require-config [env]
+  (when-not (configured? env)
+    (throw (js/Error. (str "R2 object store missing binding: " bucket-binding))))
+  (assert-safe-prefix (configured-prefix env))
+  true)
+
+(defn- full-key [env key]
+  (let [p (assert-safe-prefix (configured-prefix env))]
+    (if (= "" p) key (str p "/" key))))
+
+(defn fetch
+  "Response-shaped access to the binding, so callers written against the S3
+  transport keep working unchanged.
+
+  A missing object is a 404 Response rather than nil, matching what an HTTP
+  transport returns — `get-json`/`get-bytes` below turn that back into nil."
+  [env method key body & [_query _extra-headers]]
+  (require-config env)
+  (let [b (bucket env)
+        k (full-key env key)]
+    (case method
+      ("GET" "HEAD")
+      (-> (.get b k)
+          (.then (fn [obj]
+                   (if (nil? obj)
+                     (js/Response. nil #js {:status 404})
+                     (js/Response. (if (= method "HEAD") nil (.-body obj))
+                                   #js {:status 200})))))
+
+      "PUT"
+      (-> (.put b k body)
+          (.then (fn [_] (js/Response. nil #js {:status 200}))))
+
+      "DELETE"
+      (-> (.delete b k)
+          (.then (fn [_] (js/Response. nil #js {:status 204}))))
+
+      (js/Promise.reject (js/Error. (str "unsupported R2 method: " method))))))
+
+(defn get-json [env key]
+  (require-config env)
+  (-> (.get (bucket env) (full-key env key))
+      (.then (fn [obj] (when obj (.json obj))))))
+
+(defn get-bytes [env key]
+  (-> (fetch env "GET" key nil)
+      (.then (fn [response]
+               (cond (= (.-status response) 404) nil
+                     (not (.-ok response))
+                     (throw (js/Error. (str "R2 GET " key " failed: " (.-status response))))
+                     :else response)))))
+
+(defn put-json [env key value]
+  (require-config env)
+  (-> (.put (bucket env) (full-key env key) (js/JSON.stringify (clj->js value)))
+      (.then (fn [_] nil))))
+
+(defn put-json-if-absent
+  "Create one JSON object only when the key is absent. Resolves to boolean
+  created?. A backfill must use this rather than `put-json`: between the miss
+  that triggered it and the write, a conditional writer may have created a
+  newer value, and an unconditional PUT would silently roll it back."
+  [env key value]
+  (require-config env)
+  (-> (.put (bucket env) (full-key env key) (js/JSON.stringify (clj->js value))
+            #js {:onlyIf (js/Headers. #js {"if-none-match" "*"})})
+      (.then boolean)))
+
+(defn get-range
+  "Fetch the bytes of `[START, END)` — **half-open, like `subs`** — of one
+  object. Resolves to a Uint8Array, or nil when the object is absent.
+
+  Half-open to match `kotobase.storage.object/IRangeRead` and the B2 sibling.
+  The binding takes an offset/length pair rather than an inclusive header, so
+  this transport has no conversion to get wrong; stating the convention here
+  anyway is what keeps the two namespaces substitutable.
+
+  The over-long check is kept even though a binding cannot ignore a range: it
+  is the one assertion that separates `the range was applied` from `the range
+  was dropped and this is the whole object`, and a caller reading pack frames
+  cannot tell those apart from the bytes — every block inside still carries
+  its own CID and would verify. This namespace promises that a consumer
+  switches transports by choosing a namespace; that has to include how each
+  one fails."
+  [env key start end]
+  (require-config env)
+  (when-not (and (int? start) (int? end) (<= 0 start) (< start end))
+    (throw (js/Error. (str "R2 range must be 0 <= start < end (half-open), got "
+                           (pr-str start) "-" (pr-str end)))))
+  (let [wanted (- end start)]
+    (-> (.get (bucket env) (full-key env key)
+              #js {:range #js {:offset start :length wanted}})
+        (.then
+         (fn [obj]
+           (when obj
+             (-> (.arrayBuffer obj)
+                 (.then (fn [buffer]
+                          (let [bytes (js/Uint8Array. buffer)]
+                            (when (> (.-length bytes) wanted)
+                              (throw (js/Error.
+                                      (str "R2 ranged get " key " returned "
+                                           (.-length bytes) " bytes for a "
+                                           wanted "-byte window"))))
+                            bytes))))))))))
+
+(defn compare-and-set-json!
+  "Atomically replace one JSON object when its current `sequence` equals
+  `expected-sequence`. A nil expectation creates only when absent. Resolves to
+  boolean won?."
+  [env key expected-sequence value]
+  (require-config env)
+  (let [b (bucket env)
+        k (full-key env key)
+        body (js/JSON.stringify (clj->js value))]
+    (-> (.get b k)
+        (.then
+         (fn [current]
+           (cond
+             (nil? current)
+             (if (some? expected-sequence)
+               false
+               (-> (.put b k body
+                         #js {:onlyIf (js/Headers. #js {"if-none-match" "*"})})
+                   (.then boolean)))
+             (nil? expected-sequence) false
+             :else
+             (-> (.json current)
+                 (.then
+                  (fn [stored]
+                    (if (not= expected-sequence (aget stored "sequence"))
+                      false
+                      ;; R2Bucket.put expects an R2Conditional here, not the
+                      ;; R2Object returned by get. Passing the object itself
+                      ;; leaves `etagMatches` absent and is not a CAS.
+                      (-> (.put b k body
+                                #js {:onlyIf #js {:etagMatches (aget current "etag")}})
+                          (.then boolean))))))))))))
+
+(defn- bytes= [a b]
+  (and (= (.-byteLength a) (.-byteLength b))
+       (loop [i 0]
+         (or (= i (.-byteLength a))
+             (and (= (aget a i) (aget b i)) (recur (inc i)))))))
+
+(defn put-immutable
+  "Create an immutable object once using R2's native conditional PUT.
+
+  When another writer already created the key, read it back and require exact
+  byte equality.  `null` from R2 means the condition failed, not success.  A
+  mismatching object is an integrity incident and fails closed instead of
+  silently overwriting evidence of corruption or a key-layout collision.
+
+  Returns Promise<{:stored? boolean}>.  Bodies are bounded content-addressed
+  blocks at the caller, so normalizing once to an ArrayBuffer is intentional."
+  [env key body]
+  (require-config env)
+  (let [b (bucket env)
+        k (full-key env key)]
+    (-> (.arrayBuffer (js/Response. body))
+        (.then
+         (fn [buffer]
+           (let [condition (js/Headers. #js {"if-none-match" "*"})]
+             (-> (.put b k buffer #js {:onlyIf condition})
+               (.then
+                (fn [created]
+                  (if created
+                    {:stored? true}
+                    (-> (.get b k)
+                        (.then
+                         (fn [existing]
+                           (when-not existing
+                             (throw (ex-info "R2 immutable conditional PUT lost its winner"
+                                             {:kotobase/error :immutable-write-race
+                                              :key key})))
+                           (-> (.arrayBuffer existing)
+                               (.then
+                                (fn [existing-buffer]
+                                  (if (bytes= (js/Uint8Array. buffer)
+                                              (js/Uint8Array. existing-buffer))
+                                    {:stored? false}
+                                    (throw (ex-info "R2 immutable object differs from supplied bytes"
+                                                    {:kotobase/error :immutable-object-collision
+                                                     :key key})))))))))))))))))))

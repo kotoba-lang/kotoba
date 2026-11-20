@@ -1,0 +1,344 @@
+(ns kotoba.swift.mt5xx
+  "SWIFT MT securities settlement messages MT540-MT548 (AWAI-3154,
+  network-awai-apex ADR 0042 D1): build, read and check the FIN block-4
+  field layout. No network, no I/O.
+
+    MT540 receive free           MT544 receive free confirmation
+    MT541 receive against payment MT545 receive against payment confirmation
+    MT542 deliver free           MT546 deliver free confirmation
+    MT543 deliver against payment MT547 deliver against payment confirmation
+    MT548 settlement status and processing advice
+
+  The records use kotoba.swift's block shape, so kotoba.swift/mt->wire
+  renders them and kotoba.swift/parse-mt-wire reads them back.
+
+  NOT verified against the SWIFT Standards MT (the licensed User Handbook).
+  The sequence and field layout below (GENL/LINK/STAT, TRADDET, FIAC,
+  SETDET/SETPRTY/AMT; 20C, 23G, 25D, 98A, 35B, 36B, 97A, 22F, 95P, 19A) is the
+  widely published market-practice skeleton, and `validate` checks only that
+  skeleton and those field formats. ADR 0042 D2 says this may not be named
+  L1 until the owner decides O3 (use of the SWIFT material); network
+  validated rules and usage rules are not checked. ADR 0042 D1 keeps MT for
+  reading and for comparison with the ISO 20022 sese messages.
+
+  Modeled subset: one ISIN, a unit quantity, a safekeeping account, the
+  settlement transaction type (22F SETR), the counterparty's agent (DEAG for
+  a receipt, REAG for a delivery) and the place of settlement (PSET), and
+  for against-payment the settlement amount. MT548 carries the processing
+  (IPRC), matching (MTCH) and settlement (SETT) status without reasons."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.swift :as swift]
+            [kotoba.securities.isin :as isin]))
+
+;; ---------------------------------------------------------------------------
+;; Field values
+;; ---------------------------------------------------------------------------
+
+(def ^:private x-char #"[A-Za-z0-9/\-?:().,'+ ]")
+
+(defn reference-valid?
+  "16x reference: 1-16 SWIFT x characters, not starting or ending with a
+  slash and without two consecutive slashes."
+  [s]
+  (boolean (and (string? s) (re-matches #"[A-Za-z0-9/\-?:().,'+ ]{1,16}" s)
+                (not (str/starts-with? s "/")) (not (str/ends-with? s "/"))
+                (not (str/includes? s "//")))))
+
+(defn- iso-date->mt [d] (when (and (string? d) (re-matches #"\d{4}-\d{2}-\d{2}" d)) (str/replace d "-" "")))
+(defn- mt-date->iso [d] (when (and (string? d) (re-matches #"\d{8}" d)) (str (subs d 0 4) "-" (subs d 4 6) "-" (subs d 6 8))))
+
+(defn- decimal->mt
+  "\"100\" -> \"100,\"; \"2.5\" -> \"2,5\" (SWIFT decimal: comma mandatory)."
+  [s]
+  (when (and (string? s) (re-matches #"[0-9]+(\.[0-9]+)?" s))
+    (if (str/includes? s ".") (str/replace s "." ",") (str s ","))))
+
+(defn- mt->decimal [s]
+  (when (and (string? s) (re-matches #"[0-9]+,[0-9]*" s))
+    (let [[w f] (str/split s #"," 2)]
+      (if (seq f) (str w "." f) w))))
+
+(defn- mt-decimal-valid?
+  "15d: digits with exactly one comma, at least one digit before it, 15
+  characters at most, not zero."
+  [s]
+  (boolean (and (string? s) (re-matches #"[0-9]+,[0-9]*" s) (<= (count s) 15) (re-find #"[1-9]" s))))
+
+(def ^:private digit-value (zipmap "0123456789" (range 10)))
+(defn- digits->int [s] (reduce (fn [acc c] (+ (* 10 acc) (digit-value c))) 0 s))
+
+(defn- date8-valid? [s]
+  (boolean (when-let [iso (mt-date->iso s)]
+             (let [[y m d] (map digits->int (str/split iso #"-"))]
+               (and (<= 1 m 12)
+                    (<= 1 d (case m 2 (if (and (zero? (mod y 4)) (or (pos? (mod y 100)) (zero? (mod y 400)))) 29 28)
+                              (4 6 9 11) 30 31)))))))
+
+;; ---------------------------------------------------------------------------
+;; Building
+;; ---------------------------------------------------------------------------
+
+(def message-types
+  {[:instruction :receive :free] "540" [:instruction :receive :against-payment] "541"
+   [:instruction :deliver :free] "542" [:instruction :deliver :against-payment] "543"
+   [:confirmation :receive :free] "544" [:confirmation :receive :against-payment] "545"
+   [:confirmation :deliver :free] "546" [:confirmation :deliver :against-payment] "547"})
+
+(def ^:private type-of (into {} (map (fn [[k v]] [v k]) message-types)))
+
+(defn- field [tag value] {:swift/tag tag :swift/value value})
+(defn- seq-start [n] (field "16R" n))
+(defn- seq-end [n] (field "16S" n))
+
+(defn- record [mt sender-bic receiver-bic block-4]
+  {:swift/mt mt
+   :swift/block-1 {:swift/application-id "F" :swift/service-id "01"
+                   :swift/lt-address (swift/mt-lt-address sender-bic)
+                   :swift/session-number "0001" :swift/sequence-number "000001"}
+   :swift/block-2 {:swift/direction :input :swift/message-type mt
+                   :swift/destination-address (swift/mt-lt-address receiver-bic)
+                   :swift/priority "N"}
+   :swift/block-3 {}
+   :swift/block-4 (vec (remove nil? (flatten block-4)))
+   :swift/block-5 {}})
+
+(declare validate)
+
+(defn- checked [m] (when (:swift/valid? (validate m)) m))
+
+(defn- settlement
+  [kind {:keys [sender-bic receiver-bic reference related-reference direction payment-type
+                settlement-date effective-settlement-date isin description quantity
+                safekeeping-account transaction-type place-of-settlement agent amount]
+         :or {transaction-type "TRAD"}}]
+  (let [mt (message-types [kind direction payment-type])
+        confirmation? (= kind :confirmation)
+        date (iso-date->mt (if confirmation? effective-settlement-date settlement-date))
+        qty (decimal->mt quantity)
+        amt (some-> amount :value decimal->mt)]
+    (when (and mt (swift/bic-valid? sender-bic) (swift/bic-valid? receiver-bic) date qty
+               (isin/isin-valid? isin) (or (not confirmation?) (reference-valid? related-reference))
+               (= (= payment-type :against-payment) (boolean amt)))
+      (checked
+       (record mt sender-bic receiver-bic
+               [(seq-start "GENL") (field "20C" (str ":SEME//" reference)) (field "23G" "NEWM")
+                (when confirmation?
+                  [(seq-start "LINK") (field "20C" (str ":RELA//" related-reference)) (seq-end "LINK")])
+                (seq-end "GENL")
+                (seq-start "TRADDET")
+                (field "98A" (str (if confirmation? ":ESET//" ":SETT//") date))
+                (field "35B" (str "ISIN " isin (when description (str "\n" description))))
+                (seq-end "TRADDET")
+                (seq-start "FIAC")
+                (field "36B" (str (if confirmation? ":ESTT//" ":SETT//") "UNIT/" qty))
+                (field "97A" (str ":SAFE//" safekeeping-account))
+                (seq-end "FIAC")
+                (seq-start "SETDET")
+                (field "22F" (str ":SETR//" transaction-type))
+                (seq-start "SETPRTY") (field "95P" (str (if (= direction :receive) ":DEAG//" ":REAG//") agent)) (seq-end "SETPRTY")
+                (seq-start "SETPRTY") (field "95P" (str ":PSET//" place-of-settlement)) (seq-end "SETPRTY")
+                (when amt
+                  [(seq-start "AMT")
+                   (field "19A" (str (if confirmation? ":ESTT//" ":SETT//") (:currency amount) amt))
+                   (seq-end "AMT")])
+                (seq-end "SETDET")])))))
+
+(defn settlement-instruction
+  "MT540-MT543 from {:sender-bic :receiver-bic :reference (16x) :direction
+  (:receive|:deliver) :payment-type (:free|:against-payment)
+  :settlement-date \"YYYY-MM-DD\" :isin :description? :quantity \"100\"
+  :safekeeping-account :transaction-type? (\"TRAD\") :place-of-settlement BIC
+  :agent BIC :amount {:currency :value} (against-payment only)}, or nil."
+  [m]
+  (settlement :instruction m))
+
+(defn settlement-confirmation
+  "MT544-MT547: the instruction's keys with :related-reference (the
+  instruction's SEME) and :effective-settlement-date in place of
+  :settlement-date, or nil."
+  [m]
+  (settlement :confirmation m))
+
+(def ^:private status-codes
+  {:processing {:acknowledged "IPRC//PACK" :rejected "IPRC//REJT"}
+   :matching {:matched "MTCH//MACH" :unmatched "MTCH//NMAT"}
+   :settlement {:pending "SETT//PEND" :failing "SETT//PENF"}})
+
+(defn status-advice
+  "MT548 from {:sender-bic :receiver-bic :reference :related-reference
+  :processing? :matching? :settlement?} (same keywords as
+  kotoba.swift.securities/status-advice), or nil."
+  [{:keys [sender-bic receiver-bic reference related-reference] :as m}]
+  (let [stats (keep (fn [k] (when-let [v (get m k)] (get-in status-codes [k v]))) [:processing :matching :settlement])]
+    (when (and (swift/bic-valid? sender-bic) (swift/bic-valid? receiver-bic) (reference-valid? related-reference)
+               (seq stats) (every? #(or (nil? (get m %)) (get-in status-codes [% (get m %)])) [:processing :matching :settlement]))
+      (checked
+       (record "548" sender-bic receiver-bic
+               [(seq-start "GENL") (field "20C" (str ":SEME//" reference)) (field "23G" "INST")
+                (seq-start "LINK") (field "20C" (str ":RELA//" related-reference)) (seq-end "LINK")
+                (for [s stats] [(seq-start "STAT") (field "25D" (str ":" s)) (seq-end "STAT")])
+                (seq-end "GENL")])))))
+
+;; ---------------------------------------------------------------------------
+;; Checking the modeled skeleton
+;; ---------------------------------------------------------------------------
+
+(def ^:private field-formats
+  {"20C" #":(SEME|RELA)//([A-Za-z0-9/\-?:().,'+ ]{1,16})"
+   "23G" #"(NEWM|INST)"
+   "98A" #":(SETT|ESET)//([0-9]{8})"
+   "35B" #"ISIN ([A-Z]{2}[A-Z0-9]{9}[0-9])(\n[A-Za-z0-9/\-?:().,'+ ]{1,35}){0,4}"
+   "36B" #":(SETT|ESTT)//UNIT/([0-9,]{2,15})"
+   "97A" #":SAFE//([A-Za-z0-9/\-?:().,'+ ]{1,35})"
+   "22F" #":SETR//([A-Z0-9]{4})"
+   "95P" #":(DEAG|REAG|PSET)//([A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?)"
+   "19A" #":(SETT|ESTT)//([A-Z]{3})([0-9,]{2,15})"
+   "25D" #":(IPRC//(PACK|REJT)|MTCH//(MACH|NMAT)|SETT//(PEND|PENF))"})
+
+(def ^:private skeletons
+  "Expected top-level sequences and, per sequence, the fields in order
+  (16R/16S of nested sequences included as [:seq name])."
+  {:instruction ["GENL" "TRADDET" "FIAC" "SETDET"]
+   :status ["GENL"]})
+
+(defn- sequences
+  "Fold block 4 into nested [name children] sequences; returns
+  {:tree [...] :errors [...]}."
+  [fields]
+  (loop [[f & more] fields stack [[nil []]] errors []]
+    (if (nil? f)
+      (if (= 1 (count stack))
+        {:tree (second (first stack)) :errors errors}
+        {:tree nil :errors (conj errors {:error :unclosed-sequence :sequence (first (peek stack))})})
+      (case (:swift/tag f)
+        "16R" (recur more (conj stack [(:swift/value f) []]) errors)
+        "16S" (let [[n kids] (peek stack)]
+                (if (and (> (count stack) 1) (= n (:swift/value f)))
+                  (let [stack (pop stack) [pn pk] (peek stack)]
+                    (recur more (conj (pop stack) [pn (conj pk [:seq n kids])]) errors))
+                  (recur more stack (conj errors {:error :unbalanced-sequence :sequence (:swift/value f)}))))
+        (let [[n kids] (peek stack)]
+          (recur more (conj (pop stack) [n (conj kids f)]) errors))))))
+
+(defn- seq-named [kids n] (some #(when (and (vector? %) (= :seq (first %)) (= n (second %))) (nth % 2)) kids))
+(defn- fields-in [kids] (filter map? kids))
+(defn- tags [kids] (mapv #(if (map? %) (:swift/tag %) [:seq (second %)]) kids))
+
+(defn- expect [errors where actual expected]
+  (if (= actual expected) errors (conj errors {:error :layout :sequence where :expected expected :actual actual})))
+
+(defn validate
+  "Check an MT540-MT548 record: message type, the modeled sequence layout and
+  the field formats. Returns {:swift/valid? true :swift/mt \"541\"} or
+  {:swift/valid? false :swift/errors [...]}. This is a check of the modeled
+  skeleton, not SWIFT network validation (see the namespace docstring)."
+  [m]
+  (let [mt (get-in m [:swift/block-2 :swift/message-type])
+        kind (cond (= mt "548") :status (type-of mt) (first (type-of mt)))
+        [_ direction payment] (type-of mt)
+        fields (:swift/block-4 m)
+        {:keys [tree errors]} (sequences fields)
+        format-errors (keep identity
+                       (for [f fields
+                            :let [t (:swift/tag f) re (field-formats t)]
+                            :when (not (#{"16R" "16S"} t))]
+                        (cond (nil? re) {:error :unexpected-field :tag t}
+                              (not (re-matches re (:swift/value f))) {:error :invalid-field :tag t :value (:swift/value f)})))
+        value-errors (for [f fields
+                           :let [t (:swift/tag f) v (:swift/value f) re (field-formats t)
+                                 g (when re (re-matches re v))]
+                           :when g
+                           e [(when (and (= t "20C") (not (reference-valid? (nth g 2)))) {:error :invalid-reference :value v})
+                              (when (and (= t "98A") (not (date8-valid? (nth g 2)))) {:error :invalid-date :value v})
+                              (when (and (= t "35B") (not (isin/isin-valid? (nth g 1)))) {:error :invalid-isin :value v})
+                              (when (and (= t "36B") (not (mt-decimal-valid? (nth g 2)))) {:error :invalid-quantity :value v})
+                              (when (and (= t "19A") (not (mt-decimal-valid? (nth g 3)))) {:error :invalid-amount :value v})
+                              (when (and (= t "95P") (not (swift/bic-valid? (nth g 2)))) {:error :invalid-bic :value v})]
+                           :when e]
+                       e)
+        layout-errors
+        (if (or (nil? kind) (nil? tree))
+          [{:error (if kind :sequence-structure :unsupported-mt-type) :mt mt}]
+          (let [top (tags tree)
+                confirmation? (= kind :confirmation)]
+            (if (= kind :status)
+              (let [genl (seq-named tree "GENL")
+                    stats (filter #(and (vector? %) (= "STAT" (second %))) genl)]
+                (-> []
+                    (expect "top" top [[:seq "GENL"]])
+                    ;; GENL: 20C, 23G, LINK, then one or more STAT and nothing else
+                    (expect "GENL" (vec (take 3 (tags genl))) ["20C" "23G" [:seq "LINK"]])
+                    (cond-> (not (every? #(= [:seq "STAT"] %) (drop 3 (tags genl))))
+                      (conj {:error :layout :sequence "GENL" :expected "STAT after LINK" :actual (vec (drop 3 (tags genl)))}))
+                    (expect "LINK" (tags (seq-named genl "LINK")) ["20C"])
+                    (cond-> (empty? stats) (conj {:error :layout :sequence "STAT" :expected "one or more"}))
+                    (into (for [s stats :when (not= ["25D"] (tags (nth s 2)))]
+                            {:error :layout :sequence "STAT" :expected ["25D"] :actual (tags (nth s 2))}))))
+              (let [genl (seq-named tree "GENL") setdet (seq-named tree "SETDET")
+                    against? (= payment :against-payment)
+                    parties (filter #(and (vector? %) (= "SETPRTY" (second %))) setdet)
+                    party-codes (mapv #(second (re-matches #":([A-Z]{4})//.*" (:swift/value (first (nth % 2))))) parties)]
+                (-> []
+                    (expect "top" top (mapv #(vector :seq %) (skeletons :instruction)))
+                    (expect "GENL" (tags genl) (if confirmation? ["20C" "23G" [:seq "LINK"]] ["20C" "23G"]))
+                    (cond-> confirmation? (expect "LINK" (tags (seq-named genl "LINK")) ["20C"]))
+                    (expect "TRADDET" (tags (seq-named tree "TRADDET")) ["98A" "35B"])
+                    (expect "FIAC" (tags (seq-named tree "FIAC")) ["36B" "97A"])
+                    (expect "SETDET" (tags setdet) (cond-> ["22F" [:seq "SETPRTY"] [:seq "SETPRTY"]] against? (conj [:seq "AMT"])))
+                    (expect "SETPRTY" party-codes [(if (= direction :receive) "DEAG" "REAG") "PSET"])
+                    (cond-> against? (expect "AMT" (tags (seq-named setdet "AMT")) ["19A"]))
+                    (expect "date qualifier" (some-> (first (fields-in (seq-named tree "TRADDET"))) :swift/value (subs 1 5))
+                            (if confirmation? "ESET" "SETT"))
+                    (expect "quantity qualifier" (some-> (first (fields-in (seq-named tree "FIAC"))) :swift/value (subs 1 5))
+                            (if confirmation? "ESTT" "SETT")))))))
+        all (vec (concat errors format-errors value-errors layout-errors))]
+    (if (empty? all)
+      {:swift/valid? true :swift/mt mt}
+      {:swift/valid? false :swift/mt mt :swift/errors all})))
+
+;; ---------------------------------------------------------------------------
+;; Reading
+;; ---------------------------------------------------------------------------
+
+(defn- value-of [fields tag qualifier]
+  (some #(when (and (= tag (:swift/tag %)) (str/starts-with? (:swift/value %) (str ":" qualifier "//")))
+           (subs (:swift/value %) (+ 3 (count qualifier))))
+        fields))
+
+(defn read-message
+  "Read a record that passes `validate` (for example the result of
+  kotoba.swift/parse-mt-wire) back into the data its builder takes:
+  {:mt \"541\" :data {...}}, or nil."
+  [m]
+  (when (:swift/valid? (validate m))
+    (let [mt (get-in m [:swift/block-2 :swift/message-type])
+          fs (:swift/block-4 m)
+          [kind direction payment] (type-of mt)
+          lt->bic (fn [lt] (when lt (str (subs lt 0 8) (subs lt 9 12))))
+          base {:sender-bic (lt->bic (get-in m [:swift/block-1 :swift/lt-address]))
+                :receiver-bic (lt->bic (get-in m [:swift/block-2 :swift/destination-address]))
+                :reference (value-of fs "20C" "SEME")}]
+      {:mt mt
+       :data
+       (if (= mt "548")
+         (let [stats (keep #(when (= "25D" (:swift/tag %)) (subs (:swift/value %) 1)) fs)
+               lookup (fn [k] (some (fn [[kw code]] (when (some #{code} stats) kw)) (status-codes k)))]
+           (cond-> (assoc base :related-reference (value-of fs "20C" "RELA"))
+             (lookup :processing) (assoc :processing (lookup :processing))
+             (lookup :matching) (assoc :matching (lookup :matching))
+             (lookup :settlement) (assoc :settlement (lookup :settlement))))
+         (let [confirmation? (= kind :confirmation)
+               [isin-line & desc] (str/split (some #(when (= "35B" (:swift/tag %)) (:swift/value %)) fs) #"\n")
+               amount (value-of fs "19A" (if confirmation? "ESTT" "SETT"))]
+           (cond-> (assoc base :direction direction :payment-type payment
+                          :isin (subs isin-line 5)
+                          :quantity (mt->decimal (subs (value-of fs "36B" (if confirmation? "ESTT" "SETT")) 5))
+                          :safekeeping-account (value-of fs "97A" "SAFE")
+                          :transaction-type (some #(when (= "22F" (:swift/tag %)) (subs (:swift/value %) 7)) fs)
+                          :place-of-settlement (value-of fs "95P" "PSET")
+                          :agent (value-of fs "95P" (if (= direction :receive) "DEAG" "REAG")))
+             confirmation? (assoc :related-reference (value-of fs "20C" "RELA")
+                                  :effective-settlement-date (mt-date->iso (value-of fs "98A" "ESET")))
+             (not confirmation?) (assoc :settlement-date (mt-date->iso (value-of fs "98A" "SETT")))
+             (seq desc) (assoc :description (str/join "\n" desc))
+             amount (assoc :amount {:currency (subs amount 0 3) :value (mt->decimal (subs amount 3))}))))})))

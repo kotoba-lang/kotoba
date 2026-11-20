@@ -72,6 +72,19 @@ permission does not approve a subsequent service request. The fixture's local
 counter handler is not a PushManager implementation or permission test.
 Do not represent local node control using a fake HTTPS origin.
 
+A hand-off whose receiver the user picks in the operating system, such as a
+share sheet, has no service origin. It uses `endpoint: {'browser-action':
+'share/text', recipient: 'user-selected-app'}` (AWAI-3336). `recipient` has only
+that one value, and no origin is fabricated. Everything else is the same as a
+browser-native service effect: the operation names its service, operation and
+data categories, needs `each-operation` consent and a host adapter, takes plain
+bounded JSON copied before the modal, and never enters connect-src. The consent
+dialog says that the receiving app is chosen by the user and handles the data
+under its own rules. The host adapter only opens the system picker with the
+approved payload: it must not pick, prefill or remember a receiver. Choosing an
+app in that picker is the user's own step and is not a second approval by this
+runtime.
+
 ## Artifact admission and guest boundary
 
 `artifact: {revision: '<40 lowercase hex Git SHA>', sha256: '<64 lowercase hex>',
@@ -84,6 +97,30 @@ WebCrypto Ed25519 and a host-pinned publisher key, revision and digest, then
 validates the descriptor. The installer establishes pins independently of
 guest assertions. Ephemeral fixture keys are not production trust roots.
 Model download consent never grants remote inference.
+
+An in-memory artifact is limited to 512 MiB, because its whole body is held as one
+snapshot before the digest. A model file is larger, so an artifact may instead declare
+`delivery: 'host-stream'` (AWAI-3307), with `max-bytes` up to 64 GiB.
+
+- **Host sink:** the trusted host supplies `artifactSinks[service][operation]` when it creates
+  the broker. The sink is captured at creation, like browser adapters. An operation without a
+  sink is refused before consent and before any request.
+- **Consent:** the dialog adds the artifact revision, SHA-256, byte budget and delivery.
+  Denial sends nothing.
+- **Streaming:** after the final response origin passes the declared redirect origins, the
+  broker reads the body chunk by chunk:
+  - it hashes it incrementally (`createSha256`, FIPS 180-4; WebCrypto has no streaming digest);
+  - it enforces the byte budget and a 60-second idle deadline;
+  - it gives the sink byte copies through `write`.
+- **Outcome:** only an exact digest match calls `close({sha256, bytes, revision})`. Its plain-data
+  result is returned with `verified: true`. A mismatch, overrun, idle timeout, cancellation or read
+  error calls `abort(reason)` and never `close`.
+- **The host's own duty:** the host must discard aborted bytes and admit the file only after `close`.
+  `verifyClientArtifact` refuses a host-stream declaration.
+
+`test/browser/verify-artifact-stream.mjs` qualifies this path in a real headless Chromium. The
+artifact host and its CDN redirect are faked with the DevTools Fetch domain, and consent is answered
+with trusted input.
 
 `mountRestrictedClientApp` accepts only branded verified self-contained HTML,
 uses an opaque-origin `sandbox="allow-scripts"` iframe, restricting child CSP
@@ -115,3 +152,8 @@ Real provider APIs, live redirect delivery, product builders, publisher pin
 distribution, complete static headers, production browser consent, node / Cell
 execution and deployment remain separate acceptance gates. No production route
 cutover or stopping of an existing service is authorized by these fixtures.
+
+## Proposals
+
+- [Bounded batch consent](client-runtime-batch-consent-proposal.md) (AWAI-3276): one consent for a bounded set of
+  requests of one operation. Proposal only; not implemented, with open owner decisions.

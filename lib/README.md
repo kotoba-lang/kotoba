@@ -851,6 +851,9 @@ The bundled standard libraries live in this repository:
 | `kotoba.identify` | `kotoba.identify/src` | `identify.adapters.edn-resolver`, `identify.adapters.production-resolvers`, `identify.adapters.resolver`, `identify.core` (Kotoba project library) |
 | `kotoba.icPackaging` | `kotoba.icPackaging/src` | `ic-packaging`, `ic-packaging.bonding`, `ic-packaging.package`, `ic-packaging.thermal` (Kotoba project library) |
 | `kotoba.kotobaseLake` | `kotoba.kotobaseLake/src` | `kotobase.lake.acquire`, `kotobase.lake.catalog`, `kotobase.lake.columnar`, `kotobase.lake.compact` (Kotoba project library) |
+| `kotoba.kotobaseCommoncrawler` | `kotoba.kotobaseCommoncrawler/src` | `net-kotobase.commoncrawler.actor.graph`, `net-kotobase.commoncrawler.actor.nodes`, `net-kotobase.commoncrawler.actor.state`, `net-kotobase.commoncrawler.core`, … (Kotoba project library) |
+| `kotoba.kotobaseObjectStoreB2S3` | `kotoba.kotobaseObjectStoreB2S3/src` | `kotobase.object-store.b2-s3` (Kotoba project library) |
+| `kotoba.kotobaseObjectStoreR2` | `kotoba.kotobaseObjectStoreR2/src` | `kotobase.object-store.r2` (Kotoba project library) |
 | `kotoba.ioIpldCar` | `kotoba.ioIpldCar/src` | `ipld.car`, `ipld.car.bytes`, `ipld.car.index`, `ipld.car.trustless` (Kotoba project library) |
 | `kotoba.i18nActor` | `kotoba.i18nActor/src` | `i18n.murakumo` (Kotoba project library) |
 | `kotoba.http` | `kotoba.http/src` | `kotoba.http`, `kotoba.http.decode-json-body`, `kotoba.http.fold-headers`, `kotoba.http.form-urlencoded` (Kotoba project library) |

@@ -131,11 +131,99 @@
       (is (str/starts-with? xml "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")))
     (testing "carries the real namespace and element names"
       (is (str/includes? xml "xmlns=\"urn:iso:std:iso:20022:tech:xsd:pain.001.001.09\""))
-      (is (str/includes? xml "<CstmrCdtTrfInitn>"))
-      ;; leaf elements are pretty-printed onto their own indented line by
-      ;; the underlying emitter, so tag/text/close-tag are not contiguous
-      (is (re-find #"<PmtMtd>\s*TRF\s*</PmtMtd>" xml))
-      (is (re-find #"<InstdAmt Ccy=\"USD\">\s*7500\.00\s*</InstdAmt>" xml)))))
+      (is (str/includes? xml "<CstmrCdtTrfInitn>")))
+    (testing "values carry no surrounding whitespace (XSD simple types reject it)"
+      (is (str/includes? xml "<PmtMtd>TRF</PmtMtd>"))
+      (is (str/includes? xml "<InstdAmt Ccy=\"USD\">7500.00</InstdAmt>"))
+      (is (str/includes? xml "<CreDtTm>2026-07-14T09:30:00Z</CreDtTm>"))
+      (is (not (re-find #">\s+[^<\s]" xml)))
+      (is (not (re-find #"[^>\s]\s+</" xml))))))
+
+;; ---------------------------------------------------------------------------
+;; XSD conformance regressions (AWAI-3153 findings K1-K4, fixed in AWAI-3228)
+;; ---------------------------------------------------------------------------
+
+(defn- child-tags [el] (mapv iso/xml-tag (filter vector? (iso/xml-children el))))
+
+(deftest pain001-reqd-exctn-dt-is-a-choice-test
+  (let [pmt (-> (iso/pain001-doc pain001-params) (iso/xml-find :CstmrCdtTrfInitn) (iso/xml-find :PmtInf))
+        rd  (iso/xml-find pmt :ReqdExctnDt)]
+    (testing "ReqdExctnDt (DateAndDateTime2Choice) holds the date in a Dt child, not as text"
+      (is (= [:Dt] (child-tags rd)))
+      (is (= "" (iso/xml-text rd)))
+      (is (= "2026-07-15" (iso/xml-text (iso/xml-find rd :Dt)))))))
+
+(deftest pacs008-transaction-element-order-test
+  (let [tx (-> (iso/pacs008-doc pacs008-params) (iso/xml-find :FIToFICstmrCdtTrf) (iso/xml-find :CdtTrfTxInf))]
+    (testing "CdtTrfTxInf children follow the XSD sequence"
+      (is (= [:PmtId :IntrBkSttlmAmt :ChrgBr :Dbtr :DbtrAcct :DbtrAgt :CdtrAgt :Cdtr :CdtrAcct]
+             (child-tags tx))))))
+
+(deftest xml->str-refuses-a-missing-document-test
+  (testing "rendering a builder's nil is an error, not a declaration-only string (AWAI-3281)"
+    (is (= :no-document
+           (try (iso/xml->str nil) nil
+                (catch #?(:clj Exception :cljs js/Error) e (:swift/error (ex-data e))))))
+    (is (= :no-document
+           (try (iso/xml->str (iso/pain001-doc (assoc pain001-params :requested-execution-date "2026-02-30"))) nil
+                (catch #?(:clj Exception :cljs js/Error) e (:swift/error (ex-data e))))))))
+
+(deftest whitespace-around-a-value-survives-parsing-test
+  (testing "parse-xml keeps value text as is, so padded values are not silently repaired"
+    (let [padded (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                      "<Document xmlns=\"" iso/pacs-008-namespace "\">\n"
+                      "  <FIToFICstmrCdtTrf>\n    <GrpHdr>\n      <MsgId>\n        M-1\n      </MsgId>\n"
+                      "    </GrpHdr>\n  </FIToFICstmrCdtTrf>\n</Document>")
+          doc (iso/parse-xml padded)]
+      (is (= "\n        M-1\n      "
+             (-> doc (iso/xml-find :FIToFICstmrCdtTrf) (iso/xml-find :GrpHdr) (iso/xml-find :MsgId) iso/xml-text))))))
+
+(defn- error-kinds [r] (set (map (juxt :error :tag) (:swift/errors r))))
+
+(deftest validate-rejects-what-the-xsd-rejects-test
+  (let [pain (iso/pain001-doc pain001-params)
+        pacs (iso/pacs008-doc pacs008-params)]
+    (testing "the builders' own output validates"
+      (is (= {:swift/valid? true :swift/message-type "pain.001.001.09"} (iso/validate-iso20022 pain)))
+      (is (= {:swift/valid? true :swift/message-type "pacs.008.001.08"} (iso/validate-iso20022 pacs))))
+    (testing "K1: a value with surrounding whitespace is an invalid value"
+      (let [r (iso/validate-iso20022 (iso/parse-xml (str/replace (iso/xml->str pacs) "<NbOfTxs>1<" "<NbOfTxs>\n  1\n<")))]
+        (is (= :schema-violation (:swift/error r)))
+        (is (some #(and (= :invalid-value (:error %)) (= :NbOfTxs (peek (:path %)))) (:swift/errors r)))))
+    (testing "K2: ReqdExctnDt as bare text is rejected"
+      (let [bad (iso/parse-xml (str/replace (iso/xml->str pain)
+                                            "<ReqdExctnDt><Dt>2026-07-15</Dt></ReqdExctnDt>"
+                                            "<ReqdExctnDt>2026-07-15</ReqdExctnDt>"))
+            r   (iso/validate-iso20022 bad)]
+        (is (false? (:swift/valid? r)))
+        (is (some #(= :text-not-allowed (:error %)) (:swift/errors r)))
+        (is (some #(= :choice-needs-one-element (:error %)) (:swift/errors r)))))
+    (testing "K3: DbtrAgt before Dbtr is rejected"
+      (let [xml (iso/xml->str pacs)
+            agt (re-find #"<DbtrAgt>.*?</DbtrAgt>" xml)
+            bad (iso/parse-xml (-> xml (str/replace agt "") (str/replace "<Dbtr>" (str agt "<Dbtr>"))))
+            r   (iso/validate-iso20022 bad)]
+        (is (false? (:swift/valid? r)))
+        (is (contains? (error-kinds r) [:out-of-order-element :Dbtr]))))
+    (testing "a missing mandatory element, an unmodeled element and a bad code are rejected"
+      (is (contains? (error-kinds (iso/validate-iso20022
+                                   (iso/parse-xml (str/replace (iso/xml->str pacs) #"<ChrgBr>[A-Z]+</ChrgBr>" ""))))
+                     [:missing-element :ChrgBr]))
+      (is (contains? (error-kinds (iso/validate-iso20022
+                                   (iso/parse-xml (str/replace (iso/xml->str pacs) "<Cdtr>" "<Purp>X</Purp><Cdtr>"))))
+                     [:unexpected-element :Purp]))
+      (is (some #(= :invalid-value (:error %))
+                (:swift/errors (iso/validate-iso20022
+                                (iso/parse-xml (str/replace (iso/xml->str pacs) "<SttlmMtd>INDA<" "<SttlmMtd>XXXX<")))))))
+    (testing "value facets: impossible dates, UETR shape, amount and currency"
+      (is (nil? (iso/pain001-doc (assoc pain001-params :requested-execution-date "2026-02-30"))))
+      (is (nil? (iso/pain001-doc (assoc pain001-params :creation-date-time "2026-13-01T00:00:00Z"))))
+      (is (iso/pain001-doc (assoc pain001-params :requested-execution-date "2028-02-29")))
+      (is (nil? (iso/pacs008-doc (assoc-in pacs008-params [:transactions 0 :uetr] "EB6305C4-3E7A-4B29-9A1F-8D2CE5A71B30"))))
+      (is (nil? (iso/pacs008-doc (assoc-in pacs008-params [:transactions 0 :end-to-end-id] (apply str (repeat 36 "X"))))))
+      ;; fractionDigits 5 applies to the value: 7.500001 has 6, 7.500000 has 1
+      (is (nil? (iso/pacs008-doc (update-in pacs008-params [:transactions 0] assoc :amount-minor 7500001 :decimals 6))))
+      (is (iso/pacs008-doc (update-in pacs008-params [:transactions 0] assoc :amount-minor 7500000 :decimals 6))))))
 
 (deftest pain001-xml-roundtrip-test
   (let [doc  (iso/pain001-doc pain001-params)
@@ -180,13 +268,16 @@
 
 (deftest validate-iso20022-rejects-missing-mandatory-elements-test
   (testing "pain.001 namespace with no CstmrCdtTrfInitn body"
-    (is (= {:swift/valid? false :swift/error :missing-mandatory-elements}
+    (is (= {:swift/valid? false :swift/error :schema-violation :swift/message-type "pain.001.001.09"
+            :swift/errors [{:path [:Document] :error :missing-element :tag :CstmrCdtTrfInitn}]}
            (iso/validate-iso20022 [:Document {:xmlns iso/pain-001-namespace}]))))
-  (testing "pacs.008 namespace with no CdtTrfTxInf"
-    (is (= {:swift/valid? false :swift/error :missing-mandatory-elements}
-           (iso/validate-iso20022
+  (testing "pacs.008 namespace with no CdtTrfTxInf: every missing mandatory element is listed"
+    (let [r (iso/validate-iso20022
              [:Document {:xmlns iso/pacs-008-namespace}
-              [:FIToFICstmrCdtTrf [:GrpHdr [:MsgId "X"]]]])))))
+              [:FIToFICstmrCdtTrf [:GrpHdr [:MsgId "X"]]]])]
+      (is (= :schema-violation (:swift/error r)))
+      (is (= #{:CdtTrfTxInf :CreDtTm :NbOfTxs :SttlmInf}
+             (set (map :tag (filter #(= :missing-element (:error %)) (:swift/errors r)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Hiccup query helpers

@@ -1,0 +1,92 @@
+(ns net-kotobase.commoncrawler.actor.nodes
+  "Graph nodes for the CommonCrawl ingestion actor."
+  (:require [kotoba.lang.text :as str]
+            [net-kotobase.commoncrawler.ingest :as ingest]
+            [net-kotobase.commoncrawler.murakumo :as murakumo]
+            [net-kotobase.commoncrawler.embeddings :as embeddings]
+            [net-kotobase.commoncrawler.pipeline :as pipeline]
+            [net-kotobase.commoncrawler.store :as store]
+            [net-kotobase.commoncrawler.warc :as warc]
+            [kotobase.store :as st]))
+
+(defn fetch-captures-node
+  "Node: Fetch new captures from CC CDX index."
+  [state]
+  (let [checkpoint (:checkpoint state)
+        caps {:http-fn identity :json-read identity}
+        new-caps (ingest/index-query caps
+                                     (:crawl-id checkpoint ingest/default-crawl)
+                                     (:pattern checkpoint)
+                                     50)] ;; limit 50 per tick
+    (assoc state
+           :pending-captures new-caps
+           :processing-node :murakumo-extract)))
+
+(defn murakumo-extract-node
+  "Node: Extract structured data using cloud-murakumo LLM API."
+  [state murakumo-cfg]
+  (if (empty? (:pending-captures state))
+    (assoc state :processing-node :store-datom)
+    (let [cap (first (:pending-captures state))
+          warc-text (try (warc/range-fetch-text (str "https://data.commoncrawl.org/" (get cap :filename)) (get cap :offset) (get cap :length))
+                         (catch Throwable _ nil))]
+      (if warc-text
+        (let [extracted (murakumo/extract-content-with-llm
+                         murakumo-cfg
+                         warc-text
+                         "WARC")]
+          (assoc state
+                 :extracted-data extracted
+                 :processing-node :embeddings))
+        (assoc state
+               :processing-node :store-datom)))))
+
+(defn embeddings-node
+  "Node: Generate embeddings for extracted content."
+  [state]
+  (if (:extracted-data state)
+    (let [text-for-embedding (or (get (:extracted-data state) :content) "WARC content")
+          embedding-entity (embeddings/content-to-embedding-entity
+                            (str "embed-" ((:extracted-data state) :url "unknown-url"))
+                            (:extracted-data state)
+                            text-for-embedding)]
+      (assoc state
+             :embedding-entity embedding-entity
+             :processing-node :store-datom))
+    (assoc state :processing-node :store-datom)))
+
+(defn store-datom-node
+  "Node: Store datom-log entities to kotobase.net via IStore."
+  [state k-store]
+  (if (:extracted-data state)
+    (let [url ((:extracted-data state) :url "unknown-url")
+          html-entity (net-kotobase.commoncrawler.core/html-entity
+                       (str "html-" url)
+                       url
+                       (or (get (:extracted-data state) :title) "Untitled")
+                       (or (get (:extracted-data state) :content) "")
+                       (or (get (:extracted-data state) :links) [])
+                       (or (get (:extracted-data state) :metadata) {}))
+          datom-log (net-kotobase.commoncrawler.core/log [html-entity])]
+      ;; Store to kotobase.net - placeholder for actual IStore/-put call
+      (try
+        ;; (st/-put k-store "commoncrawl-datoms" "entities" url datom-log)
+        (println (format "Placeholder: Would store datom-log to kotobase.net for url: %s" url))
+        (catch Exception e
+          (println (format "Store error: %s" (.getMessage e)))))
+
+      ;; Update checkpoint
+      (let [last-cap (first (:pending-captures state))
+            new-checkpoint (update (:checkpoint state)
+                                   :last-warc (fn [lw] (or lw (get last-cap :filename)))
+                                   :last-offset (fn [lo] (or lo (get last-cap :offset))))]
+        (assoc state
+               :datom-log datom-log
+               :checkpoint new-checkpoint
+               :pending-captures (rest (:pending-captures state))
+               :extracted-data nil
+               :embedding-entity nil
+               :processing-node (if (empty? (rest (:pending-captures state)))
+                                  :fetch-captures
+                                  :murakumo-extract))))
+    (assoc state :processing-node :fetch-captures)))

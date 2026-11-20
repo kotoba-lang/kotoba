@@ -68,7 +68,7 @@ class TestRoundTrip:
 
     def test_minimal_return(self) -> None:
         msg = PaymentReturn(
-            group_header=GroupHeader("R", "t", 1, settlement_method="CLRG"),
+            group_header=GroupHeader("R", "2026-06-08T09:30:00Z", 1, settlement_method="CLRG"),
             transactions=(
                 PaymentReturnTransaction(
                     returned_interbank_amount=Amount(Decimal("5.00"), "USD"),
@@ -120,7 +120,7 @@ class TestReversalReconciliation:
 
     def test_return_without_original_refs_emits_no_tx_facts(self) -> None:
         msg = PaymentReturn(
-            group_header=GroupHeader("R", "t", 1, settlement_method="CLRG"),
+            group_header=GroupHeader("R", "2026-06-08T09:30:00Z", 1, settlement_method="CLRG"),
             transactions=(
                 PaymentReturnTransaction(
                     returned_interbank_amount=Amount(Decimal("1.00"), "EUR"),
