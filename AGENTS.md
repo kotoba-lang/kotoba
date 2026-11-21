@@ -20,10 +20,16 @@ AWAI-43, AWAI-48 and JUN-290. Workspace architecture and authority rules apply.
 
 ## CDCI
 
-Use Amu selfhost and canonical Kotoba only. Do not restore CLJK/CLJC, NBB,
-KBB, Clojure, JVM/Java, GraalVM, Node or a C compiler/loader as a CI prerequisite
-or fallback. Python scripts may stage/hash bytes and observe native processes;
-they must not implement language resolution, compilation or verdicts.
+The native gate, build and execution path use Amu selfhost and canonical Kotoba
+only. Do not make CLJK/CLJC, NBB, KBB, Clojure, JVM/Java, GraalVM, Node or a C
+compiler/loader a prerequisite or fallback of that path. The earlier ban on
+JVM and nbb anywhere in CI was withdrawn (owner decision 2026-11-17, JUN-290):
+oracle-only jobs and hosted CI tooling follow the language table in
+`com-junkawasaki/root` `AGENTS.md` (2026-11-19, JUN-974). Such jobs may
+orchestrate and inspect native checks, are not required checks, and never
+replace or silently back a native verdict. Python scripts may stage/hash bytes
+and observe native processes; they must not implement language resolution,
+compilation or verdicts.
 
 The 2026-10-24 replacement removes the JVM/Node launcher job and the macOS C
 loader toolchain. Original definitions/scripts are byte-preserved as inert
