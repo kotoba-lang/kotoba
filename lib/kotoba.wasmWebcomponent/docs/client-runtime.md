@@ -65,10 +65,15 @@ written; nothing is inferred from the payload.
 | `purpose` | one specific sentence (not 「サービス向上のため」) |
 | `frequency` | `one-time` or `continuous` |
 | `withdrawal` | where in settings the permission is withdrawn (「設定 › 許可した送信」) |
+| `note` | optional: a short plain-text note from the app, at most 200 characters, no control characters; shown as text, never parsed as HTML or Markdown |
 
 The host may pass `app: {name, provider, 'privacy-policy'}` to `createClientOperationBroker` from its
 own registry (never from the guest). The dialog title uses the name; trusted-page-v1 also names the
 provider and its privacy policy. A line whose value is missing is left out, never shown blank.
+Both profiles show the same declared facts: recipient, data, purpose, frequency, special care, the
+note, where to withdraw and, for a foreign recipient, a line with a link to the information page
+(AWAI-3819). Links are plain `<a>` elements to the validated HTTPS URL, opened in a new tab with
+`rel="noopener noreferrer"`. Only the notice differs between the profiles.
 
 The dialog text is a **draft** (Legal, `reports/kotoba-159-consent-wording.md`, 2026-11-22). It is
 kept in one exported object, `CLIENT_CONSENT_TEXT` (`status: 'draft'`), and Legal finalizes it before
