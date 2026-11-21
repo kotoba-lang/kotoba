@@ -183,3 +183,16 @@ foreign recipient, the country name and the information page. trusted-page-v1 st
 refusing prevents sending. `test/verify-client-dialog-qa-20261122.mjs` covers these; it fails on main
 `a316cc27b`. Per Decision, the app must not be offered to EU users until the withdrawal line is live
 (GDPR 7(3)).
+
+## 7. Links in the Tab cycle (App QA r2, 2026-11-22)
+
+App QA r2 on `ee75001ee` (sha256 `e7bcd2d7…7ebe`, Chrome 158 and Safari 26.4) passed A, B and C, the
+new trusted-page-v1 lines and the escaped note. It found that keyboard users could not reach the
+links in the dialog (the foreign-recipient こちら link and the privacy-policy link): the Tab handler
+cycled only the summary, the 全文 toggle and the buttons. The cycle is now built from every focusable
+descendant in DOM order: `a[href]`, `summary`, buttons, and other elements with `tabindex` 0 or more.
+It skips disabled and hidden controls and the inside of a closed `<details>` other than its
+`<summary>`. Links keep `target=_blank` and `rel="noopener noreferrer"` and get `tabindex` 0. Allow is
+still skipped while disabled for the first 600 ms, the heading still takes focus on open, and the
+buttons keep equal weight. `test/verify-client-dialog-qa-20261122.mjs` fails on `ee75001ee` and passes
+with the fix.
