@@ -36,6 +36,15 @@ When an operation needs an external identity, storage, federation, payment, mode
 
 Downloading a model, runtime module, or application artifact is itself an external operation. Pin an immutable source revision and verify the artifact digest before execution where the source provides one. Approval to download or run a local model never authorizes sending prompts, conversation history, or outputs to a remote inference service; that requires its own fresh approval. If an expected digest is unavailable, record the artifact as unverified and keep the corresponding runtime qualification open until an independent digest check is available.
 
+One exception applies to updating apps a trusted host installed (for example the Itonami Store). In the host's own settings, outside app control, the person may turn on automatic updates. That is a standing update approval for one declared update service. It covers reading the signed catalog from one fixed origin, and downloading from that origin and installing the artifacts that catalog lists for apps this host installed. Before it is turned on, the host shows the service, origin, operations and data categories. Only the host holds the approval, logs each use where the person can see it, and drops it at once when the person turns it off or when it expires. An update is applied without asking only if all of these hold:
+
+- the catalog verifies against a pinned publisher key;
+- the package and signer are unchanged and the version is higher;
+- the artifact digest matches;
+- the update adds no permission, external operation, endpoint origin or data category.
+
+Any other update needs a fresh, operation-specific approval. App and bot code still must not mint, persist or broaden this approval, and it never authorizes the updated app's own operations. The conditions and their rationale are in [client-runtime-standing-update-proposal.md](client-runtime-standing-update-proposal.md).
+
 Keep static hosting, browser app runtime, remote protocol services, bot fleets, build/release infrastructure, and control planes as distinct roles. This rule applies to end-user apps and does not imply that Bot fleet hosting or its control plane should move into the browser. It does not authorize stopping existing services. Treat existing server routes as migration inventory; distinguish source changes, built candidates, browser qualification, publication, and live cutover. Do not perform a production route cutover until compatibility and release evidence are complete and the cutover is separately approved.
 
 Browser consent authorizes only the displayed app operation. It does not authorize a Bot's separate tool call, and a Bot's tool approval does not substitute for browser consent.
