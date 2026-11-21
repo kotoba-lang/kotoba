@@ -163,3 +163,23 @@ fails on main `681cb85c7` and passes with the fix:
 The equal-weight rule, the heading focus and the 600 ms arm are unchanged. The VoiceOver reading and
 the moto g05 check stay with App QA. The new reviewed revision is the file as merged by that change,
 recorded in `local-changes.json` and KOTOBA-159.
+
+## 6. trusted-page-v1 facts and the app note (2026-11-22)
+
+Itonami found, while re-vendoring Kumade (AWAI-3819, kumade#37), that the trusted-page-v1 confirmation
+showed only the recipient, the data and the purpose. A follow-up change adds the remaining declared
+facts there too:
+
+- the frequency line (1 回だけ / 許可を取り消すまで続けて);
+- 「許可は、あとで {withdrawal} から取り消せます。」;
+- for a foreign recipient, 「送り先は日本の外（{country-name}）にあります。制度と送り先の措置は こちら。」,
+  linking to `foreign-info-url`.
+
+Links (also the restricted-wasm-v1 foreign page and the trusted-page-v1 privacy policy) are `<a>`
+elements to the validated HTTPS URL with `rel="noopener noreferrer"`. The descriptor may add an
+optional `note`: plain text, at most 200 characters, with no control characters. The dialog shows it
+through `textContent` only. Validation still requires the withdrawal place, the frequency and, for a
+foreign recipient, the country name and the information page. trusted-page-v1 still makes no claim that
+refusing prevents sending. `test/verify-client-dialog-qa-20261122.mjs` covers these; it fails on main
+`a316cc27b`. Per Decision, the app must not be offered to EU users until the withdrawal line is live
+(GDPR 7(3)).
