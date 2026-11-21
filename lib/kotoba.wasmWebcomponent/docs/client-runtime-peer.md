@@ -66,6 +66,30 @@ indefinite/background execution. Provider-side approval and sender-side approval
 remain independent; a sender does not grant remote storage. Receipt signatures
 are transport observations, not account/PQ/publication authority.
 
+### Declared scope enforcement and the conformance test (KOTOBA-159 D2, owner decision 2026-11-22)
+
+The broker does not enforce `snapshot-cid`, `max-transfer-bytes`, `listen-address`, `receive-ms`
+or `allow-read-back`; the host adapter does. A scoped operation therefore needs an adapter that
+declares it, `peerAdapters[service][operation] = {handle, scopeEnforcement}`, with
+`scopeEnforcement = {schema: 'kotoba.peer-scope-enforcement.v1', enforces: [...], 'max-transfer-bytes': N}`.
+`enforces` lists every scope key of the action; `N` is at most `PEER_TRANSFER_MAX_BYTES` (256 MiB)
+and at least the operation's `max-transfer-bytes`. A plain function, a missing key or a smaller
+bound is refused before consent. The broker also checks the operation's bound against
+`PEER_TRANSFER_MAX_BYTES` itself.
+
+The declaration is a claim. Each host must run `verifyPeerAdapterScopeConformance(adapter,
+{operation, inScope, violations})` in its own test suite, against its real adapter and a fixture
+peer, and record the report (`kotoba.peer-scope-conformance.v1`) with the runtime digest it vendors.
+Required violation cases: a different `snapshot-cid`, a transfer over `max-transfer-bytes`, and for
+`receive-snapshot` with `allow-read-back: false`, a read-back. Each must be refused (not time out);
+the in-scope payload must succeed.
+
+**Bunsho and Awai Drive keep their 8 MiB limit until their adapter passes this test and the report
+is recorded (AWAI-3099).**
+
+Peer addresses, relay hops and the listener follow the internal-address rule in
+[client-runtime.md](client-runtime.md): an internal address needs `scope: 'lan'` on the operation.
+
 ## AWAI-3059 nearby discovery profile
 
 `transport: nearby` declares the separate discovery profile for reaching a

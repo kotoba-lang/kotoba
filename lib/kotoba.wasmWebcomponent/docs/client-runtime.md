@@ -30,11 +30,79 @@ The verified host shell owns its document, publisher pins, eligibility,
 broker and supported browser handlers. Do not run arbitrary untrusted app
 JavaScript in that realm. Apps receive only bounded invocation.
 
-`createClientConsentHost()` provides a canonical modal displaying the service,
-operation, endpoint / action, method, path, query, data categories and redirects.
-A direct trusted MouseEvent on Allow approves one invocation; synthetic
-clicks, forged handles and a true-returning callback do not. Denial / dismissal
-sends no request. Eligibility starts empty and is not persisted user consent.
+`createClientConsentHost({locale})` provides the canonical modal (`locale` is `'ja'`, the default,
+or `'en'`). Its first screen shows the operation's declared disclosure (see below); the service,
+operation, endpoint / action, method, path, query, data categories, redirects, scope and the payload
+summary sit behind 詳細を見る (View details). A direct trusted MouseEvent on Allow approves one
+invocation; synthetic clicks, forged handles and a true-returning callback do not. When the broker is
+denied it sends no request. Eligibility starts empty and is not persisted user consent.
+
+## Profiles: which apps may use trusted-page-v1 (KOTOBA-159 finding 1, owner decision 2026-11-22)
+
+- An app that handles user data or communicates with an external service **must** use
+  `restricted-wasm-v1`: the guest runs in an opaque-origin sandbox, so the broker's refusal is the
+  only way out (with the host's static CSP; the WebRTC limit of review R6 still applies).
+- `trusted-page-v1` is limited to **owner-signed first-party apps**. Its code shares the host
+  document and can send without the dialog, so the dialog there is a notice, not an enforced consent.
+  It says so: 「この画面は送信の確認で、送信の制限を保証するものではありません。」 Its buttons are
+  閉じる / 続ける. It never says that refusing prevents sending; only `restricted-wasm-v1` says
+  「許可しない場合、この情報は送られません。」
+- A sunset date for `trusted-page-v1` is a separate owner decision (KOTOBA-159).
+
+## Disclosure (KOTOBA-159 finding 9, Legal design 2026-11-22)
+
+Every operation carries `disclosure`; descriptor validation rejects an operation without a complete
+one (`invalid-disclosure`, with the missing or invalid fields in `details`). The values are shown as
+written; nothing is inferred from the payload.
+
+| key | value |
+|---|---|
+| `recipient` | the receiving business's official legal name (not an origin or abbreviation) |
+| `country` | ISO 3166-1 alpha-2 code of the recipient, `JP` for Japan |
+| `country-name`, `foreign-info-url` | required when `country` is not `JP`: the country in words, and an HTTPS page with the 施行規則 17 条 2 項 information (country, its data-protection regime, the recipient's measures; a link to the PPC country survey is enough for the regime) |
+| `data` | data categories in words a user reads (氏名, メールアドレス, 相談内容 …), 1 to 32 |
+| `special-care` | `true` when 要配慮個人情報 or a GDPR special category is sent; then `special-care-kinds` names them (病歴 …) |
+| `purpose` | one specific sentence (not 「サービス向上のため」) |
+| `frequency` | `one-time` or `continuous` |
+| `withdrawal` | where in settings the permission is withdrawn (「設定 › 許可した送信」) |
+
+The host may pass `app: {name, provider, 'privacy-policy'}` to `createClientOperationBroker` from its
+own registry (never from the guest). The dialog title uses the name; trusted-page-v1 also names the
+provider and its privacy policy. A line whose value is missing is left out, never shown blank.
+
+The dialog text is a **draft** (Legal, `reports/kotoba-159-consent-wording.md`, 2026-11-22). It is
+kept in one exported object, `CLIENT_CONSENT_TEXT` (`status: 'draft'`), and Legal finalizes it before
+any public release. Two EU points (GDPR 49(1)(a) for continuous transfers, an Art. 27 representative)
+wait for a lawyer. The two choices have the same style, neither is focused or selected by default,
+and Allow stays disabled for the first 600 ms (finding 3).
+
+Behind 詳細を見る: the technical scope, then the payload's content type, size, SHA-256, field names
+(JSON or form bodies), header names and text. Fixed fields (data categories, redirects, scope) come
+before the guest-chosen Action, the query length is shown, and a value over 160 characters is cut
+with its length and a 全文 toggle (R5, D4).
+
+## Addresses and `scope: "lan"` (KOTOBA-159 findings 8, P1, D1)
+
+HTTP and browser-action origins, redirect origins, peer addresses, circuit-relay hops and the
+receive-snapshot listener may not name loopback, RFC 1918, link-local (169.254.169.254 included),
+CGNAT, 0.0.0.0/8, `localhost`, `.local`, `.home.arpa`, `.internal`, or the IPv6 equivalents (::1,
+fc00::/7, fe80::/10, IPv4-mapped / compatible and NAT64 forms), unless the operation declares
+`scope: 'lan'`. The dialog then says the recipient is on the local network or this device. A `lan`
+operation may name only internal hosts. `clientAddressScope(host)` exposes the classification;
+`clientEndpointAllowsRequest(endpoint, input, method, {scope: 'lan'})` and
+`clientPeerEndpointProblems(endpoint, {scope: 'lan'})` take the same option.
+
+## Generic network rails (finding 7)
+
+An endpoint whose origin is a wildcard or pattern, or whose path is made only of parameters
+(`/:a`, `/:a/:b`), is refused as `generic-network-endpoint`, whatever its capability is called.
+
+## One request at a time; canonical brokers only (R3, R4)
+
+A broker takes its single slot before it reads a payload or body and releases it when consent is
+decided. A second invoke meanwhile is refused at once (`another client operation is awaiting
+consent`). `mountRestrictedClientApp` accepts only a broker created by `createClientOperationBroker`;
+no other object, copy or wrapper is mounted, and there is no exported way to register one.
 
 `createClientOperationBroker` takes `runtime`, `requestedCapabilities`,
 `approvedOperations` (host eligibility ceiling, not consent),
