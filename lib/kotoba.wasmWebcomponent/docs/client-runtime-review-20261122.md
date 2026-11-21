@@ -143,3 +143,23 @@ screen readers. Node does not run in this repository's CI.
 The reviewed revision for vendoring is the file as merged by this change; its sha256 is recorded in
 `local-changes.json` and KOTOBA-159. Consumers that must re-vendor: Bunsho (PR #13), Kumade
 (JUN-430), kaikei, topology.
+
+## 5. App QA follow-up (2026-11-22)
+
+App QA checked `a1b90e38c` (runtime sha256 `d6f67c05…0a75`) on desktop Chrome 158 and Safari 26.4.
+Points 1 to 4 passed in both browsers. Firefox was not installed, and the phone check waits for the
+device to be unlocked. A follow-up change fixes three findings; `test/verify-client-dialog-qa-20261122.mjs`
+fails on main `681cb85c7` and passes with the fix:
+
+- **A** Notice paragraphs collapsed into one `<p>`. Each paragraph is now its own `<p>`; the stylesheet
+  also uses `pre-line`.
+- **B** The details `<pre>` overflowed the dialog at 390 px. Both details blocks now carry inline
+  wrapping styles (`pre-wrap`, `overflow-wrap: anywhere`, `max-width: 100%`, `overflow: auto`), so
+  they stay inside the dialog even when the host does not load the stylesheet. The test fixtures did
+  not load it either.
+- **C** Safari's default Tab order skipped the buttons. Each control now has `tabindex="0"`, and Tab /
+  Shift+Tab cycle inside the modal. Allow is skipped while it is disabled. Nothing is focused by default.
+
+The equal-weight rule, the heading focus and the 600 ms arm are unchanged. The VoiceOver reading and
+the moto g05 check stay with App QA. The new reviewed revision is the file as merged by that change,
+recorded in `local-changes.json` and KOTOBA-159.
