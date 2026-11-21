@@ -103,12 +103,32 @@ from descriptor declarations (`profile: 'trusted-page-v1'` outside the vendored 
   not scanned one by one.
 - The registry's `.agent-output/clones` held five more cloud-itonami apps.
 
-Result: **at least 60 apps** (51 network-awai, 9 cloud-itonami), listed in
+First result: at least 60 apps. That count missed the JUN-1407 series, so it is corrected here.
+
+**Correction (2026-11-22, Decision via App Build): the lower bound is about 860.**
+
+- **JUN-1407 series.** The series Tauri apps (isic, isco, jsic, unspsc, cofog) all declare
+  trusted-page-v1 because of the template's `build.mjs`. Listing the whole organization with
+  `gh repo list cloud-itonami` (1859 repositories) gives 820 non-archived repositories named
+  `app-itonami-cloud-itonami-(isic|isco|jsic|unspsc|cofog)-*`: isic 467, isco 340, jsic 3, unspsc 5 and
+  cofog 5. Decision counts 813 series Tauri apps among them. The 7-repository difference was not
+  checked repository by repository. The first count found only 8 of these.
+- **Other apps.** 52 apps outside the series (51 in network-awai, plus `cloud-itonami/app-itonami-cloud-itonami-app`).
+- **Total.** About 860: 813 series apps plus 52 others, or 872 by repository name.
+
+Both groups are listed in
 [evidence/trusted-page-v1-apps-20261122.txt](evidence/trusted-page-v1-apps-20261122.txt). Platform
 surfaces that also declare it: `network-awai/awai-os` (desktop, Otehon shell), `network-awai-apex`
 (node console, civic workspace, owner-store preflight), `cloud-murakumo-usb-installer` desktop and the
 registry's Android assoc descriptor. Only `app-itonami-kaikei` was found declaring
-`restricted-wasm-v1` (it also has a trusted-page-v1 declaration). This is a lower bound.
+`restricted-wasm-v1` (it also has a trusted-page-v1 declaration). The total is still a lower bound for
+the apps outside the series.
+
+**Decision's classification of the series (2026-11-22).** The 813 series apps are first-party, show
+display settings only and make no outbound communication. They are category (3) and may stay on
+trusted-page-v1 until **2027-03-31**. They move to `restricted-wasm-v1` all at once with the
+itonami-lib migration. App Build changes the template to emit `restricted-wasm-v1` this week. A sunset
+date for the other apps is still Decision's to set.
 
 ## 4. Verification
 
