@@ -81,7 +81,7 @@ cp "$HERE/cases/12-extra-drift/deps.edn" "$TMP/12.edn"
 python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$HERE/fake-kotoba-drift" "$TMP/12.edn" \
   > "$TMP/12.stdout" 2>&1
 [ "$?" != 0 ] || fail "12-extra-drift: exit 0, want non-zero"
-grep -q "extern case changed" "$TMP/12.stdout" || fail "12-extra-drift: no loud error"
+grep -q "extern osaho pin changed" "$TMP/12.stdout" || fail "12-extra-drift: no loud error"
 diff -q "$HERE/cases/12-extra-drift/deps.edn" "$TMP/12.edn" > /dev/null \
   || fail "12-extra-drift: file was modified"
 echo "ok: 12-extra-drift (loud error, untouched)"

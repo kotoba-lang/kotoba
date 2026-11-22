@@ -46,12 +46,14 @@ Exit codes: 0 = rewritten (or check clean); 1 = --check found problems;
 2 = rewrite had nothing to do (idempotent); 3 = usage/error (input left
 untouched — the file is only replaced atomically at the very end).
 
-The only extern-sha upgrade is documented in EXTRA (shitsuke->osaho):
-osaho@b94158f's own graph names deleted kotoba-core-contracts.git via a bare
-sha, so any basis containing shitsuke cannot resolve. osaho at the pinned sha
-is clean, so shitsuke's closure gains osaho/kotoba-hir/security at the single
-sha. EXTRA entries carry the exact pin they expect; a mismatch or a vanished
-reference exits loudly instead of silently changing behavior.
+The only extern-sha upgrade is documented in EXTRA_OSAHO_LIBS/EXPECT:
+any walked lib pinning osaho at a monorepo-URL sha other than --sha (e.g.
+shitsuke or jp-go-digital-design-system pinning osaho@b94158f, whose own
+graph names deleted kotoba-core-contracts.git via a bare sha, unresolvable)
+must match the documented pin exactly, else the script exits loudly;
+osaho/kotoba-hir/security are then walked at the single sha like everything
+else. Extern pins that resolve (e.g. kotoba-core-contracts@b94158f, alive)
+are left alone.
 """
 import argparse
 import difflib
@@ -66,20 +68,17 @@ MONO_URL = "https://github.com/kotoba-lang/kotoba"
 AMU_LIBS = ("io.github.kotoba-lang/amu", "kotoba-lang/amu")
 GROUPS = r"(?:io\.github\.kotoba-lang|kotoba-lang|gftd)"
 
-# Documented extern-sha upgrades: {trigger-top: {...}}. Validated at run time
-# against the monorepo at --sha; any mismatch exits loudly (see docstring).
-EXTRA = {
-    "kami-engine-cae-solver": {
-        "libs": ["io.github.kotoba-lang/osaho",
-                 "io.github.kotoba-lang/kotoba-hir",
-                 "io.github.kotoba-lang/security"],
-        "expect": {"in_lib": "io.github.kotoba-lang/shitsuke",
-                   "lib": "io.github.kotoba-lang/osaho",
-                   "url": MONO_URL + ".git",
-                   "sha": "b94158fd48ec541b70d3c455912a06f407537ddc",
-                   "root": "lib/kotoba.osaho"},
-    },
-}
+# Documented extern-sha upgrade: osaho pinned off-sha (monorepo URL) by any
+# walked lib (shitsuke, jp-go-digital-design-system, ...). That extern
+# revision's own graph names the deleted kotoba-lang/kotoba-core-contracts.git
+# via a bare sha, so any basis containing it cannot resolve; osaho at the
+# pinned sha is clean. A mismatch with the documented pin exits loudly.
+EXTRA_OSAHO_LIBS = ["io.github.kotoba-lang/osaho",
+                    "io.github.kotoba-lang/kotoba-hir",
+                    "io.github.kotoba-lang/security"]
+EXTRA_OSAHO_EXPECT = {"url": MONO_URL + ".git",
+                      "sha": "b94158fd48ec541b70d3c455912a06f407537ddc",
+                      "root": "lib/kotoba.osaho"}
 
 # Artifacts that also appear under the gftd/ group: emit the override under
 # both groups (the unused one is inert). Determined per run from the target
@@ -117,7 +116,7 @@ def load_metadata(repo, sha):
         for a in re.findall(r'"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[^"]+)"', entry):
             alias_to_path[a] = pm.group(1)
 
-    lib_local_deps = {}  # path -> [referenced lib names]
+    lib_local_deps = {}  # path -> ([local lib names], [(lib, url, sha, root)] git edges)
     lib_texts = {}  # path -> raw deps.edn text (for pin inspection)
 
     def lib_deps(path):
@@ -131,7 +130,18 @@ def load_metadata(repo, sha):
         refs = re.findall(
             r"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[a-zA-Z0-9_.\-]+)"
             r"((?:\s+|;[^\n]*)+)\{[^{}]*:local/root", txt)
-        lib_local_deps[path] = [lib for lib, _ in refs]
+        gits = []
+        for m in re.finditer(
+                r"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[a-zA-Z0-9_.\-]+)"
+                r"((?:\s+|;[^\n]*)+)\{([^{}]*)\}", txt):
+            lib, gap, block = m.group(1), m.group(2), m.group(3)
+            um = re.search(r':git/url\s+"([^"]+)"', block)
+            sm = re.search(r":git/sha\s+\"([0-9a-f]+)\"|:sha\s+\"([0-9a-f]+)\"", block)
+            rm = re.search(r':deps/root\s+"([^"]+)"', block)
+            if um and sm:
+                gits.append((lib, um.group(1), sm.group(1) or sm.group(2),
+                             rm.group(1) if rm else ""))
+        lib_local_deps[path] = ([lib for lib, _ in refs], gits)
         return lib_local_deps[path]
 
     def lib_text(path):
@@ -180,33 +190,54 @@ def load_metadata(repo, sha):
     return alias_to_path, lib_deps, lib_text, resolve
 
 
-def validate_extra(resolve, lib_text, tops):
-    """Check documented extern upgrades; loud failure on drift. Returns {top: [libs]}."""
-    ready = {}
-    for top, spec in EXTRA.items():
-        if top not in tops:
+def closure_libs(tops, resolve, lib_deps, sha, dual_arts, present_keys):
+    """Fixpoint reachable lib-name set, seeded with the tops under every
+    group spelling the target file uses (io.github form always, plus any
+    kotoba-lang/ or gftd/ spellings present), so override keys match the
+    graph's lib identities exactly. Plus dual-group extras.
+
+    Extern-sha osaho upgrade (documented): any walked lib pinning osaho at a
+    monorepo-URL sha other than the target must match EXTRA_OSAHO_EXPECT
+    exactly (else loud failure); osaho/kotoba-hir/security are then added
+    at the single sha and walked too.
+    """
+    out, agenda, seen = set(), list(tops), set()
+    for art in tops:
+        out.add("io.github.kotoba-lang/" + art)
+        for key in present_keys.get(art, ()):
+            out.add(key)
+    upgraded = False
+    while agenda:
+        art = agenda.pop()
+        if art in seen:
             continue
-        exp = spec["expect"]
-        in_path = resolve(exp["in_lib"])
-        if in_path is None:
-            sys.exit("error: extern case changed: %s has no catalog path "
-                     "(shitsuke->osaho upgrade needs re-examination)" % exp["in_lib"])
-        txt = lib_text(in_path)
-        blocks = re.findall(
-            re.escape(exp["lib"]) +
-            r"(?:\s+|;[^\n]*)+(\{[^{}]*\})", txt)
-        if not blocks:
-            sys.exit("error: extern case gone: %s no longer references %s "
-                     "(upgrade needs re-examination)" % (exp["in_lib"], exp["lib"]))
-        if not any(exp["url"] in b and exp["sha"] in b and exp["root"] in b
-                   for b in blocks):
-            sys.exit("error: extern case changed: %s's %s pin is no longer %s@%s "
-                     "(upgrade needs re-examination)"
-                     % (exp["in_lib"], exp["lib"], exp["url"], exp["sha"][:7]))
-        for lib in spec["libs"]:
-            resolve(lib)  # loud error when unmappable
-        ready[top] = list(spec["libs"])
-    return ready
+        seen.add(art)
+        path = resolve(art)
+        got = lib_deps(path)
+        if got is None:
+            sys.exit("error: cannot read %s/deps.edn at the pinned sha" % path)
+        members, gits = got
+        for lib in members:
+            if lib not in out:
+                out.add(lib)
+                agenda.append(lib.split("/", 1)[1])
+        for (lib, url, gsha, groot) in gits:
+            if lib == "io.github.kotoba-lang/osaho" and gsha != sha and not upgraded:
+                exp = EXTRA_OSAHO_EXPECT
+                if (url, gsha, groot) != (exp["url"], exp["sha"], exp["root"]):
+                    sys.exit("error: extern osaho pin changed to %s@%s (%s); "
+                             "documented upgrade no longer applies, re-examine"
+                             % (url, gsha[:7], groot))
+                for elib in EXTRA_OSAHO_LIBS:
+                    if elib not in out:
+                        out.add(elib)
+                        agenda.append(elib.split("/", 1)[1])
+                upgraded = True
+    for lib in sorted(out):
+        grp, art = lib.split("/", 1)
+        if art in dual_arts and grp != "gftd":
+            out.add("gftd/" + art)
+    return out
 
 
 def dead_url(block):
@@ -399,37 +430,6 @@ def last_entry_indent(map_text):
     return " " * 39
 
 
-def closure_libs(tops, resolve, lib_deps, extra_validated, dual_arts,
-                 present_keys):
-    """Fixpoint reachable lib-name set, seeded with the tops under every
-    group spelling the target file uses (io.github form always, plus any
-    kotoba-lang/ or gftd/ spellings present), so override keys match the
-    graph's lib identities exactly. Plus dual-group extras."""
-    out, agenda, seen = set(), list(tops), set()
-    for art in tops:
-        out.add("io.github.kotoba-lang/" + art)
-        for key in present_keys.get(art, ()):
-            out.add(key)
-    while agenda:
-        art = agenda.pop()
-        if art in seen:
-            continue
-        seen.add(art)
-        path = resolve(art)
-        members = lib_deps(path)
-        if members is None:
-            sys.exit("error: cannot read %s/deps.edn at the pinned sha" % path)
-        for lib in members + extra_validated.get(art, []):
-            if lib not in out:
-                out.add(lib)
-                agenda.append(lib.split("/", 1)[1])
-    for lib in sorted(out):
-        grp, art = lib.split("/", 1)
-        if art in dual_arts and grp != "gftd":
-            out.add("gftd/" + art)
-    return out
-
-
 def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
     """Merge :override-deps pins for want into this alias body."""
     if not want:
@@ -486,8 +486,7 @@ def present_groups(text):
     return out
 
 
-def rewrite_aliases(text, tops, resolve, lib_deps, extra_validated,
-                    dual_arts, sha):
+def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
     present = present_groups(text)
     changed = []
     guard = 0
@@ -510,7 +509,7 @@ def rewrite_aliases(text, tops, resolve, lib_deps, extra_validated,
                 sub.update(["security", "kotoba-script"])
             if not sub:
                 continue
-            subwant = closure_libs(sub, resolve, lib_deps, extra_validated,
+            subwant = closure_libs(sub, resolve, lib_deps, sha,
                                    dual_arts, present)
             new_text, ch = ensure_override_in_alias(text, name, b_open, b_close,
                                                     sha, subwant, resolve)
@@ -595,7 +594,7 @@ def main(argv=None):
     except OSError as e:
         print("error: cannot read %s: %s" % (args.deps_edn, e))
         return 3
-    alias_to_path, lib_deps, lib_text, resolve = load_metadata(args.kotoba_repo,
+    _alias_to_path, lib_deps, _lib_text, resolve = load_metadata(args.kotoba_repo,
                                                               args.sha)
     try:
         check_balanced(text)
@@ -604,11 +603,10 @@ def main(argv=None):
                                               if a))
         # tops after pass 1: freshly rewritten pins count too
         tops = current_tops(new_text, args.sha)
-        extra = validate_extra(resolve, lib_text, tops)
         dual_arts = {k.split("/", 1)[1] for k in
                      re.findall(r"gftd/[a-zA-Z0-9_.\-]+", new_text)}
         new_text, aliases = rewrite_aliases(new_text, tops, resolve,
-                                            lib_deps, extra, dual_arts, args.sha)
+                                            lib_deps, dual_arts, args.sha)
     except ValueError as e:
         print("error: %s (input left untouched)" % e)
         return 3
