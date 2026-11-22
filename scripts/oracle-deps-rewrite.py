@@ -85,11 +85,20 @@ EXTRA_OSAHO_EXPECT = {"url": MONO_URL + ".git",
 # file: any artifact referenced as gftd/<art> is dual-emitted.
 
 
+def _git_env():
+    env = dict(os.environ)
+    # abort stalled on-demand blob fetches instead of hanging forever;
+    # the caller retries the whole run (fetched objects stay cached).
+    env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+    env.setdefault("GIT_HTTP_LOW_SPEED_TIME", "60")
+    return env
+
+
 def _read_tree_file(repo, sha, path):
     """Read lib/catalog.edn or lib/<x>/deps.edn from a git checkout or dir tree."""
     if os.path.isdir(os.path.join(repo, ".git")):
         r = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (sha, path)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=_git_env())
         if r.returncode != 0:
             return None
         return r.stdout
@@ -127,21 +136,18 @@ def load_metadata(repo, sha):
             lib_local_deps[path] = None
             return None
         lib_texts[path] = txt
-        refs = re.findall(
-            r"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[a-zA-Z0-9_.\-]+)"
-            r"((?:\s+|;[^\n]*)+)\{[^{}]*:local/root", txt)
-        gits = []
-        for m in re.finditer(
-                r"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[a-zA-Z0-9_.\-]+)"
-                r"((?:\s+|;[^\n]*)+)\{([^{}]*)\}", txt):
-            lib, gap, block = m.group(1), m.group(2), m.group(3)
+        refs, gits = [], []
+        for lib, block in iter_lib_maps(txt):
+            if ":local/root" in block:
+                refs.append(lib)
+                continue
             um = re.search(r':git/url\s+"([^"]+)"', block)
             sm = re.search(r":git/sha\s+\"([0-9a-f]+)\"|:sha\s+\"([0-9a-f]+)\"", block)
             rm = re.search(r':deps/root\s+"([^"]+)"', block)
             if um and sm:
                 gits.append((lib, um.group(1), sm.group(1) or sm.group(2),
                              rm.group(1) if rm else ""))
-        lib_local_deps[path] = ([lib for lib, _ in refs], gits)
+        lib_local_deps[path] = (refs, gits)
         return lib_local_deps[path]
 
     def lib_text(path):
@@ -157,11 +163,14 @@ def load_metadata(repo, sha):
         """
         cands = []
         for txt in lib_texts.values():
-            for m in re.finditer(
-                    re.escape(lib) +
-                    r"(?:\s+|;[^\n]*)+\{\s*:local/root\s+\"\.\./([a-zA-Z0-9_.\-]+)\"",
-                    txt):
-                cands.append("lib/" + m.group(1))
+            for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", txt):
+                j = skip_gap(txt, m.end())
+                if j < len(txt) and txt[j] == "{":
+                    k = find_matching_brace(txt, j)
+                    rm = re.search(r':local/root\s+"\.\./([a-zA-Z0-9_.\-]+)"',
+                                   txt[j:k])
+                    if rm:
+                        cands.append("lib/" + rm.group(1))
         for cand in dict.fromkeys(cands):
             if _read_tree_file(repo, sha, cand + "/deps.edn") is not None:
                 return cand
@@ -260,47 +269,85 @@ def is_canonical(block, root, sha):
     return MONO_URL in block and sha in block and root in block
 
 
-LIB_PAT = (r"(" + GROUPS + r"/[a-zA-Z0-9_.\-]+)"
-           r"((?:\s+|;[^\n]*)+)(\{[^{}]*\})")
+LIB_KEY = re.compile(r"(?<![a-zA-Z0-9_.\-/])(" + GROUPS + r"/[a-zA-Z0-9_.\-]+)")
+
+def skip_gap(txt, i):
+    """Skip whitespace and ;-comments; linear, no backtracking."""
+    n = len(txt)
+    while i < n:
+        c = txt[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == ";":
+            while i < n and txt[i] != "\n":
+                i += 1
+        else:
+            break
+    return i
+
+
+def iter_lib_maps(txt):
+    """Yield (key, flat map block) for each `GROUP/name {...}` pin.
+
+    Comment-tolerant gap between key and map; linear scan (a nested
+    `(?:\\s+|;...)+` regex backtracks catastrophically on comment-heavy
+    monorepo files, so the gap is skipped procedurally). Raises ValueError
+    on unbalanced braces via find_matching_brace.
+    """
+    for m in LIB_KEY.finditer(txt):
+        key = m.group(1)
+        e = m.end()
+        if e < len(txt) and (txt[e].isalnum() or txt[e] in "_.-/"):
+            continue
+        j = skip_gap(txt, e)
+        if j < len(txt) and txt[j] == "{":
+            yield key, txt[j:find_matching_brace(txt, j)]
+
+
+def iter_lib_spans(text):
+    """Like iter_lib_maps but yields (key, start, end, block) with offsets."""
+    for m in LIB_KEY.finditer(text):
+        key = m.group(1)
+        e = m.end()
+        if e < len(text) and (text[e].isalnum() or text[e] in "_.-/"):
+            continue
+        j = skip_gap(text, e)
+        if j < len(text) and text[j] == "{":
+            k = find_matching_brace(text, j)
+            yield key, m.start(), k, text[j:k]
 
 
 def rewrite_direct(text, resolve, sha, rewrite_locals):
-    """Pass 1: rewrite dead pins. Returns (text, [rewritten artifacts])."""
+    """Pass 1: rewrite dead pins. Returns (text, [rewritten artifacts]).
+
+    Only io.github.kotoba-lang|kotoba-lang|gftd groups are scanned.
+    cognitect test-runner's bare :git/tag+:git/sha uses another group
+    and never reaches here, so every bare sha here defaults to a deleted
+    kotoba-lang repo.
+    """
     changed = []
-    pos = 0
-    while True:
-        m = re.search(LIB_PAT, text[pos:])
-        if not m:
-            break
-        base = pos
-        key, gap, block = m.group(1), m.group(2), m.group(3)
+    return _rewrite_direct_acc(text, resolve, sha, rewrite_locals, changed)
+
+
+def _rewrite_direct_acc(text, resolve, sha, rewrite_locals, changed):
+    for key, start, end, block in iter_lib_spans(text):
         if key in AMU_LIBS:
-            pos = base + m.end()  # amu is frozen; skip past it
-            continue
+            continue  # amu is frozen
         grp, art = key.split("/", 1)
-        needs = False
-        # LIB_PAT only matches io.github.kotoba-lang|kotoba-lang|gftd groups.
-        # cognitect test-runner's bare :git/tag+:git/sha uses another group
-        # and never reaches here, so every bare sha here defaults to a
-        # deleted kotoba-lang repo.
-        if dead_url(block) or bare_git_sha(block):
-            needs = True
-        elif ":local/root" in block and art in rewrite_locals:
-            needs = True
-        elif MONO_URL in block and sha not in block:
-            # same-monorepo pin at an older sha: normalize to the single sha
-            needs = True
-        if needs:
-            root = resolve(key)
-            if not is_canonical(block, root, sha):
-                new = (key + "\n        {:git/url \"%s\"\n"
-                       "         :git/sha \"%s\"\n"
-                       "         :deps/root \"%s\"}") % (MONO_URL, sha, root)
-                text = text[:base + m.start()] + new + text[base + m.end():]
-                changed.append(art)
-                pos = base + m.start() + len(new)
-                continue
-        pos = base + m.end()
+        needs = (dead_url(block) or bare_git_sha(block) or
+                 (":local/root" in block and art in rewrite_locals) or
+                 (MONO_URL in block and sha not in block))
+        if not needs:
+            continue
+        root = resolve(key)
+        if is_canonical(block, root, sha):
+            continue
+        new = (key + "\n        {:git/url \"%s\"\n"
+               "         :git/sha \"%s\"\n"
+               "         :deps/root \"%s\"}") % (MONO_URL, sha, root)
+        changed.append(art)
+        return _rewrite_direct_acc(text[:start] + new + text[end:],
+                                   resolve, sha, rewrite_locals, changed)
     return text, changed
 
 
@@ -401,13 +448,21 @@ def alias_bodies(text):
 def current_tops(text, sha):
     """Artifacts holding monorepo-URL pins at sha (the live basis tops)."""
     tops = set()
-    for m in re.finditer(LIB_PAT, text):
-        key, block = m.group(1), m.group(3)
+    for key, block in iter_lib_maps(text):
         if key in AMU_LIBS:
             continue
         if MONO_URL in block and sha in block:
             tops.add(key.split("/", 1)[1])
     return tops
+
+
+def find_entry(text, lib):
+    """(start, end) of `lib {...}` pin, or None; comment-tolerant gap."""
+    for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", text):
+        j = skip_gap(text, m.end())
+        if j < len(text) and text[j] == "{":
+            return m.start(), find_matching_brace(text, j)
+    return None
 
 
 def entry_text(lib, root, sha, indent):
@@ -444,13 +499,14 @@ def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
         for lib in sorted(want):
             art = lib.split("/", 1)[1]
             root = resolve(lib)
-            em = re.search(re.escape(lib) + r"(?:\s+|;[^\n]*)+\{[^{}]*\}", new_map)
+            em = find_entry(new_map, lib)
             ins = last_entry_indent(new_map)
             if em:
-                if is_canonical(em.group(0), root, sha):
+                eblock = new_map[em[0]:em[1]]
+                if is_canonical(eblock, root, sha):
                     continue
-                new_map = (new_map[:em.start()] +
-                           entry_text(lib, root, sha, ins) + new_map[em.end():])
+                new_map = (new_map[:em[0]] +
+                           entry_text(lib, root, sha, ins) + new_map[em[1]:])
                 merged.append(art + "(replaced)")
             else:
                 entry = "\n" + entry_text(lib, root, sha, ins)
@@ -478,8 +534,7 @@ def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
 def present_groups(text):
     """artifact -> {full lib keys used in the file} for kotoba-lang/gftd groups."""
     out = {}
-    for m in re.finditer(LIB_PAT, text):
-        key = m.group(1)
+    for key, _block in iter_lib_maps(text):
         if key in AMU_LIBS:
             continue
         out.setdefault(key.split("/", 1)[1], set()).add(key)
@@ -535,13 +590,18 @@ def check_file(path):
             if m.group(2) not in ("kotoba", "amu"):
                 problems.append("%d: dead repo URL %s" % (i, m.group(1)))
     text = "\n".join(lines)
-    for m in re.finditer(LIB_PAT, text):
-        key, block = m.group(1), m.group(3)
+    try:
+        lib_maps = list(iter_lib_maps(text))
+    except ValueError as e:
+        problems.append("unbalanced EDN: %s" % e)
+        lib_maps = []
+    for key, block in lib_maps:
         if key in AMU_LIBS:
             continue
         if ":git/url" not in block and re.search(
                 r":git/sha\s+\"[0-9a-f]+\"|:sha\s+\"[0-9a-f]+\"", block):
-            lineno = text[:m.start()].count("\n") + 1
+            lineno = text.find(key)
+            lineno = text.count("\n", 0, lineno) + 1 if lineno >= 0 else 1
             problems.append("%d: bare git sha without :git/url: %s" % (lineno, key))
     if problems:
         print("check failed (%s):" % path)
