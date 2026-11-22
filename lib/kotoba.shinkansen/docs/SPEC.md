@@ -20,6 +20,9 @@ ADR-2609092600 の app 4 面を framework の primitive としてそのまま使
     bytes     https://{cid}.ipfs.yataverse.com   Location 1（オーナー指示 2026-09-14。`{cid}.ipfs.kotobase.net` は退役、522）
     entry     https://{name}.itonami.app/        Location 2
 
+> **現在（2026-11-22、JUN-1441）:** `{cid}.ipfs.yataverse.com` は退役。raw bytes は `https://yataverse.com/ipfs/{cid}`
+> から読む（読取時に CID 検証、HTML の render はしない）。page の link は name-surface（別 host の DNSLink）が要り、まだ無い。以下は記録。
+
 - **HTML の link は CID そのもの**: `href="https://{cid}.ipfs.yataverse.com/"` が
   1 等公民（ADR-2609131630 の mirror zone が 2026-09-14 に bytes plane そのものになった）。
   **書き込み経路（2026-09-17 に測って直した）**: bytes plane は R2 `kotobase-graph-database-production` の

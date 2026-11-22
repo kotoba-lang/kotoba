@@ -89,6 +89,8 @@ Source: `kotoba-lang/yataverse/README.md`, `kotoba-lang/kura-node/README.md`,
 
 - **Protocol / endpoint (bytes plane)**: content-addressed blocks, CIDv1
   raw/sha2-256 (reads also accept legacy CIDv0 dag-pb). Read:
+  (Today, 2026-11-22: the default `readUrl` is `https://yataverse.com`, raw blocks only;
+  `ipfs.yataverse.com` and the per-CID subdomains are down — JUN-1441.)
   `GET <readUrl>/ipfs/<cid>` (default `https://ipfs.yataverse.com`, gateway 301
   to per-CID subdomain, followed ≤3 hops **inside the read host's parent
   domain only**, `Accept: application/vnd.ipld.raw`, `?format=raw`). Write:
