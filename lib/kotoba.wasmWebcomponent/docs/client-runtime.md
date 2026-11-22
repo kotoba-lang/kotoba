@@ -64,7 +64,7 @@ written; nothing is inferred from the payload.
 | `special-care` | `true` when 要配慮個人情報 or a GDPR special category is sent; then `special-care-kinds` names them (病歴 …) |
 | `purpose` | one specific sentence (not 「サービス向上のため」) |
 | `frequency` | `one-time` or `continuous` |
-| `withdrawal` | where in settings the permission is withdrawn (「設定 › 許可した送信」) |
+| `withdrawal` | where in settings the permission is withdrawn (「設定 › 許可した送信」); required for `continuous` only, and not shown for `one-time` |
 | `note` | optional: a short plain-text note from the app, at most 200 characters, no control characters; shown as text, never parsed as HTML or Markdown |
 
 The host may pass `app: {name, provider, 'privacy-policy'}` to `createClientOperationBroker` from its
@@ -116,6 +116,34 @@ the canonical `consentHost`. `invoke({capability,service,operation}, payload)`
 obtains fresh consent even after a previous successful invocation.
 Legacy `confirmOperation` / `serviceAdapters` options throw: products must
 migrate rather than fall back to a product-local callback or HTTP transport.
+
+## Declared bodies and host-local calls (KOTOBA-968, 2026-11-22)
+
+Details, threat model and verification: [client-runtime-review-20261122-host-local.md](client-runtime-review-20261122-host-local.md).
+
+- **Bodies.** An HTTP operation may declare `request-body` / `response-body` (`bytes` or `text`) with
+  `max-request-bytes` / `max-response-bytes` (at most `CLIENT_PORT_BYTES_MAX`, 16 MiB), an optional
+  `content-type` and `timeout-ms` (≤120 s). The request body is read up to its limit before consent. The response
+  is refused above its limit (Content-Length) or cancelled while it streams. The broker returns
+  `{ status, ok, headers, bytes | content }`, and the guest receives the bytes as a transferred `Uint8Array`. The
+  dialog's first screen shows the declared limits. A binary operation reserves its declared bytes against a 32 MiB
+  per-broker budget, and R3, redirect and final-origin checks are unchanged. Undeclared operations keep the
+  UTF-8, 1 MiB bridge.
+- **Host-local.** A restricted-wasm-v1 descriptor may declare `host-local` (`kotoba.host-local.v1`: `app-id`,
+  device-only encrypted erasable `storage` with quotas, `stores`, `calls`, optional `save` and `links`). The guest
+  calls it over `kotoba.client.local.v1` (`storage.*`, `device.save`, `device.openLink`). Storage needs no consent
+  and never reaches the network. Save and link use the trusted host prompt, and a link is egress to declared https
+  origins only. The host creates `createClientHostLocal({ admitted, appId, storage, consentHost })` from an
+  admitted descriptor, with its own app id (the partition), and passes it to `mountRestrictedClientApp` as
+  `hostLocal`. A storage backend must declare Legal's MUSTs (no OS cloud backup, no logging, encrypted at rest,
+  user-clearable, removed with the app). Each host runs `verifyHostStorageConformance` and records it with the
+  runtime digest it vendors. The browser backend is `createIndexedDbClientStorageBackend()`. The host shell calls
+  `clearClientAppData` when the user removes the app.
+- **Route templates.** `path-params` constrains a path parameter to an `enum` or a `charset`
+  (`lower-alnum-dash`, `alnum`, `hex`, `digits`) with `min-length` / `max-length` (≤128). A parameter-only path is
+  accepted only when every parameter is constrained.
+- **One-time wording (Legal, 2026-11-22).** For `frequency: 'one-time'` the dialog says 『この許可は今回の 1 回だけです。保存しません。』
+  instead of the withdrawal line, in both profiles; `disclosure.withdrawal` is required only for `continuous`.
 
 ## HTTP scope and browser APIs
 
