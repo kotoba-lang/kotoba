@@ -99,3 +99,18 @@ A durable outer loop, using `kotoba.lang.scheduler.driver`:
 ```sh
 kbb -M:test
 ```
+
+## Native Markov transitions
+
+`kotoba.scheduler.markov` accepts an explicit flat vector of independent
+`[origin destination]` pairs with zero-based state identifiers. Pass at most
+100,000 pairs and 64 states. `transition-row` returns the counts for one
+origin. A malformed batch returns an empty vector. A valid batch with no
+observed transitions for the origin returns a row of zeros.
+
+`probability-bps` returns the empirical one-step probability for a selected
+destination, rounded down to a basis point. It returns `-1` for a malformed
+row or when its sample count is below the caller's positive minimum. Values
+for different destinations may sum to less than 10,000 due to rounding.
+Callers supply comparable observation windows and define state meanings.
+The native project fixture is `test/kotoba/scheduler/markov_test.kotoba`.
