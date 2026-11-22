@@ -131,14 +131,21 @@ Details, threat model and verification: [client-runtime-review-20261122-host-loc
   UTF-8, 1 MiB bridge.
 - **Host-local.** A restricted-wasm-v1 descriptor may declare `host-local` (`kotoba.host-local.v1`: `app-id`,
   device-only encrypted erasable `storage` with quotas, `stores`, `calls`, optional `save` and `links`). The guest
-  calls it over `kotoba.client.local.v1` (`storage.*`, `device.save`, `device.openLink`). Storage needs no consent
+  calls it over `kotoba.client.local.v1` (`storage.*`, `device.save`, `device.openLink`); a trusted-page-v1 app's
+  host-document code calls `handle.call(call, args)` (migration). Storage needs no consent
   and never reaches the network. Save and link use the trusted host prompt, and a link is egress to declared https
   origins only. The host creates `createClientHostLocal({ admitted, appId, storage, consentHost })` from an
   admitted descriptor, with its own app id (the partition), and passes it to `mountRestrictedClientApp` as
   `hostLocal`. A storage backend must declare Legal's MUSTs (no OS cloud backup, no logging, encrypted at rest,
-  user-clearable, removed with the app). Each host runs `verifyHostStorageConformance` and records it with the
-  runtime digest it vendors. The browser backend is `createIndexedDbClientStorageBackend()`. The host shell calls
-  `clearClientAppData` when the user removes the app.
+  user-clearable, removed with the app, encrypted names, key custody). The host attests them; there is no default.
+  A host whose data an OS can back up keeps its keys in the platform keystore (`keyProvider`). Each host runs
+  `verifyHostStorageConformance` and records it with the runtime digest it vendors. The IndexedDB backend is
+  `createIndexedDbClientStorageBackend({ conformance, keyProvider })`. The host shell calls `clearClientAppData`
+  when the user removes the app.
+- **Bodies by reference.** `request-body: 'host-local'` sends stored values (`init.body: { 'host-local': { store,
+  keys } }`). `response-body: 'host-local'` writes the response into storage (`store-response: { store, key }`):
+  chunks, then a manifest. Both go up to 1 GiB, and the bytes never cross the guest bridge. Pass the app's
+  `hostLocal` to `createClientOperationBroker`.
 - **Route templates.** `path-params` constrains a path parameter to an `enum` or a `charset`
   (`lower-alnum-dash`, `alnum`, `hex`, `digits`) with `min-length` / `max-length` (≤128). A parameter-only path is
   accepted only when every parameter is constrained.
