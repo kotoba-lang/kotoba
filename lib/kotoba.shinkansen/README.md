@@ -54,6 +54,10 @@ identity or its authority.
     bytes     https://{cid}.ipfs.yataverse.com   Location (owner directive 2026-09-14; {cid}.ipfs.kotobase.net is retired)
     entry     https://{name}.itonami.app/        Location (one DNS label)
 
+> **Today (2026-11-22, JUN-1441):** `{cid}.ipfs.yataverse.com` is retired. Raw bytes are read from
+> `https://yataverse.com/ipfs/{cid}` (CID-verified on read, no HTML rendering). Page links still need a
+> name-surface (DNSLink on a separate host); none is assigned yet, so the link form below is a record.
+
 A shinkansen link in HTML is `href="https://{cid}.ipfs.yataverse.com/"` — the
 CID IS the link. The `:document` kind is self-contained by the ADR's rule:
 a document that needs to fetch its own runtime from the CDN is not one file

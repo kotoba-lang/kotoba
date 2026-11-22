@@ -92,6 +92,8 @@ Readiness evidence: recomputed CID == stored CID (bytes match the multihash);
 storage results are reported separately from inference readiness. Redirects
 are never followed on write; a write that redirects fails the task.
 
+> Today (2026-11-22, JUN-1441): read from `https://yataverse.com/ipfs/<cid>`; `ipfs.yataverse.com` is kept down.
+
 **Current measured gap (2026-10-23, independent of OCI):** the default
 endpoints do not resolve in public DNS — `ipfs.yataverse.com`, `kotobase.net`
 and `yataverse.com` all return NOERROR/NODATA (no A record) via both the
