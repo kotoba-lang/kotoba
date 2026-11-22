@@ -40,7 +40,10 @@ decision (2026-11-22).
   "stores": ["files", "vault", "staging"],
   "calls": ["storage.get", "storage.put", "storage.batch", "storage.list", "storage.clear", "device.save", "device.openLink"],
   "save": { "max-bytes": 262144, "mime-types": ["application/json", "application/octet-stream"], "octet-stream-extensions": ["bs1", "bs2", "bs3"] },
-  "links": { "origins": ["https://www.wikidata.org"], "max-url-length": 2048 }
+  "links": { "max-url-length": 2048, "targets": [
+    { "origin": "https://www.wikidata.org", "path": "/wiki/:item",
+      "path-params": { "item": { "charset": "alnum", "min-length": 2, "max-length": 16 } },
+      "query-params": { "uselang": { "enum": ["ja", "en"] } } } ] }
 }
 ```
 
@@ -109,12 +112,12 @@ host's storage files. Trusted: the host shell, its registry and pins, and its ba
 | T6 | Data survives in OS cloud backup, or after app removal (Legal L1, L4) | Each host attests the MUSTs in its backend's declaration, which has no default. A host that does not declare them gets no storage. `verifyHostStorageConformance` checks isolation, round trip, versions and compare-and-swap, atomic batch and clear. It reports the platform MUSTs (`no-cloud-backup`, `key-custody`, `removed-with-app`, `no-logging`) as `verified: false`, for the host's own evidence. A plain browser declares `no-os-backup`. The host shell must call `clearClientAppData` when the user removes the app. | host conformance; clear app data |
 | T7 | A guest exhausts memory or storage | Quota, entries and value caps per app. 16 pending calls, a call's byte arrays counted (≤64 MiB) before it is queued, and at most 128 MiB held by the queued calls of one app together. Batch limits count moved values too. A 16 MiB cap per body over the bridge. Each binary operation reserves its declared request + response bytes against a 32 MiB in-flight budget per broker, and a body by reference against a 1 GiB budget, before any body is read. The R3 slot still guards snapshot and consent. | size caps; binary bodies (R3); review 1372; stored bodies |
 | T15 | Lost updates between two mounts or tabs of one app | One storage core per (backend, app) in a document. Expected versions are checked and versions assigned inside the backend transaction. A conflict drops the stale cache. | review 1372; host conformance (compare-and-swap, atomic) |
-| T16 | A body by reference sends or stores more than approved, or exhausts memory before consent | Before consent only stored sizes and versions are read. Nothing is decrypted, and the total is checked against `max-request-bytes`. The dialog shows store, count and size. After consent each value is read, compared with its approved version and streamed into the request one at a time (`duplex: 'half'`), so the body is never held whole. A value changed after approval stops the request. A response written to storage is capped while it streams, cancelled past the limit, and its partial chunks deleted. | stored bodies |
+| T16 | A body by reference sends or stores more than approved, exhausts memory before consent, or fails after consent | Before consent only stored sizes and versions are read. Nothing is decrypted, and the total is checked against `max-request-bytes`. The upload path is chosen then too. It streams (`duplex: 'half'`) only when the host attests `uploadStreams` and the engine passes feature detection. Otherwise it buffers in the host, up to `CLIENT_UPLOAD_BUFFER_MAX` (256 MiB). A declared body that neither path can send is refused before the dialog. The dialog shows store, count, size and path. After consent each value is read and compared with its approved version. A value changed after approval stops the request. A response written to storage is capped while it streams, cancelled past the limit, and its partial chunks deleted. | stored bodies |
 | T8 | An oversize response fills memory | A declared Content-Length over the limit is refused before reading. Otherwise the body is read up to the limit and the stream is cancelled. | size caps; Yataverse B4 |
 | T9 | An oversize or unexpected request body is shown or sent | The body is read up to `max-request-bytes` before consent and refused above it, so nothing is fetched. A declared content type is enforced. The dialog shows size, type and SHA-256, never the bytes. | size caps; Yataverse B1, B2 |
 | T10 | A guest saves a file that runs or escapes the folder | Only a fixed type allowlist (no HTML, SVG, XML, scripts or executables). `application/octet-stream` is allowed only with declared extensions outside an unsafe list. The name is reduced to its last segment, stripped of control and bidi characters, and its extension matched to the type. Windows device names are prefixed. | device.save |
 | T11 | A save or link happens without the user | The host prompt is the canonical consent dialog: a trusted press after the 600 ms arm, with equal buttons. The effect runs inside that click. A synthetic, early or denied press does nothing. | device.save; device.openLink; Chromium probe |
-| T12 | A link carries data off the device | Treated as egress. Only https, only declared public origins, no credentials, a length cap. The prompt names the origin and shows the whole URL in 詳細. The URL opens with `noopener,noreferrer`. | device.openLink |
+| T12 | A link carries data off the device | Treated as egress. Only https, no credentials and a length cap. The URL must match a declared target: a fixed URL, or a template whose every path and query parameter is an enum or a constrained charset. An undeclared query parameter, free text or a fragment is refused. This is Legal's condition (2026-11-22) for opening a link without a full disclosure: a real click, and only public or fixed data. An app that puts user data in a URL declares a normal egress operation with a disclosure. The prompt names the origin and says that the IP address and the URL reach the site; the whole URL is in 詳細. The URL opens with `noopener,noreferrer`. | device.openLink |
 | T13 | Change notices leak data across apps | Notices carry store and key names only, to the same app id: in the document, or over BroadcastChannel in the host origin. | batch, versions, watch |
 | T14 | A test hook exposes keys in production | The runtime exports no test-only function. The harness lives in `test/` only. | keys and logs (no test/peek/debug export) |
 
@@ -135,17 +138,18 @@ Residual risks and limits:
   are exact, because they are checked in the backend.
 - At rest, the record count, each record's version, its 4 KiB size bucket and the partition (the app id) are visible.
   Names, exact sizes and times are not.
-- A body by reference needs a host that can stream request bodies (`duplex: 'half'`; Chromium over HTTP/2 or later).
-  A host that cannot is refused (`this host cannot stream a request body`), with no fallback that would hold the
-  body in memory. Safari and WKWebView do not stream request bodies today, so a macOS Tauri host needs a native path.
+- Streaming a stored request body needs an engine that streams uploads (Chromium, over HTTP/2 or later; not
+  WebKit) and a host that attests it with `uploadStreams`. Other hosts buffer up to 256 MiB, which holds the whole
+  body in host memory after consent. A larger declared body needs a streaming host or a native request path
+  (KOTOBA-971).
 - Follow-ups (Yataverse review, Low): the quota counts value bytes and names, not the 4 KiB padding or the meta
   records actually stored; `handle.call` is meant only for the app's own last trusted-page release.
 - The guest can use storage without consent, so the app's own descriptor and review decide what it keeps. The runtime
   limits where data goes, not what an app chooses to store.
-- `device.openLink` cannot see what the destination does with the URL. Its disclosure is the origin and URL only, not
-  a finding-9 disclosure. Legal to confirm whether that is enough.
-- The new dialog strings (byte limits, save and link prompts, one-time line) are Dev drafts in `CLIENT_CONSENT_TEXT`,
-  marked draft like the rest. Legal finalizes them.
+- `device.openLink` cannot see what the destination does with the URL. Legal (2026-11-22) accepts the origin plus the
+  full URL as its disclosure, given a real click and a URL made only of declared, constrained parts.
+- The new dialog strings (byte limits, save and link prompts, one-time line) were confirmed by Legal on 2026-11-22, with
+  the save and link notices reworded. `CLIENT_CONSENT_TEXT` as a whole keeps its draft status for the earlier wording.
 
 ## 3. Verification (2026-11-22, Node 26.0.0, Google Chrome 158.0.8127.37)
 
