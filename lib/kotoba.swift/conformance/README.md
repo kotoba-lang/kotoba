@@ -36,6 +36,7 @@ lib/kotoba.swift/conformance/check.sh
 | File | Role |
 |---|---|
 | `xsd-pins.edn` | The eight XSDs: source URL and SHA-256. The XSDs are downloaded at run time and not stored here |
+| `cbpr-guideline-pins.edn` | L2 guideline source/version pins — evidence only, not a CI gate; no guideline text vendored; O3 pending |
 | `samples.cljk` | Builds one pain.001.001.09 and one pacs.008.001.08 with `kotoba.swift.iso20022` |
 | `dump_plugin.py` | pytest plugin: records every document the Python codec builds while its own test suite runs |
 | `summarize.py` | Validates every recorded document with `xmllint --schema` and groups the errors |
@@ -213,10 +214,22 @@ where data would be lost.
 | block 3 field 121 (UETR) | `PmtId/UETR` | carried by pacs.008; `mt103` emits an empty block 3, so UETR is lost on the MT side |
 | block 1/2 sender and receiver BIC | `InstgAgt`, `InstdAgt` | not modeled (optional in the base XSD) |
 
+## L2 guideline pins (AWAI-3149)
+
+`cbpr-guideline-pins.edn` records only the CBPR+/HVPS+ rule source names and
+versions as metadata (entry `:name`, `:uri`, `:version`, `:sha256`, `:scope`,
+`:messages`); body text is not stored. Guideline text, SWIFT documents and
+samples are not vendored in this repo. O3 (ADR 0042) must decide scope before
+any fixture use. `check.sh` does NOT process this file; it is an L1 evidence
+run only. The rule IDs in it come from
+`lib/kotoba.kotobaIso20022/kotoba_iso20022/conformance.py` and are append-only
+(next new rule: CBPR-012).
+
 ## Not covered
 
 - L2 (usage guidelines such as CBPR+) and L3 (acceptance by a bank). L2
-  waits on ADR 0042 O3; L3 on O5.
+  waits on ADR 0042 O3; L3 on O5 (see `cbpr-guideline-pins.edn` for the L2
+  prep pin).
 - SWIFT MT syntax. There is no public machine-readable MT schema; MT field
   checks wait on O3.
 - The `Envelope` documents built by `build_business_message`, which wrap
