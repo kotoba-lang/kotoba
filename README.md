@@ -1451,7 +1451,7 @@ subdirectories:
 | `kotoba-lang/datom` | canonical datom model (`[e a v]` / entity↔EAVT) shared by `kotoba.kgraph` (this repo's in-memory view) and kotobase's persistent store — the concrete substrate behind **kotoba : kotobase = Clojure : Datomic** (ADR-2607032500) |
 | `kotoba-lang/org-chainagnostic-cacao` | CACAO delegation-chain verification |
 | `kotoba-lang/ed25519`, `kotoba-lang/org-ietf-ed25519` | Ed25519 sign/verify |
-| `kotoba-lang/dag-cbor`, `kotoba-lang/org-ietf-cbor` | DAG-CBOR encoding + CIDv1 |
+| `kotoba-lang/org-ietf-cbor` | DAG-CBOR encoding + CIDv1 |
 | `kotoba-lang/io-multiformats` | multiformats/multibase codecs |
 | `kotoba-lang/org-w3-did` | `did:key` / `did:web` document construction and local resolution |
 | `kotoba-lang/security` | shared security tooling consumed by this repo's package-admission and grade-A gates |
