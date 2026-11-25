@@ -62,7 +62,7 @@ def main(a):
     try:
         b = keys.Boot.__new__(keys.Boot)
         keys.Boot.__init__(b, a, out, 'profile', None, first_frame_seconds=180)
-        assert b.W(74) == 63, ('native metadata fixture mask', b.W(74))
+        assert b.W(74) == 127, ('native metadata and pointer timing fixture mask', b.W(74))
         got = b.dump(b.work+1024, 1216)
         assert got == expected, 'native packed public bytes differ from original literals'
         assert b.dump(b.work+2240, 38) == bytes(38), 'out-of-range case default changed'
