@@ -72,9 +72,10 @@ Inputs: PR 2 inputs (`pr2-inputs-20261122.md`), Yataverse's spec and acceptance 
 
 ### Pin ledger (vendor)
 
-`CLIENT_CRYPTO_LIBRARIES` is the ledger; names, versions, uses, integrity digests and files are there and are
-asserted in the test (`crypto library ledger`). Provenance: `src/vendor/README.md` for `@noble/curves@1.9.7`
-and `@noble/hashes@1.8.0`; the 2.0.1 packages (`@noble/post-quantum`, `@noble/ciphers`, `@noble/hashes`,
+`CLIENT_CRYPTO_LIBRARIES` is the ledger; names, versions, uses, `integrity` (npm package SRI) and files are there
+and are asserted in the test (`crypto library ledger`), which also pins the per-file sha512 of the vendored
+bytes so an accidental edit is caught. Provenance: `src/vendor/README.md` for `@noble/curves@1.9.7` and
+`@noble/hashes@1.8.0`; the 2.0.1 packages (`@noble/post-quantum`, `@noble/ciphers`, `@noble/hashes`,
 `@noble/curves` 2.0.1 NTT-only) are MIT-licensed (see each `LICENSE`), verbatim but for import paths, with the
 package `integrity` digests recorded in `CLIENT_CRYPTO_LIBRARIES`. Re-vendor by copying the same file lists and
 re-applying only the import-path edits.
@@ -91,6 +92,8 @@ its `oauthAgent`, and its browser/open targets.
 | # | Threat | Control | Test |
 |---|---|---|---|
 | P1 | A guest extracts a key (device secret, private key, sealing key) | Keys live in a host-memory table as non-extractable `CryptoKey`s (WebCrypto) or byte arrays held only in the host realm (vendored noble). No call returns bytes for a key: every derive/unwrap/decapsulate returns a handle. The runtime exports no test-only function (`peekKeyForTest` lives in the harness, which knows the raw secret only because it minted it). An extractable key from a host store is refused as `unavailable`. | key handles stay in the host; extractable host key is refused; no test-only export; Yataverse K1 |
+
+`keys.delete` removes the persisted key from the host store, so a later `keys.open` finds nothing. A handle the guest still holds in this mount keeps naming the (now-deleted) key until the mount closes and the table is wiped: this is intentional (generational handles; removing it would add a revocation path to every call and Yataverse accepts this). Full erase — storage and keys — still happens at `clearAppData()` / when the app is removed. |
 | P2 | A handle from another app (or another mount) names a key | Handles are random strings in a per-mount, per-app table. A foreign handle is `invalid-key`, never another app's key. The table is wiped on close. | cross-app handles and key agreement; Yataverse A2, K2 |
 | P3 | A disallowed algorithm is used | The allowlist is per-call with exact argument shapes. `crypto.generateKey` rejects anything outside `aes-256-gcm` / `xchacha20-poly1305` / `x25519` / `ml-kem-768` / `ed25519`; `crypto.hkdf` accepts only 32-byte output as a sealing key or another secret. | primitives and bounds |
 | P4 | An input exhausts memory or the table | Every input is bounded: data ≤ 16 MiB, AAD ≤ 64 KiB, labels ≤ 1024, wrapped ≤ 4 KiB, sign payload ≤ 1 MiB, 4096 handles per mount, 4 concurrent device commands. Oversize is `too-large` before anything runs. | primitives and bounds; device.command |
