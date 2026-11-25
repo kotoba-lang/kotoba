@@ -128,8 +128,9 @@ Residual risks and limits:
   conformance probe traps; its attestation is the host's own evidence (`native: 'not-observed'`).
 - The `oauthAgent` (system browser) is host code; the runtime checks the redirect URI, `state` and `iss`, but
   it cannot see what the browser shows.
-- The new dialog strings (pick, open, device-local, sign) are Legal's / pending Legal's; see the verification
-  section. `CLIENT_CONSENT_TEXT` keeps its draft status until Legal confirms them.
+- `CLIENT_CONSENT_TEXT` was confirmed by Legal (reports/kotoba-974-pr2-consent-wording.md, 2026-11-22) for
+  device-local, pick, open and sign in both locales; the link payload line is outside that confirmation and
+  remains with Legal.
 
 ## 3. Verification (2026-11-22, Node 26.0.0)
 
