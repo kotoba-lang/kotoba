@@ -68,6 +68,12 @@ MONO_URL = "https://github.com/kotoba-lang/kotoba"
 AMU_LIBS = ("io.github.kotoba-lang/amu", "kotoba-lang/amu")
 GROUPS = r"(?:io\.github\.kotoba-lang|kotoba-lang|gftd)"
 
+# EDN treats commas as whitespace: any gap between two tokens may hold commas
+# (",", ",,", ",\n", ...). Use EDN_REQ/EDN_OPT for every gap between tokens.
+# Never applied inside "..." strings or ;-comments (handled separately).
+EDN_REQ = r"[\s,]+"
+EDN_OPT = r"[\s,]*"
+
 # Documented extern-sha upgrade: osaho pinned off-sha (monorepo URL) by any
 # walked lib (shitsuke, jp-go-digital-design-system, ...). That extern
 # revision's own graph names the deleted kotoba-lang/kotoba-core-contracts.git
@@ -115,11 +121,11 @@ def load_metadata(repo, sha):
     if cat is None:
         sys.exit("error: cannot read lib/catalog.edn at %s from %s" % (sha, repo))
     alias_to_path = {}
-    for m in re.finditer(r"\{:id ", cat):
+    id_starts = [m.start() for m in re.finditer(r"\{:id" + EDN_REQ, cat)]
+    for i, start in enumerate(id_starts):
         # entry ends at the next "{:id " or EOF; entries contain no nested maps
-        nxt = cat.find("{:id ", m.end())
-        entry = cat[m.start():nxt if nxt != -1 else len(cat)]
-        pm = re.search(r':path "(lib/[^"]+)"', entry)
+        entry = cat[start:id_starts[i + 1] if i + 1 < len(id_starts) else len(cat)]
+        pm = re.search(r':path' + EDN_REQ + r'"(lib/[^"]+)"', entry)
         if not pm:
             continue
         for a in re.findall(r'"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[^"]+)"', entry):
@@ -141,9 +147,9 @@ def load_metadata(repo, sha):
             if ":local/root" in block:
                 refs.append(lib)
                 continue
-            um = re.search(r':git/url\s+"([^"]+)"', block)
-            sm = re.search(r":git/sha\s+\"([0-9a-f]+)\"|:sha\s+\"([0-9a-f]+)\"", block)
-            rm = re.search(r':deps/root\s+"([^"]+)"', block)
+            um = re.search(r':git/url' + EDN_REQ + r'"([^"]+)"', block)
+            sm = re.search(r":git/sha" + EDN_REQ + r"\"([0-9a-f]+)\"|:sha" + EDN_REQ + r"\"([0-9a-f]+)\"", block)
+            rm = re.search(r':deps/root' + EDN_REQ + r'"([^"]+)"', block)
             if um and sm:
                 gits.append((lib, um.group(1), sm.group(1) or sm.group(2),
                              rm.group(1) if rm else ""))
@@ -167,7 +173,7 @@ def load_metadata(repo, sha):
                 j = skip_gap(txt, m.end())
                 if j < len(txt) and txt[j] == "{":
                     k = find_matching_brace(txt, j)
-                    rm = re.search(r':local/root\s+"\.\./([a-zA-Z0-9_.\-]+)"',
+                    rm = re.search(r':local/root' + EDN_REQ + r'"\.\./([a-zA-Z0-9_.\-]+)"',
                                    txt[j:k])
                     if rm:
                         cands.append("lib/" + rm.group(1))
@@ -251,7 +257,7 @@ def closure_libs(tops, resolve, lib_deps, sha, dual_arts, present_keys):
 
 def dead_url(block):
     """github.com/kotoba-lang/<name> URL with <name> not in {kotoba(.git), amu(.git)}."""
-    m = re.search(r":git/url\s+\"https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?\"",
+    m = re.search(r":git/url" + EDN_REQ + r"\"https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?\"",
                   block)
     if not m:
         return False
@@ -262,7 +268,7 @@ def bare_git_sha(block):
     """:git/sha or :sha without any :git/url (default URL points at a deleted repo)."""
     if ":git/url" in block:
         return False
-    return bool(re.search(r":git/sha\s+\"[0-9a-f]+\"|:sha\s+\"[0-9a-f]+\"", block))
+    return bool(re.search(r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", block))
 
 
 def is_canonical(block, root, sha):
@@ -324,11 +330,11 @@ def _strip_comments(text):
 
 
 def skip_gap(txt, i):
-    """Skip whitespace and ;-comments; linear, no backtracking."""
+    """Skip EDN whitespace (incl. commas) and ;-comments; linear, no backtracking."""
     n = len(txt)
     while i < n:
         c = txt[i]
-        if c in " \t\r\n":
+        if c in " \t\r\n,":
             i += 1
         elif c == ";":
             while i < n and txt[i] != "\n":
@@ -474,7 +480,7 @@ def find_matching_brace(text, open_idx):
 
 def alias_bodies(text):
     """[(name, body_open, body_close)] for each map-valued alias in :aliases."""
-    m = re.search(r":aliases\s*\{", text)
+    m = re.search(r":aliases" + EDN_OPT + r"\{", text)
     if not m:
         return []
     a_open = m.end() - 1
@@ -554,7 +560,7 @@ def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
         return text, False
     body = text[b_open:b_close]
     om = None
-    for cand in re.finditer(r":override-deps\s*\{", body):
+    for cand in re.finditer(r":override-deps" + EDN_OPT + r"\{", body):
         if not _in_comment(body, cand.start()):
             om = cand
             break
@@ -618,9 +624,9 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
         progressed = False
         for name, b_open, b_close in bodies:
             body = text[b_open:b_close]
-            if name == ":test" and re.search(r":replace-deps\s*\{", body):
+            if name == ":test" and re.search(r":replace-deps" + EDN_OPT + r"\{", body):
                 continue
-            amu = bool(re.search(r"kotoba-lang/amu\s*\n?\s*\{[^{}]*(:git/url|:git/sha)",
+            amu = bool(re.search(r"kotoba-lang/amu" + EDN_OPT + r"\{[^{}]*(:git/url|:git/sha)",
                                  body))
             if name != ":test" and not amu:
                 continue
@@ -654,7 +660,7 @@ def check_file(path):
     stripped = _strip_comments(text)
     problems = []
     for m in re.finditer(
-            r":git/url\s+\"(https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?)\"",
+            r":git/url" + EDN_REQ + r"\"(https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?)\"",
             stripped):
         if m.group(2) not in ("kotoba", "amu"):
             lineno = stripped.count("\n", 0, m.start()) + 1
@@ -671,7 +677,7 @@ def check_file(path):
         # lives inside a ;-comment does not satisfy a live :git/sha.
         eff = _strip_comments(block)
         if ":git/url" not in eff and re.search(
-                r":git/sha\s+\"[0-9a-f]+\"|:sha\s+\"[0-9a-f]+\"", eff):
+                r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", eff):
             lineno = text.find(key)
             lineno = text.count("\n", 0, lineno) + 1 if lineno >= 0 else 1
             problems.append("%d: bare git sha without :git/url: %s" % (lineno, key))

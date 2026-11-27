@@ -133,4 +133,47 @@ python3 "$SCRIPT" --check "$HERE/cases/17-check-comment-sha/deps.edn" > "$TMP/17
 grep -q "bare git sha" "$TMP/17.stdout" || fail "17-check-comment-sha: no bare-sha report"
 echo "ok: 17-check-comment-sha (exit 1)"
 
+# 18: EDN commas are whitespace (:deps, / lib,, / :git/url, / :git/sha, / :sha, /
+# comma+newline). --check 1 -> rewrite 0 (valid EDN) -> re-run 2 -> --check 0.
+# Commas inside strings and ;-comments stay byte-identical.
+python3 "$SCRIPT" --check "$HERE/cases/18-comma-gaps/deps.edn" > "$TMP/18c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/18c1"; fail "18-comma-gaps check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/18c1" || fail "18-comma-gaps: no dead-URL report"
+grep -q "bare git sha" "$TMP/18c1" || fail "18-comma-gaps: no bare-sha report"
+cp "$HERE/cases/18-comma-gaps/deps.edn" "$TMP/18.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/18.edn" \
+  > "$TMP/18.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/18.stdout"; fail "18-comma-gaps: want exit 0"; }
+diff -u "$HERE/cases/18-comma-gaps/expected.edn" "$TMP/18.edn" \
+  || fail "18-comma-gaps: output differs from expected.edn"
+grep -F '1.12.0, still one version' "$TMP/18.edn" > /dev/null \
+  || fail "18-comma-gaps: comma inside string was changed"
+grep -F ':git/url, "https://github.com/kotoba-lang/evil"' "$TMP/18.edn" > /dev/null \
+  || fail "18-comma-gaps: ;-comment was changed"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/18.edn" \
+  > "$TMP/18b.stdout" 2>&1
+[ "$?" = 2 ] || fail "18-comma-gaps re-run: want exit 2"
+diff -q "$HERE/cases/18-comma-gaps/expected.edn" "$TMP/18.edn" > /dev/null \
+  || fail "18-comma-gaps re-run: file changed"
+python3 "$SCRIPT" --check "$TMP/18.edn" > "$TMP/18c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/18c2"; fail "18-comma-gaps check clean: want exit 0"; }
+echo "ok: 18-comma-gaps (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 19: commas at alias level (:aliases, / :override-deps, / lib, / :git/url,).
+# Stale override pin is replaced, closure members merged, gaps stay valid EDN.
+python3 "$SCRIPT" --check "$HERE/cases/19-comma-alias/deps.edn" > "$TMP/19c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/19c1"; fail "19-comma-alias check dirty: want exit 1"; }
+cp "$HERE/cases/19-comma-alias/deps.edn" "$TMP/19.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/19.edn" \
+  > "$TMP/19.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/19.stdout"; fail "19-comma-alias: want exit 0"; }
+diff -u "$HERE/cases/19-comma-alias/expected.edn" "$TMP/19.edn" \
+  || fail "19-comma-alias: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/19.edn" \
+  > "$TMP/19b.stdout" 2>&1
+[ "$?" = 2 ] || fail "19-comma-alias re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/19.edn" > "$TMP/19c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/19c2"; fail "19-comma-alias check clean: want exit 0"; }
+echo "ok: 19-comma-alias (check 1, rewrite 0, idempotent 2, check 0)"
+
 echo "ALL FIXTURE TESTS PASSED"
