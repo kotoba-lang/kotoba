@@ -41,10 +41,14 @@ AwaiFS, Drive, and Yataverse).
 
 Kotoba's internal canonical model uses `ontology.graph/v1` (`:schema/version`,
 `:schema/kind`, `:basis`, `:nodes`, `:edges` with `:source`/`:target`, `:layers`
-with `:node-count`, `:joins`). Yataverse PR #83 uses the camelCase wire format
-`yataverse.ontology.graph/v1` (`schema`, numeric `version`, `basisCid`, `layers`
-with `nodeCount`, `nodes` with `meta`, `edges` with `from`/`to`/`meta`, `joins`,
-`coverage`, `truncated`) and operation envelope `yataverse.ontology.operations/v1`.
+with `:node-count`, `:joins`). Yataverse PR #83 (reference fixture
+`test/fixtures/ontology-graph-v1.json`, HEAD `ef29596b`) uses the camelCase
+wire format `yataverse.ontology.graph/v1` (`schema`, numeric `version`,
+`basisCid`, `nodeCount`, `meta` (`id`, `snapshotSchema`, `stats`, `nodeCount`,
+`edgeCount`, `layerCount`, `truncated`, `edgesTruncated`), `layers` with
+`nodeCount`, `nodes` with `meta`, `edges` with `from`/`to`/`meta`, `joins`,
+`coverage`, `truncated`, `edgesTruncated`, optional `graphCid`) and operation
+envelope `yataverse.ontology.operations/v1`.
 
 Explicit bidirectional adapters bridge the two contracts without conflating them:
 

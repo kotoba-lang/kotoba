@@ -104,6 +104,9 @@
    (let [schema (mget yv :schema)
          version (mget yv :version)
          basis-cid (mget yv :basisCid)
+         graph-cid (mget yv :graphCid)
+         declared-node-count (mget yv :nodeCount)
+         raw-meta (mget yv :meta)
          resolved-limits (v/resolve-limits limits)]
      (when-not (= yataverse-graph-schema schema)
        (v/fail! :invalid-yataverse-graph
@@ -115,6 +118,15 @@
                 {:version version}))
      (when (some? basis-cid)
        (v/extract-cid basis-cid))
+     (when (some? graph-cid)
+       (v/extract-cid graph-cid))
+     (when (and (some? declared-node-count)
+                (not (and (integer? declared-node-count) (not (neg? declared-node-count)))))
+       (v/fail! :invalid-yataverse-graph
+                (str "nodeCount must be a non-negative integer, got: " (pr-str declared-node-count))
+                {:nodeCount declared-node-count}))
+     (when (and (some? raw-meta) (not (map? raw-meta)))
+       (v/fail! :invalid-yataverse-graph "top-level meta must be a map" {:meta raw-meta}))
      (v/assert-bounded-and-no-remote-context! resolved-limits yv)
      (let [raw-nodes (or (mget yv :nodes) [])
            raw-edges (or (mget yv :edges) [])
@@ -122,6 +134,10 @@
        (when-not (and (sequential? raw-nodes) (sequential? raw-edges) (sequential? raw-joins))
          (v/fail! :invalid-yataverse-graph "nodes, edges, and joins must be sequential" {}))
        (v/bounded-count-or-fail! raw-nodes (:max-nodes resolved-limits) :max-nodes-exceeded :nodes)
+       (when (and (some? declared-node-count) (not= declared-node-count (count raw-nodes)))
+         (v/fail! :invalid-yataverse-graph
+                  (str "declared nodeCount (" declared-node-count ") does not match nodes length (" (count raw-nodes) ")")
+                  {:nodeCount declared-node-count :actual (count raw-nodes)}))
        (v/bounded-count-or-fail! raw-edges (:max-edges resolved-limits) :max-edges-exceeded :edges)
        (v/bounded-count-or-fail! raw-joins (:max-joins resolved-limits) :max-joins-exceeded :joins)
        (let [nodes
@@ -254,7 +270,16 @@
                 raw-joins)))
              layers (g/build-layers nodes)
              cids (vec (sort (distinct (keep identity (concat (when basis-cid [basis-cid])
+                                                              (when graph-cid [graph-cid])
                                                               (map :cid nodes))))))
+             snap-schema (some-> raw-meta (mget :snapshotSchema) str)
+             edges-trunc (cond
+                           (contains? yv :edgesTruncated) (boolean (mget yv :edgesTruncated))
+                           (contains? yv "edgesTruncated") (boolean (mget yv :edgesTruncated))
+                           (and raw-meta (or (contains? raw-meta :edgesTruncated)
+                                             (contains? raw-meta "edgesTruncated")))
+                           (boolean (mget raw-meta :edgesTruncated))
+                           :else false)
              basis (cond-> {:schema-version g/schema-version
                             :codec "dag-cbor"
                             :hash-alg "sha2-256"
@@ -264,8 +289,11 @@
                             :layer-count (count layers)
                             :join-count (count joins)
                             :cids cids
-                            :bounds resolved-limits}
+                            :bounds resolved-limits
+                            :edges-truncated edges-trunc}
                      basis-cid (assoc :root-cid basis-cid)
+                     graph-cid (assoc :graph-cid graph-cid)
+                     snap-schema (assoc :snapshot-schema snap-schema)
                      (mget yv :id) (assoc :id (str (mget yv :id)))
                      (mget yv :stats) (assoc :stats (stringify-map-keys (mget yv :stats)))
                      (mget yv :coverage) (assoc :coverage (stringify-map-keys (mget yv :coverage)))
@@ -389,15 +417,34 @@
                    :connectors (count (filter #(= "connector" (:kind %)) yv-nodes))
                    :facts (count facts)
                    :quads (count (filter #(= "rdf-subject" (:kind %)) yv-nodes))
-                   :joins (count yv-joins)})]
-    {:schema yataverse-graph-schema
-     :version 1
-     :basisCid (:root-cid basis)
-     :id (or (:id basis) (:source basis) "kotoba-ontology-graph")
-     :stats stats
-     :layers yv-layers
-     :nodes yv-nodes
-     :edges yv-edges
-     :joins yv-joins
-     :coverage (or (:coverage basis) computed-coverage)
-     :truncated (boolean (:truncated basis))}))
+                   :joins (count yv-joins)})
+        graph-id (or (:id basis) (:source basis) "kotoba-ontology-graph")
+        node-cnt (count yv-nodes)
+        edge-cnt (count yv-edges)
+        layer-cnt (count yv-layers)
+        truncated? (boolean (:truncated basis))
+        edges-truncated? (boolean (:edges-truncated basis))
+        snap-schema (or (:snapshot-schema basis) "yataverse.ontology.snapshot/v1")
+        top-meta {:id graph-id
+                  :snapshotSchema snap-schema
+                  :stats stats
+                  :nodeCount node-cnt
+                  :edgeCount edge-cnt
+                  :layerCount layer-cnt
+                  :truncated truncated?
+                  :edgesTruncated edges-truncated?}]
+    (cond-> {:schema yataverse-graph-schema
+             :version 1
+             :basisCid (:root-cid basis)
+             :id graph-id
+             :stats stats
+             :nodeCount node-cnt
+             :meta top-meta
+             :layers yv-layers
+             :nodes yv-nodes
+             :edges yv-edges
+             :joins yv-joins
+             :coverage (or (:coverage basis) computed-coverage)
+             :truncated truncated?
+             :edgesTruncated edges-truncated?}
+      (:graph-cid basis) (assoc :graphCid (:graph-cid basis)))))

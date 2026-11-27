@@ -11,14 +11,23 @@
               :cljs :default) e
       (:reason (ex-data e)))))
 
-;; Exact seeded fixture captured from Yataverse PR #83
-;; (`createDefaultOntologySnapshot()` -> `buildOntologyGraph(snap)`).
+;; Exact official reference fixture from Yataverse PR #83 (HEAD ef29596b):
+;; `test/fixtures/ontology-graph-v1.json`.
 (def yataverse-pr83-fixture
   {"schema" "yataverse.ontology.graph/v1"
    "version" 1
    "basisCid" "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"
    "id" "yataverse-seeded-kotoba-ontology"
    "stats" {"objectTypes" 2 "connectors" 3 "facts" 4 "quads" 34 "joins" 1}
+   "nodeCount" 9
+   "meta" {"id" "yataverse-seeded-kotoba-ontology"
+           "snapshotSchema" "yataverse.ontology.snapshot/v1"
+           "stats" {"objectTypes" 2 "connectors" 3 "facts" 4 "quads" 34 "joins" 1}
+           "nodeCount" 9
+           "edgeCount" 14
+           "layerCount" 3
+           "truncated" false
+           "edgesTruncated" false}
    "layers" [{"id" "connector" "label" "Connectors" "order" 0 "nodeCount" 3}
              {"id" "object-type" "label" "Object Types" "order" 1 "nodeCount" 2}
              {"id" "fact" "label" "Facts (Provenance-Tagged)" "order" 2 "nodeCount" 4}]
@@ -94,7 +103,9 @@
                "byJurisdiction" {"jp-national" 2 "jp-tokyo" 2}
                "totalJoins" 1
                "totalMatchedJoinRows" 2}
-   "truncated" false})
+   "truncated" false
+   "edgesTruncated" false
+   "graphCid" "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"})
 
 (deftest yataverse-pr83-roundtrip-and-rendering-test
   (testing "detects Yataverse PR #83 graph and converts cleanly to Kotoba ontology.graph/v1"
@@ -107,11 +118,24 @@
       (is (= 14 (count (:edges kg))))
       (is (= 1 (count (:joins kg))))
       (is (= :syntax-only (get-in kg [:basis :cid-verification])))
-      ;; Round-trip back to Yataverse wire format
+      ;; Round-trip back to Yataverse PR #83 (HEAD ef29596b) wire format
       (let [yv (ov/->yataverse-graph kg)]
         (is (= "yataverse.ontology.graph/v1" (:schema yv)))
         (is (= 1 (:version yv)))
         (is (= "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em" (:basisCid yv)))
+        (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq" (:graphCid yv)))
+        (is (= 9 (:nodeCount yv)))
+        (is (= false (:truncated yv)))
+        (is (= false (:edgesTruncated yv)))
+        (is (= {:id "yataverse-seeded-kotoba-ontology"
+                :snapshotSchema "yataverse.ontology.snapshot/v1"
+                :stats {"objectTypes" 2 "connectors" 3 "facts" 4 "quads" 34 "joins" 1}
+                :nodeCount 9
+                :edgeCount 14
+                :layerCount 3
+                :truncated false
+                :edgesTruncated false}
+               (:meta yv)))
         (is (= 9 (count (:nodes yv))))
         (is (= 14 (count (:edges yv))))
         (is (every? #(and (string? (:from %)) (string? (:to %)) (map? (:meta %))) (:edges yv)))
@@ -161,5 +185,10 @@
          (refusal-reason #(ov/<-yataverse-graph {"schema" "yataverse.ontology.graph/v1" "version" 2}))))
   (is (= :invalid-cid
          (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "basisCid" "baaaaaaaaaaaaaaaaaaaaaaaa")))))
+  (is (= :invalid-cid
+         (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "graphCid" "baaaaaaaaaaaaaaaaaaaaaaaa")))))
+  (is (= :invalid-yataverse-graph
+         (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodeCount" 999))))
+      "inconsistent top-level nodeCount must fail closed")
   (is (= :invalid-yataverse-graph
          (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodes" [{"id" "n1" "kind" "unknown-kind"}]))))))
