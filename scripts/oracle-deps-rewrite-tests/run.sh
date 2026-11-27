@@ -230,4 +230,102 @@ python3 "$SCRIPT" --check "$TMP/21.edn" > "$TMP/21c2" 2>&1
 [ "$?" = 0 ] || { cat "$TMP/21c2"; fail "21-gap-preserve check clean: want exit 0"; }
 echo "ok: 21-gap-preserve (check 1, rewrite 0, idempotent 2, check 0, comments kept)"
 
+# 22: Kougi P1 case 1 — `:git/url"..."` with no gap after the keyword.
+# --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/22-kougi-nospace-url/deps.edn" > "$TMP/22c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/22c1"; fail "22-kougi-nospace-url check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/22c1" || fail "22-kougi-nospace-url: no dead-URL report"
+cp "$HERE/cases/22-kougi-nospace-url/deps.edn" "$TMP/22.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/22.edn" \
+  > "$TMP/22.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/22.stdout"; fail "22-kougi-nospace-url: want exit 0"; }
+diff -u "$HERE/cases/22-kougi-nospace-url/expected.edn" "$TMP/22.edn" \
+  || fail "22-kougi-nospace-url: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/22.edn" \
+  > "$TMP/22b.stdout" 2>&1
+[ "$?" = 2 ] || fail "22-kougi-nospace-url re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/22.edn" > "$TMP/22c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/22c2"; fail "22-kougi-nospace-url check clean: want exit 0"; }
+echo "ok: 22-kougi-nospace-url (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 23: Kougi P1 case 2 — `:git/sha"..."` with no gap after the keyword.
+# --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/23-kougi-nospace-sha/deps.edn" > "$TMP/23c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/23c1"; fail "23-kougi-nospace-sha check dirty: want exit 1"; }
+grep -q "bare git sha" "$TMP/23c1" || fail "23-kougi-nospace-sha: no bare-sha report"
+cp "$HERE/cases/23-kougi-nospace-sha/deps.edn" "$TMP/23.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/23.edn" \
+  > "$TMP/23.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/23.stdout"; fail "23-kougi-nospace-sha: want exit 0"; }
+diff -u "$HERE/cases/23-kougi-nospace-sha/expected.edn" "$TMP/23.edn" \
+  || fail "23-kougi-nospace-sha: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/23.edn" \
+  > "$TMP/23b.stdout" 2>&1
+[ "$?" = 2 ] || fail "23-kougi-nospace-sha re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/23.edn" > "$TMP/23c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/23c2"; fail "23-kougi-nospace-sha check clean: want exit 0"; }
+echo "ok: 23-kougi-nospace-sha (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 24: zero-gap adjacent delimiters everywhere (`:deps{`, `{:git/url"...`,
+# `:git/sha"..."`, `...}lib`, `:local/root"..."`). --check 1 -> rewrite 0
+# (with --rewrite-local-roots pprint) -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/24-adjacent-delims/deps.edn" > "$TMP/24c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/24c1"; fail "24-adjacent-delims check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/24c1" || fail "24-adjacent-delims: no dead-URL report"
+cp "$HERE/cases/24-adjacent-delims/deps.edn" "$TMP/24.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" --rewrite-local-roots pprint "$TMP/24.edn" \
+  > "$TMP/24.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/24.stdout"; fail "24-adjacent-delims: want exit 0"; }
+diff -u "$HERE/cases/24-adjacent-delims/expected.edn" "$TMP/24.edn" \
+  || fail "24-adjacent-delims: output differs from expected.edn"
+grep -F ':deps/root "lib/kotoba.pprint"' "$TMP/24.edn" > /dev/null \
+  || fail "24-adjacent-delims: :local/root pin was not rewritten"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" --rewrite-local-roots pprint "$TMP/24.edn" \
+  > "$TMP/24b.stdout" 2>&1
+[ "$?" = 2 ] || fail "24-adjacent-delims re-run: want exit 2"
+diff -q "$HERE/cases/24-adjacent-delims/expected.edn" "$TMP/24.edn" > /dev/null \
+  || fail "24-adjacent-delims re-run: file changed"
+python3 "$SCRIPT" --check "$TMP/24.edn" > "$TMP/24c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/24c2"; fail "24-adjacent-delims check clean: want exit 0"; }
+echo "ok: 24-adjacent-delims (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 25: `#_` discards (top-level pin, in-map key/value, chained `#_ #_`,
+# set, tagged literal, char literal) are invisible to --check (exit 0) and
+# to rewrite (exit 2, byte-identical).
+python3 "$SCRIPT" --check "$HERE/cases/25-discard-clean/deps.edn" > "$TMP/25c" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/25c"; fail "25-discard-clean check: want exit 0"; }
+cp "$HERE/cases/25-discard-clean/deps.edn" "$TMP/25.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/25.edn" \
+  > "$TMP/25.stdout" 2>&1
+[ "$?" = 2 ] || { cat "$TMP/25.stdout"; fail "25-discard-clean: want exit 2"; }
+cmp -s "$HERE/cases/25-discard-clean/deps.edn" "$TMP/25.edn" \
+  || fail "25-discard-clean: file was modified"
+echo "ok: 25-discard-clean (check 0, rewrite exit 2, byte-identical)"
+
+# 26: unterminated string is malformed: rewrite exits non-zero without
+# writing, and --check exits non-zero too.
+cp "$HERE/cases/26-malformed-string/deps.edn" "$TMP/26.edn"
+md5_before=$(md5 -q "$TMP/26.edn" 2>/dev/null || md5sum "$TMP/26.edn" | cut -d' ' -f1)
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/26.edn" \
+  > "$TMP/26.stdout" 2>&1
+[ "$?" != 0 ] || fail "26-malformed-string: exit 0, want non-zero"
+md5_after=$(md5 -q "$TMP/26.edn" 2>/dev/null || md5sum "$TMP/26.edn" | cut -d' ' -f1)
+[ "$md5_before" = "$md5_after" ] || fail "26-malformed-string: file was modified"
+python3 "$SCRIPT" --check "$HERE/cases/26-malformed-string/deps.edn" > "$TMP/26c" 2>&1
+[ "$?" != 0 ] || fail "26-malformed-string check: exit 0, want non-zero"
+echo "ok: 26-malformed-string (rewrite and check both non-zero, untouched)"
+
+# 27: odd map (after a `#_` discard) is malformed: rewrite exits non-zero
+# without writing, and --check exits non-zero too.
+cp "$HERE/cases/27-malformed-oddmap/deps.edn" "$TMP/27.edn"
+md5_before=$(md5 -q "$TMP/27.edn" 2>/dev/null || md5sum "$TMP/27.edn" | cut -d' ' -f1)
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/27.edn" \
+  > "$TMP/27.stdout" 2>&1
+[ "$?" != 0 ] || fail "27-malformed-oddmap: exit 0, want non-zero"
+md5_after=$(md5 -q "$TMP/27.edn" 2>/dev/null || md5sum "$TMP/27.edn" | cut -d' ' -f1)
+[ "$md5_before" = "$md5_after" ] || fail "27-malformed-oddmap: file was modified"
+python3 "$SCRIPT" --check "$HERE/cases/27-malformed-oddmap/deps.edn" > "$TMP/27c" 2>&1
+[ "$?" != 0 ] || fail "27-malformed-oddmap check: exit 0, want non-zero"
+echo "ok: 27-malformed-oddmap (rewrite and check both non-zero, untouched)"
+
 echo "ALL FIXTURE TESTS PASSED"

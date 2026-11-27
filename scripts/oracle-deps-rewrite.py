@@ -14,7 +14,7 @@ NAME and changing only :git/url / :git/sha / :deps/root:
 
 A pin is rewritten when its coordinate is dead: a :git/url at
 github.com/kotoba-lang/<name> with <name> not in {kotoba, amu}, a bare
-:git/sha or :sha (whose default URL is a deleted repo), or — only for
+:git/sha or :sha (whose default URL points at a deleted repo), or — only for
 artifacts named via --rewrite-local-roots — a :local/root sibling pin.
 Monorepo-URL pins at an older sha are normalized to --sha (single sha);
 extern-sha pins that resolve (e.g. kotoba-core-contracts@b94158f, alive)
@@ -58,7 +58,6 @@ are left alone.
 import argparse
 import difflib
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -66,15 +65,6 @@ import tempfile
 DEFAULT_SHA = "ee75001ee44a9b793602d1549e5e977c4562a5fe"
 MONO_URL = "https://github.com/kotoba-lang/kotoba"
 AMU_LIBS = ("io.github.kotoba-lang/amu", "kotoba-lang/amu")
-GROUPS = r"(?:io\.github\.kotoba-lang|kotoba-lang|gftd)"
-
-# EDN treats commas as whitespace: any gap between two tokens may hold commas
-# (",", ",,", ",\n", ...). Use EDN_REQ/EDN_OPT for every gap between tokens.
-# EDN_REQ/EDN_OPT are applied to comment-stripped text (see _coord_text).
-# Searches over raw text that may span a ;-comment either strip first or
-# cross the gap procedurally with skip_gap (linear, no regex backtracking).
-EDN_REQ = r"[\s,]+"
-EDN_OPT = r"[\s,]*"
 
 # Documented extern-sha upgrade: osaho pinned off-sha (monorepo URL) by any
 # walked lib (shitsuke, jp-go-digital-design-system, ...). That extern
@@ -117,27 +107,536 @@ def _read_tree_file(repo, sha, path):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Pure-Python EDN lexer + position-span AST (single source of truth).
+#
+# Standard library only. Whitespace, `,` and `;[^\n]*` comments are trivia
+# skipped between tokens. `{`, `}`, `[`, `]`, `(`, `)`, `"`, `;`, whitespace
+# and `,` terminate a symbol/keyword immediately, so `:git/url"..."` lexes
+# as a keyword token followed by a string token with no gap required.
+# Every node keeps its (start, end) offsets into the source text.
+# ---------------------------------------------------------------------------
+
+_TERM = set(" \t\r\n,{}[]()\";#^")
+
+
+class EdnParseError(ValueError):
+    """Any malformed EDN: unterminated string, unbalanced brackets, odd map."""
+
+
+class EdnNode:
+    __slots__ = ("start", "end")
+
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class EdnString(EdnNode):
+    __slots__ = ("value",)
+
+    def __init__(self, value, start, end):
+        EdnNode.__init__(self, start, end)
+        self.value = value
+
+
+class EdnKeyword(EdnNode):
+    __slots__ = ("name",)
+
+    def __init__(self, name, start, end):
+        EdnNode.__init__(self, start, end)
+        self.name = name
+
+
+class EdnSymbol(EdnNode):
+    __slots__ = ("name",)
+
+    def __init__(self, name, start, end):
+        EdnNode.__init__(self, start, end)
+        self.name = name
+
+
+class EdnAtom(EdnNode):
+    """Numbers, booleans, nil and character literals (kept as raw text)."""
+    __slots__ = ("text",)
+
+    def __init__(self, text, start, end):
+        EdnNode.__init__(self, start, end)
+        self.text = text
+
+
+class EdnMap(EdnNode):
+    __slots__ = ("entries",)
+
+    def __init__(self, entries, start, end):
+        EdnNode.__init__(self, start, end)
+        self.entries = entries  # list of (key, value) nodes
+
+
+class EdnVec(EdnNode):
+    __slots__ = ("items",)
+
+    def __init__(self, items, start, end):
+        EdnNode.__init__(self, start, end)
+        self.items = items
+
+
+class EdnList(EdnNode):
+    __slots__ = ("items",)
+
+    def __init__(self, items, start, end):
+        EdnNode.__init__(self, start, end)
+        self.items = items
+
+
+class EdnSet(EdnNode):
+    __slots__ = ("items",)
+
+    def __init__(self, items, start, end):
+        EdnNode.__init__(self, start, end)
+        self.items = items
+
+
+class EdnTagged(EdnNode):
+    __slots__ = ("tag", "form")
+
+    def __init__(self, tag, form, start, end):
+        EdnNode.__init__(self, start, end)
+        self.tag = tag
+        self.form = form
+
+
+class EdnMeta(EdnNode):
+    __slots__ = ("meta", "form")
+
+    def __init__(self, meta, form, start, end):
+        EdnNode.__init__(self, start, end)
+        self.meta = meta
+        self.form = form
+
+
+_SKIPPED = object()  # marker for a `#_`-discarded form (yields no value)
+
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+            "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _is_number(text):
+    digits = "0123456789"
+    s = text
+    if s[:1] in ("+", "-") and len(s) > 1:
+        s = s[1:]
+    if not s or s[0] not in digits:
+        return False
+    i = 0
+    while i < len(s) and s[i] in digits:
+        i += 1
+    if i == len(s):
+        return True
+    if s[i] == "." and i + 1 < len(s):
+        j = i + 1
+        while j < len(s) and s[j] in digits:
+            j += 1
+        if j == len(s):
+            return True
+    return False
+
+
+class _Parser:
+    def __init__(self, text):
+        self.text = text
+        self.n = len(text)
+        self.pos = 0
+
+    def fail(self, msg):
+        line = self.text.count("\n", 0, self.pos) + 1
+        raise EdnParseError("%s at line %d (offset %d)" % (msg, line, self.pos))
+
+    def skip_trivia(self):
+        while self.pos < self.n:
+            c = self.text[self.pos]
+            if c in " \t\r\n,":
+                self.pos += 1
+            elif c == ";":
+                while self.pos < self.n and self.text[self.pos] != "\n":
+                    self.pos += 1
+            else:
+                break
+
+    def read_forms(self):
+        forms = []
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                return forms
+            if self.text[self.pos] in "}])":
+                self.fail("unexpected %r" % self.text[self.pos])
+            form = self.read_form()
+            if form is not _SKIPPED:
+                forms.append(form)
+
+    def read_form(self):
+        self.skip_trivia()
+        if self.pos >= self.n:
+            self.fail("unexpected end of input")
+        c = self.text[self.pos]
+        if c == "{":
+            return self.read_map()
+        if c == "[":
+            return self.read_seq("[", "]", EdnVec)
+        if c == "(":
+            return self.read_seq("(", ")", EdnList)
+        if c == '"':
+            return self.read_string()
+        if c == "#":
+            return self.read_dispatch()
+        if c == "^":
+            return self.read_meta()
+        if c == "\\":
+            return self.read_char()
+        if c in "}])":
+            self.fail("unexpected %r" % c)
+        return self.read_token()
+
+    def read_map(self):
+        start = self.pos
+        self.pos += 1
+        entries = []
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                self.fail("unclosed `{`")
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                return EdnMap(entries, start, self.pos)
+            key = self.read_form()
+            if key is _SKIPPED:
+                continue
+            while True:
+                self.skip_trivia()
+                if self.pos >= self.n:
+                    self.fail("unclosed `{`")
+                if self.text[self.pos] == "}":
+                    self.fail("map literal must contain an even number of forms")
+                val = self.read_form()
+                if val is _SKIPPED:
+                    continue
+                entries.append((key, val))
+                break
+
+    def read_seq(self, opener, closer, cls):
+        start = self.pos
+        self.pos += 1
+        items = []
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                self.fail("unclosed `%s`" % opener)
+            if self.text[self.pos] == closer:
+                self.pos += 1
+                return cls(items, start, self.pos)
+            form = self.read_form()
+            if form is not _SKIPPED:
+                items.append(form)
+
+    def read_set(self):
+        start = self.pos
+        self.pos += 2  # consume `#{`
+        items = []
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                self.fail("unclosed `#{`")
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                return EdnSet(items, start, self.pos)
+            form = self.read_form()
+            if form is not _SKIPPED:
+                items.append(form)
+
+    def read_dispatch(self):
+        start = self.pos
+        self.pos += 1
+        if self.pos >= self.n:
+            self.fail("orphan `#`")
+        c = self.text[self.pos]
+        if c == "_":
+            self.pos += 1
+            self.skip_trivia()
+            if self.pos >= self.n or self.text[self.pos] in "}])":
+                self.fail("orphan `#_`")
+            self.read_form()  # exactly one form is discarded
+            return _SKIPPED
+        if c == "{":
+            return self.read_set()
+        j = self.pos
+        while j < self.n and self.text[j] not in _TERM:
+            j += 1
+        tag = self.text[self.pos:j]
+        if not tag:
+            self.fail("orphan `#`")
+        self.pos = j
+        self.skip_trivia()
+        if self.pos >= self.n or self.text[self.pos] in "}])":
+            self.fail("orphan tag `#%s`" % tag)
+        form = self.read_form()
+        if form is _SKIPPED:
+            self.fail("orphan tag `#%s`" % tag)
+        return EdnTagged(tag, form, start, self.pos)
+
+    def read_meta(self):
+        start = self.pos
+        self.pos += 1
+        self.skip_trivia()
+        if self.pos >= self.n or self.text[self.pos] in "}])":
+            self.fail("orphan `^`")
+        meta = self.read_form()
+        if meta is _SKIPPED:
+            self.fail("orphan `^`")
+        self.skip_trivia()
+        if self.pos >= self.n or self.text[self.pos] in "}])":
+            self.fail("orphan `^`")
+        form = self.read_form()
+        if form is _SKIPPED:
+            self.fail("orphan `^`")
+        return EdnMeta(meta, form, start, self.pos)
+
+    def read_char(self):
+        start = self.pos
+        self.pos += 1
+        j = self.pos
+        while j < self.n and self.text[j] not in _TERM:
+            j += 1
+        if j == self.pos:
+            self.fail("orphan `\\`")
+        self.pos = j
+        return EdnAtom(self.text[start:j], start, self.pos)
+
+    def read_string(self):
+        start = self.pos
+        self.pos += 1
+        buf = []
+        while True:
+            if self.pos >= self.n:
+                self.fail("unterminated string")
+            c = self.text[self.pos]
+            if c == '"':
+                self.pos += 1
+                return EdnString("".join(buf), start, self.pos)
+            if c == "\\":
+                if self.pos + 1 >= self.n:
+                    self.fail("unterminated string")
+                e = self.text[self.pos + 1]
+                if e in _ESCAPES:
+                    buf.append(_ESCAPES[e])
+                    self.pos += 2
+                elif e == "u":
+                    h = self.text[self.pos + 2:self.pos + 6]
+                    if len(h) != 4:
+                        self.fail("bad unicode escape")
+                    ok = True
+                    for ch in h:
+                        if ch not in "0123456789abcdefABCDEF":
+                            ok = False
+                    if not ok:
+                        self.fail("bad unicode escape")
+                    buf.append(chr(int(h, 16)))
+                    self.pos += 6
+                else:
+                    self.fail("bad escape `\\%s`" % e)
+            else:
+                buf.append(c)
+                self.pos += 1
+
+    def read_token(self):
+        start = self.pos
+        while self.pos < self.n and self.text[self.pos] not in _TERM:
+            self.pos += 1
+        word = self.text[start:self.pos]
+        if not word:
+            self.fail("unexpected character")
+        if word.startswith(":"):
+            if len(word) == 1:
+                self.fail("orphan `:`")
+            return EdnKeyword(word, start, self.pos)
+        if word in ("true", "false", "nil") or _is_number(word):
+            return EdnAtom(word, start, self.pos)
+        return EdnSymbol(word, start, self.pos)
+
+
+def parse_edn(text):
+    """Parse EDN text into top-level forms; `#_`-discarded forms are dropped."""
+    return _Parser(text).read_forms()
+
+
+# ---------------------------------------------------------------------------
+# AST queries: the single source of truth for --check and rewrite.
+# ---------------------------------------------------------------------------
+
+_LIB_GROUPS = ("io.github.kotoba-lang/", "kotoba-lang/", "gftd/")
+_ART_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                       "0123456789_.-")
+_HEX = frozenset("0123456789abcdef")
+
+
+def _is_lib_key(name):
+    for group in _LIB_GROUPS:
+        if name.startswith(group):
+            art = name[len(group):]
+            if not art:
+                return False
+            for c in art:
+                if c not in _ART_CHARS:
+                    return False
+            return True
+    return False
+
+
+def walk_edn(node):
+    yield node
+    if isinstance(node, EdnMap):
+        for key, val in node.entries:
+            for sub in walk_edn(key):
+                yield sub
+            for sub in walk_edn(val):
+                yield sub
+    elif isinstance(node, (EdnVec, EdnList, EdnSet)):
+        for item in node.items:
+            for sub in walk_edn(item):
+                yield sub
+    elif isinstance(node, EdnTagged):
+        for sub in walk_edn(node.form):
+            yield sub
+    elif isinstance(node, EdnMeta):
+        for sub in walk_edn(node.meta):
+            yield sub
+        for sub in walk_edn(node.form):
+            yield sub
+
+
+def iter_lib_pins(forms):
+    """(key_node, lib_name, coord_map) for each live `GROUP/artifact {...}` pin.
+
+    Pins inside `;`-comments are trivia (never parsed); pins inside `#_`
+    discards are dropped by the parser, so neither can be misdetected.
+    """
+    for form in forms:
+        for node in walk_edn(form):
+            if isinstance(node, EdnMap):
+                for key, val in node.entries:
+                    if (isinstance(key, EdnSymbol) and isinstance(val, EdnMap)
+                            and _is_lib_key(key.name)):
+                        yield key, key.name, val
+
+
+def _map_str(coord, key_name):
+    for key, val in coord.entries:
+        if (isinstance(key, EdnKeyword) and key.name == key_name
+                and isinstance(val, EdnString)):
+            return val.value
+    return None
+
+
+def _map_has(coord, key_name):
+    for key, _val in coord.entries:
+        if isinstance(key, EdnKeyword) and key.name == key_name:
+            return True
+    return False
+
+
+def _coord_sha(coord):
+    return _map_str(coord, ":git/sha") or _map_str(coord, ":sha")
+
+
+def _is_hex(text):
+    if not text:
+        return False
+    for c in text:
+        if c not in _HEX:
+            return False
+    return True
+
+
+def _mono_url(url):
+    return url == MONO_URL or url == MONO_URL + ".git"
+
+
+def dead_url(coord):
+    """github.com/kotoba-lang/<name> URL with <name> not in {kotoba(.git), amu(.git)}."""
+    url = _map_str(coord, ":git/url")
+    if url is None:
+        return False
+    prefix = "https://github.com/kotoba-lang/"
+    if not url.startswith(prefix):
+        return False
+    rest = url[len(prefix):]
+    if rest.endswith(".git"):
+        rest = rest[:-len(".git")]
+    if not rest or "/" in rest or rest in ("kotoba", "amu"):
+        return False
+    for c in rest:
+        if c not in _ART_CHARS:
+            return False
+    return True
+
+
+def bare_git_sha(coord):
+    """:git/sha or :sha without any :git/url (default URL points at a deleted repo)."""
+    if _map_has(coord, ":git/url"):
+        return False
+    return _is_hex(_map_str(coord, ":git/sha")) or _is_hex(_map_str(coord, ":sha"))
+
+
+def has_local_root(coord):
+    """:local/root present as a real key (never from a comment or discard)."""
+    return _map_has(coord, ":local/root")
+
+
+def is_canonical(coord, root, sha):
+    url = _map_str(coord, ":git/url")
+    if url is None or not _mono_url(url):
+        return False
+    return _coord_sha(coord) == sha and _map_str(coord, ":deps/root") == root
+
+
+def _needs_rewrite(lib, coord, sha, rewrite_locals):
+    if dead_url(coord) or bare_git_sha(coord):
+        return True
+    if has_local_root(coord) and lib.split("/", 1)[1] in rewrite_locals:
+        return True
+    url = _map_str(coord, ":git/url")
+    if url is not None and _mono_url(url) and _coord_sha(coord) != sha:
+        return True
+    return False
+
+
 def load_metadata(repo, sha):
     """Returns (alias_to_path, lib_deps, lib_text, resolve)."""
     cat = _read_tree_file(repo, sha, "lib/catalog.edn")
     if cat is None:
         sys.exit("error: cannot read lib/catalog.edn at %s from %s" % (sha, repo))
+    try:
+        cat_forms = parse_edn(cat)
+    except EdnParseError as e:
+        sys.exit("error: cannot parse lib/catalog.edn at %s from %s: %s"
+                 % (sha, repo, e))
     alias_to_path = {}
-    # Judge comment-stripped text (offsets are stable) so ;-comments between
-    # tokens never hide an entry; resolution values live in "..." strings.
-    cat = _strip_comments(cat)
-    id_starts = [m.start() for m in re.finditer(r"\{:id" + EDN_REQ, cat)]
-    for i, start in enumerate(id_starts):
-        # entry ends at the next "{:id " or EOF; entries contain no nested maps
-        entry = cat[start:id_starts[i + 1] if i + 1 < len(id_starts) else len(cat)]
-        pm = re.search(r':path' + EDN_REQ + r'"(lib/[^"]+)"', entry)
-        if not pm:
-            continue
-        for a in re.findall(r'"((?:io\.github\.kotoba-lang|kotoba-lang|gftd)/[^"]+)"', entry):
-            alias_to_path[a] = pm.group(1)
+    # Every group/artifact string inside an entry carrying a lib/ path maps
+    # to that path (in practice these live in the :aliases vectors).
+    for form in cat_forms:
+        for node in walk_edn(form):
+            if not isinstance(node, EdnMap):
+                continue
+            path = _map_str(node, ":path")
+            if path is None or not path.startswith("lib/"):
+                continue
+            for sub in walk_edn(node):
+                if isinstance(sub, EdnString) and _is_lib_key(sub.value):
+                    alias_to_path[sub.value] = path
 
     lib_local_deps = {}  # path -> ([local lib names], [(lib, url, sha, root)] git edges)
     lib_texts = {}  # path -> raw deps.edn text (for pin inspection)
+    lib_forms = {}  # path -> parsed AST (same text, no re-parse)
 
     def lib_deps(path):
         if path in lib_local_deps:
@@ -147,18 +646,18 @@ def load_metadata(repo, sha):
             lib_local_deps[path] = None
             return None
         lib_texts[path] = txt
+        forms = parse_edn(txt)  # EdnParseError propagates to main (exit 3)
+        lib_forms[path] = forms
         refs, gits = [], []
-        for lib, block in iter_lib_maps(txt):
-            eff = _coord_text(block)
-            if ":local/root" in eff:
+        for _key, lib, coord in iter_lib_pins(forms):
+            if has_local_root(coord):
                 refs.append(lib)
                 continue
-            um = re.search(r':git/url' + EDN_REQ + r'"([^"]+)"', eff)
-            sm = re.search(r":git/sha" + EDN_REQ + r"\"([0-9a-f]+)\"|:sha" + EDN_REQ + r"\"([0-9a-f]+)\"", eff)
-            rm = re.search(r':deps/root' + EDN_REQ + r'"([^"]+)"', eff)
-            if um and sm:
-                gits.append((lib, um.group(1), sm.group(1) or sm.group(2),
-                             rm.group(1) if rm else ""))
+            url = _map_str(coord, ":git/url")
+            gsha = _coord_sha(coord)
+            if url is not None and gsha is not None and _is_hex(gsha):
+                root = _map_str(coord, ":deps/root")
+                gits.append((lib, url, gsha, root if root is not None else ""))
         lib_local_deps[path] = (refs, gits)
         return lib_local_deps[path]
 
@@ -174,17 +673,21 @@ def load_metadata(repo, sha):
         Returns None when no referrer names it or the dir does not exist.
         """
         cands = []
-        for txt in lib_texts.values():
-            for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", txt):
-                if _in_comment(txt, m.start()) or _in_string(txt, m.start()):
+        for path, forms in lib_forms.items():
+            for _key, name, coord in iter_lib_pins(forms):
+                if name != lib:
                     continue
-                j = skip_gap(txt, m.end())
-                if j < len(txt) and txt[j] == "{":
-                    k = find_matching_brace(txt, j)
-                    rm = re.search(r':local/root' + EDN_REQ + r'"\.\./([a-zA-Z0-9_.\-]+)"',
-                                   _strip_comments(txt[j:k]))
-                    if rm:
-                        cands.append("lib/" + rm.group(1))
+                root = _map_str(coord, ":local/root")
+                if root is not None and root.startswith("../"):
+                    rest = root[len("../"):]
+                    if not rest or "/" in rest:
+                        continue
+                    ok = True
+                    for c in rest:
+                        if c not in _ART_CHARS:
+                            ok = False
+                    if ok:
+                        cands.append("lib/" + rest)
         for cand in dict.fromkeys(cands):
             if _read_tree_file(repo, sha, cand + "/deps.edn") is not None:
                 return cand
@@ -263,360 +766,101 @@ def closure_libs(tops, resolve, lib_deps, sha, dual_arts, present_keys):
     return out
 
 
-def dead_url(block):
-    """github.com/kotoba-lang/<name> URL with <name> not in {kotoba(.git), amu(.git)}.
-
-    Judges _coord_text(block) (comments blanked), exactly like --check.
-    """
-    eff = _coord_text(block)
-    m = re.search(r":git/url" + EDN_REQ + r"\"https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?\"",
-                  eff)
-    if not m:
-        return False
-    return m.group(1) not in ("kotoba", "amu")
-
-
-def bare_git_sha(block):
-    """:git/sha or :sha without any :git/url (default URL points at a deleted repo).
-
-    Judges _coord_text(block) (comments blanked), exactly like --check: a
-    :git/url living only inside a ;-comment does not satisfy a live sha.
-    """
-    eff = _coord_text(block)
-    if ":git/url" in eff:
-        return False
-    return bool(re.search(r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", eff))
-
-
-def has_local_root(block):
-    """:local/root present outside strings/comments (same _coord_text basis)."""
-    return ":local/root" in _coord_text(block)
-
-
-def is_canonical(block, root, sha):
-    """Monorepo pin judged on _coord_text(block), exactly like --check."""
-    eff = _coord_text(block)
-    return MONO_URL in eff and sha in eff and root in eff
-
-
-LIB_KEY = re.compile(r"(?<![a-zA-Z0-9_.\-/])(" + GROUPS + r"/[a-zA-Z0-9_.\-]+)")
-
-def _in_comment(text, pos):
-    """True when pos lies inside a ;-comment (string-aware, same-line scan)."""
-    ls = text.rfind("\n", 0, pos) + 1
-    in_str, esc, i = False, False, ls
-    while i < pos:
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == ';':
-                return True
-        i += 1
-    return False
-
-
-def _in_string(text, pos):
-    """True when pos lies inside a "..." literal (comment-aware scan)."""
-    in_str, esc, i = False, False, 0
-    while i < pos:
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            i += 1
-        elif c == '"':
-            in_str = True
-            i += 1
-        elif c == ';':
-            while i < pos and text[i] != '\n':
-                i += 1
-        else:
-            i += 1
-    return in_str
-
-
-def _coord_text(block):
-    """Effective coordinate text: ;-comments blanked, offsets stable.
-
-    Single source of truth for coordinate classification: dead_url(),
-    bare_git_sha(), has_local_root() and is_canonical() all judge this
-    text, so --check and the rewrite pass can never disagree on what a
-    pin's coordinates are. "..." strings (and hence the URL/sha/root
-    values) pass through byte-identical.
-    """
-    return _strip_comments(block)
-
-
-def _find_map_open(text, key_end):
-    """Brace index for `key {...}` across a comment+comma gap, else None."""
-    j = skip_gap(text, key_end)
-    if j < len(text) and text[j] == "{":
-        return j
-    return None
-
-
-def _strip_comments(text):
-    """Blank ;-comments (newlines kept, offsets stable); strings aware."""
-    out = []
-    i, n, in_str, esc = 0, len(text), False, False
-    while i < n:
-        c = text[i]
-        if in_str:
-            out.append(c)
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            i += 1
-        else:
-            if c == '"':
-                in_str = True
-                out.append(c)
-                i += 1
-            elif c == ';':
-                while i < n and text[i] != '\n':
-                    out.append(' ')
-                    i += 1
-            else:
-                out.append(c)
-                i += 1
-    return "".join(out)
-
-
-def skip_gap(txt, i):
-    """Skip EDN whitespace (incl. commas) and ;-comments; linear, no backtracking."""
-    n = len(txt)
-    while i < n:
-        c = txt[i]
-        if c in " \t\r\n,":
-            i += 1
-        elif c == ";":
-            while i < n and txt[i] != "\n":
-                i += 1
-        else:
-            break
-    return i
-
-
-def iter_lib_maps(txt):
-    """Yield (key, flat map block) for each `GROUP/name {...}` pin.
-
-    Comment-tolerant gap between key and map; linear scan (a nested
-    `(?:\\s+|;...)+` regex backtracks catastrophically on comment-heavy
-    monorepo files, so the gap is skipped procedurally). Raises ValueError
-    on unbalanced braces via find_matching_brace.
-    """
-    for m in LIB_KEY.finditer(txt):
-        if _in_comment(txt, m.start()) or _in_string(txt, m.start()):
-            continue
-        key = m.group(1)
-        e = m.end()
-        if e < len(txt) and (txt[e].isalnum() or txt[e] in "_.-/"):
-            continue
-        j = _find_map_open(txt, e)
-        if j is not None:
-            yield key, txt[j:find_matching_brace(txt, j)]
-
-
-def iter_lib_spans(text):
-    """Like iter_lib_maps but yields (key, start, end, block) with offsets."""
-    for m in LIB_KEY.finditer(text):
-        if _in_comment(text, m.start()) or _in_string(text, m.start()):
-            continue
-        key = m.group(1)
-        e = m.end()
-        if e < len(text) and (text[e].isalnum() or text[e] in "_.-/"):
-            continue
-        j = _find_map_open(text, e)
-        if j is not None:
-            k = find_matching_brace(text, j)
-            yield key, m.start(), k, text[j:k]
-
-
 def rewrite_direct(text, resolve, sha, rewrite_locals):
     """Pass 1: rewrite dead pins. Returns (text, [rewritten artifacts]).
 
     Only io.github.kotoba-lang|kotoba-lang|gftd groups are scanned.
     cognitect test-runner's bare :git/tag+:git/sha uses another group
     and never reaches here, so every bare sha here defaults to a deleted
-    kotoba-lang repo.
+    kotoba-lang repo. One pin per iteration (re-parsed each time, so spans
+    stay exact); `#_`-discarded pins are invisible to the parser.
     """
     changed = []
-    return _rewrite_direct_acc(text, resolve, sha, rewrite_locals, changed)
-
-
-def _rewrite_direct_acc(text, resolve, sha, rewrite_locals, changed):
-    for key, start, end, block in iter_lib_spans(text):
-        if key in AMU_LIBS:
-            continue  # amu is frozen
-        grp, art = key.split("/", 1)
-        # Same _coord_text basis as --check (dead_url/bare_git_sha/
-        # has_local_root/is_canonical all strip internally); a MONO_URL or
-        # sha living only in a ;-comment never counts either way.
-        eff = _coord_text(block)
-        needs = (dead_url(block) or bare_git_sha(block) or
-                 (has_local_root(block) and art in rewrite_locals) or
-                 (MONO_URL in eff and sha not in eff))
-        if not needs:
-            continue
-        root = resolve(key)
-        if is_canonical(block, root, sha):
-            continue
-        new = (key + "\n        {:git/url \"%s\"\n"
+    guard = 0
+    while guard < 1000:
+        guard += 1
+        forms = parse_edn(text)
+        target = None
+        for key, lib, coord in iter_lib_pins(forms):
+            if lib in AMU_LIBS:
+                continue  # amu is frozen
+            if not _needs_rewrite(lib, coord, sha, rewrite_locals):
+                continue
+            root = resolve(lib)
+            if is_canonical(coord, root, sha):
+                continue
+            target = (key, lib, coord, root)
+            break
+        if target is None:
+            return text, changed
+        key, lib, coord, root = target
+        new = (text[key.start:key.end] + "\n        {:git/url \"%s\"\n"
                "         :git/sha \"%s\"\n"
                "         :deps/root \"%s\"}") % (MONO_URL, sha, root)
-        changed.append(art)
-        return _rewrite_direct_acc(text[:start] + new + text[end:],
-                                   resolve, sha, rewrite_locals, changed)
-    return text, changed
-
-
-def check_balanced(text):
-    """Whole-file bracket balance (strings/comments aware); raises ValueError."""
-    stack, in_str, esc, line = [], False, False, 1
-    closes = {")": "(", "]": "[", "}": "{"}
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "\n":
-            line += 1
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == ';':
-                while i < n and text[i] != '\n':
-                    i += 1
-                continue
-            elif c in "([{":
-                stack.append((c, line))
-            elif c in ")]}":
-                if not stack or stack[-1][0] != closes[c]:
-                    raise ValueError("unbalanced %r at line %d" % (c, line))
-                stack.pop()
-        i += 1
-    if in_str:
-        raise ValueError("unterminated string")
-    if stack:
-        raise ValueError("unclosed %r opened at line %d" % (stack[-1][0], stack[-1][1]))
-
-
-def find_matching_brace(text, open_idx):
-    """Index just past the brace matching text[open_idx]; strings/comments aware."""
-    i, depth, in_str, esc, n = open_idx, 0, False, False, len(text)
-    while i < n:
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == ';':
-                while i < n and text[i] != '\n':
-                    i += 1
-                continue
-            elif c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-        i += 1
-    raise ValueError("unbalanced braces from %d" % open_idx)
-
-
-def alias_bodies(text):
-    """[(name, body_open, body_close)] for each map-valued alias in :aliases.
-
-    The :aliases -> { gap is comment+comma transparent (skip_gap), and an
-    :aliases occurrence inside a ;-comment or "..." string is skipped.
-    """
-    a_open = None
-    for m in re.finditer(
-            r"(?<![a-zA-Z0-9_.\-/+*!?<>:#]):aliases(?![a-zA-Z0-9_.\-/+*!?<>])",
-            text):
-        if _in_comment(text, m.start()) or _in_string(text, m.start()):
-            continue
-        j = _find_map_open(text, m.end())
-        if j is not None:
-            a_open = j
-            break
-    if a_open is None:
-        return []
-    a_close = find_matching_brace(text, a_open)
-    bodies, i, n = [], a_open + 1, a_close - 1
-    while i < n:
-        km = re.match(r"[\s,;]*(;[^\n]*[\s,]*)?(:[A-Za-z0-9_.\-/+*!?<>]+)", text[i:n])
-        if not km:
-            i += 1
-            continue
-        name, j = km.group(2), i + km.end()
-        while j < n and (text[j] in ' \t\r\n,' or text[j] == ';'):
-            if text[j] == ';':
-                while j < n and text[j] != '\n':
-                    j += 1
-                continue
-            j += 1
-        if j < n and text[j] == '{':
-            close = find_matching_brace(text, j)
-            bodies.append((name, j, close))
-            i = close
-        else:
-            i = j + 1 if j < n else n
-    return bodies
+        text = text[:key.start] + new + text[coord.end:]
+        changed.append(lib.split("/", 1)[1])
+    raise EdnParseError("rewrite did not converge")
 
 
 def current_tops(text, sha):
     """Artifacts holding monorepo-URL pins at sha (the live basis tops)."""
     tops = set()
-    for key, block in iter_lib_maps(text):
-        if key in AMU_LIBS:
+    for _key, lib, coord in iter_lib_pins(parse_edn(text)):
+        if lib in AMU_LIBS:
             continue
-        eff = _coord_text(block)
-        if MONO_URL in eff and sha in eff:
-            tops.add(key.split("/", 1)[1])
+        url = _map_str(coord, ":git/url")
+        if url is not None and _mono_url(url) and _coord_sha(coord) == sha:
+            tops.add(lib.split("/", 1)[1])
     return tops
 
 
-def find_entry(text, lib):
-    """(start, end) of `lib {...}` pin, or None; comment-tolerant gap.
-
-    A lib name occurring only inside a ;-comment is not a live pin, so
-    such matches are skipped; the caller then takes the add path, which
-    leaves the comment bytes untouched, instead of splicing into them.
-    """
-    for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", text):
-        if _in_comment(text, m.start()) or _in_string(text, m.start()):
+def present_groups(text):
+    """artifact -> {full lib keys used in the file} for kotoba-lang/gftd groups."""
+    out = {}
+    for _key, lib, _coord in iter_lib_pins(parse_edn(text)):
+        if lib in AMU_LIBS:
             continue
-        j = _find_map_open(text, m.end())
-        if j is not None:
-            return m.start(), find_matching_brace(text, j)
+        out.setdefault(lib.split("/", 1)[1], set()).add(lib)
+    return out
+
+
+def gftd_arts(text):
+    """Artifacts referenced as live gftd/<art> pins (never from comments/discards)."""
+    arts = set()
+    for _key, lib, _coord in iter_lib_pins(parse_edn(text)):
+        if lib.startswith("gftd/"):
+            arts.add(lib.split("/", 1)[1])
+    return arts
+
+
+def _aliases_map(forms):
+    for form in forms:
+        for node in walk_edn(form):
+            if isinstance(node, EdnMap):
+                for key, val in node.entries:
+                    if (isinstance(key, EdnKeyword) and key.name == ":aliases"
+                            and isinstance(val, EdnMap)):
+                        return val
     return None
+
+
+def _has_replace_deps(body):
+    for key, val in body.entries:
+        if (isinstance(key, EdnKeyword) and key.name == ":replace-deps"
+                and isinstance(val, EdnMap)):
+            return True
+    return False
+
+
+def _alias_has_amu(body):
+    for node in walk_edn(body):
+        if isinstance(node, EdnMap):
+            for key, val in node.entries:
+                if (isinstance(key, EdnSymbol) and isinstance(val, EdnMap)
+                        and key.name in ("io.github.kotoba-lang/amu", "kotoba-lang/amu")
+                        and (_map_has(val, ":git/url") or _map_has(val, ":git/sha"))):
+                    return True
+    return False
 
 
 def entry_text(lib, root, sha, indent):
@@ -630,80 +874,89 @@ def entry_text(lib, root, sha, indent):
 def last_entry_indent(map_text):
     lines = map_text.split("\n")
     for ln in reversed(lines):
-        if re.match(r"^(?:\s*)(?:io\.github\.kotoba-lang|kotoba-lang|gftd)/", ln):
-            return re.match(r"^(\s*)", ln).group(1)
-    for ln in reversed(lines[1:-1] if len(lines) > 2 else lines):
-        mm = re.match(r"^(\s*)\S", ln)
-        if mm:
-            return mm.group(1)
+        stripped = ln.lstrip(" \t")
+        if stripped.startswith(_LIB_GROUPS):
+            rest = stripped.split("/", 1)[1]
+            if rest and rest[0] in _ART_CHARS:
+                return ln[:len(ln) - len(stripped)]
+    middle = lines[1:-1] if len(lines) > 2 else lines
+    for ln in reversed(middle):
+        stripped = ln.lstrip(" \t")
+        if stripped:
+            return ln[:len(ln) - len(stripped)]
     return " " * 39
 
 
-def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
-    """Merge :override-deps pins for want into this alias body."""
+_KEY_INDENT_KEYS = (":extra-deps", ":replace-deps", ":main-opts",
+                    ":exec-fn", ":extra-paths", ":jvm-opts")
+_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "0123456789_")
+
+
+def _body_key_indent(inner):
+    found = None
+    for line in inner.split("\n"):
+        i = 0
+        while i < len(line) and line[i] == " ":
+            i += 1
+        if i == 0:
+            continue
+        rest = line[i:]
+        for key in _KEY_INDENT_KEYS:
+            if rest.startswith(key):
+                nxt = rest[len(key):len(key) + 1]
+                if nxt == "" or nxt not in _WORD_CHARS:
+                    found = line[:i]
+    return found if found is not None else " " * 14
+
+
+def ensure_override_in_alias(text, body, sha, want, resolve):
+    """Merge :override-deps pins for want into this alias body.
+
+    One edit per call (the caller re-parses); spans are absolute offsets.
+    """
     if not want:
         return text, False
-    body = text[b_open:b_close]
-    # :override-deps -> { across any whitespace/comma/;-comment gap; a fake
-    # :override-deps inside a ;-comment or "..." string is not an entry.
-    o_rel = None
-    for cand in re.finditer(
-            r"(?<![a-zA-Z0-9_.\-/+*!?<>:#]):override-deps(?![a-zA-Z0-9_.\-/+*!?<>])",
-            body):
-        if _in_comment(body, cand.start()) or _in_string(body, cand.start()):
-            continue
-        j = _find_map_open(body, cand.end())
-        if j is not None:
-            o_rel = j
+    override = None
+    for key, val in body.entries:
+        if (isinstance(key, EdnKeyword) and key.name == ":override-deps"
+                and isinstance(val, EdnMap)):
+            override = val
             break
-    if o_rel is not None:
-        o_open = b_open + o_rel
-        o_close = find_matching_brace(text, o_open)
-        new_map = text[o_open:o_close]
-        merged = []
+    if override is not None:
+        o_open, o_close = override.start, override.end
         for lib in sorted(want):
-            art = lib.split("/", 1)[1]
             root = resolve(lib)
-            em = find_entry(new_map, lib)
-            ins = last_entry_indent(new_map)
-            if em:
-                eblock = new_map[em[0]:em[1]]
-                if is_canonical(eblock, root, sha):
+            found = None
+            for key, val in override.entries:
+                if (isinstance(key, EdnSymbol) and key.name == lib
+                        and isinstance(val, EdnMap)):
+                    found = (key, val)
+                    break
+            ins = last_entry_indent(text[o_open:o_close])
+            if found is not None:
+                key, val = found
+                if is_canonical(val, root, sha):
                     continue
-                new_map = (new_map[:em[0]] +
-                           entry_text(lib, root, sha, ins) + new_map[em[1]:])
-                merged.append(art + "(replaced)")
-            else:
-                entry = "\n" + entry_text(lib, root, sha, ins)
-                new_map = new_map[:len(new_map) - 1].rstrip("\n") + entry + "}"
-                merged.append(art + "(added)")
-        if not merged:
-            return text, False
-        return text[:o_open] + new_map + text[o_close:], True
-    inner = text[b_open:b_close]
-    key_indent = None
-    for mm in re.finditer(r"\n([ ]+):(extra-deps|replace-deps|main-opts|exec-fn|extra-paths|jvm-opts)\b",
-                          inner):
-        key_indent = mm.group(1)
-    if key_indent is None:
-        key_indent = " " * 14
+                new_text = (text[:key.start] + entry_text(lib, root, sha, ins)
+                            + text[val.end:])
+                return new_text, True
+            entry = "\n" + entry_text(lib, root, sha, ins)
+            inner = text[o_open:o_close - 1].rstrip("\n")
+            return text[:o_open] + inner + entry + "}" + text[o_close:], True
+        return text, False
+    inner = text[body.start:body.end]
+    key_indent = _body_key_indent(inner)
     mi = key_indent + " " * len(":override-deps {")
-    roots = {lib.split("/", 1)[1]: resolve(lib) for lib in want}
-    lines = [entry_text(lib, roots[lib.split("/", 1)[1]], sha, mi) for lib in sorted(want)]
+    roots = {}
+    for lib in want:
+        roots[lib.split("/", 1)[1]] = resolve(lib)
+    lines = [entry_text(lib, roots[lib.split("/", 1)[1]], sha, mi)
+             for lib in sorted(want)]
     block = "\n%s:override-deps {%s\n%s}" % (
         key_indent, "".join("\n" + e for e in lines), key_indent)
-    head = text[:b_close - 1].rstrip("\n")
-    return head + block + "}" + text[b_close:], True
-
-
-def present_groups(text):
-    """artifact -> {full lib keys used in the file} for kotoba-lang/gftd groups."""
-    out = {}
-    for key, _block in iter_lib_maps(text):
-        if key in AMU_LIBS:
-            continue
-        out.setdefault(key.split("/", 1)[1], set()).add(key)
-    return out
+    head = text[:body.end - 1].rstrip("\n")
+    return head + block + "}" + text[body.end:], True
 
 
 def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
@@ -712,18 +965,16 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
     guard = 0
     while guard < 60:
         guard += 1
-        bodies = alias_bodies(text)
+        aliases = _aliases_map(parse_edn(text))
+        if aliases is None:
+            return text, changed
         progressed = False
-        for name, b_open, b_close in bodies:
-            body = text[b_open:b_close]
-            # Judge comment-stripped body (offsets unused here): ;-comments
-            # between :replace-deps and { (or amu and {) are transparent, and
-            # fake keys living only in comments never match.
-            sbody = _strip_comments(body)
-            if name == ":test" and re.search(r":replace-deps" + EDN_OPT + r"\{", sbody):
+        for key, body in [(k, v) for k, v in aliases.entries
+                          if isinstance(k, EdnKeyword) and isinstance(v, EdnMap)]:
+            name = key.name
+            if name == ":test" and _has_replace_deps(body):
                 continue
-            amu = bool(re.search(r"kotoba-lang/amu" + EDN_OPT + r"\{[^{}]*(:git/url|:git/sha)",
-                                 sbody))
+            amu = _alias_has_amu(body)
             if name != ":test" and not amu:
                 continue
             sub = set()
@@ -735,10 +986,11 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
                 continue
             subwant = closure_libs(sub, resolve, lib_deps, sha,
                                    dual_arts, present)
-            new_text, ch = ensure_override_in_alias(text, name, b_open, b_close,
-                                                    sha, subwant, resolve)
-            if ch:
+            new_text, did = ensure_override_in_alias(text, body, sha, subwant,
+                                                     resolve)
+            if did:
                 text = new_text
+                present = present_groups(text)
                 changed.append(name)
                 progressed = True
                 break
@@ -751,33 +1003,25 @@ def check_file(path):
     """Exit 1 with a listing when dead pins remain; 0 when clean. No writes."""
     with open(path) as f:
         text = f.read()
-    # scan comment-stripped text so ;-comments never count and a :git/url
-    # value on the next line still matches; offsets map 1:1 to text.
-    stripped = _strip_comments(text)
-    problems = []
-    for m in re.finditer(
-            r":git/url" + EDN_REQ + r"\"(https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?)\"",
-            stripped):
-        if m.group(2) not in ("kotoba", "amu"):
-            lineno = stripped.count("\n", 0, m.start()) + 1
-            problems.append("%d: dead repo URL %s" % (lineno, m.group(1)))
     try:
-        # Same span enumeration as the rewrite pass (iter_lib_spans), so both
-        # modes see the same pins at the same offsets.
-        lib_spans = list(iter_lib_spans(text))
-    except ValueError as e:
-        problems.append("unbalanced EDN: %s" % e)
-        lib_spans = []
-    for key, start, _end, block in lib_spans:
-        if key in AMU_LIBS:
+        forms = parse_edn(text)
+    except EdnParseError as e:
+        print("check failed (%s):" % path)
+        print("  unbalanced EDN: %s" % e)
+        return 1
+    problems = []
+    for key, lib, coord in iter_lib_pins(forms):
+        if lib in AMU_LIBS:
             continue
-        # Judge effective (non-comment) coordinates only: a :git/url that
-        # lives inside a ;-comment does not satisfy a live :git/sha.
-        eff = _coord_text(block)
-        if ":git/url" not in eff and re.search(
-                r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", eff):
-            lineno = text.count("\n", 0, start) + 1
-            problems.append("%d: bare git sha without :git/url: %s" % (lineno, key))
+        # Actual map keys and string values only: a :git/url living inside
+        # a `;`-comment or a `#_` discard is trivia, never a coordinate.
+        url = _map_str(coord, ":git/url")
+        if url is not None and dead_url(coord):
+            lineno = text.count("\n", 0, key.start) + 1
+            problems.append("%d: dead repo URL %s" % (lineno, url))
+        elif bare_git_sha(coord):
+            lineno = text.count("\n", 0, key.start) + 1
+            problems.append("%d: bare git sha without :git/url: %s" % (lineno, lib))
     if problems:
         print("check failed (%s):" % path)
         for p in problems:
@@ -832,22 +1076,17 @@ def main(argv=None):
     _alias_to_path, lib_deps, _lib_text, resolve = load_metadata(args.kotoba_repo,
                                                               args.sha)
     try:
-        check_balanced(text)
         new_text, direct = rewrite_direct(text, resolve, args.sha,
                                           set(a for a in args.rewrite_local_roots.split(",")
                                               if a))
         # tops after pass 1: freshly rewritten pins count too
         tops = current_tops(new_text, args.sha)
-        # Live gftd/ pins only: a gftd/... mention inside a ;-comment or
-        # "..." string is not a pin the rewrite pass sees.
-        dual_arts = set()
-        for gm in re.finditer(r"gftd/[a-zA-Z0-9_.\-]+", new_text):
-            if _in_comment(new_text, gm.start()) or _in_string(new_text, gm.start()):
-                continue
-            dual_arts.add(gm.group(0).split("/", 1)[1])
+        # Live gftd/ pins only: a gftd/... mention inside a `;`-comment,
+        # a "..." string or a `#_` discard is not a pin the rewrite pass sees.
+        dual_arts = gftd_arts(new_text)
         new_text, aliases = rewrite_aliases(new_text, tops, resolve,
                                             lib_deps, dual_arts, args.sha)
-    except ValueError as e:
+    except EdnParseError as e:
         print("error: %s (input left untouched)" % e)
         return 3
     except SystemExit as e:
