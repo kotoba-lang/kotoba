@@ -49,13 +49,19 @@ frame with byte-identical contents. **AWS S3 proper has not been probed**;
 "S3-compatible" is not one behaviour, which is the same reason
 `:conditional-put` defaults to `:unverified` here.
 
-It is an operator-run probe, not a gate: it needs credentials (Keychain
-service `b2:ai-gftd-datasets`, resolved by exact name — never enumerated)
-and a network, and a fleet node has neither. Same shape as
-`probe-conditional-put!`, and for the same reason.
+It is an operator-run probe, not a gate: it needs credentials (an exact
+Keychain service name supplied via `B2_PROBE_KEYCHAIN_SERVICE`, resolved by
+exact name — never enumerated), a target bucket supplied via
+`B2_PROBE_BUCKET` (optionally `B2_PROBE_ENDPOINT` and `B2_PROBE_REGION`), and
+a network, and a fleet node has none of them. Missing required environment
+variables fail closed with exit code `2` before reading the Keychain or
+contacting any endpoint. Same shape as `probe-conditional-put!`, and for the
+same reason.
 
 ```bash
-kbb --backend sci --classpath "src:<io-ipld-car>/src:$(kbb -Spath -M:cljs-test)"     test/b2_range_probe.cljk
+B2_PROBE_KEYCHAIN_SERVICE=<keychain-service> \
+B2_PROBE_BUCKET=<bucket> \
+kbb --backend sci --classpath "src:<io-ipld-car>/src:$(kbb -Spath -M:cljs-test)" test/b2_range_probe.cljk
 ```
 
 A `200` answer to a ranged GET means the endpoint **ignored** `Range` and is

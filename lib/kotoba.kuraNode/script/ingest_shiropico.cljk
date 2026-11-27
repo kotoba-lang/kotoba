@@ -8,7 +8,7 @@
   that somebody would be upset to lose.
 
   Why it is safe to be the first. These assets already have TWO copies — the
-  source bucket `ai-gftd-datasets` and a git-annex trusted copy in
+  source B2 bucket (configured via `SRC_BUCKET`) and a git-annex trusted copy in
   `gftdcojp-m365-annex`. **Both are Backblaze B2.** Different buckets, one
   provider, therefore one failure domain by `kura.node.store/domain-key`'s own
   reading. So kura failing costs nothing here, and kura succeeding genuinely
@@ -70,7 +70,7 @@
              :key-id (env "SRC_KEY_ID") :secret (env "SRC_APP_KEY")
              :endpoint "https://s3.us-west-004.backblazeb2.com"
              :host "s3.us-west-004.backblazeb2.com"
-             :bucket "ai-gftd-datasets" :region "us-west-004"
+             :bucket (env "SRC_BUCKET") :region "us-west-004"
              :prefix "" :now-fn hf/now-iso
              :independence :shared-provider :availability :always-on
              :failure-domain {:provider "backblaze-b2" :account "datasets"}}))
@@ -172,8 +172,8 @@
   ;; not a pattern — a foreign bucket is not a shard store. Fine for a one-off
   ;; ingest; if this becomes routine the right fix is a small object-read seam
   ;; rather than more scripts leaning on the gap.
-  (doseq [v ["SRC_KEY_ID" "SRC_APP_KEY" "B2_KEY_ID" "B2_APP_KEY" "KURA_NODE_TOKEN"]]
-    (assert (seq (or (env v) "")) (str v " is required")))
+  (doseq [v ["SRC_BUCKET" "SRC_KEY_ID" "SRC_APP_KEY" "B2_KEY_ID" "B2_APP_KEY" "KURA_NODE_TOKEN"]]
+    (assert (not (str/blank? (or (env v) ""))) (str v " is required")))
   (let [src (source-store)]
     (-> (fleet> )
         (.then (fn [stores]
