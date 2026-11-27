@@ -184,7 +184,25 @@
       (is (= "yes" (get-in doc-node [:attributes ":doc/reasserted"])))
       (is (= "US" (get-in doc-node [:attributes ":doc/note"])))
       (is (empty? (filter #(= :datom-ref (:kind %)) (:edges g)))
-          "untyped plain string matching an entity id must not silently create a :datom-ref edge"))))
+          "untyped plain string matching an entity id must not silently create a :datom-ref edge")))
+
+  (testing "non-schema namespaced keyword matching an entity ID does NOT invent :datom-ref, while genuine declared :ref self-reference preserves a self-edge"
+    (let [g (ov/project-graph
+             {:kotoba-schema [{:db/ident :org/parent
+                               :db/valueType :db.type/ref
+                               :db/cardinality :db.cardinality/one}]
+              :datoms [[:status/open :label/name "Open" 10 true]
+                       ;; Non-schema keyword matching entity :status/open must stay scalar
+                       [:doc/b :doc/state :status/open 10 true]
+                       ;; Genuine declared ref self-reference must produce a :datom-ref self-edge
+                       [:org/root :org/parent :org/root 10 true]]})
+          ref-edges (filter #(= :datom-ref (:kind %)) (:edges g))
+          doc-b (first (filter #(= "entity:doc/b" (:id %)) (:nodes g)))]
+      (is (= ":status/open" (get-in doc-b [:attributes ":doc/state"])))
+      (is (= 1 (count ref-edges)))
+      (is (= "entity:org/root" (:source (first ref-edges))))
+      (is (= "entity:org/root" (:target (first ref-edges))))
+      (is (true? (get-in (first ref-edges) [:metadata :self-ref]))))))
 
 (deftest rdf-quad-provenance-datatype-language-and-disambiguation-test
   (let [g (ov/project-graph
@@ -218,24 +236,31 @@
            (set (map #(get-in % [:metadata :predicate-iri]) rdf-edges))))
     (is (= #{"urn:g:1" "urn:g:2"}
            (set (map #(get-in % [:metadata :graph]) rdf-edges))))
+    (is (= ["urn:g:1" "urn:g:2"]
+           (get-in s1 [:provenance :named-graphs]))
+        "same RDF node across multiple named graphs must retain sorted union of named graphs")
     (is (= ["Hello@en" "こんにちは@ja"]
            (get-in s1 [:attributes "http://www.w3.org/2000/01/rdf-schema#label"])))
     (is (= "42^^<http://www.w3.org/2001/XMLSchema#integer>"
            (get-in s1 [:attributes "http://schema.example/amount"])))))
 
 (deftest join-scoping-and-ambiguity-handling-test
-  (testing "type-scoped join isolates values by declared :from-type and :to-type"
+  (testing "type-scoped join isolates values by declared :from-type and :to-type, including string-ID facts extended by datoms"
     (let [g (ov/project-graph
              {:facts [{:id "t1" :ontology/type :tender :code "JP"}
+                      {:id "t-str-2" :ontology/type :tender :name "Extended via datom"}
                       {:id "x1" :ontology/type :other :code "SHOULD-NOT-LEAK"}
-                      {:id "c1" :ontology/type :country :iso "JP"}]
+                      {:id "c1" :ontology/type :country :iso "JP"}
+                      {:id "c2" :ontology/type :country :iso "US"}]
+              :datoms [["t-str-2" :code "US" 101 true]]
               :joins [{:id "join:scoped"
                        :from-type :tender :from-attr :code
                        :to-type :country :to-attr :iso
                        :match-rule :exact}]})
           j (first (:joins g))]
-      (is (= 1 (:total-source-count j)))
-      (is (= 1 (:matched-count j)))
+      (is (= 2 (:total-source-count j)))
+      (is (= 2 (:matched-count j)))
+      (is (= [["JP" "JP"] ["US" "US"]] (:matched-pairs j)))
       (is (= :full (:status j)))))
 
   (testing "ambiguous join match fails closed by default (:on-ambiguous :error)"
@@ -266,11 +291,18 @@
 (deftest filter-and-vertical-layout-test
   (let [graph (ov/project-graph sample-input)
         only-onto (ov/filter-graph graph {:layers ["connector" "ontology"]})
+        empty-layers (ov/filter-graph graph {:layers []})
+        empty-kinds (ov/filter-graph graph {:kinds []})
         by-kind-str (ov/filter-graph graph {:kinds ["connector"]})
         by-kind-kw (ov/filter-graph graph {:kinds [:connector]})
         by-query (ov/filter-graph graph {:query "jp.kkj"})
         vertical (ov/layout-graph graph {:direction :vertical})]
     (is (= #{"connector" "ontology"} (set (map :layer (:nodes only-onto)))))
+    (is (= 0 (count (:nodes empty-layers)))
+        "explicit {:layers []} must return 0 nodes (not fall back to unfiltered)")
+    (is (= 0 (count (:edges empty-layers))))
+    (is (= 0 (count (:nodes empty-kinds)))
+        "explicit {:kinds []} must return 0 nodes")
     (is (= by-kind-str by-kind-kw) "string and keyword kind filters must agree")
     (is (= ["connector:jp.kkj"] (mapv :id (:nodes by-query))))
     (is (= :vertical (get-in vertical [:layout :direction])))

@@ -1,7 +1,9 @@
 (ns kotoba.ontology-viz.validate
-  "Fail-closed input validation, normalized-graph boundary validation, explicit
-  safety bounds (enforced before full collection realization), remote-context
-  guards, strict hex paint validation, and binary CIDv1 multiformats parsing."
+  "Fail-closed input validation, normalized-graph boundary validation (no
+  undeclared layers, duplicate IDs, dangling edge endpoints, or unchecked
+  layout coordinates), explicit safety bounds (including total walk budget,
+  root width, and key length), remote-context guards, strict hex paint
+  validation, and binary CIDv1 multiformats parsing."
   (:require [clojure.string :as str]
             [kotoba.ontology-viz.escape :as esc]))
 
@@ -13,9 +15,11 @@
    :max-value-length 1024
    :max-depth 16
    :max-joins 128
+   :max-join-pairs 5000
    :max-attributes-per-node 64
    :max-input-items 10000
-   :max-collection-width 2048})
+   :max-collection-width 2048
+   :max-walk-nodes 50000})
 
 (def hard-limits
   "Absolute ceilings that caller-supplied `:limits` may never exceed."
@@ -25,9 +29,11 @@
    :max-value-length 8192
    :max-depth 64
    :max-joins 1024
+   :max-join-pairs 50000
    :max-attributes-per-node 512
    :max-input-items 50000
-   :max-collection-width 10000})
+   :max-collection-width 10000
+   :max-walk-nodes 200000})
 
 (def valid-match-rules
   #{:exact :exact-uppercase :exact-lowercase :prefix :mapping})
@@ -100,7 +106,6 @@
              acc 0
              out (transient [])]
         (if (= i n)
-          ;; Residual bits (< 5) must be zero (canonical base32, no alias padding)
           (when (zero? (bit-and acc (dec (bit-shift-left 1 bits))))
             (persistent! out))
           (let [digit (get base32-lookup (.charAt s i))]
@@ -150,16 +155,9 @@
    0x72 :libp2p-key})
 
 (defn parse-cidv1
-  "Strictly parse a canonical base32lower ('b'-multibase) CIDv1 binary structure:
-  - canonical base32 round-trip (rejects non-zero residual padding bits)
-  - varint version == 1
-  - positive multicodec varint
-  - recognized multihash code + valid digest length
-  - exact remaining byte length == declared digest length
-
-  Returns `{:version 1 :codec-code ... :codec ... :hash-code ... :digest-length ...}`
-  or `nil` if malformed. NOTE: this validates CIDv1 syntax/structure only
-  (`:cid-verification :syntax-only`), never cryptographic block integrity."
+  "Strictly parse a canonical base32lower ('b'-multibase) CIDv1 binary structure.
+  NOTE: validates CIDv1 syntax/structure only (`:syntax-only`), never
+  cryptographic block integrity."
   [s]
   (when (and (string? s)
              (<= 10 (count s) 256)
@@ -188,8 +186,7 @@
                            :verification :syntax-only})))))))))))))
 
 (defn valid-cid?
-  "True when `s` is a structurally valid canonical base32lower CIDv1 string
-  (verified by binary varint/multicodec/multihash parsing)."
+  "True when `s` is a structurally valid canonical base32lower CIDv1 string."
   [s]
   (boolean (parse-cidv1 s)))
 
@@ -213,11 +210,7 @@
   (->IpldLink cid))
 
 (defn ipld-link?
-  "True when `x` is a recognized IPLD Link representation:
-  - `IpldLink` record from this library,
-  - `ipld.link/Link` record (carries `:cid` and type name ending in `Link`),
-  - DAG-JSON link map `{\"/\" \"bafy...\"}`,
-  - explicit link map `{:ipld/link \"bafy...\"}` or `{:ipld/cid \"bafy...\"}`."
+  "True when `x` is a recognized IPLD Link representation."
   [x]
   (cond
     (instance? IpldLink x) true
@@ -240,9 +233,9 @@
     (let [raw (cond
                 (string? x) x
                 (instance? IpldLink x) (:cid x)
-                (and (map? x) (contains? x "/")) (get x "/")
-                (and (map? x) (contains? x :ipld/link)) (:ipld/link x)
-                (and (map? x) (contains? x :ipld/cid)) (:ipld/cid x)
+                (and (map? x) (not (sorted? x)) (contains? x "/")) (get x "/")
+                (and (map? x) (not (sorted? x)) (contains? x :ipld/link)) (:ipld/link x)
+                (and (map? x) (not (sorted? x)) (contains? x :ipld/cid)) (:ipld/cid x)
                 (and (record? x) (contains? x :cid)) (:cid x)
                 :else nil)]
       (when-not (valid-cid? raw)
@@ -367,7 +360,7 @@
              (str "attribute count (" actual ") exceeds max-attributes-per-node (" limit ") on " node-id)
              {:node-id node-id :actual actual :limit limit}))))
 
-;; ── Remote @context & Deep Structure Guards ──────────────────────────────────
+;; ── Remote @context & Deep Structure Guards (with Total Work Budget) ─────────
 
 (def ^:private remote-uri-re #"^\s*(https?|ftp|file|ws|wss|data|javascript|vbscript):")
 
@@ -378,7 +371,12 @@
 (def ^:private kw-at-context (keyword "@context"))
 (def ^:private kw-at-import (keyword "@import"))
 
-(defn- assert-context-value-local! [ctx path]
+(defn- assert-context-value-local! [ctx path limits work-vol]
+  (let [w (vswap! work-vol inc)]
+    (when (> w (:max-walk-nodes limits))
+      (fail! :max-walk-nodes-exceeded
+             (str "structure walk exceeded total work budget (" (:max-walk-nodes limits) ")")
+             {:limit (:max-walk-nodes limits) :path path})))
   (cond
     (nil? ctx) nil
     (string? ctx)
@@ -386,27 +384,53 @@
            (str "remote or string @context reference is forbidden (offline fail-closed): " ctx)
            {:path path :context ctx})
     (map? ctx)
-    (doseq [[k v] ctx]
-      (when (and (or (= k "@import") (= k kw-at-import)) (some? v))
-        (fail! :remote-context-forbidden
-               "JSON-LD @import remote context directive is forbidden"
-               {:path (conj path k) :value v})))
+    (do
+      (bounded-count-or-fail! ctx (:max-collection-width limits) :max-collection-width-exceeded (pr-str path))
+      (doseq [[k v] ctx]
+        (assert-label-length! limits :context/key (if (keyword? k) (name k) (str k)))
+        (when (and (or (= k "@import") (= k kw-at-import)) (some? v))
+          (fail! :remote-context-forbidden
+                 "JSON-LD @import remote context directive is forbidden"
+                 {:path (conj path k) :value v}))))
     (sequential? ctx)
-    (doseq [[idx item] (map-indexed vector ctx)]
-      (assert-context-value-local! item (conj path idx)))
+    (do
+      (bounded-count-or-fail! ctx (:max-collection-width limits) :max-collection-width-exceeded (pr-str path))
+      (doseq [[idx item] (map-indexed vector ctx)]
+        (assert-context-value-local! item (conj path idx) limits work-vol)))
     :else
     (fail! :remote-context-forbidden
            "unsupported @context value"
            {:path path :context ctx})))
 
 (defn assert-bounded-and-no-remote-context!
-  "Walk `data` enforcing `:max-depth`, `:max-collection-width`, `:max-value-length`,
-  and rejecting any remote `@context` references or remote-fetch flags."
+  "Walk `data` enforcing `:max-depth`, `:max-collection-width` (including root
+  map width), `:max-label-length` on map keys, `:max-value-length`, total
+  visited node work budget `:max-walk-nodes`, and rejecting any remote `@context`
+  references or remote-fetch flags."
   [limits data]
   (let [max-depth (:max-depth limits)
         max-width (:max-collection-width limits)
-        max-val-len (:max-value-length limits)]
-    (letfn [(walk [x depth path]
+        max-val-len (:max-value-length limits)
+        max-key-len (:max-label-length limits)
+        max-work (:max-walk-nodes limits)
+        work (volatile! 0)]
+    (letfn [(tick! [path]
+              (let [w (vswap! work inc)]
+                (when (> w max-work)
+                  (fail! :max-walk-nodes-exceeded
+                         (str "structure walk exceeded total work budget (" max-work ")")
+                         {:limit max-work :path path}))))
+            (check-key! [k path]
+              (let [ks (cond
+                         (string? k) k
+                         (keyword? k) (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+                         :else (str k))]
+                (when (> (count ks) max-key-len)
+                  (fail! :max-label-length-exceeded
+                         (str "map key length (" (count ks) ") exceeds max-label-length (" max-key-len ")")
+                         {:actual (count ks) :limit max-key-len :path path}))))
+            (walk [x depth path]
+              (tick! path)
               (when (> depth max-depth)
                 (fail! :max-depth-exceeded
                        (str "nesting depth (" depth ") exceeds max-depth (" max-depth ")")
@@ -423,11 +447,11 @@
 
                 (map? x)
                 (do
-                  (when (pos? depth)
-                    (bounded-count-or-fail! x max-width :max-collection-width-exceeded (pr-str path)))
+                  (bounded-count-or-fail! x max-width :max-collection-width-exceeded (pr-str path))
                   (doseq [[k v] x]
+                    (check-key! k path)
                     (when (or (= k "@context") (= k kw-at-context))
-                      (assert-context-value-local! v (conj path k)))
+                      (assert-context-value-local! v (conj path k) limits work))
                     (when (and (or (= k :fetch-remote?)
                                    (= k :resolve-remote-context?)
                                    (= k :allow-remote-fetch?))
@@ -446,6 +470,38 @@
 
                 :else nil))]
       (walk data 0 []))))
+
+;; ── Layout Option & Dimension Validation ─────────────────────────────────────
+
+(defn assert-finite-pos! [field val]
+  (when-not (and (esc/finite-number? val) (pos? (double val)))
+    (fail! :invalid-layout
+           (str "layout field " field " must be a finite positive number, got: " (pr-str val))
+           {:field field :value val})))
+
+(defn assert-finite-nonneg! [field val]
+  (when-not (and (esc/finite-number? val) (>= (double val) 0.0))
+    (fail! :invalid-layout
+           (str "layout field " field " must be a finite non-negative number, got: " (pr-str val))
+           {:field field :value val})))
+
+(defn validate-layout-options!
+  "Validate all layout geometry options used in SVG coordinate math."
+  [opts]
+  (when (and (some? opts) (not (map? opts)))
+    (fail! :invalid-layout "layout options must be a map" {:layout opts}))
+  (when (map? opts)
+    (when (contains? opts :direction)
+      (when-not (contains? #{:horizontal :vertical} (:direction opts))
+        (fail! :invalid-layout
+               "layout :direction must be :horizontal or :vertical"
+               {:direction (:direction opts)})))
+    (doseq [k [:width :height :node-width :node-height]]
+      (when (contains? opts k)
+        (assert-finite-pos! k (get opts k))))
+    (doseq [k [:col-gap :row-gap :pad-x :pad-y]]
+      (when (contains? opts k)
+        (assert-finite-nonneg! k (get opts k))))))
 
 ;; ── Top-level Projection Input Validation ────────────────────────────────────
 
@@ -486,8 +542,10 @@
       (when-not (or (map? ipld-nodes) (sequential? ipld-nodes))
         (fail! :invalid-ipld-node "`:ipld-nodes` must be a map or sequence" {:ipld-nodes ipld-nodes}))
       (bounded-count-or-fail! ipld-nodes (:max-input-items limits) :max-input-items-exceeded :ipld-nodes))
+    (when-let [lay (:layout input)]
+      (validate-layout-options! lay))
 
-    ;; Deep bounded walk (depth, collection width, value length, remote @context)
+    ;; Deep bounded walk (depth, collection width, key length, value length, total work, remote @context)
     (assert-bounded-and-no-remote-context! limits input)
 
     ;; Detailed domain field checks
@@ -585,23 +643,12 @@
 
 ;; ── Normalized Graph Boundary Validation (G3: No Unchecked Caller Bypass) ───
 
-(defn- assert-finite-pos! [field val]
-  (when-not (and (esc/finite-number? val) (pos? (double val)))
-    (fail! :invalid-layout
-           (str "layout field " field " must be a finite positive number, got: " (pr-str val))
-           {:field field :value val})))
-
-(defn- assert-finite-coord! [field val]
-  (when-not (and (esc/finite-number? val) (>= (double val) 0.0))
-    (fail! :invalid-layout
-           (str "layout coordinate " field " must be a finite non-negative number, got: " (pr-str val))
-           {:field field :value val})))
-
 (defn validate-graph!
   "Fail-closed validation of any caller-supplied normalized `ontology.graph/v1`
   map at render/layout/filter/dispatch boundaries. Enforces schema version,
-  resource bounds, finite layout dimensions, CIDv1 structure, and strict
-  `#RRGGBB` paint allowlist."
+  resource bounds, unique layer/node/edge IDs, declared node layers, non-dangling
+  edge endpoints, finite layout dimensions (width/height/padding/gaps), CIDv1
+  structure, and strict `#RRGGBB` paint allowlist."
   [graph]
   (when-not (map? graph)
     (fail! :invalid-graph "graph must be a map" {:type (str (type graph))}))
@@ -640,50 +687,80 @@
       (when-let [ver (:cid-verification basis)]
         (when-not (contains? valid-cid-verification-states ver)
           (fail! :invalid-basis "invalid :cid-verification in basis" {:cid-verification ver})))
-      ;; Validate layers and paint fields strictly
-      (doseq [l layers]
-        (when-not (and (map? l) (string? (:id l)) (not (str/blank? (:id l))))
-          (fail! :invalid-layer "layer must be a map with non-empty string :id" {:layer l}))
-        (assert-label-length! limits :layer/id (:id l))
-        (assert-label-length! limits :layer/label (:label l))
-        (assert-safe-hex-color! :layer/color (:color l))
-        (assert-safe-hex-color! :layer/bg (:bg l))
-        (when (contains? l :node-count)
-          (when-not (and (integer? (:node-count l)) (not (neg? (:node-count l))))
-            (fail! :invalid-layer "layer :node-count must be a non-negative integer" {:layer l}))))
-      ;; Validate nodes
-      (doseq [n nodes]
-        (when-not (and (map? n) (string? (:id n)) (not (str/blank? (:id n)))
-                       (string? (:layer n)) (not (str/blank? (:layer n))))
-          (fail! :invalid-node "node must be a map with non-empty string :id and :layer" {:node n}))
-        (assert-label-length! limits :node/id (:id n))
-        (assert-label-length! limits :node/label (:label n))
-        (assert-label-length! limits :node/layer (:layer n))
-        (when-let [k (:kind n)]
-          (when-not (contains? valid-node-kinds k)
-            (fail! :invalid-node (str "unsupported node :kind " (pr-str k)) {:node-id (:id n) :kind k})))
-        (when-let [c (:cid n)] (extract-cid c))
-        (when-let [attrs (:attributes n)]
-          (when-not (map? attrs)
-            (fail! :invalid-node "node :attributes must be a map" {:node-id (:id n)}))
-          (assert-attributes-count! limits (:id n) (count attrs)))
-        (when-let [lay (:layout n)]
-          (when-not (map? lay)
-            (fail! :invalid-layout "node :layout must be a map" {:node-id (:id n)}))
-          (assert-finite-coord! :layout/x (:x lay))
-          (assert-finite-coord! :layout/y (:y lay))
-          (assert-finite-pos! :layout/width (:width lay))
-          (assert-finite-pos! :layout/height (:height lay))))
-      ;; Validate edges
-      (doseq [e edges]
-        (when-not (and (map? e) (string? (:id e)) (string? (:source e)) (string? (:target e)))
-          (fail! :invalid-edge "edge must be a map with string :id, :source, :target" {:edge e}))
-        (assert-label-length! limits :edge/id (:id e))
-        (assert-label-length! limits :edge/label (:label e))
-        (when-let [k (:kind e)]
-          (when-not (contains? valid-edge-kinds k)
-            (fail! :invalid-edge (str "unsupported edge :kind " (pr-str k)) {:edge-id (:id e) :kind k})))
-        (when-let [c (:cid e)] (extract-cid c)))
+
+      ;; Validate layers, strict paint hex, and unique layer IDs
+      (let [declared-layers
+            (reduce
+             (fn [seen l]
+               (when-not (and (map? l) (string? (:id l)) (not (str/blank? (:id l))))
+                 (fail! :invalid-layer "layer must be a map with non-empty string :id" {:layer l}))
+               (when (contains? seen (:id l))
+                 (fail! :duplicate-layer-id (str "duplicate layer id: " (:id l)) {:layer-id (:id l)}))
+               (assert-label-length! limits :layer/id (:id l))
+               (assert-label-length! limits :layer/label (:label l))
+               (assert-safe-hex-color! :layer/color (:color l))
+               (assert-safe-hex-color! :layer/bg (:bg l))
+               (when (contains? l :node-count)
+                 (when-not (and (integer? (:node-count l)) (not (neg? (:node-count l))))
+                   (fail! :invalid-layer "layer :node-count must be a non-negative integer" {:layer l})))
+               (conj seen (:id l)))
+             #{}
+             layers)
+            ;; Validate nodes, unique node IDs, and declared layer membership
+            node-ids
+            (reduce
+             (fn [seen n]
+               (when-not (and (map? n) (string? (:id n)) (not (str/blank? (:id n)))
+                              (string? (:layer n)) (not (str/blank? (:layer n))))
+                 (fail! :invalid-node "node must be a map with non-empty string :id and :layer" {:node n}))
+               (when (contains? seen (:id n))
+                 (fail! :duplicate-node-id (str "duplicate node id: " (:id n)) {:node-id (:id n)}))
+               (when-not (contains? declared-layers (:layer n))
+                 (fail! :undeclared-node-layer
+                        (str "node " (:id n) " belongs to undeclared layer " (pr-str (:layer n)))
+                        {:node-id (:id n) :layer (:layer n) :declared-layers (vec (sort declared-layers))}))
+               (assert-label-length! limits :node/id (:id n))
+               (assert-label-length! limits :node/label (:label n))
+               (assert-label-length! limits :node/layer (:layer n))
+               (when-let [k (:kind n)]
+                 (when-not (contains? valid-node-kinds k)
+                   (fail! :invalid-node (str "unsupported node :kind " (pr-str k)) {:node-id (:id n) :kind k})))
+               (when-let [c (:cid n)] (extract-cid c))
+               (when-let [attrs (:attributes n)]
+                 (when-not (map? attrs)
+                   (fail! :invalid-node "node :attributes must be a map" {:node-id (:id n)}))
+                 (assert-attributes-count! limits (:id n) (count attrs)))
+               (when-let [lay (:layout n)]
+                 (when-not (map? lay)
+                   (fail! :invalid-layout "node :layout must be a map" {:node-id (:id n)}))
+                 (assert-finite-nonneg! :layout/x (:x lay))
+                 (assert-finite-nonneg! :layout/y (:y lay))
+                 (assert-finite-pos! :layout/width (:width lay))
+                 (assert-finite-pos! :layout/height (:height lay)))
+               (conj seen (:id n)))
+             #{}
+             nodes)]
+        ;; Validate edges, unique edge IDs, and non-dangling source/target endpoints
+        (reduce
+         (fn [seen e]
+           (when-not (and (map? e) (string? (:id e)) (string? (:source e)) (string? (:target e)))
+             (fail! :invalid-edge "edge must be a map with string :id, :source, :target" {:edge e}))
+           (when (contains? seen (:id e))
+             (fail! :duplicate-edge-id (str "duplicate edge id: " (:id e)) {:edge-id (:id e)}))
+           (when-not (and (contains? node-ids (:source e)) (contains? node-ids (:target e)))
+             (fail! :dangling-edge-endpoint
+                    (str "edge " (:id e) " references missing endpoint(s): " (:source e) " -> " (:target e))
+                    {:edge-id (:id e) :source (:source e) :target (:target e)}))
+           (assert-label-length! limits :edge/id (:id e))
+           (assert-label-length! limits :edge/label (:label e))
+           (when-let [k (:kind e)]
+             (when-not (contains? valid-edge-kinds k)
+               (fail! :invalid-edge (str "unsupported edge :kind " (pr-str k)) {:edge-id (:id e) :kind k})))
+           (when-let [c (:cid e)] (extract-cid c))
+           (conj seen (:id e)))
+         #{}
+         edges))
+
       ;; Validate joins
       (doseq [j joins]
         (when-not (and (map? j) (string? (:id j)) (string? (:from-attr j)) (string? (:to-attr j)))
@@ -699,13 +776,10 @@
           (let [cov (:coverage j)]
             (when-not (and (esc/finite-number? cov) (<= 0.0 (double cov) 1.0))
               (fail! :invalid-join "join :coverage must be finite in [0.0, 1.0]" {:join-id (:id j) :coverage cov})))))
-      ;; Validate canvas layout if present
+
+      ;; Validate ALL canvas layout numeric fields used in SVG coordinate math
       (when-let [lay (:layout graph)]
-        (when-not (map? lay)
-          (fail! :invalid-layout "graph :layout must be a map" {:layout lay}))
+        (validate-layout-options! lay)
         (assert-finite-pos! :canvas/width (:width lay))
-        (assert-finite-pos! :canvas/height (:height lay))
-        (when-let [dir (:direction lay)]
-          (when-not (contains? #{:horizontal :vertical} dir)
-            (fail! :invalid-layout "layout :direction must be :horizontal or :vertical" {:direction dir}))))
+        (assert-finite-pos! :canvas/height (:height lay)))
       limits)))

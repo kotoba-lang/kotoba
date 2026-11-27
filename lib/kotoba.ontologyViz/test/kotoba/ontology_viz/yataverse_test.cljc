@@ -191,6 +191,7 @@
   (testing "Yataverse operation adapter returns yataverse.ontology.operations/v1 envelopes"
     (let [g-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {})
           i-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.inspect" {})
+          i-node (ov/invoke-yataverse yataverse-pr83-fixture "ontology.inspect" {:node-id "type:tender"})
           v-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.view" {:format "all" :title "YV All"})
           s-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sql"
                                      {:query "SELECT id, kind FROM nodes WHERE layer = 'connector'"})
@@ -201,11 +202,99 @@
       (is (= "yataverse.ontology.graph/v1" (get-in g-res [:result :schema])))
       (is (= 2 (count (get-in i-res [:result :objectTypes]))))
       (is (= 3 (count (get-in i-res [:result :connectors]))))
+      (is (= "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"
+             (get-in i-res [:result :blockCids :root])))
+      (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"
+             (get-in i-res [:result :blockCids :graph])))
+      (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"
+             (get-in i-node [:result :blockCids :graph])))
+      (is (= "yataverse.ontology.operations/v1" (get-in v-res [:result :semanticSchema :schema])))
       (is (some? (get-in v-res [:result :viewModel])))
       (is (string? (get-in v-res [:result :svg])))
       (is (string? (get-in v-res [:result :html])))
       (is (= 3 (get-in s-res [:result :rowCount])))
-      (is (= 5 (get-in q-res [:result :rowCount]))))))
+      (is (= 9 (get-in s-res [:result :scannedRows])))
+      (is (= 5 (get-in q-res [:result :rowCount])))
+      (is (string? (get-in q-res [:result :algebraEdn])))
+      (is (str/includes? (get-in q-res [:result :algebraEdn]) ":sparql/op"))))
+
+  (testing "KotobaSpec v1.0: basisCid pin and visibility (allowedSources / jurisdiction) fail closed"
+    (let [wrong-cid "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+          deny-all (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
+                                        {:visibility {:allowedSources []}})
+          only-kkj (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
+                                        {:visibility {:allowedSources ["jp.kkj"]}})
+          only-tokyo (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
+                                          {:visibility {:jurisdiction "jp-tokyo"}})
+          deny-jur (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
+                                        {:visibility {:jurisdiction []}})
+          deny-sql (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sql"
+                                        {:query "SELECT id FROM nodes"
+                                         :visibility {:allowedSources []}})]
+      (is (= :basis-cid-mismatch
+             (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
+                                                   {:basisCid wrong-cid}))))
+      (is (= 0 (count (get-in deny-all [:result :nodes])))
+          "empty allowedSources: [] must fail closed with 0 nodes")
+      (is (= 0 (count (get-in deny-all [:result :edges]))))
+      (is (= 0 (get-in deny-sql [:result :rowCount])))
+      (is (= ["fact:tender:kkj-2026-001"]
+             (mapv :id (filter #(= "fact" (:kind %)) (get-in only-kkj [:result :nodes]))))
+          "allowedSources: [jp.kkj] must filter out jp.geps and jp.agencies facts")
+      (is (= #{"fact:agency:ag-tokyo" "fact:tender:geps-2026-042"}
+             (set (map :id (filter #(= "fact" (:kind %)) (get-in only-tokyo [:result :nodes])))))
+          "jurisdiction: jp-tokyo must keep only jp-tokyo facts")
+      (is (= 0 (count (filter #(= "fact" (:kind %)) (get-in deny-jur [:result :nodes]))))
+          "empty jurisdiction: [] must fail closed")))
+
+  (testing "KotobaSpec v1.0: empty standard layer (nodeCount: 0) preserved on round-trip and projection"
+    (let [no-facts-body (-> yataverse-pr83-fixture
+                            (dissoc "graphCid")
+                            (assoc "nodes" (vec (remove #(= "fact" (get % "layer"))
+                                                        (get yataverse-pr83-fixture "nodes"))))
+                            (assoc "edges" (vec (take 4 (get yataverse-pr83-fixture "edges"))))
+                            (assoc "nodeCount" 5)
+                            (assoc-in ["meta" "nodeCount"] 5)
+                            (assoc-in ["meta" "edgeCount"] 4)
+                            (assoc-in ["layers" 2 "nodeCount"] 0))
+          {expected-cid :cid} (ov/encode-ontology-graph-dag-cbor no-facts-body)
+          no-facts-yv (assoc no-facts-body "graphCid" expected-cid)
+          kg (ov/<-yataverse-graph no-facts-yv)
+          rt (ov/->yataverse-graph kg)]
+      (is (= ["connector" "object-type" "fact"] (mapv :id (:layers rt)))
+          "standard 3 layers must not be dropped when fact nodeCount is 0")
+      (is (= [3 2 0] (mapv :nodeCount (:layers rt))))
+      (is (= expected-cid (:graphCid rt)))
+      ;; Newly projected Kotoba graph without facts also preserves all 3 standard layers
+      (let [proj-kg (ov/project-graph {:ontology {:object-types [{:id :agency :name "Agency"}]}
+                                       :connectors {:connectors [{:id :jp.agencies :name "Agencies" :object-type :agency}]}})
+            proj-yv (ov/->yataverse-graph proj-kg)]
+        (is (= ["connector" "object-type" "fact"] (mapv :id (:layers proj-yv))))
+        (is (= [1 1 0] (mapv :nodeCount (:layers proj-yv))))
+        (is (= 2 (count (:nodes (ov/<-yataverse-graph proj-yv))))))))
+
+  (testing "KotobaSpec v1.0: $awaiType decimal normalization, integer equivalence, and non-finite refusal"
+    (let [float-map {"a" 0.92 "b" 0.5 "c" 0.123456 "d" 0.0001 "e" 1.0e-7}
+          explicit-decimal-map {"a" {"$awaiType" "decimal" "value" "0.92"}
+                                "b" {"$awaiType" "decimal" "value" "0.5"}
+                                "c" {"$awaiType" "decimal" "value" "0.123456"}
+                                "d" {"$awaiType" "decimal" "value" "0.0001"}
+                                "e" {"$awaiType" "decimal" "value" "1e-7"}}
+          {cid-f :cid bytes-f :bytes} (ov/encode-ontology-graph-dag-cbor float-map)
+          {cid-e :cid bytes-e :bytes} (ov/encode-ontology-graph-dag-cbor explicit-decimal-map)
+          {cid-int :cid} (ov/encode-ontology-graph-dag-cbor {"n" 1 "z" 0})
+          {cid-flt-int :cid} (ov/encode-ontology-graph-dag-cbor {"n" 1.0 "z" -0.0})]
+      (is (= bytes-e bytes-f)
+          "non-integer floats must encode identically to Yataverse {$awaiType: decimal} maps")
+      (is (= cid-e cid-f))
+      (is (= cid-int cid-flt-int)
+          "integer-valued floats (1.0, -0.0) must encode as CBOR integers identically to 1, 0")
+      (is (= :dag-cbor-non-finite
+             (refusal-reason #(ov/encode-ontology-graph-dag-cbor {"bad" ##NaN}))))
+      (is (= :dag-cbor-non-finite
+             (refusal-reason #(ov/encode-ontology-graph-dag-cbor {"bad" ##Inf}))))
+      (is (= :dag-cbor-non-finite
+             (refusal-reason #(ov/encode-ontology-graph-dag-cbor {"bad" ##-Inf})))))))
 
 (deftest yataverse-negative-validation-test
   (is (= :invalid-yataverse-graph
@@ -221,13 +310,19 @@
       "inconsistent top-level nodeCount must fail closed")
   (is (= :invalid-yataverse-graph
          (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodes" [{"id" "n1" "kind" "unknown-kind"}])))))
-  (testing "tampered array order with stale graphCid fails closed with :graph-cid-mismatch"
+  (testing "tampered array order with stale graphCid fails closed with exact KotobaSpec v1.0 recomputed CID"
     (let [lex-sorted-edges (vec (sort-by #(get % "id") (get yataverse-pr83-fixture "edges")))
           reordered-edges-yv (assoc yataverse-pr83-fixture "edges" lex-sorted-edges)
-          reversed-nodes-yv (assoc yataverse-pr83-fixture "nodes" (vec (reverse (get yataverse-pr83-fixture "nodes"))))]
-      (is (= :graph-cid-mismatch
-             (refusal-reason #(ov/<-yataverse-graph reordered-edges-yv)))
+          reversed-nodes-yv (assoc yataverse-pr83-fixture "nodes" (vec (reverse (get yataverse-pr83-fixture "nodes"))))
+          err-data (try
+                     (ov/<-yataverse-graph reordered-edges-yv)
+                     nil
+                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                       (ex-data e)))]
+      (is (= :graph-cid-mismatch (:reason err-data))
           "lexicographically reordered edges (e1, e10, ...) with old graphCid must fail closed")
+      (is (= "bafyreid2ie7idv5vljfojdocazd4a4zqixz7di2nshjvvdbkknnitrye2i" (:computed err-data))
+          "recomputed CID for e1,e10,... reordered edges must match KotobaSpec v1.0 vector exactly")
       (is (= :graph-cid-mismatch
              (refusal-reason #(ov/<-yataverse-graph reversed-nodes-yv)))
           "reordered nodes with old graphCid must fail closed"))))

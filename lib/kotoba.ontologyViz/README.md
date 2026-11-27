@@ -68,10 +68,14 @@ Explicit bidirectional adapters bridge the two contracts without conflating them
   DAG-CBOR + SHA-256 CIDv1 (`0x01 0x71 0x12 0x20`) encoder matching Yataverse
   PR #83's `encodeOntologyGraphDagCbor` byte-for-byte.
 - `(ov/invoke-yataverse graph-or-yv op params)` — dispatches `ontology.graph`,
-  `ontology.inspect`, `ontology.view` (`json|svg|html|all` -> `basisCid`,
-  `semanticSchema`, `viewModel`, optional `svg`/`html`), `ontology.query_sql`
-  (accepting `:query` or `:sql`), and `ontology.query_sparql` (accepting
-  `:query` or `:sparql`) in the `yataverse.ontology.operations/v1` envelope.
+  `ontology.inspect` (including `blockCids`), `ontology.view` (`json|svg|html|all`
+  -> `basisCid`, Yataverse `yataverse.ontology.operations/v1` `semanticSchema`,
+  `viewModel`, optional `svg`/`html`), `ontology.query_sql` (including
+  `scannedRows`, accepting `:query` or `:sql`), and `ontology.query_sparql`
+  (including `algebraEdn` and `PREFIX` QName expansion, accepting `:query` or
+  `:sparql`), enforcing `:basisCid` pinning and `:jurisdiction` /
+  `:allowedSources` visibility constraints (empty `:allowedSources []` fails
+  closed) in the `yataverse.ontology.operations/v1` envelope.
 
 ## Usage
 

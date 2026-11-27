@@ -5,7 +5,8 @@
   Byte-for-byte compatible with Yataverse PR #83's `encodeOntologyGraphDagCbor`
   (`src/dag-cbor.mjs` + `toDagCborSafe` in `src/ontology.mjs` + `cidFor` in
   `src/cid.mjs`) across JVM Clojure, Babashka, nbb, and ClojureScript."
-  (:require [kotoba.ontology-viz.escape :as esc]
+  (:require [clojure.string :as str]
+            [kotoba.ontology-viz.escape :as esc]
             [kotoba.ontology-viz.validate :as v]))
 
 ;; ── Pure .cljc UTF-8 encoding ────────────────────────────────────────────────
@@ -228,6 +229,24 @@
                    (<= -9007199254740991 r 9007199254740991))
           r)))))
 
+(defn- canonical-decimal-str
+  "Format a finite non-integer number matching ECMAScript `String(value)` in
+  Yataverse `toDagCborSafe` across JVM Clojure, Babashka, nbb, and CLJS."
+  [x]
+  #?(:cljs (js/String (double x))
+     :clj (let [d (double x)
+                abs-d (Math/abs d)]
+            (if (and (>= abs-d 1.0e-6) (< abs-d 1.0e21))
+              (.toPlainString (.stripTrailingZeros (java.math.BigDecimal/valueOf d)))
+              (let [s (str d)
+                    [mant exp] (str/split s #"E")
+                    mant-clean (if (str/ends-with? mant ".0")
+                                 (subs mant 0 (- (count mant) 2))
+                                 mant)
+                    exp-int (Long/parseLong exp)
+                    exp-str (if (neg? exp-int) (str "e" exp-int) (str "e+" exp-int))]
+                (str mant-clean exp-str))))))
+
 (defn- encode-item! [out x depth]
   (when (> depth 64)
     (v/fail! :max-depth-exceeded "DAG-CBOR encoding depth exceeded 64" {:depth depth}))
@@ -250,7 +269,7 @@
           (push-head! out 0 iv)
           (push-head! out 1 (- -1 iv)))
         ;; Yataverse toDagCborSafe decimal wrapper for non-integer floats
-        (encode-item! out {"$awaiType" "decimal" "value" (esc/fmt-num x)} (inc depth))))
+        (encode-item! out {"$awaiType" "decimal" "value" (canonical-decimal-str x)} (inc depth))))
 
     (string? x)
     (let [bs (utf8-bytes x)]

@@ -295,6 +295,21 @@
                                             :nodeCount (or (mget l :nodeCount) 0)})
                                          raw-layers))
              layers (g/build-layers nodes)
+             ;; Include any zero-count layers declared in preserved-yv-layers so
+             ;; KotobaSpec v1.0 empty standard layers never fail undeclared-layer checks
+             layers-with-preserved
+             (if (seq preserved-yv-layers)
+               (let [existing-ids (set (map :id layers))
+                     extra (keep (fn [{:keys [id label order]}]
+                                   (let [k-lid (get yv-layer->kotoba-layer id id)]
+                                     (when-not (contains? existing-ids k-lid)
+                                       (assoc (get g/default-layer-specs k-lid
+                                                   {:id k-lid :label label :color "#475569" :bg "#f8fafc"})
+                                              :order order
+                                              :node-count 0))))
+                                 preserved-yv-layers)]
+                 (vec (sort-by :order (concat layers extra))))
+               layers)
              cids (vec (sort (distinct (keep identity (concat (when basis-cid [basis-cid])
                                                               (when graph-cid [graph-cid])
                                                               (map :cid nodes))))))
@@ -313,7 +328,7 @@
                             :graph-cid-verification (if (some? graph-cid) :verified :absent)
                             :node-count (count nodes)
                             :edge-count (count edges)
-                            :layer-count (count layers)
+                            :layer-count (count layers-with-preserved)
                             :join-count (count joins)
                             :cids cids
                             :bounds resolved-limits
@@ -330,7 +345,7 @@
              graph {:schema/version g/schema-version
                     :schema/kind g/schema-kind
                     :basis basis
-                    :layers layers
+                    :layers layers-with-preserved
                     :nodes nodes
                     :edges edges
                     :joins joins}]
@@ -417,18 +432,21 @@
               :coverageRatio ratio}))
          joins)
         layer-counts (frequencies (map :layer yv-nodes))
+        ;; KotobaSpec v1.0: ALWAYS preserve standard 3 layers (connector, object-type, fact)
+        ;; even when nodeCount is 0.
         yv-layers
         (if-let [preserved (:yataverse-layers basis)]
           (mapv (fn [l] (assoc l :nodeCount (get layer-counts (:id l) 0))) preserved)
-          (let [yv-layer-order [["connector" "Connectors"]
-                                ["object-type" "Object Types"]
-                                ["attribute" "Attributes"]
-                                ["fact" "Facts (Provenance-Tagged)"]
-                                ["rdf-subject" "RDF Subjects"]
-                                ["ipld" "IPLD / DAG-CBOR"]]
-                known-lids (set (map first yv-layer-order))
+          (let [standard-layers [["connector" "Connectors"]
+                                 ["object-type" "Object Types"]
+                                 ["fact" "Facts (Provenance-Tagged)"]]
+                optional-layers [["attribute" "Attributes"]
+                                 ["rdf-subject" "RDF Subjects"]
+                                 ["ipld" "IPLD / DAG-CBOR"]]
+                known-lids (set (map first (concat standard-layers optional-layers)))
                 extra-lids (sort (remove known-lids (keys layer-counts)))
-                all-layers (concat (filter (fn [[lid _]] (pos? (get layer-counts lid 0))) yv-layer-order)
+                all-layers (concat standard-layers
+                                   (filter (fn [[lid _]] (pos? (get layer-counts lid 0))) optional-layers)
                                    (map (fn [lid] [lid lid]) extra-lids))]
             (vec (map-indexed (fn [idx [lid lbl]]
                                 {:id lid
@@ -436,7 +454,16 @@
                                  :order idx
                                  :nodeCount (get layer-counts lid 0)})
                               all-layers))))
-        facts (filter #(= "fact" (:kind %)) yv-nodes)
+        ;; On newly projected graphs (no preserved :yataverse-layers), canonicalize
+        ;; node order by (layer order asc, id code-unit asc) and joins by name asc.
+        yv-layer-rank (into {} (map (juxt :id :order) yv-layers))
+        final-nodes (if (:yataverse-layers basis)
+                      yv-nodes
+                      (vec (sort-by (fn [n] [(get yv-layer-rank (:layer n) 999) (:id n)]) yv-nodes)))
+        final-joins (if (:yataverse-layers basis)
+                      yv-joins
+                      (vec (sort-by :name yv-joins)))
+        facts (filter #(= "fact" (:kind %)) final-nodes)
         by-connector (frequencies (keep #(get-in % [:meta "ontology/source"]) facts))
         by-type (frequencies (keep #(get-in % [:meta "ontology/type"]) facts))
         by-jur (frequencies (keep #(or (get-in % [:meta "jurisdiction"])
@@ -445,16 +472,16 @@
         computed-coverage {:byConnector (into {} by-connector)
                            :byObjectType (into {} by-type)
                            :byJurisdiction (into {} by-jur)
-                           :totalJoins (count yv-joins)
-                           :totalMatchedJoinRows (reduce + 0 (map :matchedRows yv-joins))}
+                           :totalJoins (count final-joins)
+                           :totalMatchedJoinRows (reduce + 0 (map :matchedRows final-joins))}
         stats (or (:stats basis)
-                  {:objectTypes (count (filter #(= "object-type" (:kind %)) yv-nodes))
-                   :connectors (count (filter #(= "connector" (:kind %)) yv-nodes))
+                  {:objectTypes (count (filter #(= "object-type" (:kind %)) final-nodes))
+                   :connectors (count (filter #(= "connector" (:kind %)) final-nodes))
                    :facts (count facts)
-                   :quads (count (filter #(= "rdf-subject" (:kind %)) yv-nodes))
-                   :joins (count yv-joins)})
+                   :quads (count (filter #(= "rdf-subject" (:kind %)) final-nodes))
+                   :joins (count final-joins)})
         graph-id (or (:id basis) (:source basis) "kotoba-ontology-graph")
-        node-cnt (count yv-nodes)
+        node-cnt (count final-nodes)
         edge-cnt (count yv-edges)
         layer-cnt (count yv-layers)
         truncated? (boolean (:truncated basis))
@@ -476,9 +503,9 @@
               :nodeCount node-cnt
               :meta top-meta
               :layers yv-layers
-              :nodes yv-nodes
+              :nodes final-nodes
               :edges yv-edges
-              :joins yv-joins
+              :joins final-joins
               :coverage (or (:coverage basis) computed-coverage)
               :truncated truncated?
               :edgesTruncated edges-truncated?}

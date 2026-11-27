@@ -45,6 +45,11 @@
                 :zoomOut {:enabled true}
                 :zoomReset {:enabled false}
                 :clearSearch {:enabled false}}
+     :opAvailability {"ontology.inspect" {:enabled (boolean first-id)}
+                      "ontology.graph" {:enabled true}
+                      "ontology.view" {:enabled true}
+                      "ontology.query_sql" {:enabled true}
+                      "ontology.query_sparql" {:enabled true}}
      :ops sem/operation-names}))
 
 (def ^:private viewer-css
@@ -155,6 +160,13 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
         zoomOut: {enabled: zoom > 0.35},
         zoomReset: {enabled: Math.abs(zoom - 1.0) > 0.001},
         clearSearch: {enabled: q.length > 0}
+      },
+      opAvailability: {
+        'ontology.inspect': {enabled: !!selectedNodeId},
+        'ontology.graph': {enabled: true},
+        'ontology.view': {enabled: true},
+        'ontology.query_sql': {enabled: true},
+        'ontology.query_sparql': {enabled: true}
       },
       ops: (semSchema.operations || []).map(function(o){ return o.name; })
     };
@@ -336,10 +348,79 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   if(zout) zout.addEventListener('click', function(){ setZoom(zoom - 0.15); });
   if(zrst) zrst.addEventListener('click', function(){ setZoom(1.0); });
 
+  function filterGraphLocal(params){
+    var p = params || {};
+    var hasLayers = p.layers !== undefined && p.layers !== null;
+    var layerSet = hasLayers ? Object.create(null) : null;
+    if(hasLayers){ p.layers.forEach(function(l){ layerSet[String(l)] = true; }); }
+    var hasKinds = p.kinds !== undefined && p.kinds !== null;
+    var kindSet = hasKinds ? Object.create(null) : null;
+    if(hasKinds){ p.kinds.forEach(function(k){ kindSet[String(k)] = true; }); }
+    var q = (p.query ? String(p.query) : '').trim().toLowerCase();
+    var keptNodes = (graph.nodes || []).filter(function(n){
+      if(layerSet && !layerSet[n.layer]) return false;
+      if(kindSet && !kindSet[n.kind]) return false;
+      if(q && String(n.id || '').toLowerCase().indexOf(q) === -1 &&
+         String(n.label || '').toLowerCase().indexOf(q) === -1 &&
+         String(n.cid || '').toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+    var keptIds = Object.create(null);
+    keptNodes.forEach(function(n){ keptIds[n.id] = true; });
+    var keptEdges = (graph.edges || []).filter(function(e){
+      return !!(keptIds[e.source] && keptIds[e.target]);
+    });
+    return {nodes: keptNodes, edges: keptEdges};
+  }
+
+  function querySqlLocal(sql){
+    var s = String(sql || '').trim().replace(/;\\s*$/, '');
+    if(/;|--|\\/\\*/.test(s) || /\\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|PRAGMA)\\b/i.test(s)){
+      throw new Error('unsafe-sql');
+    }
+    var m = s.match(/^SELECT\\s+(.+?)\\s+FROM\\s+(nodes|edges|joins|layers)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*'([^']*)')?(?:\\s+LIMIT\\s+(\\d+))?$/i);
+    if(!m) throw new Error('unsupported-sql-shape');
+    var tbl = m[2].toLowerCase();
+    var rows = (graph[tbl] || []).map(function(r){ return Object.assign({}, r); });
+    var scanned = rows.length;
+    if(m[3]){ var wc = m[3].toLowerCase(); rows = rows.filter(function(r){ return String(r[wc] !== undefined ? r[wc] : '') === m[4]; }); }
+    var lim = m[5] ? Math.min(500, parseInt(m[5], 10)) : 100;
+    var out = rows.slice(0, lim);
+    return {dialect:'sql-readonly-v1', table:tbl, 'scanned-rows':scanned, 'row-count':out.length, rows:out};
+  }
+
+  function querySparqlLocal(sparql){
+    var s = String(sparql || '').trim();
+    if(/\\b(SERVICE|LOAD|INSERT|DELETE|DROP|CLEAR|CREATE)\\b/i.test(s)) throw new Error('remote-fetch-forbidden');
+    var triples = [];
+    (graph.nodes || []).forEach(function(n){
+      triples.push([n.id, 'rdf:type', n.kind]);
+      triples.push([n.id, 'rdfs:label', n.label]);
+      if(n.cid) triples.push([n.id, 'ipld:cid', n.cid]);
+      triples.push([n.id, 'kotoba:layer', n.layer]);
+    });
+    (graph.edges || []).forEach(function(e){ triples.push([e.source, e.label, e.target]); });
+    return {dialect:'sparql-readonly-v1', form:/^ASK\\b/i.test(s) ? 'ASK' : 'SELECT', tripleCount:triples.length};
+  }
+
+  function invokeLocal(op, params){
+    var p = params || {};
+    if(op === 'ontology.inspect') return inspectPayload(p['node-id'] || selectedNodeId);
+    if(op === 'ontology.graph') return filterGraphLocal(p);
+    if(op === 'ontology.view') return {format:'svg', state: window.__KOTOBA_ONTOLOGY_SCREEN__};
+    if(op === 'ontology.query_sql') return querySqlLocal(p.sql || p.query);
+    if(op === 'ontology.query_sparql') return querySparqlLocal(p.sparql || p.query);
+    throw new Error('unknown-operation: ' + op);
+  }
+
   window.kotobaOntologyViewer = {
     getState: function(){ return window.__KOTOBA_ONTOLOGY_SCREEN__; },
     selectNode: selectNode,
-    inspectNode: inspectPayload
+    inspectNode: inspectPayload,
+    filterGraph: filterGraphLocal,
+    querySql: querySqlLocal,
+    querySparql: querySparqlLocal,
+    invoke: invokeLocal
   };
 
   if(selectedNodeId){

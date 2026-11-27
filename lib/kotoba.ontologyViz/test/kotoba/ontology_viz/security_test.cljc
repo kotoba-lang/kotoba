@@ -63,7 +63,24 @@
 
     (testing "invalid join counts in caller-supplied graph fail closed"
       (let [bad-join (assoc-in valid-graph [:joins 0 :matched-count] "<script>alert(1)</script>")]
-        (is (= :invalid-join (refusal-reason #(ov/render-html bad-join))))))))
+        (is (= :invalid-join (refusal-reason #(ov/render-html bad-join))))))
+
+    (testing "G3 structural integrity: undeclared node layer, duplicate IDs, dangling edges, and unchecked canvas coords fail closed"
+      (let [bad-layer (assoc-in valid-graph [:nodes 0 :layer] "undeclared-ghost")
+            dup-layer (update valid-graph :layers conj (first (:layers valid-graph)))
+            dup-node (update valid-graph :nodes conj (first (:nodes valid-graph)))
+            dup-edge (update valid-graph :edges conj (first (:edges valid-graph)))
+            dangling-edge (assoc-in valid-graph [:edges 0 :target] "node:does-not-exist")
+            bad-pad (assoc-in valid-graph [:layout :pad-x] -10)
+            bad-gap (assoc-in valid-graph [:layout :col-gap] "evil")]
+        (is (= :undeclared-node-layer (refusal-reason #(ov/render-svg bad-layer))))
+        (is (= :duplicate-layer-id (refusal-reason #(ov/render-svg dup-layer))))
+        (is (= :duplicate-node-id (refusal-reason #(ov/render-svg dup-node))))
+        (is (= :duplicate-edge-id (refusal-reason #(ov/render-svg dup-edge))))
+        (is (= :dangling-edge-endpoint (refusal-reason #(ov/render-svg dangling-edge))))
+        (is (= :invalid-layout (refusal-reason #(ov/render-svg bad-pad))))
+        (is (= :invalid-layout (refusal-reason #(ov/render-svg bad-gap))))
+        (is (= :invalid-layout (refusal-reason #(ov/layout-graph valid-graph {:pad-x -5}))))))))
 
 (deftest remote-context-and-external-fetch-refused-test
   (testing "remote JSON-LD @context string or @import directive fails closed"
@@ -136,7 +153,46 @@
             #(ov/project-graph
               {:limits {:max-joins 1}
                :joins [{:from-attr :a :to-attr :b}
-                       {:from-attr :c :to-attr :d}]}))))))
+                       {:from-attr :c :to-attr :d}]})))))
+
+  (testing "G3 work budgets: total walk nodes, root map width, map key length, join pairs, and SPARQL scan steps fail closed"
+    (is (= :max-walk-nodes-exceeded
+           (refusal-reason
+            #(ov/project-graph
+              {:limits {:max-walk-nodes 10}
+               :facts (vec (for [i (range 15)] {:id (str "f" i) :v i}))}))))
+    (is (= :max-collection-width-exceeded
+           (refusal-reason
+            #(ov/project-graph
+              (assoc (into {} (for [i (range 6)] [(str "k" i) i]))
+                     :limits {:max-collection-width 4})))))
+    (is (= :max-label-length-exceeded
+           (refusal-reason
+            #(ov/project-graph
+              {:limits {:max-label-length 16}
+               :facts [{:id "f1" (apply str (repeat 24 "k")) "v"}]}))))
+    (is (= :max-join-pairs-exceeded
+           (refusal-reason
+            #(ov/project-graph
+              {:limits {:max-join-pairs 5}
+               :joins [{:id "join:wide"
+                        :from-attr :a :to-attr :b
+                        :match-rule :prefix
+                        :on-ambiguous :all
+                        :source-values ["P"]
+                        :target-values ["P1" "P2" "P3" "P4" "P5" "P6"]}]}))))
+    (let [wide-g (ov/project-graph
+                  {:ontology {:object-types
+                              (vec (for [i (range 35)]
+                                     {:id (keyword (str "w" i)) :name (str "W" i)}))}})]
+      (is (= :sparql-scan-limit-exceeded
+             (refusal-reason
+              #(ov/invoke wide-g "ontology.query_sparql"
+                          {:sparql "SELECT ?a ?b ?c WHERE { ?a rdf:type object-type . ?b rdf:type object-type . ?c rdf:type nonexistent-kind }"}))))
+      (is (= :sparql-solution-limit-exceeded
+             (refusal-reason
+              #(ov/invoke wide-g "ontology.query_sparql"
+                          {:sparql "SELECT ?a ?b ?c WHERE { ?a rdf:type object-type . ?b rdf:type object-type . ?c rdf:type object-type }"})))))))
 
 (deftest xss-and-script-injection-escaped-test
   (let [xss-payload "</script><img src=x onerror=alert(1)><svg onload=\"alert('x')\"> & '\"test\"'"

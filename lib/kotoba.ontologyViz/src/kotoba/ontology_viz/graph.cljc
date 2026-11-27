@@ -102,10 +102,20 @@
              (or a {})
              (or b {})))
 
+(defn- merge-provenance
+  "Merge provenance maps without dropping multi-graph provenance: `:named-graphs`
+  is merged as a deterministically sorted union."
+  [a b]
+  (let [base (merge a b)
+        ng-a (:named-graphs a)
+        ng-b (:named-graphs b)]
+    (if (or ng-a ng-b)
+      (assoc base :named-graphs (vec (sort (distinct (concat ng-a ng-b)))))
+      base)))
+
 (defn- merge-node
   "Merge incoming node into existing node while preserving higher-priority
-  human-readable labels (declared type/connector names are never overwritten by
-  inferred ID placeholders)."
+  human-readable labels and multi-graph provenance union."
   [existing incoming limits]
   (let [merged-attrs (merge-attrs (:attributes existing) (:attributes incoming))
         ex-prio (or (::label-priority existing) 1)
@@ -120,8 +130,8 @@
       (seq merged-attrs) (assoc :attributes merged-attrs)
       (and (:cid existing) (nil? (:cid incoming))) (assoc :cid (:cid existing))
       (and (:keys existing) (empty? (:keys incoming))) (assoc :keys (:keys existing))
-      (and (:provenance existing) (:provenance incoming))
-      (assoc :provenance (merge (:provenance existing) (:provenance incoming))))))
+      (or (:provenance existing) (:provenance incoming))
+      (assoc :provenance (merge-provenance (:provenance existing) (:provenance incoming))))))
 
 (defn- add-node [state node]
   (let [limits (:limits state)
@@ -155,7 +165,7 @@
 
 (defn- record-attr-value
   "Record observed attribute values both globally and scoped by `owner-type`
-  so join coverage can cleanly isolate values per declared object type."
+  so join coverage cleanly isolates values per declared object type."
   ([state attr val] (record-attr-value state nil attr val))
   ([state owner-type attr val]
    (if (and (some? attr) (some? val))
@@ -269,7 +279,6 @@
                                                           :status (id-str (or (:status c) :unknown))}
                                                    safe-repo (assoc :repo safe-repo))}
                               cid (assoc :cid cid)))
-           ;; Low-priority stub so a declared type's human-readable label is never clobbered
            st2 (if (contains? (:nodes st1) target-id)
                  st1
                  (add-node st1 {:id target-id
@@ -340,9 +349,8 @@
            src (:ontology/source fact)
            cid (v/extract-cid (or (:ipld/cid fact) (:cid fact)))
            ent-key (or (:id fact) (:db/id fact) (str "fact-" idx))
-           node-id (if otype
-                     (str "entity:" (id-str ent-key))
-                     (str "entity:" (id-str ent-key)))
+           ent-str (id-str ent-key)
+           node-id (str "entity:" ent-str)
            payload (dissoc fact :ontology/type :ontology/source :ontology/fetched-at :ontology/confidence)
            provenance (cond-> {}
                         otype (assoc :type (id-str otype))
@@ -350,18 +358,21 @@
                         (:ontology/fetched-at fact) (assoc :fetched-at (str (:ontology/fetched-at fact)))
                         (contains? fact :ontology/confidence) (assoc :confidence (:ontology/confidence fact)))
            human-label (or (:name fact) (:title fact))
-           st1 (add-node st (cond-> {:id node-id
-                                     :label (str (or human-label (id-str ent-key)))
-                                     ::label-priority (if human-label 3 2)
-                                     :kind :entity
-                                     :layer "instance"
-                                     :attributes (into {}
-                                                       (map (fn [[k val]]
-                                                              [(kw-str k)
-                                                               (if (v/ipld-link? val) (v/extract-cid val) (str val))]))
-                                                       payload)
-                                     :provenance provenance}
-                              cid (assoc :cid cid)))
+           st0 (if otype
+                 (assoc-in st [:entity-types ent-str] (id-str otype))
+                 st)
+           st1 (add-node st0 (cond-> {:id node-id
+                                      :label (str (or human-label ent-str))
+                                      ::label-priority (if human-label 3 2)
+                                      :kind :entity
+                                      :layer "instance"
+                                      :attributes (into {}
+                                                        (map (fn [[k val]]
+                                                               [(kw-str k)
+                                                                (if (v/ipld-link? val) (v/extract-cid val) (str val))]))
+                                                        payload)
+                                      :provenance provenance}
+                               cid (assoc :cid cid)))
            st2 (reduce-kv (fn [acc k val] (record-attr-value acc otype k val)) st1 payload)
            st3 (if otype
                  (let [t-id (str "type:" (id-str otype))]
@@ -439,30 +450,42 @@
     (sort-by :idx (vals active))))
 
 (defn- explicit-entity-ref
-  "Return referenced entity ID if `v` is an explicit reference (map `{:db/id ...}`
-  or `{:entity/ref ...}`, schema-declared `:ref` attribute, or namespaced keyword
-  matching a known keyword entity). Never infers refs from untyped plain strings."
-  [a-str v ref-attrs known-kw-entities]
+  "Return referenced entity ID ONLY when `v` is an explicit reference wrapper
+  (`{:db/id ...}` / `{:entity/ref ...}`) or `a-str` is schema-declared `:ref`
+  / `:db.type/ref`. Never infers reference edges from untyped plain strings or
+  untyped namespaced keywords accidentally matching another entity ID."
+  [a-str v ref-attrs]
   (cond
     (and (map? v) (contains? v :db/id)) (:db/id v)
     (and (map? v) (contains? v :entity/ref)) (:entity/ref v)
     (contains? ref-attrs a-str) v
-    (and (keyword? v) (namespace v) (contains? known-kw-entities v)) v
     :else nil))
 
-(defn- entity-owner-type [e]
-  (when (and (keyword? e) (namespace e))
-    (namespace e)))
+(defn- resolve-datom-owner-type
+  "Resolve owner type for entity `e` using declared `:entity-types` (from facts
+  or `:ontology/type` datoms) first, falling back to keyword namespace."
+  [e entity-types]
+  (or (get entity-types (id-str e))
+      (when (and (keyword? e) (namespace e))
+        (namespace e))))
 
 (defn- project-datoms [state datoms ref-attrs]
   (let [active (fold-eavt-datoms datoms)
-        known-kw-entities (set (filter #(and (keyword? %) (namespace %)) (map :e active)))]
+        ;; Also harvest any `:ontology/type` assertions from active datoms
+        datom-types (reduce
+                     (fn [m {:keys [e a v]}]
+                       (if (= :ontology/type a)
+                         (assoc m (id-str e) (id-str v))
+                         m))
+                     (:entity-types state)
+                     active)
+        state* (assoc state :entity-types datom-types)]
     (reduce
      (fn [st {:keys [e a v tx]}]
        (let [e-str (id-str e)
              e-node-id (str "entity:" e-str)
              a-str (kw-str a)
-             owner-type (entity-owner-type e)
+             owner-type (resolve-datom-owner-type e datom-types)
              st1 (-> st
                      (add-node {:id e-node-id
                                 :label e-str
@@ -471,7 +494,7 @@
                                 :layer "instance"})
                      (record-attr-value owner-type a v))
              ref-target (when-not (v/ipld-link? v)
-                          (explicit-entity-ref a-str v ref-attrs known-kw-entities))]
+                          (explicit-entity-ref a-str v ref-attrs))]
          (cond
            (v/ipld-link? v)
            (let [cid (v/extract-cid v)
@@ -492,7 +515,8 @@
                             :cid cid
                             :metadata (cond-> {:attribute a-str} tx (assoc :tx tx))})))
 
-           (and (some? ref-target) (not= e-str (id-str ref-target)))
+           ;; Preserve genuine self-references as self-edges (do NOT collapse to scalar)
+           (some? ref-target)
            (let [t-id (str "entity:" (id-str ref-target))]
              (-> st1
                  (add-node {:id t-id :label (id-str ref-target) ::label-priority 1 :kind :entity :layer "instance"})
@@ -502,7 +526,9 @@
                             :label a-str
                             :kind :datom-ref
                             :layer "instance"
-                            :metadata (cond-> {:attribute a-str} tx (assoc :tx tx))})))
+                            :metadata (cond-> {:attribute a-str}
+                                        tx (assoc :tx tx)
+                                        (= e-node-id t-id) (assoc :self-ref true))})))
 
            :else
            (add-node st1 {:id e-node-id
@@ -511,7 +537,7 @@
                           :kind :entity
                           :layer "instance"
                           :attributes {a-str (str v)}}))))
-     state
+     state*
      active)))
 
 ;; ── Full-Fidelity RDF Quad Projection (`org.w3.rdf` shape) ───────────────────
@@ -542,7 +568,6 @@
                    (record-attr-value nil p-str o-str))]
        (if (or (= o-kind :iri) (= o-kind :blank))
          (let [o-id (str "rdf:" o-str)
-               ;; Full predicate IRI + named graph prevents provenance collision
                edge-id (str "edge:" s-id "->" o-id "|" p-str (or graph-suffix ""))]
            (-> st1
                (add-node (cond-> {:id o-id
@@ -642,7 +667,7 @@
      state
      entries)))
 
-;; ── Scoped & Ambiguity-Safe External Join Coverage Evaluation ────────────────
+;; ── Scoped, Ambiguity-Safe & Pair-Bounded External Join Coverage ─────────────
 
 (defn- normalize-join-val [rule mapping v]
   (let [s (str v)]
@@ -673,26 +698,27 @@
     :else (vec (distinct (get observed-global attr-k [])))))
 
 (defn evaluate-join
-  "Pure evaluator for external join coverage (e.g. `:jurisdiction/code` <->
-  `:country/iso3`) with match rules, explicit correspondence mapping, exclusion
-  rules, type-scoped value extraction, and explicit ambiguity handling
-  (`:on-ambiguous` `:error` [default] or `:all` — never input-order first-match)."
-  ([join-spec] (evaluate-join join-spec {} {}))
-  ([join-spec observed-attr-values] (evaluate-join join-spec observed-attr-values {}))
+  "Pure evaluator for external join coverage with match rules, explicit mapping,
+  exclusions, type-scoped extraction, fail-closed ambiguity handling, and an
+  explicit candidate-pair bound (`:max-join-pairs`) enforced incrementally."
+  ([join-spec] (evaluate-join join-spec {} {} v/default-limits))
+  ([join-spec observed-attr-values] (evaluate-join join-spec observed-attr-values {} v/default-limits))
   ([join-spec observed-attr-values observed-typed-values]
+   (evaluate-join join-spec observed-attr-values observed-typed-values v/default-limits))
+  ([join-spec observed-attr-values observed-typed-values limits]
    (let [from-attr (kw-str (:from-attr join-spec))
          to-attr (kw-str (:to-attr join-spec))
          join-id (or (:id join-spec)
                      (str "join:" (id-str (:from-attr join-spec)) "->" (id-str (:to-attr join-spec))))
          rule (or (:match-rule join-spec) (if (seq (:mapping join-spec)) :mapping :exact))
          on-ambiguous (or (:on-ambiguous join-spec) :error)
+         max-pairs (or (:max-join-pairs limits) (:max-join-pairs v/default-limits))
          mapping (into {} (map (fn [[k val]] [(str k) (str val)])) (or (:mapping join-spec) {}))
          exclude-set (set (concat (:exclude join-spec) (:exclude-values join-spec)))
          src-raw (resolve-scoped-values (:source-values join-spec) (:from-type join-spec) from-attr
                                         observed-typed-values observed-attr-values)
          tgt-raw (resolve-scoped-values (:target-values join-spec) (:to-type join-spec) to-attr
                                         observed-typed-values observed-attr-values)
-         ;; Map normalized key -> sorted vector of ALL distinct target values (deterministic, no last-wins)
          tgt-index (reduce
                     (fn [m tv]
                       (let [ts (str tv)
@@ -704,7 +730,7 @@
                     {}
                     tgt-raw)
          tgt-sorted (vec (sort (distinct (map str tgt-raw))))
-         {:keys [matched-sources matched-pairs unmatched excluded]}
+         {:keys [matched-sources matched-pairs pair-count unmatched excluded]}
          (reduce
           (fn [acc sv]
             (let [s (str sv)]
@@ -727,10 +753,21 @@
                              {:join-id join-id :source-value s :candidates candidates :match-rule rule})
 
                     :else
-                    (-> acc
-                        (update :matched-sources conj s)
-                        (update :matched-pairs into (map (fn [c] [s c]) candidates))))))))
-          {:matched-sources [] :matched-pairs [] :unmatched [] :excluded []}
+                    (let [next-pair-count (+ (:pair-count acc) (count candidates))]
+                      (when (> next-pair-count max-pairs)
+                        (v/fail! :max-join-pairs-exceeded
+                                 (str "join " join-id " exceeded max-join-pairs (" max-pairs ")")
+                                 {:join-id join-id :limit max-pairs :actual next-pair-count}))
+                      (let [existing-sample (:matched-pairs acc)
+                            room (max 0 (- 50 (count existing-sample)))
+                            sample-add (if (pos? room)
+                                         (map (fn [c] [s c]) (take room candidates))
+                                         [])]
+                        (-> acc
+                            (assoc :pair-count next-pair-count)
+                            (update :matched-sources conj s)
+                            (update :matched-pairs into sample-add)))))))))
+          {:matched-sources [] :matched-pairs [] :pair-count 0 :unmatched [] :excluded []}
           (sort-by str src-raw))
          total (count src-raw)
          excl-n (count excluded)
@@ -760,13 +797,14 @@
               :cardinality (or (:cardinality join-spec) :many-to-one)
               :exclude (vec (sort (map str exclude-set)))
               :matched-count match-n
+              :matched-rows pair-count
               :unmatched-count unmatch-n
               :excluded-count excl-n
               :total-source-count total
               :eligible-count eligible
               :coverage coverage
               :status status
-              :matched-pairs (vec (take 50 (sort matched-pairs)))
+              :matched-pairs (vec (sort matched-pairs))
               :unmatched-values (vec (take 50 (sort unmatched)))
               :excluded-values (vec (take 50 (sort excluded)))}
        (:description join-spec) (assoc :description (:description join-spec))))))
@@ -774,7 +812,7 @@
 (defn- project-joins [state joins]
   (reduce
    (fn [st jspec]
-     (let [evaluated (evaluate-join jspec (:observed-attr-values st) (:observed-typed-values st))
+     (let [evaluated (evaluate-join jspec (:observed-attr-values st) (:observed-typed-values st) (:limits st))
            from-id (:from-node evaluated)
            to-id (:to-node evaluated)
            cov-label (if (some? (:coverage evaluated))
@@ -833,23 +871,22 @@
       all-keys))))
 
 (defn layout-graph
-  "Validate and assign deterministic layered DAG coordinates to every node
-  while preserving the existing order of `(:nodes graph)` (crucial for
-  content-addressed round-trip fidelity). Supports `:direction` `:horizontal`
-  (default) or `:vertical`."
+  "Validate input graph AND caller layout options, assign deterministic layered
+  DAG coordinates preserving `(:nodes graph)` order, and validate the resulting
+  graph before returning."
   ([graph] (layout-graph graph {}))
-  ([graph {:keys [direction node-width node-height col-gap row-gap pad-x pad-y]
-           :or {direction :horizontal
-                node-width 216
-                node-height 68
-                col-gap 92
-                row-gap 28
-                pad-x 40
-                pad-y 84}}]
+  ([graph opts]
    (v/validate-graph! graph)
-   (when-not (contains? #{:horizontal :vertical} direction)
-     (v/fail! :invalid-layout "layout :direction must be :horizontal or :vertical" {:direction direction}))
-   (let [layers (:layers graph)
+   (v/validate-layout-options! opts)
+   (let [{:keys [direction node-width node-height col-gap row-gap pad-x pad-y]
+          :or {direction :horizontal
+               node-width 216
+               node-height 68
+               col-gap 92
+               row-gap 28
+               pad-x 40
+               pad-y 84}} (or opts {})
+         layers (:layers graph)
          layer-index (into {} (map-indexed (fn [i l] [(:id l) i]) layers))
          {:keys [positioned-nodes]}
          (reduce
@@ -887,10 +924,12 @@
                  :col-gap col-gap
                  :row-gap row-gap
                  :pad-x pad-x
-                 :pad-y pad-y}]
-     (assoc graph
-            :nodes positioned-nodes
-            :layout canvas))))
+                 :pad-y pad-y}
+         result (assoc graph
+                       :nodes positioned-nodes
+                       :layout canvas)]
+     (v/validate-graph! result)
+     result)))
 
 ;; ── Public Projection Entry Point ────────────────────────────────────────────
 
@@ -908,6 +947,7 @@
                     :nodes {}
                     :edges {}
                     :joins []
+                    :entity-types {}
                     :observed-attr-values {}
                     :observed-typed-values {}}
         state (-> init-state
@@ -953,7 +993,7 @@
                :joins joins}]
     (layout-graph graph (or (:layout input) {}))))
 
-;; ── Normalized Filtering (Agent / Browser Equivalence) ───────────────────────
+;; ── Normalized Filtering (Agent / Browser Equivalence incl. empty []) ────────
 
 (defn- normalize-kind-filter [k]
   (let [kw (cond
@@ -968,13 +1008,15 @@
 
 (defn filter-graph
   "Validate and filter a normalized graph by `:layers`, `:kinds` (strings or
-  keywords, strictly validated against `valid-node-kinds`), and/or `:query`
-  (case-insensitive substring over node id, label, or CID). Keeps only edges
-  whose source AND target both remain visible (identical to HTML viewer filter)."
+  keywords, strictly validated against `valid-node-kinds`), and/or `:query`.
+
+  Crucially distinguishes `nil` (no filter) from explicit empty `[]`: passing
+  `{:layers []}` or `{:kinds []}` returns 0 nodes and 0 edges, matching the
+  interactive HTML viewer when all layer checkboxes are unchecked."
   [graph {:keys [layers kinds query]}]
   (v/validate-graph! graph)
-  (let [layer-set (when (seq layers) (set (map id-str layers)))
-        kind-set (when (seq kinds) (set (map normalize-kind-filter kinds)))
+  (let [layer-set (when (some? layers) (set (map id-str layers)))
+        kind-set (when (some? kinds) (set (map normalize-kind-filter kinds)))
         q (when-not (str/blank? query) (str/lower-case (str/trim query)))
         keep-node? (fn [n]
                      (and (or (nil? layer-set) (contains? layer-set (:layer n)))
@@ -993,8 +1035,6 @@
                     (assoc :nodes kept-nodes
                            :edges kept-edges
                            :layers kept-layers)
-                    ;; Clear stale pre-filter stats/coverage/graph-cid so downstream
-                    ;; encoders recompute exact values for the filtered subgraph.
                     (update :basis (fn [b]
                                      (-> b
                                          (dissoc :graph-cid :stats :coverage :yataverse-layers)

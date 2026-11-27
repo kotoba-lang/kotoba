@@ -50,6 +50,12 @@
       (is (= "kotoba.ontology-viewer" (:screen/id screen-state)))
       (is (= "ready" (:screen/status screen-state)))
       (is (= ov/operation-names (:ops screen-state)))
+      (is (= 5 (count (:opAvailability screen-state))))
+      (is (every? #(true? (:enabled %)) (vals (:opAvailability screen-state))))
+      (is (str/includes? html "filterGraph: filterGraphLocal"))
+      (is (str/includes? html "querySql: querySqlLocal"))
+      (is (str/includes? html "querySparql: querySparqlLocal"))
+      (is (str/includes? html "invoke: invokeLocal"))
       (is (= (count (get-in artifact [:graph :nodes])) (count (:visibleNodeIds screen-state))))
       (is (= (count (get-in artifact [:graph :edges])) (count (:visibleEdgeIds screen-state)))))
 
@@ -104,12 +110,18 @@
         (is (true? (:found by-cid)))
         (is (false? (:found missing)))))
 
-    (testing "ontology.graph filters by layer and string kinds"
+    (testing "ontology.graph and ontology.view honor explicit empty {:layers []} (0 nodes / 0 edges)"
       (let [by-layer (ov/invoke graph "ontology.graph" {:layers ["ipld"]})
-            by-kind (ov/invoke graph "ontology.graph" {:kinds ["connector"]})]
+            by-kind (ov/invoke graph "ontology.graph" {:kinds ["connector"]})
+            empty-g (ov/invoke graph "ontology.graph" {:layers []})
+            empty-v (ov/invoke graph "ontology.view" {:format "svg" :layers []})]
         (is (= "ontology.graph/v1" (:schema/version by-layer)))
         (is (= #{"ipld"} (set (map :layer (:nodes by-layer)))))
-        (is (= #{:connector} (set (map :kind (:nodes by-kind)))))))
+        (is (= #{:connector} (set (map :kind (:nodes by-kind)))))
+        (is (= 0 (count (:nodes empty-g))))
+        (is (= 0 (count (:edges empty-g))))
+        (is (not (str/includes? (:content empty-v) "data-node-id="))
+            "ontology.view with explicit {:layers []} must render 0 nodes")))
 
     (testing "ontology.view renders svg and html"
       (let [v-svg (ov/invoke graph "ontology.view" {:format "svg" :title "View SVG"})
@@ -121,7 +133,7 @@
         (is (= "text/html; charset=utf-8" (:content-type v-html)))
         (is (str/includes? (:content v-html) "View HTML"))))
 
-    (testing "ontology.query_sql executes bounded read-only SELECT (accepting :sql or :query)"
+    (testing "ontology.query_sql executes bounded read-only SELECT (accepting :sql or :query) with scanned-rows"
       (let [res (ov/invoke graph "ontology.query_sql"
                            {:sql "SELECT id, kind FROM nodes WHERE layer = 'connector' LIMIT 10"})
             res-alias (ov/invoke graph "ontology.query_sql"
@@ -131,18 +143,49 @@
         (is (= "nodes" (:table res)))
         (is (= ["id" "kind"] (:columns res)))
         (is (= 2 (:row-count res)))
+        (is (= (count (:nodes graph)) (:scanned-rows res)))
         (is (= #{"connector:jp.geps" "connector:jp.kkj"}
                (set (map #(get % "id") (:rows res)))))))
 
-    (testing "ontology.query_sparql executes bounded read-only SELECT and ASK"
+    (testing "ontology.query_sparql executes PREFIX-expanded QNames, typed/language RDF literals, and returns algebra-edn"
       (let [sel (ov/invoke graph "ontology.query_sparql"
                            {:sparql "SELECT ?s ?cid WHERE { ?s ipld:cid ?cid } LIMIT 10"})
             ask-yes (ov/invoke graph "ontology.query_sparql"
                                {:sparql "ASK { connector:jp.kkj produces type:tender }"})
             ask-no (ov/invoke graph "ontology.query_sparql"
-                              {:sparql "ASK { connector:jp.kkj produces type:nonexistent }"})]
+                              {:sparql "ASK { connector:jp.kkj produces type:nonexistent }"})
+            rdf-g (ov/project-graph
+                   {:quads [{:subject {:rdf/type :iri :value "urn:ex:s1"}
+                             :predicate {:rdf/type :iri :value "http://vocab-a.example/rel"}
+                             :object {:rdf/type :iri :value "urn:ex:o1"}}
+                            {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                             :predicate {:rdf/type :iri :value "http://vocab-b.example/rel"}
+                             :object {:rdf/type :iri :value "urn:ex:o2"}}
+                            {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                             :predicate {:rdf/type :iri :value "http://www.w3.org/2000/01/rdf-schema#label"}
+                             :object {:rdf/type :literal :value "Hello" :language "en"}}
+                            {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                             :predicate {:rdf/type :iri :value "http://schema.example/amount"}
+                             :object {:rdf/type :literal :value "42"
+                                      :datatype {:rdf/type :iri :value "http://www.w3.org/2001/XMLSchema#integer"}}}]})
+            pfx-a (ov/invoke rdf-g "ontology.query_sparql"
+                             {:sparql "PREFIX va: <http://vocab-a.example/> SELECT ?s ?o WHERE { ?s va:rel ?o }"})
+            lit-lang (ov/invoke rdf-g "ontology.query_sparql"
+                                {:sparql "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> SELECT ?s ?l WHERE { ?s rdfs:label ?l }"})
+            lit-typed (ov/invoke rdf-g "ontology.query_sparql"
+                                 {:sparql "PREFIX sch: <http://schema.example/> ASK { <urn:ex:s1> sch:amount \"42\"^^xsd:integer }"})
+            lit-bare (ov/invoke rdf-g "ontology.query_sparql"
+                                {:sparql "PREFIX sch: <http://schema.example/> ASK { <urn:ex:s1> sch:amount \"42\" }"})]
         (is (= "sparql-readonly-v1" (:dialect sel)))
         (is (= "SELECT" (:form sel)))
+        (is (string? (:algebra-edn sel)))
+        (is (str/includes? (:algebra-edn sel) ":sparql/op"))
         (is (pos? (:row-count sel)))
         (is (true? (:ask ask-yes)))
-        (is (false? (:ask ask-no)))))))
+        (is (false? (:ask ask-no)))
+        (is (= 1 (:row-count pfx-a))
+            "PREFIX va: must expand va:rel to http://vocab-a.example/rel without colliding with vocab-b")
+        (is (= "urn:ex:o1" (get-in pfx-a [:bindings 0 "?o"])))
+        (is (some #(= "Hello@en" (get % "?l")) (:bindings lit-lang)))
+        (is (true? (:ask lit-typed)))
+        (is (true? (:ask lit-bare)))))))
