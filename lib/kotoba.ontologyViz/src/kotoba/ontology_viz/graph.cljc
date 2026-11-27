@@ -833,8 +833,10 @@
       all-keys))))
 
 (defn layout-graph
-  "Validate and assign deterministic layered DAG coordinates to every node.
-  Supports `:direction` `:horizontal` (default) or `:vertical`."
+  "Validate and assign deterministic layered DAG coordinates to every node
+  while preserving the existing order of `(:nodes graph)` (crucial for
+  content-addressed round-trip fidelity). Supports `:direction` `:horizontal`
+  (default) or `:vertical`."
   ([graph] (layout-graph graph {}))
   ([graph {:keys [direction node-width node-height col-gap row-gap pad-x pad-y]
            :or {direction :horizontal
@@ -849,29 +851,28 @@
      (v/fail! :invalid-layout "layout :direction must be :horizontal or :vertical" {:direction direction}))
    (let [layers (:layers graph)
          layer-index (into {} (map-indexed (fn [i l] [(:id l) i]) layers))
-         grouped (group-by :layer (:nodes graph))
-         positioned-nodes
-         (vec
-          (mapcat
-           (fn [{:keys [id]}]
-             (let [col (get layer-index id 0)
-                   members (sort-by :id (get grouped id []))]
-               (map-indexed
-                (fn [row node]
-                  (let [x (if (= direction :vertical)
-                            (+ pad-x (* row (+ node-width row-gap)))
-                            (+ pad-x (* col (+ node-width col-gap))))
-                        y (if (= direction :vertical)
-                            (+ pad-y (* col (+ node-height col-gap)))
-                            (+ pad-y (* row (+ node-height row-gap))))]
-                    (assoc node :layout {:x x
-                                         :y y
-                                         :width node-width
-                                         :height node-height
-                                         :column col
-                                         :row row})))
-                members)))
-           layers))
+         {:keys [positioned-nodes]}
+         (reduce
+          (fn [{:keys [row-counts positioned-nodes]} node]
+            (let [lid (:layer node)
+                  col (get layer-index lid 0)
+                  row (get row-counts lid 0)
+                  x (if (= direction :vertical)
+                      (+ pad-x (* row (+ node-width row-gap)))
+                      (+ pad-x (* col (+ node-width col-gap))))
+                  y (if (= direction :vertical)
+                      (+ pad-y (* col (+ node-height col-gap)))
+                      (+ pad-y (* row (+ node-height row-gap))))]
+              {:row-counts (assoc row-counts lid (inc row))
+               :positioned-nodes (conj positioned-nodes
+                                       (assoc node :layout {:x x
+                                                            :y y
+                                                            :width node-width
+                                                            :height node-height
+                                                            :column col
+                                                            :row row}))}))
+          {:row-counts {} :positioned-nodes []}
+          (:nodes graph))
          max-x (reduce max (+ pad-x node-width)
                        (map (fn [n] (+ (get-in n [:layout :x]) (get-in n [:layout :width])))
                             positioned-nodes))
@@ -992,8 +993,12 @@
                     (assoc :nodes kept-nodes
                            :edges kept-edges
                            :layers kept-layers)
-                    (update :basis assoc
-                            :node-count (count kept-nodes)
-                            :edge-count (count kept-edges)
-                            :layer-count (count kept-layers)))]
+                    ;; Clear stale pre-filter stats/coverage/graph-cid so downstream
+                    ;; encoders recompute exact values for the filtered subgraph.
+                    (update :basis (fn [b]
+                                     (-> b
+                                         (dissoc :graph-cid :stats :coverage :yataverse-layers)
+                                         (assoc :node-count (count kept-nodes)
+                                                :edge-count (count kept-edges)
+                                                :layer-count (count kept-layers))))))]
     (layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))

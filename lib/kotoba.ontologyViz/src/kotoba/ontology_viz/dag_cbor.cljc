@@ -1,0 +1,329 @@
+(ns kotoba.ontology-viz.dag-cbor
+  "Pure, zero-dependency `.cljc` canonical DAG-CBOR encoder, FIPS 180-4 SHA-256,
+  and CIDv1 (`dag-cbor` 0x71 / `sha2-256` 0x12 / base32lower) derivation.
+
+  Byte-for-byte compatible with Yataverse PR #83's `encodeOntologyGraphDagCbor`
+  (`src/dag-cbor.mjs` + `toDagCborSafe` in `src/ontology.mjs` + `cidFor` in
+  `src/cid.mjs`) across JVM Clojure, Babashka, nbb, and ClojureScript."
+  (:require [kotoba.ontology-viz.escape :as esc]
+            [kotoba.ontology-viz.validate :as v]))
+
+;; ── Pure .cljc UTF-8 encoding ────────────────────────────────────────────────
+
+(defn utf8-bytes
+  "Encode string `s` to a vector of unsigned UTF-8 byte ints (0..255)."
+  [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff) (.getBytes ^String (str s) "UTF-8"))
+     :cljs (let [text (str s)
+                 n (.-length text)
+                 out (transient [])]
+             (loop [i 0
+                    acc out]
+               (if (>= i n)
+                 (persistent! acc)
+                 (let [cp (.codePointAt text i)
+                       step (if (> cp 0xffff) 2 1)]
+                   (cond
+                     (< cp 0x80)
+                     (recur (+ i step) (conj! acc cp))
+
+                     (< cp 0x800)
+                     (recur (+ i step)
+                            (-> acc
+                                (conj! (bit-or 0xc0 (unsigned-bit-shift-right cp 6)))
+                                (conj! (bit-or 0x80 (bit-and cp 0x3f)))))
+
+                     (< cp 0x10000)
+                     (recur (+ i step)
+                            (-> acc
+                                (conj! (bit-or 0xe0 (unsigned-bit-shift-right cp 12)))
+                                (conj! (bit-or 0x80 (bit-and (unsigned-bit-shift-right cp 6) 0x3f)))
+                                (conj! (bit-or 0x80 (bit-and cp 0x3f)))))
+
+                     :else
+                     (recur (+ i step)
+                            (-> acc
+                                (conj! (bit-or 0xf0 (unsigned-bit-shift-right cp 18)))
+                                (conj! (bit-or 0x80 (bit-and (unsigned-bit-shift-right cp 12) 0x3f)))
+                                (conj! (bit-or 0x80 (bit-and (unsigned-bit-shift-right cp 6) 0x3f)))
+                                (conj! (bit-or 0x80 (bit-and cp 0x3f))))))))))))
+
+;; ── Pure .cljc FIPS 180-4 SHA-256 ────────────────────────────────────────────
+
+(def ^:private sha256-k
+  [0x428a2f98 0x71374491 0xb5c0fbcf 0xe9b5dba5 0x3956c25b 0x59f111f1 0x923f82a4 0xab1c5ed5
+   0xd807aa98 0x12835b01 0x243185be 0x550c7dc3 0x72be5d74 0x80deb1fe 0x9bdc06a7 0xc19bf174
+   0xe49b69c1 0xefbe4786 0x0fc19dc6 0x240ca1cc 0x2de92c6f 0x4a7484aa 0x5cb0a9dc 0x76f988da
+   0x983e5152 0xa831c66d 0xb00327c8 0xbf597fc7 0xc6e00bf3 0xd5a79147 0x06ca6351 0x14292967
+   0x27b70a85 0x2e1b2138 0x4d2c6dfc 0x53380d13 0x650a7354 0x766a0abb 0x81c2c92e 0x92722c85
+   0xa2bfe8a1 0xa81a664b 0xc24b8b70 0xc76c51a3 0xd192e819 0xd6990624 0xf40e3585 0x106aa070
+   0x19a4c116 0x1e376c08 0x2748774c 0x34b0bcb5 0x391c0cb3 0x4ed8aa4a 0x5b9cca4f 0x682e6ff3
+   0x748f82ee 0x78a5636f 0x84c87814 0x8cc70208 0x90befffa 0xa4506ceb 0xbef9a3f7 0xc67178f2])
+
+(defn- u32 [x] (bit-and x 0xffffffff))
+
+(defn- rotr32 [x n]
+  (let [xu (u32 x)]
+    (u32 (bit-or (unsigned-bit-shift-right xu n)
+                 (bit-shift-left xu (- 32 n))))))
+
+(defn- add32
+  ([a b] (u32 (+ a b)))
+  ([a b c] (u32 (+ a b c)))
+  ([a b c d] (u32 (+ a b c d)))
+  ([a b c d e] (u32 (+ a b c d e))))
+
+(defn- sha256-pure [bytes]
+  (let [bit-len (* 8 (count bytes))
+        bit-hi (quot bit-len 0x100000000)
+        bit-lo (mod bit-len 0x100000000)
+        pad-zeros (mod (- 56 (mod (+ (count bytes) 1) 64)) 64)
+        padded (vec (concat bytes
+                            [0x80]
+                            (repeat pad-zeros 0)
+                            [(bit-and (unsigned-bit-shift-right bit-hi 24) 0xff)
+                             (bit-and (unsigned-bit-shift-right bit-hi 16) 0xff)
+                             (bit-and (unsigned-bit-shift-right bit-hi 8) 0xff)
+                             (bit-and bit-hi 0xff)
+                             (bit-and (unsigned-bit-shift-right bit-lo 24) 0xff)
+                             (bit-and (unsigned-bit-shift-right bit-lo 16) 0xff)
+                             (bit-and (unsigned-bit-shift-right bit-lo 8) 0xff)
+                             (bit-and bit-lo 0xff)]))
+        n-blocks (quot (count padded) 64)
+        [h0 h1 h2 h3 h4 h5 h6 h7]
+        (loop [blk 0
+               h0 0x6a09e667 h1 0xbb67ae85 h2 0x3c6ef372 h3 0xa54ff53a
+               h4 0x510e527f h5 0x9b05688c h6 0x1f83d9ab h7 0x5be0cd19]
+          (if (= blk n-blocks)
+            [h0 h1 h2 h3 h4 h5 h6 h7]
+            (let [base (* blk 64)
+                  w (loop [i 0
+                           arr (transient [])]
+                      (if (= i 64)
+                        (persistent! arr)
+                        (let [wi (if (< i 16)
+                                   (let [o (+ base (* i 4))]
+                                     (u32 (bit-or (bit-shift-left (nth padded o) 24)
+                                                  (bit-shift-left (nth padded (+ o 1)) 16)
+                                                  (bit-shift-left (nth padded (+ o 2)) 8)
+                                                  (nth padded (+ o 3)))))
+                                   (let [w15 (nth arr (- i 15))
+                                         w2 (nth arr (- i 2))
+                                         s0 (bit-xor (rotr32 w15 7) (rotr32 w15 18) (unsigned-bit-shift-right w15 3))
+                                         s1 (bit-xor (rotr32 w2 17) (rotr32 w2 19) (unsigned-bit-shift-right w2 10))]
+                                     (add32 (nth arr (- i 16)) s0 (nth arr (- i 7)) s1)))]
+                          (recur (inc i) (conj! arr wi)))))
+                  [a b c d e f g h]
+                  (loop [i 0
+                         a h0 b h1 c h2 d h3 e h4 f h5 g h6 h h7]
+                    (if (= i 64)
+                      [a b c d e f g h]
+                      (let [S1 (bit-xor (rotr32 e 6) (rotr32 e 11) (rotr32 e 25))
+                            ch (u32 (bit-xor (bit-and e f) (bit-and (u32 (bit-not e)) g)))
+                            t1 (add32 h S1 ch (nth sha256-k i) (nth w i))
+                            S0 (bit-xor (rotr32 a 2) (rotr32 a 13) (rotr32 a 22))
+                            maj (u32 (bit-xor (bit-and a b) (bit-and a c) (bit-and b c)))
+                            t2 (add32 S0 maj)]
+                        (recur (inc i)
+                               (add32 t1 t2) a b c
+                               (add32 d t1) e f g))))]
+              (recur (inc blk)
+                     (add32 h0 a) (add32 h1 b) (add32 h2 c) (add32 h3 d)
+                     (add32 h4 e) (add32 h5 f) (add32 h6 g) (add32 h7 h)))))]
+    (vec (mapcat (fn [word]
+                   [(bit-and (unsigned-bit-shift-right word 24) 0xff)
+                    (bit-and (unsigned-bit-shift-right word 16) 0xff)
+                    (bit-and (unsigned-bit-shift-right word 8) 0xff)
+                    (bit-and word 0xff)])
+                 [h0 h1 h2 h3 h4 h5 h6 h7]))))
+
+(defn sha256-bytes
+  "Compute the 32-byte SHA-256 digest of unsigned byte vector `bytes`.
+  Uses `java.security.MessageDigest` on JVM/Babashka and pure FIPS 180-4
+  SHA-256 on CLJS/nbb (zero Node or browser crypto dependency)."
+  [bytes]
+  #?(:clj (let [md (java.security.MessageDigest/getInstance "SHA-256")
+                arr (byte-array (count bytes))]
+            (dotimes [i (count bytes)]
+              (aset arr i (unchecked-byte (nth bytes i))))
+            (mapv #(bit-and (int %) 0xff) (.digest md arr)))
+     :cljs (sha256-pure bytes)))
+
+;; ── Canonical DAG-CBOR Encoder (Yataverse `toDagCborSafe` + `encodeDagCbor`) ─
+
+(defn- key-str [k]
+  (cond
+    (string? k) k
+    (keyword? k) (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+    :else (v/fail! :dag-cbor-invalid-key "DAG-CBOR map keys must be strings or keywords" {:key k})))
+
+(defn- compare-byte-vecs
+  "DAG-CBOR canonical map-key comparator: byte length first, then unsigned bytewise."
+  [a b]
+  (let [na (count a) nb (count b)]
+    (if (not= na nb)
+      (compare na nb)
+      (loop [i 0]
+        (if (= i na)
+          0
+          (let [d (- (nth a i) (nth b i))]
+            (if (zero? d) (recur (inc i)) d)))))))
+
+(defn- push-head! [out major n]
+  (let [prefix (bit-shift-left major 5)]
+    (cond
+      (< n 24)
+      (conj! out (bit-or prefix n))
+
+      (< n 0x100)
+      (-> out
+          (conj! (bit-or prefix 24))
+          (conj! n))
+
+      (< n 0x10000)
+      (-> out
+          (conj! (bit-or prefix 25))
+          (conj! (bit-and (unsigned-bit-shift-right n 8) 0xff))
+          (conj! (bit-and n 0xff)))
+
+      (< n 0x100000000)
+      (-> out
+          (conj! (bit-or prefix 26))
+          (conj! (bit-and (unsigned-bit-shift-right n 24) 0xff))
+          (conj! (bit-and (unsigned-bit-shift-right n 16) 0xff))
+          (conj! (bit-and (unsigned-bit-shift-right n 8) 0xff))
+          (conj! (bit-and n 0xff)))
+
+      :else
+      ;; Safe JS integer range up to 2^53 - 1
+      (let [hi (quot n 0x100000000)
+            lo (mod n 0x100000000)]
+        (-> out
+            (conj! (bit-or prefix 27))
+            (conj! (bit-and (unsigned-bit-shift-right hi 24) 0xff))
+            (conj! (bit-and (unsigned-bit-shift-right hi 16) 0xff))
+            (conj! (bit-and (unsigned-bit-shift-right hi 8) 0xff))
+            (conj! (bit-and hi 0xff))
+            (conj! (bit-and (unsigned-bit-shift-right lo 24) 0xff))
+            (conj! (bit-and (unsigned-bit-shift-right lo 16) 0xff))
+            (conj! (bit-and (unsigned-bit-shift-right lo 8) 0xff))
+            (conj! (bit-and lo 0xff)))))))
+
+(defn- push-bytes! [out bs]
+  (reduce conj! out bs))
+
+(defn- safe-integer-val
+  "Return exact integer if `x` is an integer or integer-valued float in JS safe
+  integer range; otherwise nil (must use Yataverse decimal wrapper)."
+  [x]
+  (when (esc/finite-number? x)
+    (cond
+      (integer? x)
+      (when (<= -9007199254740991 x 9007199254740991) x)
+
+      :else
+      (let [d (double x)
+            r (esc/round-int d)]
+        (when (and (== d (double r))
+                   (<= -9007199254740991 r 9007199254740991))
+          r)))))
+
+(defn- encode-item! [out x depth]
+  (when (> depth 64)
+    (v/fail! :max-depth-exceeded "DAG-CBOR encoding depth exceeded 64" {:depth depth}))
+  (cond
+    (nil? x)
+    (conj! out 0xf6)
+
+    (true? x)
+    (conj! out 0xf5)
+
+    (false? x)
+    (conj! out 0xf4)
+
+    (number? x)
+    (do
+      (when-not (esc/finite-number? x)
+        (v/fail! :dag-cbor-non-finite "DAG-CBOR forbids NaN/Infinity" {:value x}))
+      (if-let [iv (safe-integer-val x)]
+        (if (>= iv 0)
+          (push-head! out 0 iv)
+          (push-head! out 1 (- -1 iv)))
+        ;; Yataverse toDagCborSafe decimal wrapper for non-integer floats
+        (encode-item! out {"$awaiType" "decimal" "value" (esc/fmt-num x)} (inc depth))))
+
+    (string? x)
+    (let [bs (utf8-bytes x)]
+      (-> out (push-head! 3 (count bs)) (push-bytes! bs)))
+
+    (keyword? x)
+    (let [bs (utf8-bytes (key-str x))]
+      (-> out (push-head! 3 (count bs)) (push-bytes! bs)))
+
+    (v/ipld-link? x)
+    (let [cid-str (v/extract-cid x)
+          cid-bs (v/cidv1-bytes cid-str)
+          payload (into [0x00] cid-bs)]
+      (-> out
+          (conj! 0xd8)
+          (conj! 0x2a)
+          (push-head! 2 (count payload))
+          (push-bytes! payload)))
+
+    (sequential? x)
+    (let [out1 (push-head! out 4 (count x))]
+      (reduce (fn [acc item] (encode-item! acc item (inc depth))) out1 x))
+
+    (map? x)
+    (let [entries (map (fn [[k val]]
+                         (let [ks (key-str k)]
+                           [(utf8-bytes ks) ks val]))
+                       x)
+          sorted (sort (fn [[ba _ _] [bb _ _]] (compare-byte-vecs ba bb)) entries)]
+      (loop [prev nil
+             rem-s sorted]
+        (when-let [[kb ks _] (first rem-s)]
+          (when (and prev (= prev kb))
+            (v/fail! :dag-cbor-duplicate-key (str "duplicate DAG-CBOR map key: " ks) {:key ks}))
+          (recur kb (next rem-s))))
+      (let [out1 (push-head! out 5 (count sorted))]
+        (reduce (fn [acc [kb _ val]]
+                  (-> acc
+                      (push-head! 3 (count kb))
+                      (push-bytes! kb)
+                      (encode-item! val (inc depth))))
+                out1
+                sorted)))
+
+    :else
+    (v/fail! :dag-cbor-unsupported-value
+             (str "value is not DAG-CBOR encodable: " (pr-str x))
+             {:value x})))
+
+(defn encode-dag-cbor
+  "Encode `value` into a vector of unsigned canonical DAG-CBOR bytes matching
+  Yataverse's `encodeDagCbor(toDagCborSafe(value))` byte-for-byte."
+  [value]
+  (persistent! (encode-item! (transient []) value 0)))
+
+(defn cidv1-dag-cbor
+  "Compute canonical lower-case base32 CIDv1 (`0x01 0x71 0x12 0x20 || sha256(bytes)`)
+  for canonical DAG-CBOR byte vector `bytes`."
+  [cbor-bytes]
+  (let [digest (sha256-bytes cbor-bytes)
+        cid-bytes (into [0x01 0x71 0x12 0x20] digest)]
+    (str "b" (v/base32-encode cid-bytes))))
+
+(defn encode-ontology-graph-dag-cbor
+  "Compute canonical DAG-CBOR bytes and CIDv1 (`graphCid`) for a Yataverse
+  `yataverse.ontology.graph/v1` map (excluding any self-referential `graphCid`
+  key). Returns `{:cid \"bafyrei...\" :bytes [...] :byte-length n}`."
+  [yv-graph]
+  (when-not (map? yv-graph)
+    (v/fail! :invalid-yataverse-graph "expected Yataverse graph map for DAG-CBOR encoding" {}))
+  (let [body (dissoc yv-graph :graphCid "graphCid")
+        bytes (encode-dag-cbor body)
+        cid (cidv1-dag-cbor bytes)]
+    {:cid cid
+     :bytes bytes
+     :byte-length (count bytes)}))

@@ -118,12 +118,30 @@
       (is (= 14 (count (:edges kg))))
       (is (= 1 (count (:joins kg))))
       (is (= :syntax-only (get-in kg [:basis :cid-verification])))
+      (is (= :verified (get-in kg [:basis :graph-cid-verification])))
+      ;; Exact array order is preserved (e1, e2, ..., e14 — NOT e1, e10, ...)
+      (is (= ["e1" "e2" "e3" "e4" "e5" "e6" "e7" "e8" "e9" "e10" "e11" "e12" "e13" "e14"]
+             (mapv :id (:edges kg))))
+      (is (= (mapv #(get % "id") (get yataverse-pr83-fixture "nodes"))
+             (mapv :id (:nodes kg))))
       ;; Round-trip back to Yataverse PR #83 (HEAD ef29596b) wire format
-      (let [yv (ov/->yataverse-graph kg)]
+      (let [yv (ov/->yataverse-graph kg)
+            {:keys [cid bytes byte-length]} (ov/encode-ontology-graph-dag-cbor yv)]
         (is (= "yataverse.ontology.graph/v1" (:schema yv)))
         (is (= 1 (:version yv)))
         (is (= "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em" (:basisCid yv)))
         (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq" (:graphCid yv)))
+        (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq" cid)
+            "canonical DAG-CBOR CID of round-tripped graph must match Yataverse PR #83 byte-for-byte")
+        (is (= 4588 byte-length)
+            "canonical DAG-CBOR byte length must match Yataverse PR #83 encodeOntologyGraphDagCbor")
+        (is (= [0xae 0x62 0x69 0x64 0x78 0x20 0x79 0x61 0x74 0x61 0x76 0x65 0x72 0x73 0x65 0x2d]
+               (subvec bytes 0 16))
+            "canonical DAG-CBOR header bytes must match Yataverse PR #83 exactly")
+        (is (= ["e1" "e2" "e3" "e4" "e5" "e6" "e7" "e8" "e9" "e10" "e11" "e12" "e13" "e14"]
+               (mapv :id (:edges yv))))
+        (is (= (mapv #(get % "id") (get yataverse-pr83-fixture "nodes"))
+               (mapv :id (:nodes yv))))
         (is (= 9 (:nodeCount yv)))
         (is (= false (:truncated yv)))
         (is (= false (:edgesTruncated yv)))
@@ -143,7 +161,18 @@
         (is (= "tender_with_agency" (get-in yv [:joins 0 :name])))
         (is (= 2 (get-in yv [:joins 0 :matchedRows])))
         (is (= 1 (get-in yv [:joins 0 :coverageRatio])))
-        (is (= 2 (get-in yv [:coverage "totalMatchedJoinRows"]))))))
+        (is (= 2 (get-in yv [:coverage "totalMatchedJoinRows"]))))
+
+      ;; Filtered / modified graph must NEVER inherit stale graphCid; it must recompute fresh CID
+      (let [filtered-kg (ov/filter-graph kg {:layers ["connector" "ontology"]})
+            filtered-yv (ov/->yataverse-graph filtered-kg)
+            {recomputed :cid} (ov/encode-ontology-graph-dag-cbor filtered-yv)]
+        (is (not= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq" (:graphCid filtered-yv))
+            "filtered graph must not inherit the unfiltered input graphCid")
+        (is (= recomputed (:graphCid filtered-yv))
+            "filtered graph graphCid must match its own canonical DAG-CBOR bytes")
+        ;; Re-ingesting the filtered Yataverse graph verifies its freshly computed graphCid
+        (is (= 5 (count (:nodes (ov/<-yataverse-graph filtered-yv))))))))
 
   (testing "direct rendering and Semantic UI ops work on raw Yataverse PR #83 fixture"
     (let [svg (ov/render-svg yataverse-pr83-fixture {:title "Yataverse Seeded"})
@@ -191,4 +220,14 @@
          (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodeCount" 999))))
       "inconsistent top-level nodeCount must fail closed")
   (is (= :invalid-yataverse-graph
-         (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodes" [{"id" "n1" "kind" "unknown-kind"}]))))))
+         (refusal-reason #(ov/<-yataverse-graph (assoc yataverse-pr83-fixture "nodes" [{"id" "n1" "kind" "unknown-kind"}])))))
+  (testing "tampered array order with stale graphCid fails closed with :graph-cid-mismatch"
+    (let [lex-sorted-edges (vec (sort-by #(get % "id") (get yataverse-pr83-fixture "edges")))
+          reordered-edges-yv (assoc yataverse-pr83-fixture "edges" lex-sorted-edges)
+          reversed-nodes-yv (assoc yataverse-pr83-fixture "nodes" (vec (reverse (get yataverse-pr83-fixture "nodes"))))]
+      (is (= :graph-cid-mismatch
+             (refusal-reason #(ov/<-yataverse-graph reordered-edges-yv)))
+          "lexicographically reordered edges (e1, e10, ...) with old graphCid must fail closed")
+      (is (= :graph-cid-mismatch
+             (refusal-reason #(ov/<-yataverse-graph reversed-nodes-yv)))
+          "reordered nodes with old graphCid must fail closed"))))

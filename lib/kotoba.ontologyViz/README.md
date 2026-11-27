@@ -53,12 +53,20 @@ envelope `yataverse.ontology.operations/v1`.
 Explicit bidirectional adapters bridge the two contracts without conflating them:
 
 - `(ov/<-yataverse-graph yv-graph)` — validates and converts a Yataverse PR #83
-  graph (keyword- or string-keyed) into a laid-out Kotoba `ontology.graph/v1`.
+  graph (keyword- or string-keyed) into a laid-out Kotoba `ontology.graph/v1`
+  while preserving exact `nodes`/`edges`/`layers`/`joins` array order. When
+  `graphCid` is present, recomputes canonical DAG-CBOR + SHA-256 CIDv1 and
+  fails closed (`:graph-cid-mismatch`) on any content or array-order mismatch.
   `render-svg`, `render-html`, `invoke`, and `build-artifact` also accept a
   `yataverse.ontology.graph/v1` map directly via this adapter.
 - `(ov/->yataverse-graph kotoba-graph)` — validates and converts a Kotoba
   `ontology.graph/v1` graph into Yataverse PR #83's exact `yataverse.ontology.graph/v1`
-  wire format.
+  wire format, preserving exact array order and always recomputing a fresh
+  canonical DAG-CBOR `graphCid` from the emitted bytes (never inheriting a stale
+  `graphCid` onto a filtered/modified graph).
+- `(ov/encode-ontology-graph-dag-cbor yv-graph)` — pure `.cljc` canonical
+  DAG-CBOR + SHA-256 CIDv1 (`0x01 0x71 0x12 0x20`) encoder matching Yataverse
+  PR #83's `encodeOntologyGraphDagCbor` byte-for-byte.
 - `(ov/invoke-yataverse graph-or-yv op params)` — dispatches `ontology.graph`,
   `ontology.inspect`, `ontology.view` (`json|svg|html|all` -> `basisCid`,
   `semanticSchema`, `viewModel`, optional `svg`/`html`), `ontology.query_sql`

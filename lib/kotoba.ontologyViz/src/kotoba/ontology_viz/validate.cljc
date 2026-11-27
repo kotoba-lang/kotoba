@@ -60,7 +60,9 @@
 (def ^:private base32-lookup
   (into {} (map-indexed (fn [idx ch] [ch idx]) base32-alphabet)))
 
-(defn- base32-encode [bytes]
+(defn base32-encode
+  "Encode unsigned byte vector into canonical RFC4648 unpadded lowercase base32."
+  [bytes]
   (let [n (count bytes)]
     (loop [i 0
            bits 0
@@ -87,7 +89,7 @@
                   [b-rem a-rem o]))]
           (recur (inc i) rem-bits rem-acc next-out))))))
 
-(defn- base32-decode
+(defn base32-decode
   "Decode RFC4648 lower-case unpadded base32. Returns vector of unsigned bytes
   or nil if any character is invalid or trailing bits are non-zero."
   [s]
@@ -191,6 +193,14 @@
   [s]
   (boolean (parse-cidv1 s)))
 
+(defn cidv1-bytes
+  "Return the binary CIDv1 unsigned byte vector for a validated base32lower
+  CIDv1 string, failing closed with `:invalid-cid` on malformed input."
+  [s]
+  (when-not (valid-cid? s)
+    (fail! :invalid-cid (str "invalid CIDv1 string: " (pr-str s)) {:cid s}))
+  (base32-decode (subs s 1)))
+
 (defrecord IpldLink [cid])
 
 (defn ipld-link
@@ -211,6 +221,7 @@
   [x]
   (cond
     (instance? IpldLink x) true
+    (sorted? x) false
     (and (map? x) (= 1 (count x)) (contains? x "/")) true
     (and (map? x) (contains? x :ipld/link)) true
     (and (map? x) (contains? x :ipld/cid) (= 1 (count x))) true

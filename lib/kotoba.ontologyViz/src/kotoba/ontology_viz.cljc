@@ -5,7 +5,8 @@
   self-contained interactive HTML viewers, and Semantic UI `noun.verb` contracts.
 
   Compatible with JVM Clojure, Babashka, nbb, and ClojureScript."
-  (:require [kotoba.ontology-viz.escape :as esc]
+  (:require [kotoba.ontology-viz.dag-cbor :as dcbor]
+            [kotoba.ontology-viz.escape :as esc]
             [kotoba.ontology-viz.graph :as g]
             [kotoba.ontology-viz.html :as html]
             [kotoba.ontology-viz.semantic :as sem]
@@ -48,6 +49,9 @@
 (def yataverse-graph? yv/yataverse-graph?)
 (def <-yataverse-graph yv/<-yataverse-graph)
 (def ->yataverse-graph yv/->yataverse-graph)
+(def encode-dag-cbor dcbor/encode-dag-cbor)
+(def encode-ontology-graph-dag-cbor dcbor/encode-ontology-graph-dag-cbor)
+(def cidv1-dag-cbor dcbor/cidv1-dag-cbor)
 
 ;; ── Pure offline renderers & machine-readable screen state ───────────────────
 
