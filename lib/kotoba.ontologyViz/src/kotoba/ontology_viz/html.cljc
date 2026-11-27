@@ -359,9 +359,10 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
 
   function filterGraphLocal(params){
     var p = params || {};
-    var hasLayers = p.layers !== undefined && p.layers !== null;
+    var rawLayers = (p.activeLayers !== undefined && p.activeLayers !== null) ? p.activeLayers : p.layers;
+    var hasLayers = rawLayers !== undefined && rawLayers !== null;
     var layerSet = hasLayers ? Object.create(null) : null;
-    if(hasLayers){ p.layers.forEach(function(l){ layerSet[String(l)] = true; }); }
+    if(hasLayers){ rawLayers.forEach(function(l){ layerSet[String(l)] = true; }); }
     var hasKinds = p.kinds !== undefined && p.kinds !== null;
     var kindSet = hasKinds ? Object.create(null) : null;
     if(hasKinds){ p.kinds.forEach(function(k){ kindSet[String(k)] = true; }); }
@@ -382,43 +383,291 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     return {nodes: keptNodes, edges: keptEdges};
   }
 
-  function querySqlLocal(sql){
+  var SQL_TABLE_SCHEMAS = {
+    nodes: ['cid', 'id', 'kind', 'label', 'layer'],
+    edges: ['cid', 'id', 'kind', 'label', 'layer', 'source', 'target'],
+    joins: ['cardinality', 'coverage', 'excluded_count', 'from_attr', 'from_node', 'id', 'match_rule', 'matched_count', 'status', 'to_attr', 'to_node', 'unmatched_count'],
+    layers: ['id', 'label', 'node_count', 'order']
+  };
+
+  function sqlTableRows(tbl){
+    if(tbl === 'nodes'){
+      return (graph.nodes || []).map(function(n){
+        return {id:n.id, label:n.label, kind:String(n.kind || ''), layer:n.layer, cid:n.cid !== undefined ? n.cid : null};
+      });
+    }
+    if(tbl === 'edges'){
+      return (graph.edges || []).map(function(e){
+        return {id:e.id, source:e.source, target:e.target, label:e.label, kind:String(e.kind || ''), layer:e.layer, cid:e.cid !== undefined ? e.cid : null};
+      });
+    }
+    if(tbl === 'joins'){
+      return (graph.joins || []).map(function(j){
+        return {
+          id:j.id, from_node:j['from-node'], from_attr:j['from-attr'], to_node:j['to-node'], to_attr:j['to-attr'],
+          match_rule:String(j['match-rule'] || ''), cardinality:String(j.cardinality || ''),
+          matched_count:j['matched-count'], unmatched_count:j['unmatched-count'], excluded_count:j['excluded-count'],
+          coverage:j.coverage !== undefined ? j.coverage : null, status:String(j.status || '')
+        };
+      });
+    }
+    if(tbl === 'layers'){
+      return (graph.layers || []).map(function(l){
+        return {id:l.id, label:l.label, order:l.order, node_count:l['node-count']};
+      });
+    }
+    throw new Error('unknown-sql-table');
+  }
+
+  function querySqlLocal(sql, opts){
     var s = String(sql || '').trim().replace(/;\\s*$/, '');
-    if(/;|--|\\/\\*/.test(s) || /\\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|PRAGMA)\\b/i.test(s)){
+    if(!s || s.length > 2048) throw new Error('invalid-sql');
+    if(/;|--|\\/\\*/.test(s) || /\\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|PRAGMA|ATTACH|DETACH|REPLACE|MERGE|EXEC|EXECUTE|CALL|GRANT|REVOKE|COPY|VACUUM)\\b/i.test(s)){
       throw new Error('unsafe-sql');
     }
     var m = s.match(/^SELECT\\s+(.+?)\\s+FROM\\s+(nodes|edges|joins|layers)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*'([^']*)')?(?:\\s+LIMIT\\s+(\\d+))?$/i);
     if(!m) throw new Error('unsupported-sql-shape');
     var tbl = m[2].toLowerCase();
-    var rows = (graph[tbl] || []).map(function(r){ return Object.assign({}, r); });
+    var allowed = SQL_TABLE_SCHEMAS[tbl];
+    var colsRaw = m[1].trim();
+    var cols;
+    if(colsRaw === '*'){
+      cols = allowed.slice();
+    } else {
+      cols = colsRaw.split(',').map(function(c){
+        var t = c.trim();
+        if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(t)) throw new Error('unsupported-sql-shape');
+        var lc = t.toLowerCase();
+        if(allowed.indexOf(lc) === -1) throw new Error('unknown-sql-column');
+        return lc;
+      });
+    }
+    var rows = sqlTableRows(tbl);
     var scanned = rows.length;
-    if(m[3]){ var wc = m[3].toLowerCase(); rows = rows.filter(function(r){ return String(r[wc] !== undefined ? r[wc] : '') === m[4]; }); }
-    var lim = m[5] ? Math.min(500, parseInt(m[5], 10)) : 100;
-    var out = rows.slice(0, lim);
-    return {dialect:'sql-readonly-v1', table:tbl, 'scanned-rows':scanned, 'row-count':out.length, rows:out};
+    if(m[3]){
+      var wc = m[3].toLowerCase();
+      if(allowed.indexOf(wc) === -1) throw new Error('unknown-sql-column');
+      rows = rows.filter(function(r){ return String(r[wc] !== undefined && r[wc] !== null ? r[wc] : '') === m[4]; });
+    }
+    var paramLim = (opts && opts.limit !== undefined) ? parseInt(opts.limit, 10) : 100;
+    if(!(paramLim >= 1 && paramLim <= 500)) throw new Error('invalid-sql');
+    var lim = paramLim;
+    if(m[5]){
+      var sqlLim = parseInt(m[5], 10);
+      if(!(sqlLim >= 1 && sqlLim <= 500)) throw new Error('invalid-sql');
+      lim = Math.min(paramLim, sqlLim);
+    }
+    var projected = rows.slice(0, lim).map(function(r){
+      var obj = {};
+      cols.forEach(function(c){ obj[c] = r[c]; });
+      return obj;
+    });
+    return {
+      dialect: 'sql-readonly-v1',
+      table: tbl,
+      columns: cols,
+      'row-count': projected.length,
+      'scanned-rows': scanned,
+      scannedRows: scanned,
+      rows: projected
+    };
   }
 
-  function querySparqlLocal(sparql){
-    var s = String(sparql || '').trim();
-    if(/\\b(SERVICE|LOAD|INSERT|DELETE|DROP|CLEAR|CREATE)\\b/i.test(s)) throw new Error('remote-fetch-forbidden');
-    var triples = [];
+  var DEFAULT_SPARQL_PREFIXES = {
+    rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+    rdfs: 'http://www.w3.org/2000/01/rdf-schema#',
+    xsd: 'http://www.w3.org/2001/XMLSchema#'
+  };
+
+  function canonicalNodeTerm(id){
+    var s = String(id || '');
+    return s.indexOf('rdf:') === 0 ? s.slice(4) : s;
+  }
+
+  function expandSparqlTerm(tok, pmap){
+    if(tok.indexOf('?') === 0) return tok;
+    if(tok.length >= 2 && tok.charAt(0) === '<' && tok.charAt(tok.length - 1) === '>') return tok.slice(1, -1);
+    if(tok.charAt(0) === '\"'){
+      var lm = tok.match(/^\"([^\"]*)\"(.*)$/);
+      if(lm){
+        var lex = lm[1], suf = lm[2];
+        if(!suf) return lex;
+        if(suf.charAt(0) === '@') return lex + suf;
+        if(suf.indexOf('^^') === 0) return lex + '^^<' + expandSparqlTerm(suf.slice(2), pmap) + '>';
+      }
+      return tok;
+    }
+    var ci = tok.indexOf(':');
+    if(ci !== -1){
+      var pfx = tok.slice(0, ci), loc = tok.slice(ci + 1);
+      if(Object.prototype.hasOwnProperty.call(pmap, pfx)) return pmap[pfx] + loc;
+    }
+    return tok;
+  }
+
+  function buildLocalTriples(){
+    var rdfType = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    var rdfsLabel = 'http://www.w3.org/2000/01/rdf-schema#label';
+    var seen = Object.create(null);
+    var out = [];
+    function pushT(s, p, o){
+      var k = s + '\\u0000' + p + '\\u0000' + o;
+      if(!seen[k]){ seen[k] = true; out.push([s, p, o]); }
+    }
     (graph.nodes || []).forEach(function(n){
-      triples.push([n.id, 'rdf:type', n.kind]);
-      triples.push([n.id, 'rdfs:label', n.label]);
-      if(n.cid) triples.push([n.id, 'ipld:cid', n.cid]);
-      triples.push([n.id, 'kotoba:layer', n.layer]);
+      var s = (n.attributes && n.attributes.iri) ? String(n.attributes.iri) : canonicalNodeTerm(n.id);
+      pushT(s, rdfType, String(n.kind || 'node'));
+      pushT(s, rdfsLabel, String(n.label || ''));
+      pushT(s, 'kotoba:layer', String(n.layer || ''));
+      if(n.cid) pushT(s, 'ipld:cid', String(n.cid));
+      if(n.attributes){
+        Object.keys(n.attributes).forEach(function(k){
+          if(k === 'iri') return;
+          var v = n.attributes[k];
+          if(v === null || v === undefined) return;
+          var pk = k.replace(/\\s+\\[[^\\]]+\\]$/, '');
+          var vals = Array.isArray(v) ? v : [v];
+          vals.forEach(function(val){ pushT(s, pk, String(val)); });
+        });
+      }
     });
-    (graph.edges || []).forEach(function(e){ triples.push([e.source, e.label, e.target]); });
-    return {dialect:'sparql-readonly-v1', form:/^ASK\\b/i.test(s) ? 'ASK' : 'SELECT', tripleCount:triples.length};
+    (graph.edges || []).forEach(function(e){
+      var s = canonicalNodeTerm(e.source);
+      var o = canonicalNodeTerm(e.target);
+      var p = (e.metadata && e.metadata['predicate-iri']) ? String(e.metadata['predicate-iri']) : String(e.label || '');
+      pushT(s, p, o);
+    });
+    return out;
+  }
+
+  function querySparqlLocal(sparql, opts){
+    var s = String(sparql || '').trim();
+    if(!s || s.length > 2048) throw new Error('invalid-sparql');
+    if(/\\b(SERVICE|LOAD|INSERT|DELETE|DROP|CLEAR|CREATE|ADD|MOVE|COPY|SILENT)\\b|\\bFROM\\s+NAMED\\b|\\bFROM\\s+<https?:/i.test(s)){
+      throw new Error('remote-fetch-forbidden');
+    }
+    var pmap = Object.assign({}, DEFAULT_SPARQL_PREFIXES);
+    var rem = s;
+    var pm;
+    while((pm = rem.match(/^PREFIX\\s+([A-Za-z0-9_-]*):\\s*<([^>]+)>\\s*/i))){
+      pmap[pm[1]] = pm[2];
+      rem = rem.slice(pm[0].length).trim();
+    }
+    if(/\\b(OPTIONAL|UNION|FILTER|GRAPH|BIND|VALUES|ORDER\\s+BY|GROUP\\s+BY|HAVING|OFFSET|MINUS|SUBSELECT|CONSTRUCT|DESCRIBE)\\b/i.test(rem)){
+      throw new Error('unsupported-sparql-clause');
+    }
+    var askM = rem.match(/^ASK\\s*(?:WHERE\\s*)?\\{([^{}]*)\\}$/i);
+    var selM = askM ? null : rem.match(/^SELECT\\s+(\\*|(?:\\?[A-Za-z0-9_]+(?:\\s+\\?[A-Za-z0-9_]+)*))\\s+(?:WHERE\\s*)?\\{([^{}]*)\\}(?:\\s+LIMIT\\s+([0-9]+))?$/i);
+    if(!askM && !selM) throw new Error('unsafe-sparql');
+    var whereBody = askM ? askM[1] : selM[2];
+    var toks = whereBody.match(/\"[^\"]*\"(?:\\^\\^(?:<[^>]+>|[A-Za-z0-9_-]*:[A-Za-z0-9_.-]+)|@[A-Za-z0-9-]+)?|<[^>]+>|\\?[A-Za-z0-9_]+|[^\\s]+/g) || [];
+    var clauses = [], cur = [];
+    toks.forEach(function(tok){
+      if(tok === '.'){ if(cur.length){ clauses.push(cur); cur = []; } }
+      else if(tok.length > 1 && tok.charAt(tok.length - 1) === '.' && tok.charAt(0) !== '\"' && tok.charAt(0) !== '<'){
+        cur.push(tok.slice(0, -1)); clauses.push(cur); cur = [];
+      } else { cur.push(tok); }
+    });
+    if(cur.length) clauses.push(cur);
+    if(!clauses.length) throw new Error('invalid-sparql');
+    var patterns = clauses.map(function(c){
+      if(c.length !== 3) throw new Error('invalid-sparql');
+      return c.map(function(t){ return expandSparqlTerm(t, pmap); });
+    });
+    var triples = buildLocalTriples();
+    var steps = 0;
+    var solutions = [{}];
+    patterns.forEach(function(pat){
+      var next = [];
+      for(var bi = 0; bi < solutions.length; bi++){
+        var b = solutions[bi];
+        for(var ti = 0; ti < triples.length; ti++){
+          steps++;
+          if(steps > 100000) throw new Error('sparql-scan-limit-exceeded');
+          var t = triples[ti], nb = Object.assign({}, b), ok = true;
+          for(var idx = 0; idx < 3; idx++){
+            var pt = pat[idx], tv = String(t[idx]);
+            if(pt.charAt(0) === '?'){
+              if(Object.prototype.hasOwnProperty.call(nb, pt)){ if(nb[pt] !== tv){ ok = false; break; } }
+              else { nb[pt] = tv; }
+            } else {
+              if(pt !== tv && canonicalNodeTerm(pt) !== tv){ ok = false; break; }
+            }
+          }
+          if(ok){
+            next.push(nb);
+            if(next.length > 10000) throw new Error('sparql-solution-limit-exceeded');
+          }
+        }
+      }
+      solutions = next;
+    });
+    function ednTerm(x){ return x.charAt(0) === '?' ? x : JSON.stringify(x); }
+    var bgpEdn = '{:sparql/op :bgp, :patterns [' + patterns.map(function(p){ return '[' + p.map(ednTerm).join(' ') + ']'; }).join(' ') + ']}';
+    if(askM){
+      var hit = solutions.length > 0;
+      return {
+        dialect: 'sparql-readonly-v1',
+        form: 'ask',
+        boolean: hit,
+        vars: [],
+        'row-count': hit ? 1 : 0,
+        'algebra-edn': bgpEdn,
+        algebraEdn: bgpEdn,
+        bindings: []
+      };
+    }
+    var paramLim = (opts && opts.limit !== undefined) ? parseInt(opts.limit, 10) : 100;
+    if(!(paramLim >= 1 && paramLim <= 500)) throw new Error('invalid-sparql');
+    var lim = paramLim;
+    if(selM[3]){
+      var qLim = parseInt(selM[3], 10);
+      if(!(qLim >= 1 && qLim <= 500)) throw new Error('invalid-sparql');
+      lim = Math.min(paramLim, qLim);
+    }
+    var head = selM[1].trim();
+    var projVars;
+    if(head === '*'){
+      var vs = Object.create(null);
+      solutions.forEach(function(sol){ Object.keys(sol).forEach(function(k){ vs[k] = true; }); });
+      projVars = Object.keys(vs).sort();
+    } else {
+      projVars = head.match(/\\?[A-Za-z0-9_]+/g) || [];
+    }
+    var limited = solutions.slice(0, lim).map(function(sol){
+      var row = {};
+      projVars.forEach(function(v){ if(Object.prototype.hasOwnProperty.call(sol, v)) row[v] = sol[v]; });
+      return row;
+    });
+    var projEdn = '{:sparql/op :project, :vars [' + projVars.join(' ') + '], :pattern ' + bgpEdn + '}';
+    var sliceEdn = '{:sparql/op :slice, :offset 0, :limit ' + lim + ', :pattern ' + projEdn + '}';
+    return {
+      dialect: 'sparql-readonly-v1',
+      form: 'select',
+      vars: projVars,
+      'row-count': limited.length,
+      'algebra-edn': sliceEdn,
+      algebraEdn: sliceEdn,
+      bindings: limited
+    };
   }
 
   function invokeLocal(op, params){
     var p = params || {};
     if(op === 'ontology.inspect') return inspectPayload(p['node-id'] || selectedNodeId);
     if(op === 'ontology.graph') return filterGraphLocal(p);
-    if(op === 'ontology.view') return {format:'svg', state: window.__KOTOBA_ONTOLOGY_SCREEN__};
-    if(op === 'ontology.query_sql') return querySqlLocal(p.sql || p.query);
-    if(op === 'ontology.query_sparql') return querySparqlLocal(p.sparql || p.query);
+    if(op === 'ontology.view'){
+      var fmt = String(p.format || 'svg').toLowerCase();
+      if(fmt !== 'svg' && fmt !== 'html') throw new Error('invalid-format');
+      var svgEl = stage ? stage.querySelector('svg') : null;
+      return {
+        format: fmt,
+        'content-type': fmt === 'html' ? 'text/html; charset=utf-8' : 'image/svg+xml',
+        content: fmt === 'html' ? ('<!DOCTYPE html>' + document.documentElement.outerHTML) : (svgEl ? svgEl.outerHTML : '')
+      };
+    }
+    if(op === 'ontology.query_sql') return querySqlLocal(p.sql || p.query, p);
+    if(op === 'ontology.query_sparql') return querySparqlLocal(p.sparql || p.query, p);
     throw new Error('unknown-operation: ' + op);
   }
 

@@ -16,6 +16,7 @@
    :max-depth 16
    :max-joins 128
    :max-join-pairs 5000
+   :max-join-comparisons 50000
    :max-attributes-per-node 64
    :max-input-items 10000
    :max-collection-width 2048
@@ -30,6 +31,7 @@
    :max-depth 64
    :max-joins 1024
    :max-join-pairs 50000
+   :max-join-comparisons 250000
    :max-attributes-per-node 512
    :max-input-items 50000
    :max-collection-width 10000
@@ -52,14 +54,26 @@
     :join :join-instance :ipld-link})
 
 (def valid-cid-verification-states
-  "Allowed verification states for `:cid-verification` and `:basis-cid-verification`
-  (snapshot body verification axis)."
-  #{:syntax-only :verified :absent})
+  "Allowed 2-valued verification states for `:cid-verification` and
+  `:basis-cid-verification` (snapshot body verification axis, #565 / KotobaSpec v1.0.1)."
+  #{:syntax-only :verified})
 
 (def valid-graph-cid-verification-states
   "Allowed verification states for `:graph-cid-verification`
   (graph DAG-CBOR CID verification axis, strictly separated from snapshot basisCid)."
   #{:verified :syntax-only :absent})
+
+(def forbidden-wire-verification-keys
+  "Internal verification status keys that must NEVER appear anywhere inside a
+  wire `yataverse.ontology.graph/v1` payload, node `meta`, or edge `metadata`."
+  #{"graphCidVerified" "basisCidVerified" "verificationScope"
+    "graphVerification" "basisVerification"
+    "cid-verification" "basis-cid-verification" "graph-cid-verification"
+    "cidVerification" "basisCidVerification" "graphCidVerification"})
+
+(def forbidden-object-keys
+  "Prototype-pollution keys refused in wire payloads and DAG-CBOR maps."
+  #{"__proto__" "constructor" "prototype"})
 
 (defn fail!
   "Throw a structured ex-info refusal with an explicit `:reason` keyword."
@@ -378,12 +392,66 @@
 (def ^:private kw-at-context (keyword "@context"))
 (def ^:private kw-at-import (keyword "@import"))
 
-(defn- assert-context-value-local! [ctx path limits work-vol]
+(defn- key->wire-str [k]
+  (cond
+    (string? k) k
+    (keyword? k) (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+    :else (str k)))
+
+(defn assert-no-forbidden-wire-keys!
+  "Recursively walk `data` with explicit depth and work budgets, failing closed
+  if any map key is an internal verification status field (`:forbidden-verification-field`)
+  or a prototype-pollution key (`:forbidden-wire-key`)."
+  ([data] (assert-no-forbidden-wire-keys! default-limits data))
+  ([limits data]
+   (let [max-depth (:max-depth limits)
+         max-work (:max-walk-nodes limits)
+         max-width (:max-collection-width limits)
+         work (volatile! 0)]
+     (letfn [(walk [x depth path]
+               (let [w (vswap! work inc)]
+                 (when (> w max-work)
+                   (fail! :max-walk-nodes-exceeded
+                          (str "wire-key validation exceeded total work budget (" max-work ")")
+                          {:limit max-work :path path})))
+               (when (> depth max-depth)
+                 (fail! :max-depth-exceeded
+                        (str "wire-key validation depth (" depth ") exceeds max-depth (" max-depth ")")
+                        {:depth depth :limit max-depth :path path}))
+               (cond
+                 (ipld-link? x) nil
+                 (map? x)
+                 (do
+                   (bounded-count-or-fail! x max-width :max-collection-width-exceeded (pr-str path))
+                   (doseq [[k v] x]
+                     (let [ks (key->wire-str k)]
+                       (when (contains? forbidden-object-keys ks)
+                         (fail! :forbidden-wire-key
+                                (str "forbidden object key in wire payload: " ks)
+                                {:key ks :path (conj path ks)}))
+                       (when (contains? forbidden-wire-verification-keys ks)
+                         (fail! :forbidden-verification-field
+                                (str "internal verification field must not appear in wire payload: " ks)
+                                {:key ks :path (conj path ks)}))
+                       (walk v (inc depth) (conj path ks)))))
+                 (or (sequential? x) (set? x))
+                 (do
+                   (bounded-count-or-fail! x max-width :max-collection-width-exceeded (pr-str path))
+                   (doseq [[idx item] (map-indexed vector x)]
+                     (walk item (inc depth) (conj path idx))))
+                 :else nil))]
+       (walk data 0 [])))))
+
+(defn- assert-context-value-local! [ctx depth path limits work-vol]
   (let [w (vswap! work-vol inc)]
     (when (> w (:max-walk-nodes limits))
       (fail! :max-walk-nodes-exceeded
              (str "structure walk exceeded total work budget (" (:max-walk-nodes limits) ")")
              {:limit (:max-walk-nodes limits) :path path})))
+  (when (> depth (:max-depth limits))
+    (fail! :max-depth-exceeded
+           (str "@context nesting depth (" depth ") exceeds max-depth (" (:max-depth limits) ")")
+           {:depth depth :limit (:max-depth limits) :path path}))
   (cond
     (nil? ctx) nil
     (string? ctx)
@@ -398,12 +466,14 @@
         (when (and (or (= k "@import") (= k kw-at-import)) (some? v))
           (fail! :remote-context-forbidden
                  "JSON-LD @import remote context directive is forbidden"
-                 {:path (conj path k) :value v}))))
+                 {:path (conj path k) :value v}))
+        (when (or (map? v) (sequential? v))
+          (assert-context-value-local! v (inc depth) (conj path k) limits work-vol))))
     (sequential? ctx)
     (do
       (bounded-count-or-fail! ctx (:max-collection-width limits) :max-collection-width-exceeded (pr-str path))
       (doseq [[idx item] (map-indexed vector ctx)]
-        (assert-context-value-local! item (conj path idx) limits work-vol)))
+        (assert-context-value-local! item (inc depth) (conj path idx) limits work-vol)))
     :else
     (fail! :remote-context-forbidden
            "unsupported @context value"
@@ -458,7 +528,7 @@
                   (doseq [[k v] x]
                     (check-key! k path)
                     (when (or (= k "@context") (= k kw-at-context))
-                      (assert-context-value-local! v (conj path k) limits work))
+                      (assert-context-value-local! v (inc depth) (conj path k) limits work))
                     (when (and (or (= k :fetch-remote?)
                                    (= k :resolve-remote-context?)
                                    (= k :allow-remote-fetch?))
@@ -523,12 +593,12 @@
     (when (some? cid-ver)
       (when-not (contains? valid-cid-verification-states cid-ver)
         (fail! :invalid-basis
-               "`:cid-verification` must be :syntax-only, :verified, or :absent"
+               "`:cid-verification` must be :syntax-only or :verified"
                {:cid-verification cid-ver})))
     (when (some? basis-ver)
       (when-not (contains? valid-cid-verification-states basis-ver)
         (fail! :invalid-basis
-               "`:basis-cid-verification` must be :syntax-only, :verified, or :absent"
+               "`:basis-cid-verification` must be :syntax-only or :verified"
                {:basis-cid-verification basis-ver})))
     (when (and (some? cid-ver) (some? basis-ver) (not= cid-ver basis-ver))
       (fail! :invalid-basis
@@ -686,6 +756,13 @@
       (when-let [rl (:root-link basis)] (extract-cid rl))
       (when-let [gc (:graph-cid basis)] (extract-cid gc))
       (validate-basis-verification! basis)
+      ;; Do NOT allow callers to claim :verified snapshot basis without cryptographic block-closure verification
+      (when (or (= :verified (:cid-verification basis))
+                (= :verified (:basis-cid-verification basis)))
+        (fail! :unverified-basis-claim
+               "cannot claim :verified basisCid on unverified projection input (no snapshot block closure verified)"
+               {:cid-verification (:cid-verification basis)
+                :basis-cid-verification (:basis-cid-verification basis)}))
       (assert-label-length! limits :basis/source (:source basis)))
     limits))
 

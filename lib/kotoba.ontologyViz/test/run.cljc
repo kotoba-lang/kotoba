@@ -1,5 +1,6 @@
 (ns run
   (:require [clojure.test :as t]
+            [kotoba.ontology-viz.catalog-test]
             [kotoba.ontology-viz.graph-test]
             [kotoba.ontology-viz.render-test]
             [kotoba.ontology-viz.security-test]
@@ -16,7 +17,8 @@
     #?(:clj (System/exit 1)
        :cljs (when (exists? js/process) (.exit js/process 1)))))
 
-(t/run-tests 'kotoba.ontology-viz.graph-test
+(t/run-tests 'kotoba.ontology-viz.catalog-test
+             'kotoba.ontology-viz.graph-test
              'kotoba.ontology-viz.render-test
              'kotoba.ontology-viz.security-test
              'kotoba.ontology-viz.yataverse-test)

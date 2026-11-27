@@ -77,11 +77,44 @@
   #?(:clj (Math/round (double x))
      :cljs (js/Math.round x)))
 
+(defn canonical-decimal-str
+  "Format a finite number without 4-decimal rounding, matching ECMAScript
+  `String(value)` / Yataverse `toDagCborSafe` across JVM Clojure, Babashka,
+  nbb, and ClojureScript. Integers and integer-valued floats (e.g. `120.0`,
+  `-0.0`) render without `.0` (`\"120\"`, `\"0\"`)."
+  [x]
+  (when-not (finite-number? x)
+    (throw (ex-info (str "non-finite number cannot be formatted: " (pr-str x))
+                    {:reason :invalid-number :value x})))
+  (cond
+    (integer? x) (str x)
+    :else
+    #?(:cljs (let [d (double x)]
+               (if (zero? d) "0" (js/String d)))
+       :clj (let [d (double x)]
+              (if (zero? d)
+                "0"
+                (let [r (round-int d)]
+                  (if (and (== d (double r))
+                           (<= -9007199254740991 r 9007199254740991))
+                    (str r)
+                    (let [abs-d (Math/abs d)]
+                      (if (and (>= abs-d 1.0e-6) (< abs-d 1.0e21))
+                        (.toPlainString (.stripTrailingZeros (java.math.BigDecimal/valueOf d)))
+                        (let [s (str d)
+                              [mant exp] (str/split s #"E")
+                              mant-clean (if (str/ends-with? mant ".0")
+                                           (subs mant 0 (- (count mant) 2))
+                                           mant)
+                              exp-int (Long/parseLong exp)
+                              exp-str (if (neg? exp-int) (str "e" exp-int) (str "e+" exp-int))]
+                          (str mant-clean exp-str)))))))))))
+
 (defn fmt-num
-  "Format a finite number identically across JVM, Babashka, and CLJS/nbb.
-  Integers and integer-valued floats (e.g. `120.0`) always render without `.0`
-  (`\"120\"`). Non-integer floats round to at most 4 decimal places with
-  trailing fractional zeros stripped (e.g. `108.5`, `0.6667`)."
+  "Format a finite number for SVG layout coordinates identically across JVM,
+  Babashka, and CLJS/nbb. Integers and integer-valued floats (e.g. `120.0`)
+  always render without `.0` (`\"120\"`). Non-integer floats round to at most 4
+  decimal places with trailing fractional zeros stripped."
   [x]
   (when-not (finite-number? x)
     (throw (ex-info (str "non-finite number cannot be formatted: " (pr-str x))
@@ -142,14 +175,16 @@
 
 (defn json-encode
   "Deterministically encode Clojure/ClojureScript data to compact JSON.
-  Map keys are sorted lexicographically and numbers use `fmt-num`, so outputs
-  are byte-identical across JVM, Babashka, nbb, and ClojureScript."
+  Map keys are sorted lexicographically and finite numbers use full-precision
+  `canonical-decimal-str` (matching DAG-CBOR `toDagCborSafe` and JS
+  `JSON.stringify`), so outputs are byte-identical across JVM, Babashka, nbb,
+  and ClojureScript without 4-decimal rounding drift."
   [v]
   (cond
     (nil? v) "null"
     (true? v) "true"
     (false? v) "false"
-    (number? v) (if (finite-number? v) (fmt-num v) "null")
+    (number? v) (if (finite-number? v) (canonical-decimal-str v) "null")
     (string? v) (escape-json-string v)
     (keyword? v) (escape-json-string (json-key-str v))
     (symbol? v) (escape-json-string (str v))

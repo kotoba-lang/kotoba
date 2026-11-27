@@ -147,13 +147,19 @@
         (is (= #{"connector:jp.geps" "connector:jp.kkj"}
                (set (map #(get % "id") (:rows res)))))))
 
-    (testing "ontology.query_sparql executes PREFIX-expanded QNames, typed/language RDF literals, and returns algebra-edn"
+    (testing "ontology.query_sparql executes PREFIX-expanded QNames, strict typed/language RDF literals (no lexical fallback), EDN/JSON algebra inputs, and returns :pattern algebra-edn"
       (let [sel (ov/invoke graph "ontology.query_sparql"
                            {:sparql "SELECT ?s ?cid WHERE { ?s ipld:cid ?cid } LIMIT 10"})
             ask-yes (ov/invoke graph "ontology.query_sparql"
                                {:sparql "ASK { connector:jp.kkj produces type:tender }"})
             ask-no (ov/invoke graph "ontology.query_sparql"
                               {:sparql "ASK { connector:jp.kkj produces type:nonexistent }"})
+            by-edn (ov/invoke graph "ontology.query_sparql"
+                              {:algebraEdn "{:sparql/op :project :vars [?s ?cid] :pattern {:sparql/op :bgp :patterns [[?s \"ipld:cid\" ?cid]]}}"})
+            by-alg (ov/invoke graph "ontology.query_sparql"
+                              {:algebra {:op "slice" :offset 0 :limit 2
+                                         :pattern {:op "project" :vars ["?s" "?cid"]
+                                                   :pattern {:op "bgp" :patterns [["?s" "ipld:cid" "?cid"]]}}}})
             rdf-g (ov/project-graph
                    {:quads [{:subject {:rdf/type :iri :value "urn:ex:s1"}
                              :predicate {:rdf/type :iri :value "http://vocab-a.example/rel"}
@@ -170,22 +176,31 @@
                                       :datatype {:rdf/type :iri :value "http://www.w3.org/2001/XMLSchema#integer"}}}]})
             pfx-a (ov/invoke rdf-g "ontology.query_sparql"
                              {:sparql "PREFIX va: <http://vocab-a.example/> SELECT ?s ?o WHERE { ?s va:rel ?o }"})
-            lit-lang (ov/invoke rdf-g "ontology.query_sparql"
-                                {:sparql "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> SELECT ?s ?l WHERE { ?s rdfs:label ?l }"})
+            lit-lang-exact (ov/invoke rdf-g "ontology.query_sparql"
+                                      {:sparql "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ASK { <urn:ex:s1> rdfs:label \"Hello\"@en }"})
+            lit-lang-plain (ov/invoke rdf-g "ontology.query_sparql"
+                                      {:sparql "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ASK { <urn:ex:s1> rdfs:label \"Hello\" }"})
             lit-typed (ov/invoke rdf-g "ontology.query_sparql"
                                  {:sparql "PREFIX sch: <http://schema.example/> ASK { <urn:ex:s1> sch:amount \"42\"^^xsd:integer }"})
             lit-bare (ov/invoke rdf-g "ontology.query_sparql"
                                 {:sparql "PREFIX sch: <http://schema.example/> ASK { <urn:ex:s1> sch:amount \"42\" }"})]
         (is (= "sparql-readonly-v1" (:dialect sel)))
-        (is (= "SELECT" (:form sel)))
+        (is (= "select" (:form sel)))
         (is (string? (:algebra-edn sel)))
-        (is (str/includes? (:algebra-edn sel) ":sparql/op"))
+        (is (str/includes? (:algebra-edn sel) ":pattern"))
+        (is (not (str/includes? (:algebra-edn sel) ":child")))
         (is (pos? (:row-count sel)))
-        (is (true? (:ask ask-yes)))
-        (is (false? (:ask ask-no)))
+        (is (= (:bindings sel) (:bindings by-edn)))
+        (is (= 2 (:row-count by-alg)))
+        (is (= "ask" (:form ask-yes)))
+        (is (true? (:boolean ask-yes)))
+        (is (false? (:boolean ask-no)))
         (is (= 1 (:row-count pfx-a))
             "PREFIX va: must expand va:rel to http://vocab-a.example/rel without colliding with vocab-b")
         (is (= "urn:ex:o1" (get-in pfx-a [:bindings 0 "?o"])))
-        (is (some #(= "Hello@en" (get % "?l")) (:bindings lit-lang)))
-        (is (true? (:ask lit-typed)))
-        (is (true? (:ask lit-bare)))))))
+        (is (true? (:boolean lit-lang-exact)))
+        (is (false? (:boolean lit-lang-plain))
+            "plain literal must NOT implicitly match language-tagged literal @en")
+        (is (true? (:boolean lit-typed)))
+        (is (false? (:boolean lit-bare))
+            "plain literal must NOT implicitly match typed literal ^^xsd:integer")))))

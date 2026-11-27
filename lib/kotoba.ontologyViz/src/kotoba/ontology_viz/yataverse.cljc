@@ -143,6 +143,7 @@
      (when (and (some? raw-meta) (not (map? raw-meta)))
        (v/fail! :invalid-yataverse-graph "top-level meta must be a map" {:meta raw-meta}))
      (v/assert-bounded-and-no-remote-context! resolved-limits yv)
+     (v/assert-no-forbidden-wire-keys! resolved-limits yv)
      (let [raw-nodes (or (mget yv :nodes) [])
            raw-edges (or (mget yv :edges) [])
            raw-joins (or (mget yv :joins) [])
@@ -392,16 +393,51 @@
               :layer yv-layer
               :meta meta-map}))
          nodes)
+        ;; On newly projected Kotoba native graphs (no preserved :yataverse-layers),
+        ;; sort edges by Yataverse generator phase order (produces -> join ->
+        ;; fact instance/source -> join-instance -> other Kotoba edges) and assign
+        ;; sequential numeric IDs e1..eN per KotobaSpec v1.0.1.
+        native-phase-key (fn [e]
+                           (let [k (:kind e)
+                                 phase (case k
+                                         :produces 0
+                                         :join 1
+                                         :instance-of 2
+                                         :provenance 2
+                                         :join-instance 3
+                                         4)
+                                 sub-phase (case k
+                                             :instance-of 0
+                                             :provenance 1
+                                             0)]
+                             [phase
+                              (if (#{1 3} phase) (:label e) (:source e))
+                              sub-phase
+                              (:source e)
+                              (:target e)
+                              (:label e)
+                              (:id e)]))
         yv-edges
-        (mapv
-         (fn [e]
-           {:id (:id e)
-            :from (:source e)
-            :to (:target e)
-            :label (or (:label e) "")
-            :kind (get kotoba-edge-kind->yv-edge-kind (:kind e) (name (or (:kind e) :provenance)))
-            :meta (stringify-map-keys (:metadata e))})
-         edges)
+        (if (:yataverse-layers basis)
+          (mapv
+           (fn [e]
+             {:id (:id e)
+              :from (:source e)
+              :to (:target e)
+              :label (or (:label e) "")
+              :kind (get kotoba-edge-kind->yv-edge-kind (:kind e) (name (or (:kind e) :provenance)))
+              :meta (stringify-map-keys (:metadata e))})
+           edges)
+          (vec
+           (map-indexed
+            (fn [idx e]
+              {:id (str "e" (inc idx))
+               :from (:source e)
+               :to (:target e)
+               :label (or (:label e) "")
+               :kind (get kotoba-edge-kind->yv-edge-kind (:kind e) (name (or (:kind e) :provenance)))
+               :meta (stringify-map-keys (:metadata e))})
+            (sort-by native-phase-key edges))))
         yv-joins
         (mapv
          (fn [j]
@@ -512,5 +548,6 @@
               :coverage (or (:coverage basis) computed-coverage)
               :truncated truncated?
               :edgesTruncated edges-truncated?}
+        _ (v/assert-no-forbidden-wire-keys! body)
         {computed-graph-cid :cid} (dcbor/encode-ontology-graph-dag-cbor body)]
     (assoc body :graphCid computed-graph-cid)))

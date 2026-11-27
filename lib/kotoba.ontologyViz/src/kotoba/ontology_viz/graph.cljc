@@ -713,6 +713,8 @@
          rule (or (:match-rule join-spec) (if (seq (:mapping join-spec)) :mapping :exact))
          on-ambiguous (or (:on-ambiguous join-spec) :error)
          max-pairs (or (:max-join-pairs limits) (:max-join-pairs v/default-limits))
+         max-comparisons (or (:max-join-comparisons limits) (:max-join-comparisons v/default-limits))
+         comparisons (volatile! 0)
          mapping (into {} (map (fn [[k val]] [(str k) (str val)])) (or (:mapping join-spec) {}))
          exclude-set (set (concat (:exclude join-spec) (:exclude-values join-spec)))
          src-raw (resolve-scoped-values (:source-values join-spec) (:from-type join-spec) from-attr
@@ -738,9 +740,20 @@
                 (update acc :excluded conj s)
                 (let [norm (normalize-join-val rule mapping sv)
                       candidates (if (= rule :prefix)
-                                   (vec (filter #(or (str/starts-with? % norm)
-                                                     (str/starts-with? norm %))
-                                                tgt-sorted))
+                                   (persistent!
+                                    (reduce
+                                     (fn [matches tv]
+                                       (let [c (vswap! comparisons inc)]
+                                         (when (> c max-comparisons)
+                                           (v/fail! :max-join-comparisons-exceeded
+                                                    (str "join " join-id " exceeded max-join-comparisons (" max-comparisons ")")
+                                                    {:join-id join-id :limit max-comparisons :comparisons c})))
+                                       (if (or (str/starts-with? tv norm)
+                                               (str/starts-with? norm tv))
+                                         (conj! matches tv)
+                                         matches))
+                                     (transient [])
+                                     tgt-sorted))
                                    (get tgt-index norm []))]
                   (cond
                     (empty? candidates)
@@ -968,7 +981,8 @@
         all-cids (vec (sort (distinct (keep identity (concat (when root-cid [root-cid])
                                                              (map :cid nodes)
                                                              (map :cid edges))))))
-        cid-ver (or (:basis-cid-verification raw-basis) (:cid-verification raw-basis) :syntax-only)
+        ;; Unverified projection never self-promotes basisCid to :verified
+        cid-ver :syntax-only
         basis (cond-> {:schema-version schema-version
                        :codec (str (or (:codec raw-basis) "dag-cbor"))
                        :hash-alg (str (or (:hash-alg raw-basis) "sha2-256"))

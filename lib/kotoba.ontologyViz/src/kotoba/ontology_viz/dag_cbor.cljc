@@ -229,101 +229,147 @@
                    (<= -9007199254740991 r 9007199254740991))
           r)))))
 
-(defn- canonical-decimal-str
-  "Format a finite non-integer number matching ECMAScript `String(value)` in
-  Yataverse `toDagCborSafe` across JVM Clojure, Babashka, nbb, and CLJS."
-  [x]
-  #?(:cljs (js/String (double x))
-     :clj (let [d (double x)
-                abs-d (Math/abs d)]
-            (if (and (>= abs-d 1.0e-6) (< abs-d 1.0e21))
-              (.toPlainString (.stripTrailingZeros (java.math.BigDecimal/valueOf d)))
-              (let [s (str d)
-                    [mant exp] (str/split s #"E")
-                    mant-clean (if (str/ends-with? mant ".0")
-                                 (subs mant 0 (- (count mant) 2))
-                                 mant)
-                    exp-int (Long/parseLong exp)
-                    exp-str (if (neg? exp-int) (str "e" exp-int) (str "e+" exp-int))]
-                (str mant-clean exp-str))))))
+(def default-max-cbor-items 100000)
+(def hard-max-cbor-items 200000)
+(def default-max-cbor-bytes 4194304)
+(def hard-max-cbor-bytes 8388608)
+(def default-max-cbor-depth 64)
+(def hard-max-cbor-depth 64)
 
-(defn- encode-item! [out x depth]
-  (when (> depth 64)
-    (v/fail! :max-depth-exceeded "DAG-CBOR encoding depth exceeded 64" {:depth depth}))
-  (cond
-    (nil? x)
-    (conj! out 0xf6)
+(defn- resolve-cbor-limits [opts]
+  (let [clamp (fn [k default-v hard-v]
+                (let [v (get opts k default-v)]
+                  (when-not (and (integer? v) (pos? v) (<= v hard-v))
+                    (v/fail! :invalid-limit
+                             (str "DAG-CBOR limit " k " must be an integer in [1, " hard-v "], got: " (pr-str v))
+                             {:key k :value v :ceiling hard-v}))
+                  v))]
+    {:max-items (clamp :max-items default-max-cbor-items hard-max-cbor-items)
+     :max-bytes (clamp :max-bytes default-max-cbor-bytes hard-max-cbor-bytes)
+     :max-depth (clamp :max-depth default-max-cbor-depth hard-max-cbor-depth)}))
 
-    (true? x)
-    (conj! out 0xf5)
+(defn- check-cbor-bytes! [out max-bytes]
+  (when (> (count out) max-bytes)
+    (v/fail! :dag-cbor-byte-limit-exceeded
+             (str "DAG-CBOR output exceeded max-bytes (" max-bytes ")")
+             {:limit max-bytes :actual (count out)}))
+  out)
 
-    (false? x)
-    (conj! out 0xf4)
+(defn- encode-item! [out x depth limits items-vol]
+  (let [max-depth (:max-depth limits)
+        max-items (:max-items limits)
+        max-bytes (:max-bytes limits)
+        visited (vswap! items-vol inc)]
+    (when (> visited max-items)
+      (v/fail! :dag-cbor-item-limit-exceeded
+               (str "DAG-CBOR encoding exceeded max-items (" max-items ")")
+               {:limit max-items :visited visited}))
+    (when (> depth max-depth)
+      (v/fail! :max-depth-exceeded (str "DAG-CBOR encoding depth exceeded " max-depth) {:depth depth :limit max-depth}))
+    (check-cbor-bytes! out max-bytes)
+    (cond
+      (nil? x)
+      (check-cbor-bytes! (conj! out 0xf6) max-bytes)
 
-    (number? x)
-    (do
-      (when-not (esc/finite-number? x)
-        (v/fail! :dag-cbor-non-finite "DAG-CBOR forbids NaN/Infinity" {:value x}))
-      (if-let [iv (safe-integer-val x)]
-        (if (>= iv 0)
-          (push-head! out 0 iv)
-          (push-head! out 1 (- -1 iv)))
-        ;; Yataverse toDagCborSafe decimal wrapper for non-integer floats
-        (encode-item! out {"$awaiType" "decimal" "value" (canonical-decimal-str x)} (inc depth))))
+      (true? x)
+      (check-cbor-bytes! (conj! out 0xf5) max-bytes)
 
-    (string? x)
-    (let [bs (utf8-bytes x)]
-      (-> out (push-head! 3 (count bs)) (push-bytes! bs)))
+      (false? x)
+      (check-cbor-bytes! (conj! out 0xf4) max-bytes)
 
-    (keyword? x)
-    (let [bs (utf8-bytes (key-str x))]
-      (-> out (push-head! 3 (count bs)) (push-bytes! bs)))
+      (number? x)
+      (do
+        (when-not (esc/finite-number? x)
+          (v/fail! :dag-cbor-non-finite "DAG-CBOR forbids NaN/Infinity" {:value x}))
+        (if-let [iv (safe-integer-val x)]
+          (check-cbor-bytes!
+           (if (>= iv 0)
+             (push-head! out 0 iv)
+             (push-head! out 1 (- -1 iv)))
+           max-bytes)
+          ;; Yataverse toDagCborSafe decimal wrapper for non-integer floats
+          (encode-item! out {"$awaiType" "decimal" "value" (esc/canonical-decimal-str x)} (inc depth) limits items-vol)))
 
-    (v/ipld-link? x)
-    (let [cid-str (v/extract-cid x)
-          cid-bs (v/cidv1-bytes cid-str)
-          payload (into [0x00] cid-bs)]
-      (-> out
-          (conj! 0xd8)
-          (conj! 0x2a)
-          (push-head! 2 (count payload))
-          (push-bytes! payload)))
+      (string? x)
+      (let [bs (utf8-bytes x)]
+        (when (> (+ (count out) (count bs) 9) max-bytes)
+          (v/fail! :dag-cbor-byte-limit-exceeded
+                   (str "DAG-CBOR text string would exceed max-bytes (" max-bytes ")")
+                   {:limit max-bytes}))
+        (check-cbor-bytes! (-> out (push-head! 3 (count bs)) (push-bytes! bs)) max-bytes))
 
-    (sequential? x)
-    (let [out1 (push-head! out 4 (count x))]
-      (reduce (fn [acc item] (encode-item! acc item (inc depth))) out1 x))
+      (keyword? x)
+      (let [bs (utf8-bytes (key-str x))]
+        (check-cbor-bytes! (-> out (push-head! 3 (count bs)) (push-bytes! bs)) max-bytes))
 
-    (map? x)
-    (let [entries (map (fn [[k val]]
-                         (let [ks (key-str k)]
-                           [(utf8-bytes ks) ks val]))
-                       x)
-          sorted (sort (fn [[ba _ _] [bb _ _]] (compare-byte-vecs ba bb)) entries)]
-      (loop [prev nil
-             rem-s sorted]
-        (when-let [[kb ks _] (first rem-s)]
-          (when (and prev (= prev kb))
-            (v/fail! :dag-cbor-duplicate-key (str "duplicate DAG-CBOR map key: " ks) {:key ks}))
-          (recur kb (next rem-s))))
-      (let [out1 (push-head! out 5 (count sorted))]
-        (reduce (fn [acc [kb _ val]]
-                  (-> acc
-                      (push-head! 3 (count kb))
-                      (push-bytes! kb)
-                      (encode-item! val (inc depth))))
-                out1
-                sorted)))
+      (v/ipld-link? x)
+      (let [cid-str (v/extract-cid x)
+            cid-bs (v/cidv1-bytes cid-str)
+            payload (into [0x00] cid-bs)]
+        (check-cbor-bytes!
+         (-> out
+             (conj! 0xd8)
+             (conj! 0x2a)
+             (push-head! 2 (count payload))
+             (push-bytes! payload))
+         max-bytes))
 
-    :else
-    (v/fail! :dag-cbor-unsupported-value
-             (str "value is not DAG-CBOR encodable: " (pr-str x))
-             {:value x})))
+      (sequential? x)
+      (let [remaining (max 0 (- max-items visited))
+            n (bounded-count (inc remaining) x)]
+        (when (> n remaining)
+          (v/fail! :dag-cbor-item-limit-exceeded
+                   (str "DAG-CBOR array exceeds remaining item budget (" max-items ")")
+                   {:limit max-items :observed-at-least (+ visited n)}))
+        (let [out1 (check-cbor-bytes! (push-head! out 4 n) max-bytes)]
+          (reduce (fn [acc item] (encode-item! acc item (inc depth) limits items-vol)) out1 x)))
+
+      (map? x)
+      (let [remaining (max 0 (- max-items visited))
+            n (bounded-count (inc remaining) x)]
+        (when (> n remaining)
+          (v/fail! :dag-cbor-item-limit-exceeded
+                   (str "DAG-CBOR map exceeds remaining item budget (" max-items ")")
+                   {:limit max-items :observed-at-least (+ visited n)}))
+        (let [entries (map (fn [[k val]]
+                             (let [ks (key-str k)]
+                               (when (contains? v/forbidden-object-keys ks)
+                                 (v/fail! :forbidden-wire-key
+                                          (str "forbidden DAG-CBOR map key: " ks)
+                                          {:key ks}))
+                               [(utf8-bytes ks) ks val]))
+                           x)
+              sorted (sort (fn [[ba _ _] [bb _ _]] (compare-byte-vecs ba bb)) entries)]
+          (loop [prev nil
+                 rem-s sorted]
+            (when-let [[kb ks _] (first rem-s)]
+              (when (and prev (= prev kb))
+                (v/fail! :dag-cbor-duplicate-key (str "duplicate DAG-CBOR map key: " ks) {:key ks}))
+              (recur kb (next rem-s))))
+          (let [out1 (check-cbor-bytes! (push-head! out 5 n) max-bytes)]
+            (reduce (fn [acc [kb _ val]]
+                      (-> acc
+                          (push-head! 3 (count kb))
+                          (push-bytes! kb)
+                          (check-cbor-bytes! max-bytes)
+                          (encode-item! val (inc depth) limits items-vol)))
+                    out1
+                    sorted))))
+
+      :else
+      (v/fail! :dag-cbor-unsupported-value
+               (str "value is not DAG-CBOR encodable: " (pr-str x))
+               {:value x}))))
 
 (defn encode-dag-cbor
   "Encode `value` into a vector of unsigned canonical DAG-CBOR bytes matching
-  Yataverse's `encodeDagCbor(toDagCborSafe(value))` byte-for-byte."
-  [value]
-  (persistent! (encode-item! (transient []) value 0)))
+  Yataverse's `encodeDagCbor(toDagCborSafe(value))` byte-for-byte, enforcing
+  explicit depth, item-count, and output-byte budgets."
+  ([value] (encode-dag-cbor value {}))
+  ([value opts]
+   (let [limits (resolve-cbor-limits (or opts {}))
+         items (volatile! 0)]
+     (persistent! (encode-item! (transient []) value 0 limits items)))))
 
 (defn cidv1-dag-cbor
   "Compute canonical lower-case base32 CIDv1 (`0x01 0x71 0x12 0x20 || sha256(bytes)`)
@@ -336,11 +382,13 @@
 (defn encode-ontology-graph-dag-cbor
   "Compute canonical DAG-CBOR bytes and CIDv1 (`graphCid`) for a Yataverse
   `yataverse.ontology.graph/v1` map (excluding any self-referential `graphCid`
-  key). Returns `{:cid \"bafyrei...\" :bytes [...] :byte-length n}`."
+  key and refusing any internal verification fields or prototype-pollution keys
+  anywhere inside the payload). Returns `{:cid \"bafyrei...\" :bytes [...] :byte-length n}`."
   [yv-graph]
   (when-not (map? yv-graph)
     (v/fail! :invalid-yataverse-graph "expected Yataverse graph map for DAG-CBOR encoding" {}))
   (let [body (dissoc yv-graph :graphCid "graphCid")
+        _ (v/assert-no-forbidden-wire-keys! body)
         bytes (encode-dag-cbor body)
         cid (cidv1-dag-cbor bytes)]
     {:cid cid

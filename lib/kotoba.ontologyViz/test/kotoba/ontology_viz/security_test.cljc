@@ -86,6 +86,9 @@
       (is (= :invalid-basis
              (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :graph-cid-verification] :bogus)))))
       (is (= :invalid-basis
+             (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :basis-cid-verification] :absent))))
+          ":basis-cid-verification is strictly 2-valued (:syntax-only | :verified); :absent must be refused")
+      (is (= :invalid-basis
              (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :basis-cid-verification] :verified))))
           "contradicting :cid-verification :syntax-only vs :basis-cid-verification :verified must fail closed")
       (is (= :invalid-basis
@@ -96,7 +99,15 @@
                                                       (update :basis dissoc :root-cid)
                                                       (assoc-in [:basis :cid-verification] :verified)
                                                       (assoc-in [:basis :basis-cid-verification] :verified)))))
-          "claiming basis :verified without :root-cid must fail closed"))))
+          "claiming basis :verified without :root-cid must fail closed")
+      (is (= :unverified-basis-claim
+             (refusal-reason #(ov/project-graph {:basis {:root-cid gt/sample-root-cid
+                                                         :cid-verification :verified}})))
+          "project-graph must refuse unbacked caller :verified basis claim")
+      (is (= :unverified-basis-claim
+             (refusal-reason #(ov/project-graph {:basis {:root-cid gt/sample-root-cid
+                                                         :basis-cid-verification :verified}})))
+          "project-graph must refuse unbacked caller :basis-cid-verification :verified"))))
 
 (deftest remote-context-and-external-fetch-refused-test
   (testing "remote JSON-LD @context string or @import directive fails closed"
@@ -197,6 +208,30 @@
                         :on-ambiguous :all
                         :source-values ["P"]
                         :target-values ["P1" "P2" "P3" "P4" "P5" "P6"]}]}))))
+    (is (= :max-join-comparisons-exceeded
+           (refusal-reason
+            #(ov/project-graph
+              {:limits {:max-join-comparisons 10}
+               :joins [{:id "join:nonmatch-wide"
+                        :from-attr :a :to-attr :b
+                        :match-rule :prefix
+                        :source-values ["A1" "A2" "A3" "A4"]
+                        :target-values ["Z1" "Z2" "Z3" "Z4"]}]})))
+        "unmatched prefix join comparisons must obey :max-join-comparisons budget")
+    (let [deep-ctx (reduce (fn [acc _] [acc]) {:a "b"} (range 10))]
+      (is (= :max-depth-exceeded
+             (refusal-reason
+              #(ov/project-graph {:limits {:max-depth 5}
+                                  :facts [{:id "f1" "@context" deep-ctx}]})))
+          "deeply nested @context arrays must obey :max-depth"))
+    (is (= :dag-cbor-item-limit-exceeded
+           (refusal-reason
+            #(ov/encode-dag-cbor (map identity (range)) {:max-items 20})))
+        "encode-dag-cbor must bound infinite/huge sequences without hanging")
+    (is (= :dag-cbor-byte-limit-exceeded
+           (refusal-reason
+            #(ov/encode-dag-cbor {"big" (apply str (repeat 200 "a"))} {:max-bytes 64})))
+        "encode-dag-cbor must enforce explicit byte budget")
     (let [wide-g (ov/project-graph
                   {:ontology {:object-types
                               (vec (for [i (range 35)]
@@ -299,7 +334,7 @@
                                  :limit 1})
             sel-last (ov/invoke big-graph "ontology.query_sparql"
                                 {:sparql "SELECT ?s WHERE { ?s rdf:type object-type . ?s rdfs:label \"Type 59\" } LIMIT 1"})]
-        (is (true? (:ask ask-last)))
+        (is (true? (:boolean ask-last)))
         (is (= 1 (:row-count sel-last)))
         (is (= "type:t59" (get-in sel-last [:bindings 0 "?s"])))))
 

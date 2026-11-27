@@ -202,23 +202,48 @@
       (is (= "yataverse.ontology.graph/v1" (get-in g-res [:result :schema])))
       (is (= 2 (count (get-in i-res [:result :objectTypes]))))
       (is (= 3 (count (get-in i-res [:result :connectors]))))
-      (is (= "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"
-             (get-in i-res [:result :blockCids :root])))
-      (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"
-             (get-in i-res [:result :blockCids :graph])))
-      (is (= "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"
-             (get-in i-node [:result :blockCids :graph])))
+      (is (= "yataverse.ontology.graph/v1" (get-in i-res [:result :schema]))
+          "graph-only inspect must not masquerade as yataverse.ontology.snapshot/v1")
+      (is (= "graph-only" (get-in i-res [:result :inspectionScope])))
+      (is (false? (get-in i-res [:result :snapshotClosureVerified])))
+      (is (= {:graph "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"}
+             (get-in i-res [:result :blockCids]))
+          "graph-only inspect must not fabricate snapshot block closure CIDs")
+      (is (= {:graph "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"}
+             (get-in i-node [:result :blockCids])))
       (is (= "yataverse.ontology.operations/v1" (get-in v-res [:result :semanticSchema :schema])))
       (is (some? (get-in v-res [:result :viewModel])))
       (is (string? (get-in v-res [:result :svg])))
       (is (string? (get-in v-res [:result :html])))
       (is (= 3 (get-in s-res [:result :rowCount])))
       (is (= 9 (get-in s-res [:result :scannedRows])))
+      (is (= "select" (get-in q-res [:result :form])))
       (is (= 5 (get-in q-res [:result :rowCount])))
       (is (string? (get-in q-res [:result :algebraEdn])))
-      (is (str/includes? (get-in q-res [:result :algebraEdn]) ":sparql/op"))))
+      (is (str/includes? (get-in q-res [:result :algebraEdn]) ":pattern"))
+      ;; Yataverse PR #83 ASK shape (form: "ask", boolean: true/false) + algebraEdn input
+      (let [ask-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sparql"
+                                         {:query "ASK { connector:jp.kkj produces type:tender }"})
+            edn-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sparql"
+                                         {:algebraEdn "{:sparql/op :project :vars [?s] :pattern {:sparql/op :bgp :patterns [[?s \"produces\" \"type:tender\"]]}}"})]
+        (is (= "ask" (get-in ask-res [:result :form])))
+        (is (true? (get-in ask-res [:result :boolean])))
+        (is (not (contains? (:result ask-res) :ask)))
+        (is (= 2 (get-in edn-res [:result :rowCount]))))
+      ;; activeLayers: [] and maxNodes enforcement + unsupported carBase64 refusal
+      (let [empty-al-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:activeLayers []})
+            empty-al-v (ov/invoke-yataverse yataverse-pr83-fixture "ontology.view" {:format "json" :activeLayers []})
+            capped-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 4})]
+        (is (= 0 (count (get-in empty-al-g [:result :nodes]))))
+        (is (= 0 (count (get-in empty-al-g [:result :edges]))))
+        (is (= 0 (count (get-in empty-al-v [:result :viewModel :graph :nodes]))))
+        (is (= 4 (count (get-in capped-g [:result :nodes]))))
+        (is (true? (get-in capped-g [:result :truncated])))
+        (is (= :invalid-limit (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 0}))))
+        (is (= :invalid-limit (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 501}))))
+        (is (= :unsupported-operation-param (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.inspect" {:carBase64 "AAAA"})))))))
 
-  (testing "KotobaSpec v1.0: basisCid pin and visibility (allowedSources / jurisdiction) fail closed"
+  (testing "KotobaSpec v1.0: basisCid pin and visibility (allowedSources / jurisdiction) fail closed AND recompute joins/coverage"
     (let [wrong-cid "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
           deny-all (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph"
                                         {:visibility {:allowedSources []}})
@@ -237,13 +262,21 @@
       (is (= 0 (count (get-in deny-all [:result :nodes])))
           "empty allowedSources: [] must fail closed with 0 nodes")
       (is (= 0 (count (get-in deny-all [:result :edges]))))
+      (is (= 0 (count (get-in deny-all [:result :joins])))
+          "empty allowedSources: [] must not leak join metadata")
+      (is (= 0 (get-in deny-all [:result :coverage :totalMatchedJoinRows])))
       (is (= 0 (get-in deny-sql [:result :rowCount])))
       (is (= ["fact:tender:kkj-2026-001"]
              (mapv :id (filter #(= "fact" (:kind %)) (get-in only-kkj [:result :nodes]))))
           "allowedSources: [jp.kkj] must filter out jp.geps and jp.agencies facts")
+      (is (= 0 (get-in only-kkj [:result :joins 0 :matchedRows]))
+          "when right-hand agency facts are filtered out by allowedSources, join matchedRows must recompute to 0")
+      (is (= 1 (get-in only-kkj [:result :joins 0 :leftCount])))
       (is (= #{"fact:agency:ag-tokyo" "fact:tender:geps-2026-042"}
              (set (map :id (filter #(= "fact" (:kind %)) (get-in only-tokyo [:result :nodes])))))
           "jurisdiction: jp-tokyo must keep only jp-tokyo facts")
+      (is (= 1 (get-in only-tokyo [:result :joins 0 :matchedRows]))
+          "jurisdiction: jp-tokyo must recompute join matchedRows to 1 (not leak 2 from jp-national)")
       (is (= 0 (count (filter #(= "fact" (:kind %)) (get-in deny-jur [:result :nodes]))))
           "empty jurisdiction: [] must fail closed")))
 
@@ -405,4 +438,29 @@
                             "graphCidVerified" "basisCidVerified" "verificationScope"
                             "graphVerification" "basisVerification"]]
           (is (not (contains? yv internal-k))
-              (str "wire yataverse.ontology.graph/v1 must NEVER contain internal verification key " internal-k)))))))
+              (str "wire yataverse.ontology.graph/v1 must NEVER contain internal verification key " internal-k)))))
+
+    (testing "Native Kotoba graph -> Yataverse uses sequential e1..eN phase-ordered edges, full-precision decimal JSON, and refuses injected verification/proto keys"
+      (let [native-kg (ov/project-graph
+                       {:ontology {:object-types [{:id :agency :name "Agency"}
+                                                  {:id :tender :name "Tender"}]}
+                        :connectors {:connectors [{:id :jp.agencies :name "Agencies" :object-type :agency}
+                                                  {:id :jp.kkj :name "KKJ" :object-type :tender}]}
+                        :facts [{:id "t-1" :ontology/type :tender :ontology/source :jp.kkj
+                                 :ontology/confidence 0.123456789}]
+                        :basis {:root-cid "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"}})
+            native-yv (ov/->yataverse-graph native-kg)
+            native-json (ov/json-encode native-yv)]
+        (is (= (mapv #(str "e" (inc %)) (range (count (:edges native-yv))))
+               (mapv :id (:edges native-yv)))
+            "native Kotoba graph exported to Yataverse must number edges sequentially e1..eN")
+        (is (str/includes? native-json "0.123456789")
+            "json-encode must preserve full-precision decimals matching DAG-CBOR (no 4-decimal rounding)")
+        ;; Injected verification keys in node meta or edge metadata fail closed
+        (let [bad-node-meta (assoc-in native-yv [:nodes 0 :meta "graphCidVerified"] true)
+              bad-edge-meta (assoc-in native-yv [:edges 0 :meta "verificationScope"] "graph-cid-only")
+              bad-proto (assoc native-yv "__proto__" {"polluted" true})]
+          (is (= :forbidden-verification-field (refusal-reason #(ov/encode-ontology-graph-dag-cbor bad-node-meta))))
+          (is (= :forbidden-verification-field (refusal-reason #(ov/<-yataverse-graph bad-node-meta))))
+          (is (= :forbidden-verification-field (refusal-reason #(ov/encode-ontology-graph-dag-cbor bad-edge-meta))))
+          (is (= :forbidden-wire-key (refusal-reason #(ov/encode-ontology-graph-dag-cbor bad-proto)))))))))

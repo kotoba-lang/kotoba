@@ -4,7 +4,8 @@
   full RDF predicate IRIs, typed/language literals, algebraEdn, scannedRows,
   total scan budgets, and basis/visibility enforcement), plus Yataverse PR #83
   operation adapter (`invoke-yataverse`)."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [kotoba.ontology-viz.graph :as g]
             [kotoba.ontology-viz.svg :as svg]
             [kotoba.ontology-viz.validate :as v]
@@ -198,12 +199,68 @@
       (and (map? vis) (contains? vis s)) [true (get vis s)]
       :else [false nil])))
 
+(defn- recompute-visible-joins
+  "Recompute join counts and coverage strictly from the visible `kept-nodes`
+  and `kept-edges` so visibility filtering (`allowedSources` / `jurisdiction`)
+  never leaks restricted join counts, matched pairs, or coverage ratios."
+  [joins kept-nodes kept-edges]
+  (let [kept-ids (set (map :id kept-nodes))
+        entity-nodes (filter #(= :entity (:kind %)) kept-nodes)
+        type-counts (frequencies
+                     (keep (fn [n]
+                             (or (get-in n [:provenance :type])
+                                 (get-in n [:meta "ontology/type"])))
+                           entity-nodes))
+        join-inst-edges (filter #(= :join-instance (:kind %)) kept-edges)]
+    (vec
+     (keep
+      (fn [j]
+        (let [fn-id (:from-node j)
+              tn-id (:to-node j)]
+          (when (and (contains? kept-ids fn-id)
+                     (contains? kept-ids tn-id))
+            (let [jname (or (:name j) (:id j))
+                  ltype (or (:from-type j)
+                            (when (and (string? fn-id) (str/starts-with? fn-id "type:"))
+                              (subs fn-id 5)))
+                  rtype (or (:to-type j)
+                            (when (and (string? tn-id) (str/starts-with? tn-id "type:"))
+                              (subs tn-id 5)))
+                  matching-edges (filter #(= (:label %) jname) join-inst-edges)
+                  lcnt (get type-counts ltype 0)
+                  rcnt (get type-counts rtype 0)
+                  matched-left (count (distinct (map :source matching-edges)))
+                  matched-rows (count matching-edges)
+                  unmatched (max 0 (- lcnt matched-left))
+                  cov (when (pos? lcnt)
+                        (/ (double matched-left) (double lcnt)))
+                  status (cond
+                           (zero? lcnt) :schema-only
+                           (= matched-left lcnt) :full
+                           (pos? matched-left) :partial
+                           :else :unmatched)]
+              (assoc j
+                     :total-source-count lcnt
+                     :eligible-count lcnt
+                     :right-count rcnt
+                     :matched-count matched-left
+                     :matched-rows matched-rows
+                     :unmatched-count unmatched
+                     :excluded-count 0
+                     :coverage cov
+                     :status status
+                     :matched-pairs []
+                     :unmatched-values []
+                     :excluded-values [])))))
+      joins))))
+
 (defn apply-visibility
   "Enforce `:basisCid`/`:basis` pin and `:allowedSources` / `:jurisdiction`
-  visibility constraints (top-level or nested under `:visibility`) fail-closed.
+  visibility constraints (top-level or nested under `:visibility`) fail-closed,
+  recomputing `:joins`, counts, and coverage strictly over visible nodes.
 
   Crucially:
-  - Explicit `:allowedSources []` denies ALL nodes (fail-closed -> 0 nodes/edges).
+  - Explicit `:allowedSources []` denies ALL nodes (fail-closed -> 0 nodes/edges/joins).
   - Explicit `:jurisdiction []` denies ALL jurisdiction-bearing nodes (and facts)."
   [graph params]
   (assert-basis-pin! graph params)
@@ -244,18 +301,21 @@
             kept-edges (vec (filter #(and (contains? kept-ids (:source %))
                                           (contains? kept-ids (:target %)))
                                     (:edges graph)))
+            kept-joins (recompute-visible-joins (:joins graph) kept-nodes kept-edges)
             kept-layers (g/build-layers kept-nodes)
             updated (-> graph
                         (assoc :nodes kept-nodes
                                :edges kept-edges
-                               :layers kept-layers)
+                               :layers kept-layers
+                               :joins kept-joins)
                         (update :basis (fn [b]
                                          (-> b
                                              (dissoc :graph-cid :stats :coverage :yataverse-layers)
                                              (assoc :graph-cid-verification :absent
                                                     :node-count (count kept-nodes)
                                                     :edge-count (count kept-edges)
-                                                    :layer-count (count kept-layers))))))]
+                                                    :layer-count (count kept-layers)
+                                                    :join-count (count kept-joins))))))]
         (g/layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))))
 
 ;; ── Portable regex & safe bounded integer parsing ────────────────────────────
@@ -586,13 +646,14 @@
 (defn- sparql-var? [tok]
   (and (string? tok) (str/starts-with? tok "?")))
 
-(defn- constant-term-matches? [pat actual]
+(defn- constant-term-matches?
+  "Strict RDF term comparison: NEVER falls back to bare lexical matching on
+  typed (`^^<dt>`) or language-tagged (`@lang`) literals."
+  [pat actual]
   (let [actual-s (str actual)
         pat-clean (canonical-node-term pat)]
     (or (= pat actual-s)
-        (= pat-clean actual-s)
-        (when-let [bare (strip-literal-decorations actual-s)]
-          (= pat bare)))))
+        (= pat-clean actual-s))))
 
 (defn- match-sparql-term [pat actual bindings]
   (if (sparql-var? pat)
@@ -672,7 +733,8 @@
      patterns)))
 
 (defn- build-algebra-edn
-  "Build a deterministic `kotoba.sparql`-compatible EDN algebra string."
+  "Build a deterministic `kotoba.sparql` / Yataverse PR #83-compatible EDN
+  algebra string using `:pattern` as the uniform composition key."
   [form patterns proj-vars limit-n]
   (let [bgp {:sparql/op :bgp
              :patterns (mapv (fn [[s p o]]
@@ -681,70 +743,204 @@
                                 (if (sparql-var? o) (symbol o) o)])
                              patterns)}]
     (pr-str
-     (if (= form "ASK")
-       {:sparql/op :ask :child bgp}
+     (if (= form "ask")
+       bgp
        (let [proj {:sparql/op :project
                    :vars (mapv symbol proj-vars)
-                   :child bgp}]
+                   :pattern bgp}]
          (if limit-n
-           {:sparql/op :slice :offset 0 :limit limit-n :child proj}
+           {:sparql/op :slice :offset 0 :limit limit-n :pattern proj}
            proj))))))
+
+(defn- algebra-term->str [t]
+  (cond
+    (symbol? t) (name t)
+    (string? t) t
+    (map? t)
+    (let [rt (or (:rdf/type t) (:rdfType t) (get t "rdfType") (get t "rdf/type"))
+          rt-name (if (keyword? rt) (name rt) (str rt))
+          val (or (:value t) (get t "value"))
+          lang (or (:language t) (get t "language"))
+          dt (or (:datatype t) (get t "datatype"))]
+      (cond
+        (= rt-name "iri") (str val)
+        (= rt-name "blank") (str val)
+        (= rt-name "literal")
+        (cond
+          lang (str val "@" lang)
+          dt (let [dt-s (if (map? dt) (str (or (:value dt) (get dt "value"))) (str dt))]
+               (str val "^^<" dt-s ">"))
+          :else (str val))
+        :else (v/fail! :invalid-sparql-algebra (str "unsupported RDF term map in SPARQL algebra: " (pr-str t)) {:term t})))
+    :else (v/fail! :invalid-sparql-algebra (str "unsupported term in SPARQL algebra: " (pr-str t)) {:term t})))
+
+(defn- extract-algebra-spec
+  "Normalize a parsed EDN (`{:sparql/op ... :pattern ...}`) or Yataverse JSON
+  (`{:op ... :pattern ...}`) SPARQL algebra tree into
+  `{:form \"select\"|\"ask\" :patterns [[s p o] ...] :vars [...] :limit n}`."
+  ([node] (extract-algebra-spec node 0 nil nil nil))
+  ([node depth form-acc vars-acc limit-acc]
+   (when (> depth 16)
+     (v/fail! :max-depth-exceeded "SPARQL algebra nesting depth exceeded 16" {:depth depth}))
+   (when-not (map? node)
+     (v/fail! :invalid-sparql-algebra "SPARQL algebra node must be a map" {:node node}))
+   (let [raw-op (or (:sparql/op node) (:op node) (get node "op"))
+         op-str (if (keyword? raw-op) (name raw-op) (str raw-op))
+         inner (or (:pattern node) (get node "pattern"))]
+     (case op-str
+       "bgp"
+       (let [pats (or (:patterns node) (get node "patterns"))]
+         (when-not (and (sequential? pats) (seq pats))
+           (v/fail! :invalid-sparql-algebra "BGP algebra requires non-empty :patterns vector" {:node node}))
+         (let [norm-pats (mapv (fn [p]
+                                 (when-not (and (sequential? p) (= 3 (count p)))
+                                   (v/fail! :invalid-sparql-algebra "each BGP pattern must have 3 terms [s p o]" {:pattern p}))
+                                 (mapv algebra-term->str p))
+                               pats)]
+           {:form (or form-acc "select")
+            :patterns norm-pats
+            :vars vars-acc
+            :limit limit-acc}))
+
+       "project"
+       (let [raw-vars (or (:vars node) (get node "vars"))
+             vs (when (sequential? raw-vars)
+                  (mapv (fn [v]
+                          (let [s (if (symbol? v) (name v) (str v))]
+                            (when-not (sparql-var? s)
+                              (v/fail! :invalid-sparql-algebra (str "invalid projected variable: " s) {:var v}))
+                            s))
+                        raw-vars))]
+         (extract-algebra-spec inner (inc depth) (or form-acc "select") vs limit-acc))
+
+       "slice"
+       (let [raw-lim (or (:limit node) (get node "limit"))
+             raw-off (or (:offset node) (get node "offset"))
+             _ (when (and (some? raw-off) (not= 0 raw-off))
+                 (v/fail! :unsupported-sparql-clause "non-zero OFFSET is not supported in read-only slice" {:offset raw-off}))
+             lim (when (some? raw-lim)
+                   (parse-bounded-positive-int! raw-lim max-query-limit :slice/limit :invalid-sparql))]
+         (extract-algebra-spec inner (inc depth) form-acc vars-acc (if limit-acc (min limit-acc (or lim limit-acc)) lim)))
+
+       "ask"
+       (extract-algebra-spec inner (inc depth) "ask" [] limit-acc)
+
+       (v/fail! :unsupported-sparql-clause
+                (str "unsupported SPARQL algebra operator: " op-str)
+                {:op op-str})))))
+
+(defn- parse-algebra-edn! [edn-str]
+  (when-not (and (string? edn-str) (not (str/blank? edn-str)))
+    (v/fail! :invalid-sparql-algebra "algebraEdn must be a non-empty string" {:algebraEdn edn-str}))
+  (when (> (count edn-str) 2048)
+    (v/fail! :invalid-sparql-algebra "algebraEdn exceeds 2048 character safety bound" {:length (count edn-str)}))
+  (let [parsed (try
+                 (edn/read-string edn-str)
+                 (catch #?(:clj Exception :cljs :default) e
+                   (v/fail! :invalid-sparql-algebra
+                            (str "failed to parse algebraEdn: " #?(:clj (.getMessage e) :cljs (.-message e)))
+                            {:algebraEdn edn-str})))]
+    (v/assert-no-forbidden-wire-keys! parsed)
+    parsed))
 
 (defn query-sparql
   "Validate and execute a bounded read-only SPARQL SELECT or ASK BGP query
-  against the projected graph triples, expanding PREFIX declarations,
-  enforcing basis/visibility constraints, and consuming the entire query
-  fail-closed."
+  (accepting SPARQL text via `:sparql`/`:query`, EDN algebra via `:algebraEdn`,
+  or JSON/map algebra via `:algebra`) against the projected graph triples,
+  expanding PREFIX declarations, enforcing basis/visibility constraints, and
+  returning Yataverse PR #83-compatible lowercase `:form` (`\"select\"`/`\"ask\"`),
+  `:boolean` for ASK, and `:pattern`-composed `:algebra-edn`."
   [graph-or-yv params]
   (let [graph (-> (svg/normalize-and-validate-graph graph-or-yv)
                   (apply-visibility params))
-        sparql (extract-query-string! params :sparql :query :invalid-sparql)
-        clean (validate-sparql-readonly! sparql)
+        raw-sparql (or (:sparql params) (:query params))
+        _ (when (and (some? (:sparql params)) (some? (:query params)))
+            (v/fail! :invalid-sparql-arguments "provide only one of :sparql or :query" {}))
+        raw-edn (:algebraEdn params)
+        raw-alg (:algebra params)
+        provided (+ (if (some? raw-sparql) 1 0)
+                    (if (some? raw-edn) 1 0)
+                    (if (some? raw-alg) 1 0))
+        _ (when-not (= 1 provided)
+            (v/fail! :invalid-sparql-arguments
+                     "provide exactly one of :sparql/:query, :algebraEdn, or :algebra"
+                     {:provided provided}))
         param-limit (if (contains? params :limit)
                       (parse-bounded-positive-int! (:limit params) max-query-limit :limit :invalid-sparql)
                       100)
         scan-budget (if-let [ms (get-in params [:limits :maxScanSteps])]
                       (parse-bounded-positive-int! ms max-sparql-scan-steps :limits/maxScanSteps :invalid-sparql)
                       max-sparql-scan-steps)
-        [prefix-map body-only] (parse-prefixes clean)
-        ask-m (re-matches sparql-ask-full-re body-only)
-        sel-m (when-not ask-m (re-matches sparql-select-full-re body-only))]
-    (when (and (nil? ask-m) (nil? sel-m))
-      (if (re-find unsupported-sparql-modifier-re body-only)
-        (v/fail! :unsupported-sparql-clause
-                 "unsupported SPARQL clause or trailing modifier (supported: PREFIX*, SELECT <vars|*> [WHERE] { <bgp> } [LIMIT n], ASK [WHERE] { <bgp> })"
-                 {:sparql clean})
-        (v/fail! :unsafe-sparql
-                 "invalid or unsupported read-only SPARQL query syntax"
-                 {:sparql clean})))
-    (let [triples (graph->triples graph)]
-      (if ask-m
-        (let [patterns (parse-triple-patterns (second ask-m) prefix-map)
-              solutions (eval-bgp-fail-closed patterns triples scan-budget)]
-          {:dialect "sparql-readonly-v1"
-           :form "ASK"
-           :vars []
-           :ask (boolean (seq solutions))
-           :row-count (if (seq solutions) 1 0)
-           :algebra-edn (build-algebra-edn "ASK" patterns [] nil)
-           :bindings []})
-        (let [[_ select-head where-body sparql-limit-str] sel-m
-              effective-limit (if sparql-limit-str
-                                (min param-limit
-                                     (parse-bounded-positive-int! sparql-limit-str max-query-limit :sparql/limit :invalid-sparql))
-                                param-limit)
-              patterns (parse-triple-patterns where-body prefix-map)
-              solutions (eval-bgp-fail-closed patterns triples scan-budget)
-              proj-vars (if (= "*" (str/trim select-head))
-                          (vec (sort (distinct (mapcat keys solutions))))
-                          (vec (re-seq #"\?[A-Za-z0-9_]+" select-head)))
-              limited (vec (take effective-limit (map #(select-keys % proj-vars) solutions)))]
-          {:dialect "sparql-readonly-v1"
-           :form "SELECT"
-           :vars proj-vars
-           :row-count (count limited)
-           :algebra-edn (build-algebra-edn "SELECT" patterns proj-vars effective-limit)
-           :bindings limited})))))
+        triples (graph->triples graph)]
+    (if (some? raw-sparql)
+      (let [clean (validate-sparql-readonly! raw-sparql)
+            [prefix-map body-only] (parse-prefixes clean)
+            ask-m (re-matches sparql-ask-full-re body-only)
+            sel-m (when-not ask-m (re-matches sparql-select-full-re body-only))]
+        (when (and (nil? ask-m) (nil? sel-m))
+          (if (re-find unsupported-sparql-modifier-re body-only)
+            (v/fail! :unsupported-sparql-clause
+                     "unsupported SPARQL clause or trailing modifier (supported: PREFIX*, SELECT <vars|*> [WHERE] { <bgp> } [LIMIT n], ASK [WHERE] { <bgp> })"
+                     {:sparql clean})
+            (v/fail! :unsafe-sparql
+                     "invalid or unsupported read-only SPARQL query syntax"
+                     {:sparql clean})))
+        (if ask-m
+          (let [patterns (parse-triple-patterns (second ask-m) prefix-map)
+                solutions (eval-bgp-fail-closed patterns triples scan-budget)
+                hit? (boolean (seq solutions))]
+            {:dialect "sparql-readonly-v1"
+             :form "ask"
+             :boolean hit?
+             :vars []
+             :row-count (if hit? 1 0)
+             :algebra-edn (build-algebra-edn "ask" patterns [] nil)
+             :bindings []})
+          (let [[_ select-head where-body sparql-limit-str] sel-m
+                effective-limit (if sparql-limit-str
+                                  (min param-limit
+                                       (parse-bounded-positive-int! sparql-limit-str max-query-limit :sparql/limit :invalid-sparql))
+                                  param-limit)
+                patterns (parse-triple-patterns where-body prefix-map)
+                solutions (eval-bgp-fail-closed patterns triples scan-budget)
+                proj-vars (if (= "*" (str/trim select-head))
+                            (vec (sort (distinct (mapcat keys solutions))))
+                            (vec (re-seq #"\?[A-Za-z0-9_]+" select-head)))
+                limited (vec (take effective-limit (map #(select-keys % proj-vars) solutions)))]
+            {:dialect "sparql-readonly-v1"
+             :form "select"
+             :vars proj-vars
+             :row-count (count limited)
+             :algebra-edn (build-algebra-edn "select" patterns proj-vars effective-limit)
+             :bindings limited})))
+      ;; Execute EDN or map algebra directly (Yataverse PR #83 interop)
+      (let [alg-node (if (some? raw-edn) (parse-algebra-edn! raw-edn) raw-alg)
+            _ (when (some? raw-alg) (v/assert-no-forbidden-wire-keys! raw-alg))
+            spec (extract-algebra-spec alg-node)
+            form (let [f (or (:form params) (:form spec) "select")]
+                   (str/lower-case (if (keyword? f) (name f) (str f))))
+            patterns (:patterns spec)
+            solutions (eval-bgp-fail-closed patterns triples scan-budget)]
+        (if (= form "ask")
+          (let [hit? (boolean (seq solutions))]
+            {:dialect "sparql-readonly-v1"
+             :form "ask"
+             :boolean hit?
+             :vars []
+             :row-count (if hit? 1 0)
+             :algebra-edn (build-algebra-edn "ask" patterns [] nil)
+             :bindings []})
+          (let [effective-limit (if (:limit spec) (min param-limit (:limit spec)) param-limit)
+                proj-vars (if (seq (:vars spec))
+                            (:vars spec)
+                            (vec (sort (distinct (mapcat keys solutions)))))
+                limited (vec (take effective-limit (map #(select-keys % proj-vars) solutions)))]
+            {:dialect "sparql-readonly-v1"
+             :form "select"
+             :vars proj-vars
+             :row-count (count limited)
+             :algebra-edn (build-algebra-edn "select" patterns proj-vars effective-limit)
+             :bindings limited}))))))
 
 ;; ── Node Inspection & Operation Dispatch ─────────────────────────────────────
 
@@ -770,17 +966,90 @@
          :outgoing outgoing
          :joins joins}))))
 
-(defn- has-graph-filter? [params]
-  (or (some? (:layers params))
-      (some? (:kinds params))
-      (not (str/blank? (:query params)))))
+(def ^:private max-yataverse-graph-nodes 500)
+
+(def ^:private yv-layer->kotoba-filter-layer
+  {"connector" "connector"
+   "object-type" "ontology"
+   "fact" "instance"
+   "rdf-subject" "rdf"
+   "ipld" "ipld"
+   "attribute" "attribute"})
+
+(defn- resolve-layer-filter-param
+  "Resolve `:layers` / `:activeLayers` (or string equivalents). Returns
+  `[present? normalized-vec]`. Explicit `[]` returns `[true []]` -> 0 nodes."
+  [params map-yv-names?]
+  (let [has-l? (or (contains? params :layers) (contains? params "layers"))
+        has-al? (or (contains? params :activeLayers) (contains? params "activeLayers"))
+        raw-l (if (contains? params :layers) (:layers params) (get params "layers"))
+        raw-al (if (contains? params :activeLayers) (:activeLayers params) (get params "activeLayers"))]
+    (when (and has-l? has-al? (not= (vec raw-l) (vec raw-al)))
+      (v/fail! :invalid-input "provide consistent :layers / :activeLayers values" {:layers raw-l :activeLayers raw-al}))
+    (cond
+      (or has-l? has-al?)
+      (let [raw (if has-al? raw-al raw-l)]
+        (when-not (and (sequential? raw) (every? #(or (string? %) (keyword? %)) raw))
+          (v/fail! :invalid-active-layers "layers/activeLayers must be a sequence of layer ID strings" {:layers raw}))
+        (let [strs (mapv #(if (keyword? %) (name %) %) raw)
+              mapped (if map-yv-names?
+                       (mapv #(get yv-layer->kotoba-filter-layer % %) strs)
+                       strs)]
+          [true mapped]))
+      :else [false nil])))
+
+(defn- apply-max-nodes-bound [graph params]
+  (let [has-max? (or (contains? params :maxNodes) (contains? params "maxNodes"))
+        raw-max (if (contains? params :maxNodes) (:maxNodes params) (get params "maxNodes"))]
+    (if-not has-max?
+      graph
+      (let [bound (parse-bounded-positive-int! raw-max max-yataverse-graph-nodes :maxNodes :invalid-limit)
+            orig-nodes (:nodes graph)]
+        (if (<= (count orig-nodes) bound)
+          graph
+          (let [kept-nodes (vec (take bound orig-nodes))
+                kept-ids (set (map :id kept-nodes))
+                kept-edges (vec (filter #(and (contains? kept-ids (:source %))
+                                              (contains? kept-ids (:target %)))
+                                        (:edges graph)))
+                kept-joins (recompute-visible-joins (:joins graph) kept-nodes kept-edges)
+                kept-layers (g/build-layers kept-nodes)
+                updated (-> graph
+                            (assoc :nodes kept-nodes
+                                   :edges kept-edges
+                                   :layers kept-layers
+                                   :joins kept-joins)
+                            (update :basis (fn [b]
+                                             (-> b
+                                                 (dissoc :graph-cid :stats :coverage :yataverse-layers)
+                                                 (assoc :truncated true
+                                                        :graph-cid-verification :absent
+                                                        :node-count (count kept-nodes)
+                                                        :edge-count (count kept-edges)
+                                                        :layer-count (count kept-layers)
+                                                        :join-count (count kept-joins))))))]
+            (g/layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))))))
+
+(defn- apply-graph-filters
+  "Apply `:layers` / `:activeLayers` (explicit `[]` -> 0 nodes/0 edges),
+  `:kinds`, `:query`, and optional `:maxNodes` cleanly."
+  [graph params map-yv-names?]
+  (let [[has-layers? norm-layers] (resolve-layer-filter-param params map-yv-names?)
+        has-kinds? (some? (:kinds params))
+        has-query? (not (str/blank? (:query params)))
+        filtered (if (or has-layers? has-kinds? has-query?)
+                   (g/filter-graph graph (cond-> (select-keys params [:kinds :query])
+                                           has-layers? (assoc :layers norm-layers)))
+                   graph)]
+    (apply-max-nodes-bound filtered params)))
 
 (defn invoke
   "Dispatch a Semantic UI `noun.verb` operation locally against a validated
   `ontology.graph/v1` (or Yataverse `yataverse.ontology.graph/v1`) graph.
 
-  Distinguishes `nil` from explicit empty `layers: []` / `kinds: []` so
-  clearing all layers returns 0 nodes / 0 edges identically to the HTML viewer."
+  Distinguishes `nil` from explicit empty `layers: []` / `activeLayers: []` /
+  `kinds: []` so clearing all layers returns 0 nodes / 0 edges identically to
+  the HTML viewer."
   ([graph-or-yv op params] (invoke graph-or-yv op params {}))
   ([graph-or-yv op params {:keys [render-html-fn]}]
    (let [graph (-> (svg/normalize-and-validate-graph graph-or-yv)
@@ -790,15 +1059,11 @@
        (inspect-node graph params)
 
        "ontology.graph"
-       (if (has-graph-filter? params)
-         (g/filter-graph graph params)
-         graph)
+       (apply-graph-filters graph params false)
 
        "ontology.view"
        (let [fmt (str/lower-case (str (or (:format params) "svg")))
-             filtered (if (has-graph-filter? params)
-                        (g/filter-graph graph params)
-                        graph)
+             filtered (apply-graph-filters graph params false)
              opts (select-keys params [:title])]
          (case fmt
            "svg" {:format "svg"
@@ -827,7 +1092,11 @@
 
 ;; ── Yataverse PR #83 Operation Adapter ───────────────────────────────────────
 
-(defn- yataverse-snapshot-inspection [graph yv-graph]
+(defn- yataverse-graph-inspection
+  "Build an honest graph-level inspection payload for `ontology.inspect` when
+  operating on a standalone graph (no full snapshot block closure verified).
+  Never fabricates snapshot schema or snapshot block closure CIDs."
+  [graph yv-graph]
   (let [object-types (mapv (fn [n]
                              {:id (if (str/starts-with? (:id n) "type:") (subs (:id n) 5) (:id n))
                               :name (or (get-in n [:meta "name"]) (:label n))
@@ -844,11 +1113,13 @@
                                         (get-in n [:provenance :status])
                                         "unknown")})
                          (filter #(= :connector (:kind %)) (:nodes graph)))
-        block-cids (cond-> {}
-                     (:basisCid yv-graph) (assoc :root (:basisCid yv-graph))
-                     (:graphCid yv-graph) (assoc :graph (:graphCid yv-graph)))]
+        block-cids (if (:graphCid yv-graph)
+                     {:graph (:graphCid yv-graph)}
+                     {})]
     {:basisCid (:basisCid yv-graph)
-     :schema (:schema yv-graph)
+     :schema yv/yataverse-graph-schema
+     :inspectionScope "graph-only"
+     :snapshotClosureVerified false
      :id (:id yv-graph)
      :blockCids block-cids
      :stats (:stats yv-graph)
@@ -862,14 +1133,17 @@
 
 (defn invoke-yataverse
   "Yataverse PR #83 operation adapter: accepts a Kotoba `ontology.graph/v1` OR
-  Yataverse `yataverse.ontology.graph/v1` graph, enforces `:basisCid` pin and
-  `:jurisdiction`/`:allowedSources` visibility, dispatches `ontology.graph`,
-  `ontology.inspect` (with `blockCids`), `ontology.view` (aligned `viewModel` &
-  `yataverse.ontology.operations/v1` `semanticSchema`), `ontology.query_sql`
-  (with `scannedRows`), and `ontology.query_sparql` (with `algebraEdn`), and
-  returns Yataverse's `yataverse.ontology.operations/v1` envelope."
+  Yataverse `yataverse.ontology.graph/v1` graph, enforces `:basisCid` pin,
+  `:jurisdiction`/`:allowedSources` visibility, `:activeLayers`/`:layers`
+  (including explicit empty `[]` -> 0 nodes/0 edges), and `:maxNodes`, refuses
+  unsupported snapshot-only parameters (e.g. `:carBase64`), and returns
+  Yataverse's `yataverse.ontology.operations/v1` envelope."
   ([graph-or-yv op params] (invoke-yataverse graph-or-yv op params {}))
   ([graph-or-yv op params {:keys [render-html-fn]}]
+   (when (or (contains? params :carBase64) (contains? params "carBase64"))
+     (v/fail! :unsupported-operation-param
+              "CAR snapshot verification (:carBase64) is not supported in graph-only adapter"
+              {:param :carBase64}))
    (let [graph (-> (svg/normalize-and-validate-graph graph-or-yv)
                    (apply-visibility params))
          yv-graph (yv/->yataverse-graph graph)
@@ -877,19 +1151,17 @@
          result
          (case op
            "ontology.graph"
-           (let [filtered (if (has-graph-filter? params)
-                            (g/filter-graph graph params)
-                            graph)]
+           (let [filtered (apply-graph-filters graph params true)]
              (yv/->yataverse-graph filtered))
 
            "ontology.inspect"
            (if (or (:node-id params) (:cid params))
              (assoc (inspect-node graph params)
                     :basisCid basis-cid
-                    :blockCids (cond-> {}
-                                 basis-cid (assoc :root basis-cid)
-                                 (:graphCid yv-graph) (assoc :graph (:graphCid yv-graph))))
-             (yataverse-snapshot-inspection graph yv-graph))
+                    :inspectionScope "graph-only"
+                    :snapshotClosureVerified false
+                    :blockCids (if (:graphCid yv-graph) {:graph (:graphCid yv-graph)} {}))
+             (yataverse-graph-inspection graph yv-graph))
 
            "ontology.view"
            (let [fmt (str/lower-case (str (or (:format params) "all")))
@@ -897,14 +1169,13 @@
                      (v/fail! :invalid-format
                               (str "expected json|svg|html|all, got: " fmt)
                               {:format fmt :allowed ["json" "svg" "html" "all"]}))
-                 filtered (if (has-graph-filter? params)
-                            (g/filter-graph graph params)
-                            graph)
+                 filtered (apply-graph-filters graph params true)
                  filtered-yv (yv/->yataverse-graph filtered)
                  opts (select-keys params [:title])
-                 inspection (yataverse-snapshot-inspection filtered filtered-yv)
+                 inspection (yataverse-graph-inspection filtered filtered-yv)
                  view-model {:basisCid basis-cid
                              :schema yv/yataverse-graph-schema
+                             :inspectionScope "graph-only"
                              :id (:id filtered-yv)
                              :stats (:stats filtered-yv)
                              :inspection inspection
@@ -939,14 +1210,19 @@
 
            "ontology.query_sparql"
            (let [res (query-sparql graph params)]
-             (cond-> {:basisCid basis-cid
-                      :form (:form res)
-                      :variables (:vars res)
-                      :bindings (:bindings res)
-                      :rowCount (:row-count res)
-                      :algebraEdn (:algebra-edn res)
-                      :readOnly true}
-               (contains? res :ask) (assoc :ask (:ask res))))
+             (if (= "ask" (:form res))
+               {:basisCid basis-cid
+                :form "ask"
+                :boolean (:boolean res)
+                :algebraEdn (:algebra-edn res)
+                :readOnly true}
+               {:basisCid basis-cid
+                :form "select"
+                :variables (:vars res)
+                :bindings (:bindings res)
+                :rowCount (:row-count res)
+                :algebraEdn (:algebra-edn res)
+                :readOnly true}))
 
            (v/fail! :unknown-operation
                     (str "unknown Semantic UI operation: " op)
