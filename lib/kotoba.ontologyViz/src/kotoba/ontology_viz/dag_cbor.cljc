@@ -346,3 +346,271 @@
     {:cid cid
      :bytes bytes
      :byte-length (count bytes)}))
+
+;; ── Pure .cljc UTF-8 Decoding & Strict Canonical DAG-CBOR Validator/Decoder ──
+
+(defn utf8-decode
+  "Strictly decode unsigned UTF-8 byte vector `bs` to a string (handling
+  supplementary planes such as U+10000 cleanly across JVM, bb, and nbb)."
+  [bs]
+  #?(:clj (let [arr (byte-array (count bs))]
+            (dotimes [i (count bs)]
+              (aset arr i (unchecked-byte (nth bs i))))
+            (let [decoder (-> (java.nio.charset.StandardCharsets/UTF_8)
+                              (.newDecoder)
+                              (.onMalformedInput java.nio.charset.CodingErrorAction/REPORT)
+                              (.onUnmappableCharacter java.nio.charset.CodingErrorAction/REPORT))]
+              (try
+                (.toString (.decode decoder (java.nio.ByteBuffer/wrap arr)))
+                (catch java.nio.charset.CharacterCodingException _
+                  (v/fail! :dag-cbor-invalid-utf8 "invalid UTF-8 bytes in DAG-CBOR text string" {})))))
+     :cljs (let [n (count bs)
+                 out (transient [])]
+             (loop [i 0
+                    acc out]
+               (if (= i n)
+                 (apply str (persistent! acc))
+                 (let [b0 (nth bs i)]
+                   (cond
+                     (< b0 0x80)
+                     (recur (inc i) (conj! acc (js/String.fromCharCode b0)))
+
+                     (and (<= 0xc2 b0 0xdf) (< (inc i) n))
+                     (let [b1 (nth bs (inc i))]
+                       (when-not (= 0x80 (bit-and b1 0xc0))
+                         (v/fail! :dag-cbor-invalid-utf8 "invalid 2-byte UTF-8 sequence" {:offset i}))
+                       (let [cp (bit-or (bit-shift-left (bit-and b0 0x1f) 6)
+                                        (bit-and b1 0x3f))]
+                         (recur (+ i 2) (conj! acc (js/String.fromCodePoint cp)))))
+
+                     (and (<= 0xe0 b0 0xef) (< (+ i 2) n))
+                     (let [b1 (nth bs (+ i 1))
+                           b2 (nth bs (+ i 2))]
+                       (when-not (and (= 0x80 (bit-and b1 0xc0))
+                                      (= 0x80 (bit-and b2 0xc0)))
+                         (v/fail! :dag-cbor-invalid-utf8 "invalid 3-byte UTF-8 sequence" {:offset i}))
+                       (let [cp (bit-or (bit-shift-left (bit-and b0 0x0f) 12)
+                                        (bit-shift-left (bit-and b1 0x3f) 6)
+                                        (bit-and b2 0x3f))]
+                         (when (or (< cp 0x800) (<= 0xd800 cp 0xdfff))
+                           (v/fail! :dag-cbor-invalid-utf8 "overlong or surrogate UTF-8 sequence" {:offset i}))
+                         (recur (+ i 3) (conj! acc (js/String.fromCodePoint cp)))))
+
+                     (and (<= 0xf0 b0 0xf4) (< (+ i 3) n))
+                     (let [b1 (nth bs (+ i 1))
+                           b2 (nth bs (+ i 2))
+                           b3 (nth bs (+ i 3))]
+                       (when-not (and (= 0x80 (bit-and b1 0xc0))
+                                      (= 0x80 (bit-and b2 0xc0))
+                                      (= 0x80 (bit-and b3 0xc0)))
+                         (v/fail! :dag-cbor-invalid-utf8 "invalid 4-byte UTF-8 sequence" {:offset i}))
+                       (let [cp (bit-or (bit-shift-left (bit-and b0 0x07) 18)
+                                        (bit-shift-left (bit-and b1 0x3f) 12)
+                                        (bit-shift-left (bit-and b2 0x3f) 6)
+                                        (bit-and b3 0x3f))]
+                         (when (or (< cp 0x10000) (> cp 0x10ffff))
+                           (v/fail! :dag-cbor-invalid-utf8 "out-of-range 4-byte UTF-8 sequence" {:offset i}))
+                         (recur (+ i 4) (conj! acc (js/String.fromCodePoint cp)))))
+
+                     :else
+                     (v/fail! :dag-cbor-invalid-utf8 "malformed UTF-8 byte sequence" {:offset i :byte b0}))))))))
+
+(defn- read-cbor-arg [bs offset ai]
+  (let [n (count bs)]
+    (cond
+      (< ai 24)
+      [ai offset]
+
+      (= ai 24)
+      (do
+        (when (>= offset n) (v/fail! :dag-cbor-truncated "truncated 1-byte CBOR argument" {:offset offset}))
+        (let [val (nth bs offset)]
+          (when (< val 24)
+            (v/fail! :dag-cbor-non-canonical-int "non-minimal 1-byte CBOR integer" {:offset offset :value val}))
+          [val (inc offset)]))
+
+      (= ai 25)
+      (do
+        (when (> (+ offset 2) n) (v/fail! :dag-cbor-truncated "truncated 2-byte CBOR argument" {:offset offset}))
+        (let [val (bit-or (bit-shift-left (nth bs offset) 8)
+                          (nth bs (inc offset)))]
+          (when (< val 0x100)
+            (v/fail! :dag-cbor-non-canonical-int "non-minimal 2-byte CBOR integer" {:offset offset :value val}))
+          [val (+ offset 2)]))
+
+      (= ai 26)
+      (do
+        (when (> (+ offset 4) n) (v/fail! :dag-cbor-truncated "truncated 4-byte CBOR argument" {:offset offset}))
+        (let [val (+ (* (nth bs offset) 16777216)
+                     (* (nth bs (+ offset 1)) 65536)
+                     (* (nth bs (+ offset 2)) 256)
+                     (nth bs (+ offset 3)))]
+          (when (< val 0x10000)
+            (v/fail! :dag-cbor-non-canonical-int "non-minimal 4-byte CBOR integer" {:offset offset :value val}))
+          [val (+ offset 4)]))
+
+      (= ai 27)
+      (do
+        (when (> (+ offset 8) n) (v/fail! :dag-cbor-truncated "truncated 8-byte CBOR argument" {:offset offset}))
+        (let [hi (+ (* (nth bs offset) 16777216)
+                    (* (nth bs (+ offset 1)) 65536)
+                    (* (nth bs (+ offset 2)) 256)
+                    (nth bs (+ offset 3)))
+              lo (+ (* (nth bs (+ offset 4)) 16777216)
+                    (* (nth bs (+ offset 5)) 65536)
+                    (* (nth bs (+ offset 6)) 256)
+                    (nth bs (+ offset 7)))
+              val (+ (* hi 4294967296) lo)]
+          (when (< val 0x100000000)
+            (v/fail! :dag-cbor-non-canonical-int "non-minimal 8-byte CBOR integer" {:offset offset :value val}))
+          [val (+ offset 8)]))
+
+      (= ai 31)
+      (v/fail! :dag-cbor-indefinite-length "DAG-CBOR forbids indefinite-length items" {:offset offset})
+
+      :else
+      (v/fail! :dag-cbor-invalid-additional-info "invalid CBOR additional info" {:offset offset :ai ai}))))
+
+(defn- decode-cbor-item [bs offset depth]
+  (when (> depth 64)
+    (v/fail! :max-depth-exceeded "DAG-CBOR decoding depth exceeded 64" {:depth depth}))
+  (when (>= offset (count bs))
+    (v/fail! :dag-cbor-truncated "unexpected end of DAG-CBOR input" {:offset offset}))
+  (let [head (nth bs offset)
+        major (unsigned-bit-shift-right head 5)
+        ai (bit-and head 0x1f)
+        pos (inc offset)]
+    (case major
+      ;; 0: unsigned int
+      0
+      (let [[val next-off] (read-cbor-arg bs pos ai)]
+        [val next-off nil])
+
+      ;; 1: negative int
+      1
+      (let [[val next-off] (read-cbor-arg bs pos ai)]
+        [(- -1 val) next-off nil])
+
+      ;; 2: byte string
+      2
+      (let [[len next-off] (read-cbor-arg bs pos ai)
+            end (+ next-off len)]
+        (when (> end (count bs))
+          (v/fail! :dag-cbor-truncated "truncated CBOR byte string" {:offset next-off :length len}))
+        [(subvec bs next-off end) end nil])
+
+      ;; 3: UTF-8 text string
+      3
+      (let [[len next-off] (read-cbor-arg bs pos ai)
+            end (+ next-off len)]
+        (when (> end (count bs))
+          (v/fail! :dag-cbor-truncated "truncated CBOR text string" {:offset next-off :length len}))
+        [(utf8-decode (subvec bs next-off end)) end nil])
+
+      ;; 4: array
+      4
+      (let [[len next-off] (read-cbor-arg bs pos ai)]
+        (loop [i 0
+               off next-off
+               acc (transient [])]
+          (if (= i len)
+            [(persistent! acc) off nil]
+            (let [[item n-off _] (decode-cbor-item bs off (inc depth))]
+              (recur (inc i) n-off (conj! acc item))))))
+
+      ;; 5: map (strict canonical UTF-8 byte-length then unsigned bytewise key ordering)
+      5
+      (let [[len next-off] (read-cbor-arg bs pos ai)]
+        (loop [i 0
+               off next-off
+               prev-key-bytes nil
+               key-order (transient [])
+               entries (transient [])]
+          (if (= i len)
+            (let [ks (persistent! key-order)
+                  es (persistent! entries)]
+              [(into {} es) off ks])
+            (do
+              (when (>= off (count bs))
+                (v/fail! :dag-cbor-truncated "truncated CBOR map key" {:offset off}))
+              (let [kh (nth bs off)
+                    kmaj (unsigned-bit-shift-right kh 5)
+                    kai (bit-and kh 0x1f)]
+                (when-not (= kmaj 3)
+                  (v/fail! :dag-cbor-invalid-key "DAG-CBOR map keys must be UTF-8 text strings" {:offset off :major kmaj}))
+                (let [[klen koff] (read-cbor-arg bs (inc off) kai)
+                      kend (+ koff klen)]
+                  (when (> kend (count bs))
+                    (v/fail! :dag-cbor-truncated "truncated CBOR map key bytes" {:offset koff :length klen}))
+                  (let [kbytes (subvec bs koff kend)
+                        kstr (utf8-decode kbytes)]
+                    (when prev-key-bytes
+                      (let [cmp (compare-byte-vecs prev-key-bytes kbytes)]
+                        (cond
+                          (zero? cmp)
+                          (v/fail! :dag-cbor-duplicate-key
+                                   (str "duplicate DAG-CBOR map key: " kstr)
+                                   {:key kstr :offset off})
+
+                          (pos? cmp)
+                          (v/fail! :map-keys-not-sorted
+                                   (str "DAG-CBOR map keys not in canonical UTF-8 byte-length/bytewise order at key: " (pr-str kstr))
+                                   {:key kstr :offset off}))))
+                    (let [[vval voff _] (decode-cbor-item bs kend (inc depth))]
+                      (recur (inc i) voff kbytes (conj! key-order kstr) (conj! entries [kstr vval]))))))))))
+
+      ;; 6: tag (only tag 42 for IPLD CIDv1 link)
+      6
+      (let [[tag next-off] (read-cbor-arg bs pos ai)]
+        (when-not (= tag 42)
+          (v/fail! :dag-cbor-unsupported-tag (str "DAG-CBOR only permits tag 42, got: " tag) {:tag tag}))
+        (let [[payload end _] (decode-cbor-item bs next-off (inc depth))]
+          (when-not (and (vector? payload) (pos? (count payload)) (= 0 (first payload)))
+            (v/fail! :dag-cbor-invalid-link "tag 42 payload must be a byte string prefixed with 0x00" {}))
+          (let [cid-str (str "b" (v/base32-encode (subvec payload 1)))]
+            [(v/ipld-link cid-str) end nil])))
+
+      ;; 7: simple values (floats forbidden in KotobaSpec v1.0/v1.0.1)
+      7
+      (case ai
+        20 [false pos nil]
+        21 [true pos nil]
+        22 [nil pos nil]
+        (v/fail! :dag-cbor-unsupported-simple
+                 (str "DAG-CBOR forbids floats and unsupported simple value ai=" ai)
+                 {:ai ai :offset offset})))))
+
+(defn decode-dag-cbor
+  "Strictly validate and decode canonical DAG-CBOR unsigned byte vector `cbor-bytes`.
+  Enforces canonical minimal integer encoding, valid UTF-8, and canonical DAG-CBOR
+  map key order (UTF-8 byte length ascending, then unsigned UTF-8 bytewise ascending;
+  rejects non-canonical UTF-16 order with `:map-keys-not-sorted`).
+  Returns `{:value <decoded> :root-keys <vec-or-nil>}`."
+  [cbor-bytes]
+  (when-not (and (sequential? cbor-bytes) (every? #(and (integer? %) (<= 0 % 255)) cbor-bytes))
+    (v/fail! :dag-cbor-invalid-bytes "expected sequence of unsigned bytes (0..255)" {}))
+  (let [bs (vec cbor-bytes)
+        [val end-off root-keys] (decode-cbor-item bs 0 0)]
+    (when-not (= end-off (count bs))
+      (v/fail! :dag-cbor-trailing-bytes
+               (str "trailing bytes after DAG-CBOR root item: " (- (count bs) end-off))
+               {:consumed end-off :total (count bs)}))
+    {:value val
+     :root-keys root-keys}))
+
+(defn validate-dag-cbor!
+  "Strictly validate canonical DAG-CBOR byte vector `cbor-bytes`. Returns `:ok`
+  when canonical; throws `ex-info` (e.g. `:reason :map-keys-not-sorted`) on violation."
+  [cbor-bytes]
+  (decode-dag-cbor cbor-bytes)
+  :ok)
+
+(defn validate-dag-cbor
+  "Validate canonical DAG-CBOR byte vector `cbor-bytes`. Returns `nil` when valid,
+  or the failure reason keyword (e.g. `:map-keys-not-sorted`) when invalid."
+  [cbor-bytes]
+  (try
+    (validate-dag-cbor! cbor-bytes)
+    nil
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+      (:reason (ex-data e)))))

@@ -50,6 +50,9 @@
 (def <-yataverse-graph yv/<-yataverse-graph)
 (def ->yataverse-graph yv/->yataverse-graph)
 (def encode-dag-cbor dcbor/encode-dag-cbor)
+(def decode-dag-cbor dcbor/decode-dag-cbor)
+(def validate-dag-cbor dcbor/validate-dag-cbor)
+(def validate-dag-cbor! dcbor/validate-dag-cbor!)
 (def encode-ontology-graph-dag-cbor dcbor/encode-ontology-graph-dag-cbor)
 (def cidv1-dag-cbor dcbor/cidv1-dag-cbor)
 

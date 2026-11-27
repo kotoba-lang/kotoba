@@ -219,10 +219,13 @@
          layers (:layers graph)
          basis (:basis graph)
          nodes-by-id (into {} (map (juxt :id identity) nodes))
-         cid-ver (name (or (:cid-verification basis) :syntax-only))
+         cid-ver (name (or (:basis-cid-verification basis) (:cid-verification basis) :syntax-only))
+         graph-cid-ver (some-> (:graph-cid-verification basis) name)
          footer-text (str "schema=" g/schema-version
                           " | codec=" (or (:codec basis) "dag-cbor")
                           " | cid=" cid-ver
+                          (when (and graph-cid-ver (not= graph-cid-ver "absent"))
+                            (str " | graph-cid=" graph-cid-ver))
                           (when-let [rc (:root-cid basis)]
                             (str " | root=" (esc/short-cid rc)))
                           " | nodes=" (count nodes)

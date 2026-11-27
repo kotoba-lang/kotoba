@@ -252,7 +252,8 @@
                         (update :basis (fn [b]
                                          (-> b
                                              (dissoc :graph-cid :stats :coverage :yataverse-layers)
-                                             (assoc :node-count (count kept-nodes)
+                                             (assoc :graph-cid-verification :absent
+                                                    :node-count (count kept-nodes)
                                                     :edge-count (count kept-edges)
                                                     :layer-count (count kept-layers))))))]
         (g/layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))))

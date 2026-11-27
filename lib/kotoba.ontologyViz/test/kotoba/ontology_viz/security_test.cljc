@@ -80,7 +80,23 @@
         (is (= :dangling-edge-endpoint (refusal-reason #(ov/render-svg dangling-edge))))
         (is (= :invalid-layout (refusal-reason #(ov/render-svg bad-pad))))
         (is (= :invalid-layout (refusal-reason #(ov/render-svg bad-gap))))
-        (is (= :invalid-layout (refusal-reason #(ov/layout-graph valid-graph {:pad-x -5}))))))))
+        (is (= :invalid-layout (refusal-reason #(ov/layout-graph valid-graph {:pad-x -5}))))))
+
+    (testing "KotobaSpec v1.0.1 basis two-axis verification domain and consistency checks fail closed"
+      (is (= :invalid-basis
+             (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :graph-cid-verification] :bogus)))))
+      (is (= :invalid-basis
+             (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :basis-cid-verification] :verified))))
+          "contradicting :cid-verification :syntax-only vs :basis-cid-verification :verified must fail closed")
+      (is (= :invalid-basis
+             (refusal-reason #(ov/validate-graph! (assoc-in valid-graph [:basis :graph-cid-verification] :verified))))
+          "claiming :graph-cid-verification :verified without :graph-cid must fail closed")
+      (is (= :invalid-basis
+             (refusal-reason #(ov/validate-graph! (-> valid-graph
+                                                      (update :basis dissoc :root-cid)
+                                                      (assoc-in [:basis :cid-verification] :verified)
+                                                      (assoc-in [:basis :basis-cid-verification] :verified)))))
+          "claiming basis :verified without :root-cid must fail closed"))))
 
 (deftest remote-context-and-external-fetch-refused-test
   (testing "remote JSON-LD @context string or @import directive fails closed"

@@ -64,9 +64,27 @@ Explicit bidirectional adapters bridge the two contracts without conflating them
   wire format, preserving exact array order and always recomputing a fresh
   canonical DAG-CBOR `graphCid` from the emitted bytes (never inheriting a stale
   `graphCid` onto a filtered/modified graph).
-- `(ov/encode-ontology-graph-dag-cbor yv-graph)` — pure `.cljc` canonical
-  DAG-CBOR + SHA-256 CIDv1 (`0x01 0x71 0x12 0x20`) encoder matching Yataverse
-  PR #83's `encodeOntologyGraphDagCbor` byte-for-byte.
+- `(ov/encode-ontology-graph-dag-cbor yv-graph)` / `(ov/decode-dag-cbor bytes)` /
+  `(ov/validate-dag-cbor bytes)` — pure `.cljc` canonical DAG-CBOR + SHA-256
+  CIDv1 (`0x01 0x71 0x12 0x20`) encoder and strict canonical validator matching
+  Yataverse PR #83's `encodeOntologyGraphDagCbor` / `validateDagCbor`
+  byte-for-byte.
+- **KotobaSpec v1.0.1 two-layer ordering & two-axis verification**:
+  - **Arrays (`nodes`/`edges`/`layers`/`joins`)**: input order preserved on
+    round-trip; newly projected arrays sort by **UTF-16 code-unit order**
+    (`compare` in Clojure/bb/nbb, `a < b ? -1 : a > b ? 1 : 0` in JS, where
+    `U+10000` precedes `U+E000`).
+  - **DAG-CBOR map keys**: canonical **UTF-8 byte-length ascending, then
+    unsigned UTF-8 bytewise ascending** (`"\uE000"` [3B] → `"\uE000a"` [4B] →
+    `"\uD800\uDC00"` [4B]); non-canonical UTF-16 key order in raw CBOR bytes is
+    refused with `:map-keys-not-sorted`.
+  - **Two-axis verification (never leaked into wire JSON)**: `:cid-verification`
+    and `:basis-cid-verification` represent snapshot body verification
+    (`:syntax-only` on `<-yataverse-graph` even when `graphCid` verifies),
+    strictly separated from `:graph-cid-verification` (`:verified` /
+    `:syntax-only` / `:absent`). None of these verification status fields are
+    ever emitted into `yataverse.ontology.graph/v1` wire JSON or `graphCid`
+    DAG-CBOR input bytes.
 - `(ov/invoke-yataverse graph-or-yv op params)` — dispatches `ontology.graph`,
   `ontology.inspect` (including `blockCids`), `ontology.view` (`json|svg|html|all`
   -> `basisCid`, Yataverse `yataverse.ontology.operations/v1` `semanticSchema`,

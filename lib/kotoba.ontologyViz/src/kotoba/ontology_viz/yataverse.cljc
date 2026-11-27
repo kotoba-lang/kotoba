@@ -324,7 +324,10 @@
              basis (cond-> {:schema-version g/schema-version
                             :codec "dag-cbor"
                             :hash-alg "sha2-256"
+                            ;; KotobaSpec v1.0.1 two-axis verification separation:
+                            ;; graphCid verification NEVER promotes snapshot basisCid to :verified.
                             :cid-verification :syntax-only
+                            :basis-cid-verification :syntax-only
                             :graph-cid-verification (if (some? graph-cid) :verified :absent)
                             :node-count (count nodes)
                             :edge-count (count edges)

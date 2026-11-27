@@ -52,7 +52,14 @@
     :join :join-instance :ipld-link})
 
 (def valid-cid-verification-states
-  #{:syntax-only :verified})
+  "Allowed verification states for `:cid-verification` and `:basis-cid-verification`
+  (snapshot body verification axis)."
+  #{:syntax-only :verified :absent})
+
+(def valid-graph-cid-verification-states
+  "Allowed verification states for `:graph-cid-verification`
+  (graph DAG-CBOR CID verification axis, strictly separated from snapshot basisCid)."
+  #{:verified :syntax-only :absent})
 
 (defn fail!
   "Throw a structured ex-info refusal with an explicit `:reason` keyword."
@@ -503,6 +510,48 @@
       (when (contains? opts k)
         (assert-finite-nonneg! k (get opts k))))))
 
+(defn validate-basis-verification!
+  "Validate two-axis verification metadata (`:cid-verification` /
+  `:basis-cid-verification` for snapshot body vs `:graph-cid-verification` for
+  graphCid) for domain membership and internal consistency (KotobaSpec v1.0.1)."
+  [basis]
+  (let [cid-ver (:cid-verification basis)
+        basis-ver (:basis-cid-verification basis)
+        graph-ver (:graph-cid-verification basis)
+        has-root? (some? (or (:root-cid basis) (:root-link basis)))
+        has-graph-cid? (some? (:graph-cid basis))]
+    (when (some? cid-ver)
+      (when-not (contains? valid-cid-verification-states cid-ver)
+        (fail! :invalid-basis
+               "`:cid-verification` must be :syntax-only, :verified, or :absent"
+               {:cid-verification cid-ver})))
+    (when (some? basis-ver)
+      (when-not (contains? valid-cid-verification-states basis-ver)
+        (fail! :invalid-basis
+               "`:basis-cid-verification` must be :syntax-only, :verified, or :absent"
+               {:basis-cid-verification basis-ver})))
+    (when (and (some? cid-ver) (some? basis-ver) (not= cid-ver basis-ver))
+      (fail! :invalid-basis
+             (str "contradictory `:cid-verification` (" cid-ver ") and `:basis-cid-verification` (" basis-ver ")")
+             {:cid-verification cid-ver :basis-cid-verification basis-ver}))
+    (when (and (= :verified (or basis-ver cid-ver)) (not has-root?))
+      (fail! :invalid-basis
+             "basis verification cannot be :verified when :root-cid is absent"
+             {:cid-verification cid-ver :basis-cid-verification basis-ver}))
+    (when (some? graph-ver)
+      (when-not (contains? valid-graph-cid-verification-states graph-ver)
+        (fail! :invalid-basis
+               "`:graph-cid-verification` must be :verified, :syntax-only, or :absent"
+               {:graph-cid-verification graph-ver}))
+      (when (and (#{:verified :syntax-only} graph-ver) (not has-graph-cid?))
+        (fail! :invalid-basis
+               (str "`:graph-cid-verification` " graph-ver " requires a valid `:graph-cid`")
+               {:graph-cid-verification graph-ver}))
+      (when (and (= :absent graph-ver) has-graph-cid?)
+        (fail! :invalid-basis
+               "`:graph-cid-verification` cannot be :absent when `:graph-cid` is present"
+               {:graph-cid-verification graph-ver :graph-cid (:graph-cid basis)})))))
+
 ;; ── Top-level Projection Input Validation ────────────────────────────────────
 
 (defn- assert-input-budget! [limits items kind]
@@ -635,9 +684,8 @@
         (fail! :invalid-basis "`:basis` must be a map" {:basis basis}))
       (when-let [rc (:root-cid basis)] (extract-cid rc))
       (when-let [rl (:root-link basis)] (extract-cid rl))
-      (when-let [ver (:cid-verification basis)]
-        (when-not (contains? valid-cid-verification-states ver)
-          (fail! :invalid-basis "`:cid-verification` must be :syntax-only or :verified" {:cid-verification ver})))
+      (when-let [gc (:graph-cid basis)] (extract-cid gc))
+      (validate-basis-verification! basis)
       (assert-label-length! limits :basis/source (:source basis)))
     limits))
 
@@ -683,10 +731,9 @@
         (bounded-count-or-fail! joins (:max-joins limits) :max-joins-exceeded :joins))
       (assert-bounded-and-no-remote-context! limits graph)
       (when-let [rc (:root-cid basis)] (extract-cid rc))
+      (when-let [gc (:graph-cid basis)] (extract-cid gc))
       (doseq [c (:cids basis)] (extract-cid c))
-      (when-let [ver (:cid-verification basis)]
-        (when-not (contains? valid-cid-verification-states ver)
-          (fail! :invalid-basis "invalid :cid-verification in basis" {:cid-verification ver})))
+      (validate-basis-verification! basis)
 
       ;; Validate layers, strict paint hex, and unique layer IDs
       (let [declared-layers

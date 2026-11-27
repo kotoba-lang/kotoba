@@ -968,11 +968,13 @@
         all-cids (vec (sort (distinct (keep identity (concat (when root-cid [root-cid])
                                                              (map :cid nodes)
                                                              (map :cid edges))))))
-        cid-ver (or (:cid-verification raw-basis) :syntax-only)
+        cid-ver (or (:basis-cid-verification raw-basis) (:cid-verification raw-basis) :syntax-only)
         basis (cond-> {:schema-version schema-version
                        :codec (str (or (:codec raw-basis) "dag-cbor"))
                        :hash-alg (str (or (:hash-alg raw-basis) "sha2-256"))
                        :cid-verification cid-ver
+                       :basis-cid-verification cid-ver
+                       :graph-cid-verification :absent
                        :node-count (count nodes)
                        :edge-count (count edges)
                        :layer-count (count layers)
@@ -1038,7 +1040,8 @@
                     (update :basis (fn [b]
                                      (-> b
                                          (dissoc :graph-cid :stats :coverage :yataverse-layers)
-                                         (assoc :node-count (count kept-nodes)
+                                         (assoc :graph-cid-verification :absent
+                                                :node-count (count kept-nodes)
                                                 :edge-count (count kept-edges)
                                                 :layer-count (count kept-layers))))))]
     (layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))

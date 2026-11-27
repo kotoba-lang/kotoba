@@ -32,7 +32,14 @@
      :screen/status "ready"
      :schema/version sem/contract-version
      :basis/cid (get-in graph [:basis :root-cid])
-     :basis/cid-verification (name (or (get-in graph [:basis :cid-verification]) :syntax-only))
+     :basis/cid-verification (name (or (get-in graph [:basis :basis-cid-verification])
+                                       (get-in graph [:basis :cid-verification])
+                                       :syntax-only))
+     :basis/basis-cid-verification (name (or (get-in graph [:basis :basis-cid-verification])
+                                             (get-in graph [:basis :cid-verification])
+                                             :syntax-only))
+     :basis/graph-cid-verification (name (or (get-in graph [:basis :graph-cid-verification])
+                                             :absent))
      :activeTab "inspect"
      :selectedNodeId first-id
      :activeLayers (mapv :id layers)
@@ -146,7 +153,9 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       'screen/status': 'ready',
       'schema/version': semSchema['schema/version'] || 'kotoba.semantic-ui/v1',
       'basis/cid': (graph.basis && graph.basis['root-cid']) || null,
-      'basis/cid-verification': (graph.basis && graph.basis['cid-verification']) || 'syntax-only',
+      'basis/cid-verification': (graph.basis && (graph.basis['basis-cid-verification'] || graph.basis['cid-verification'])) || 'syntax-only',
+      'basis/basis-cid-verification': (graph.basis && (graph.basis['basis-cid-verification'] || graph.basis['cid-verification'])) || 'syntax-only',
+      'basis/graph-cid-verification': (graph.basis && graph.basis['graph-cid-verification']) || 'absent',
       activeTab: activeTab,
       selectedNodeId: selectedNodeId,
       activeLayers: enabledLayers,
@@ -517,7 +526,8 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
          node-cnt-s (esc/escape-html (esc/fmt-num (count (:nodes graph))))
          edge-cnt-s (esc/escape-html (esc/fmt-num (count (:edges graph))))
          join-cnt-s (esc/escape-html (esc/fmt-num (count joins)))
-         cid-ver (esc/escape-html (name (or (:cid-verification basis) :syntax-only)))]
+         cid-ver (esc/escape-html (name (or (:basis-cid-verification basis) (:cid-verification basis) :syntax-only)))
+         graph-cid-ver (some-> (:graph-cid-verification basis) name)]
      (str "<!DOCTYPE html>\n"
           "<html lang=\"en\">\n"
           "<head>\n"
@@ -534,7 +544,9 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
           "    <div class=\"ov-basis-badges\">\n"
           "      <span class=\"ov-pill\">" (esc/escape-html g/schema-version) "</span>\n"
           "      <span class=\"ov-pill\">codec: " (esc/escape-html (or (:codec basis) "dag-cbor")) "</span>\n"
-          "      <span class=\"ov-pill\">cid: " cid-ver "</span>\n"
+          "      <span class=\"ov-pill\">basis-cid: " cid-ver "</span>\n"
+          (when (and graph-cid-ver (not= graph-cid-ver "absent"))
+            (str "      <span class=\"ov-pill\">graph-cid: " (esc/escape-html graph-cid-ver) "</span>\n"))
           (when-let [rc (:root-cid basis)]
             (str "      <span class=\"ov-pill\" title=\"" (esc/escape-attr rc) "\">root: "
                  (esc/escape-html (esc/short-cid rc)) "</span>\n"))

@@ -326,3 +326,83 @@
       (is (= :graph-cid-mismatch
              (refusal-reason #(ov/<-yataverse-graph reversed-nodes-yv)))
           "reordered nodes with old graphCid must fail closed"))))
+
+(deftest kotobaspec-v101-unicode-ordering-and-two-axis-verification-test
+  (let [u10000 "\uD800\uDC00"  ;; U+10000: UTF-16 [0xD800 0xDC00], UTF-8 4B [F0 90 80 80]
+        uE000  "\uE000"        ;; U+E000:  UTF-16 [0xE000],        UTF-8 3B [EE 80 80]
+        uE000a "\uE000a"]      ;; U+E000+'a':                      UTF-8 4B [EE 80 80 61]
+    (testing "KotobaSpec v1.0.1 (a) Array sort UTF-16 positive: U+10000 precedes U+E000 with deterministic bytes & CID"
+      (is (neg? (compare u10000 uE000))
+          "UTF-16 code-unit compare must place U+10000 (0xD800) before U+E000 (0xE000)")
+      (let [kg (ov/project-graph
+                {:ontology {:object-types [{:id :tender :name "Tender"}]}
+                 :facts [{:id (str "tender:" uE000) :ontology/type :tender :jurisdiction uE000}
+                         {:id (str "tender:" u10000) :ontology/type :tender :jurisdiction u10000}]
+                 :basis {:id "unicode-order-fixture"
+                         :root-cid "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"}})
+            yv (ov/->yataverse-graph kg)
+            fact-ids (mapv :id (filter #(= "fact" (:layer %)) (:nodes yv)))
+            {:keys [cid bytes]} (ov/encode-ontology-graph-dag-cbor yv)
+            rt (ov/<-yataverse-graph yv)]
+        (is (= [(str "entity:tender:" u10000) (str "entity:tender:" uE000)] fact-ids)
+            "newly projected array must sort nodes by UTF-16 code-unit order (U+10000 before U+E000)")
+        (is (= cid (:graphCid yv)))
+        (is (= :ok (ov/validate-dag-cbor! bytes)))
+        (is (= :verified (get-in rt [:basis :graph-cid-verification])))
+        (is (= :syntax-only (get-in rt [:basis :basis-cid-verification])))
+        (is (= :syntax-only (get-in rt [:basis :cid-verification])))
+
+        (testing "KotobaSpec v1.0.1 (b) Array sort UTF-16 negative: [...U+E000..., ...U+10000...] + stale graphCid -> :graph-cid-mismatch"
+          (let [non-facts (vec (remove #(= "fact" (:layer %)) (:nodes yv)))
+                rev-facts (vec (reverse (filter #(= "fact" (:layer %)) (:nodes yv))))
+                tampered (assoc yv :nodes (into non-facts rev-facts))]
+            (is (= :graph-cid-mismatch
+                   (refusal-reason #(ov/<-yataverse-graph tampered)))
+                "reordered Unicode array [U+E000, U+10000] with stale graphCid must fail closed")))))
+
+    (testing "KotobaSpec v1.0.1 (c) DAG-CBOR map key UTF-8 positive: U+E000 (3B) -> U+E000a (4B) -> U+10000 (4B)"
+      (let [bytes (ov/encode-dag-cbor {u10000 3 uE000a 2 uE000 1})
+            expected-bytes [0xa3
+                            0x63 0xee 0x80 0x80 0x01
+                            0x64 0xee 0x80 0x80 0x61 0x02
+                            0x64 0xf0 0x90 0x80 0x80 0x03]
+            decoded (ov/decode-dag-cbor bytes)]
+        (is (= expected-bytes bytes)
+            "canonical DAG-CBOR bytes must sort keys by UTF-8 byte length then unsigned UTF-8 byte value")
+        (is (nil? (ov/validate-dag-cbor bytes)))
+        (is (= [uE000 uE000a u10000] (:root-keys decoded)))
+        (is (= {uE000 1 uE000a 2 u10000 3} (:value decoded)))))
+
+    (testing "KotobaSpec v1.0.1 (d) Non-canonical UTF-16 map key order in raw CBOR bytes -> :map-keys-not-sorted"
+      (let [non-canon-utf16 [0xa2 0x64 0xf0 0x90 0x80 0x80 0x01 0x63 0xee 0x80 0x80 0x02]
+            non-canon-same-len [0xa2 0x64 0xf0 0x90 0x80 0x80 0x01 0x64 0xee 0x80 0x80 0x61 0x02]]
+        (is (= :map-keys-not-sorted (ov/validate-dag-cbor non-canon-utf16)))
+        (is (= :map-keys-not-sorted (refusal-reason #(ov/validate-dag-cbor! non-canon-utf16))))
+        (is (= :map-keys-not-sorted (refusal-reason #(ov/decode-dag-cbor non-canon-utf16))))
+        (is (= :map-keys-not-sorted (ov/validate-dag-cbor non-canon-same-len)))
+        (is (= :map-keys-not-sorted (refusal-reason #(ov/decode-dag-cbor non-canon-same-len))))))
+
+    (testing "KotobaSpec v1.0.1 two-axis verification separation & strict wire non-inclusion"
+      (let [kg (ov/<-yataverse-graph yataverse-pr83-fixture)
+            yv (ov/->yataverse-graph kg)
+            svg (ov/render-svg kg)
+            html (ov/render-html kg)
+            st (ov/initial-screen-state kg)]
+        (is (= :verified (get-in kg [:basis :graph-cid-verification]))
+            "graphCid verified against canonical DAG-CBOR bytes")
+        (is (= :syntax-only (get-in kg [:basis :basis-cid-verification]))
+            "graphCid match MUST NOT promote snapshot basisCid to :verified")
+        (is (= :syntax-only (get-in kg [:basis :cid-verification])))
+        (is (= "syntax-only" (:basis/basis-cid-verification st)))
+        (is (= "verified" (:basis/graph-cid-verification st)))
+        (is (str/includes? svg "cid=syntax-only"))
+        (is (str/includes? svg "graph-cid=verified"))
+        (is (str/includes? html "basis-cid: syntax-only"))
+        (is (str/includes? html "graph-cid: verified"))
+        (doseq [internal-k [:cid-verification :basis-cid-verification :graph-cid-verification
+                            :graphCidVerified :basisCidVerified :verificationScope
+                            "cid-verification" "basis-cid-verification" "graph-cid-verification"
+                            "graphCidVerified" "basisCidVerified" "verificationScope"
+                            "graphVerification" "basisVerification"]]
+          (is (not (contains? yv internal-k))
+              (str "wire yataverse.ontology.graph/v1 must NEVER contain internal verification key " internal-k)))))))
