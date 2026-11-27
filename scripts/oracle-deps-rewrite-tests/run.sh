@@ -176,4 +176,58 @@ python3 "$SCRIPT" --check "$TMP/19.edn" > "$TMP/19c2" 2>&1
 [ "$?" = 0 ] || { cat "$TMP/19c2"; fail "19-comma-alias check clean: want exit 0"; }
 echo "ok: 19-comma-alias (check 1, rewrite 0, idempotent 2, check 0)"
 
+# 20: Kougi re-review case (:git/url, ; comment + next-line URL + :git/sha,).
+# --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/20-kougi-comment/deps.edn" > "$TMP/20c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/20c1"; fail "20-kougi-comment check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/20c1" || fail "20-kougi-comment: no dead-URL report"
+cp "$HERE/cases/20-kougi-comment/deps.edn" "$TMP/20.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/20.edn" \
+  > "$TMP/20.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/20.stdout"; fail "20-kougi-comment: want exit 0"; }
+diff -u "$HERE/cases/20-kougi-comment/expected.edn" "$TMP/20.edn" \
+  || fail "20-kougi-comment: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/20.edn" \
+  > "$TMP/20b.stdout" 2>&1
+[ "$?" = 2 ] || fail "20-kougi-comment re-run: want exit 2"
+diff -q "$HERE/cases/20-kougi-comment/expected.edn" "$TMP/20.edn" > /dev/null \
+  || fail "20-kougi-comment re-run: file changed"
+python3 "$SCRIPT" --check "$TMP/20.edn" > "$TMP/20c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/20c2"; fail "20-kougi-comment check clean: want exit 0"; }
+echo "ok: 20-kougi-comment (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 21: comment+comma gaps at every token position, with byte-preservation of
+# rewrite-exempt comments. --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+# Preserved: leading/fake-pin/:deps-gap/text-floor/fake-url comments, the string
+# holding ";" and ",", :aliases/:override-deps gap comments, ghost comment.
+python3 "$SCRIPT" --check "$HERE/cases/21-gap-preserve/deps.edn" > "$TMP/21c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/21c1"; fail "21-gap-preserve check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/21c1" || fail "21-gap-preserve: no dead-URL report"
+cp "$HERE/cases/21-gap-preserve/deps.edn" "$TMP/21.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/21.edn" \
+  > "$TMP/21.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/21.stdout"; fail "21-gap-preserve: want exit 0"; }
+diff -u "$HERE/cases/21-gap-preserve/expected.edn" "$TMP/21.edn" \
+  || fail "21-gap-preserve: output differs from expected.edn"
+for line in ';; leading comment stays byte-identical' \
+            ' ;; fake pin in comment is ignored: io.github.kotoba-lang/evil {:git/url "https://github.com/kotoba-lang/evil" :git/sha "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
+            ' :deps ; comment after :deps' \
+            '  ;; comment for the text lib stays.' \
+            '  ;; :git/url "https://github.com/kotoba-lang/fake" is a fake.' \
+            '  org.clojure/clojure {:mvn/version "1.12.0, still one version; not a comment"}}' \
+            ' :aliases ; comment after :aliases' \
+            '         :override-deps ; comment after :override-deps' \
+            '         {;; fake: io.github.kotoba-lang/ghost {:git/sha "cccccccccccccccccccccccccccccccccccccccc"}'; do
+  grep -F -x -- "$line" "$TMP/21.edn" > /dev/null \
+    || fail "21-gap-preserve: comment/string line not preserved: $line"
+done
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/21.edn" \
+  > "$TMP/21b.stdout" 2>&1
+[ "$?" = 2 ] || fail "21-gap-preserve re-run: want exit 2"
+diff -q "$HERE/cases/21-gap-preserve/expected.edn" "$TMP/21.edn" > /dev/null \
+  || fail "21-gap-preserve re-run: file changed"
+python3 "$SCRIPT" --check "$TMP/21.edn" > "$TMP/21c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/21c2"; fail "21-gap-preserve check clean: want exit 0"; }
+echo "ok: 21-gap-preserve (check 1, rewrite 0, idempotent 2, check 0, comments kept)"
+
 echo "ALL FIXTURE TESTS PASSED"

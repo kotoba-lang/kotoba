@@ -70,7 +70,9 @@ GROUPS = r"(?:io\.github\.kotoba-lang|kotoba-lang|gftd)"
 
 # EDN treats commas as whitespace: any gap between two tokens may hold commas
 # (",", ",,", ",\n", ...). Use EDN_REQ/EDN_OPT for every gap between tokens.
-# Never applied inside "..." strings or ;-comments (handled separately).
+# EDN_REQ/EDN_OPT are applied to comment-stripped text (see _coord_text).
+# Searches over raw text that may span a ;-comment either strip first or
+# cross the gap procedurally with skip_gap (linear, no regex backtracking).
 EDN_REQ = r"[\s,]+"
 EDN_OPT = r"[\s,]*"
 
@@ -121,6 +123,9 @@ def load_metadata(repo, sha):
     if cat is None:
         sys.exit("error: cannot read lib/catalog.edn at %s from %s" % (sha, repo))
     alias_to_path = {}
+    # Judge comment-stripped text (offsets are stable) so ;-comments between
+    # tokens never hide an entry; resolution values live in "..." strings.
+    cat = _strip_comments(cat)
     id_starts = [m.start() for m in re.finditer(r"\{:id" + EDN_REQ, cat)]
     for i, start in enumerate(id_starts):
         # entry ends at the next "{:id " or EOF; entries contain no nested maps
@@ -144,12 +149,13 @@ def load_metadata(repo, sha):
         lib_texts[path] = txt
         refs, gits = [], []
         for lib, block in iter_lib_maps(txt):
-            if ":local/root" in block:
+            eff = _coord_text(block)
+            if ":local/root" in eff:
                 refs.append(lib)
                 continue
-            um = re.search(r':git/url' + EDN_REQ + r'"([^"]+)"', block)
-            sm = re.search(r":git/sha" + EDN_REQ + r"\"([0-9a-f]+)\"|:sha" + EDN_REQ + r"\"([0-9a-f]+)\"", block)
-            rm = re.search(r':deps/root' + EDN_REQ + r'"([^"]+)"', block)
+            um = re.search(r':git/url' + EDN_REQ + r'"([^"]+)"', eff)
+            sm = re.search(r":git/sha" + EDN_REQ + r"\"([0-9a-f]+)\"|:sha" + EDN_REQ + r"\"([0-9a-f]+)\"", eff)
+            rm = re.search(r':deps/root' + EDN_REQ + r'"([^"]+)"', eff)
             if um and sm:
                 gits.append((lib, um.group(1), sm.group(1) or sm.group(2),
                              rm.group(1) if rm else ""))
@@ -170,11 +176,13 @@ def load_metadata(repo, sha):
         cands = []
         for txt in lib_texts.values():
             for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", txt):
+                if _in_comment(txt, m.start()) or _in_string(txt, m.start()):
+                    continue
                 j = skip_gap(txt, m.end())
                 if j < len(txt) and txt[j] == "{":
                     k = find_matching_brace(txt, j)
                     rm = re.search(r':local/root' + EDN_REQ + r'"\.\./([a-zA-Z0-9_.\-]+)"',
-                                   txt[j:k])
+                                   _strip_comments(txt[j:k]))
                     if rm:
                         cands.append("lib/" + rm.group(1))
         for cand in dict.fromkeys(cands):
@@ -256,23 +264,39 @@ def closure_libs(tops, resolve, lib_deps, sha, dual_arts, present_keys):
 
 
 def dead_url(block):
-    """github.com/kotoba-lang/<name> URL with <name> not in {kotoba(.git), amu(.git)}."""
+    """github.com/kotoba-lang/<name> URL with <name> not in {kotoba(.git), amu(.git)}.
+
+    Judges _coord_text(block) (comments blanked), exactly like --check.
+    """
+    eff = _coord_text(block)
     m = re.search(r":git/url" + EDN_REQ + r"\"https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?\"",
-                  block)
+                  eff)
     if not m:
         return False
     return m.group(1) not in ("kotoba", "amu")
 
 
 def bare_git_sha(block):
-    """:git/sha or :sha without any :git/url (default URL points at a deleted repo)."""
-    if ":git/url" in block:
+    """:git/sha or :sha without any :git/url (default URL points at a deleted repo).
+
+    Judges _coord_text(block) (comments blanked), exactly like --check: a
+    :git/url living only inside a ;-comment does not satisfy a live sha.
+    """
+    eff = _coord_text(block)
+    if ":git/url" in eff:
         return False
-    return bool(re.search(r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", block))
+    return bool(re.search(r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", eff))
+
+
+def has_local_root(block):
+    """:local/root present outside strings/comments (same _coord_text basis)."""
+    return ":local/root" in _coord_text(block)
 
 
 def is_canonical(block, root, sha):
-    return MONO_URL in block and sha in block and root in block
+    """Monorepo pin judged on _coord_text(block), exactly like --check."""
+    eff = _coord_text(block)
+    return MONO_URL in eff and sha in eff and root in eff
 
 
 LIB_KEY = re.compile(r"(?<![a-zA-Z0-9_.\-/])(" + GROUPS + r"/[a-zA-Z0-9_.\-]+)")
@@ -297,6 +321,50 @@ def _in_comment(text, pos):
                 return True
         i += 1
     return False
+
+
+def _in_string(text, pos):
+    """True when pos lies inside a "..." literal (comment-aware scan)."""
+    in_str, esc, i = False, False, 0
+    while i < pos:
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+        elif c == '"':
+            in_str = True
+            i += 1
+        elif c == ';':
+            while i < pos and text[i] != '\n':
+                i += 1
+        else:
+            i += 1
+    return in_str
+
+
+def _coord_text(block):
+    """Effective coordinate text: ;-comments blanked, offsets stable.
+
+    Single source of truth for coordinate classification: dead_url(),
+    bare_git_sha(), has_local_root() and is_canonical() all judge this
+    text, so --check and the rewrite pass can never disagree on what a
+    pin's coordinates are. "..." strings (and hence the URL/sha/root
+    values) pass through byte-identical.
+    """
+    return _strip_comments(block)
+
+
+def _find_map_open(text, key_end):
+    """Brace index for `key {...}` across a comment+comma gap, else None."""
+    j = skip_gap(text, key_end)
+    if j < len(text) and text[j] == "{":
+        return j
+    return None
 
 
 def _strip_comments(text):
@@ -353,28 +421,28 @@ def iter_lib_maps(txt):
     on unbalanced braces via find_matching_brace.
     """
     for m in LIB_KEY.finditer(txt):
-        if _in_comment(txt, m.start()):
+        if _in_comment(txt, m.start()) or _in_string(txt, m.start()):
             continue
         key = m.group(1)
         e = m.end()
         if e < len(txt) and (txt[e].isalnum() or txt[e] in "_.-/"):
             continue
-        j = skip_gap(txt, e)
-        if j < len(txt) and txt[j] == "{":
+        j = _find_map_open(txt, e)
+        if j is not None:
             yield key, txt[j:find_matching_brace(txt, j)]
 
 
 def iter_lib_spans(text):
     """Like iter_lib_maps but yields (key, start, end, block) with offsets."""
     for m in LIB_KEY.finditer(text):
-        if _in_comment(text, m.start()):
+        if _in_comment(text, m.start()) or _in_string(text, m.start()):
             continue
         key = m.group(1)
         e = m.end()
         if e < len(text) and (text[e].isalnum() or text[e] in "_.-/"):
             continue
-        j = skip_gap(text, e)
-        if j < len(text) and text[j] == "{":
+        j = _find_map_open(text, e)
+        if j is not None:
             k = find_matching_brace(text, j)
             yield key, m.start(), k, text[j:k]
 
@@ -396,9 +464,13 @@ def _rewrite_direct_acc(text, resolve, sha, rewrite_locals, changed):
         if key in AMU_LIBS:
             continue  # amu is frozen
         grp, art = key.split("/", 1)
+        # Same _coord_text basis as --check (dead_url/bare_git_sha/
+        # has_local_root/is_canonical all strip internally); a MONO_URL or
+        # sha living only in a ;-comment never counts either way.
+        eff = _coord_text(block)
         needs = (dead_url(block) or bare_git_sha(block) or
-                 (":local/root" in block and art in rewrite_locals) or
-                 (MONO_URL in block and sha not in block))
+                 (has_local_root(block) and art in rewrite_locals) or
+                 (MONO_URL in eff and sha not in eff))
         if not needs:
             continue
         root = resolve(key)
@@ -479,11 +551,23 @@ def find_matching_brace(text, open_idx):
 
 
 def alias_bodies(text):
-    """[(name, body_open, body_close)] for each map-valued alias in :aliases."""
-    m = re.search(r":aliases" + EDN_OPT + r"\{", text)
-    if not m:
+    """[(name, body_open, body_close)] for each map-valued alias in :aliases.
+
+    The :aliases -> { gap is comment+comma transparent (skip_gap), and an
+    :aliases occurrence inside a ;-comment or "..." string is skipped.
+    """
+    a_open = None
+    for m in re.finditer(
+            r"(?<![a-zA-Z0-9_.\-/+*!?<>:#]):aliases(?![a-zA-Z0-9_.\-/+*!?<>])",
+            text):
+        if _in_comment(text, m.start()) or _in_string(text, m.start()):
+            continue
+        j = _find_map_open(text, m.end())
+        if j is not None:
+            a_open = j
+            break
+    if a_open is None:
         return []
-    a_open = m.end() - 1
     a_close = find_matching_brace(text, a_open)
     bodies, i, n = [], a_open + 1, a_close - 1
     while i < n:
@@ -513,7 +597,8 @@ def current_tops(text, sha):
     for key, block in iter_lib_maps(text):
         if key in AMU_LIBS:
             continue
-        if MONO_URL in block and sha in block:
+        eff = _coord_text(block)
+        if MONO_URL in eff and sha in eff:
             tops.add(key.split("/", 1)[1])
     return tops
 
@@ -526,10 +611,10 @@ def find_entry(text, lib):
     leaves the comment bytes untouched, instead of splicing into them.
     """
     for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", text):
-        if _in_comment(text, m.start()):
+        if _in_comment(text, m.start()) or _in_string(text, m.start()):
             continue
-        j = skip_gap(text, m.end())
-        if j < len(text) and text[j] == "{":
+        j = _find_map_open(text, m.end())
+        if j is not None:
             return m.start(), find_matching_brace(text, j)
     return None
 
@@ -559,13 +644,20 @@ def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
     if not want:
         return text, False
     body = text[b_open:b_close]
-    om = None
-    for cand in re.finditer(r":override-deps" + EDN_OPT + r"\{", body):
-        if not _in_comment(body, cand.start()):
-            om = cand
+    # :override-deps -> { across any whitespace/comma/;-comment gap; a fake
+    # :override-deps inside a ;-comment or "..." string is not an entry.
+    o_rel = None
+    for cand in re.finditer(
+            r"(?<![a-zA-Z0-9_.\-/+*!?<>:#]):override-deps(?![a-zA-Z0-9_.\-/+*!?<>])",
+            body):
+        if _in_comment(body, cand.start()) or _in_string(body, cand.start()):
+            continue
+        j = _find_map_open(body, cand.end())
+        if j is not None:
+            o_rel = j
             break
-    if om:
-        o_open = b_open + om.end() - 1
+    if o_rel is not None:
+        o_open = b_open + o_rel
         o_close = find_matching_brace(text, o_open)
         new_map = text[o_open:o_close]
         merged = []
@@ -624,10 +716,14 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
         progressed = False
         for name, b_open, b_close in bodies:
             body = text[b_open:b_close]
-            if name == ":test" and re.search(r":replace-deps" + EDN_OPT + r"\{", body):
+            # Judge comment-stripped body (offsets unused here): ;-comments
+            # between :replace-deps and { (or amu and {) are transparent, and
+            # fake keys living only in comments never match.
+            sbody = _strip_comments(body)
+            if name == ":test" and re.search(r":replace-deps" + EDN_OPT + r"\{", sbody):
                 continue
             amu = bool(re.search(r"kotoba-lang/amu" + EDN_OPT + r"\{[^{}]*(:git/url|:git/sha)",
-                                 body))
+                                 sbody))
             if name != ":test" and not amu:
                 continue
             sub = set()
@@ -666,20 +762,21 @@ def check_file(path):
             lineno = stripped.count("\n", 0, m.start()) + 1
             problems.append("%d: dead repo URL %s" % (lineno, m.group(1)))
     try:
-        lib_maps = list(iter_lib_maps(text))
+        # Same span enumeration as the rewrite pass (iter_lib_spans), so both
+        # modes see the same pins at the same offsets.
+        lib_spans = list(iter_lib_spans(text))
     except ValueError as e:
         problems.append("unbalanced EDN: %s" % e)
-        lib_maps = []
-    for key, block in lib_maps:
+        lib_spans = []
+    for key, start, _end, block in lib_spans:
         if key in AMU_LIBS:
             continue
         # Judge effective (non-comment) coordinates only: a :git/url that
         # lives inside a ;-comment does not satisfy a live :git/sha.
-        eff = _strip_comments(block)
+        eff = _coord_text(block)
         if ":git/url" not in eff and re.search(
                 r":git/sha" + EDN_REQ + r"\"[0-9a-f]+\"|:sha" + EDN_REQ + r"\"[0-9a-f]+\"", eff):
-            lineno = text.find(key)
-            lineno = text.count("\n", 0, lineno) + 1 if lineno >= 0 else 1
+            lineno = text.count("\n", 0, start) + 1
             problems.append("%d: bare git sha without :git/url: %s" % (lineno, key))
     if problems:
         print("check failed (%s):" % path)
@@ -741,8 +838,13 @@ def main(argv=None):
                                               if a))
         # tops after pass 1: freshly rewritten pins count too
         tops = current_tops(new_text, args.sha)
-        dual_arts = {k.split("/", 1)[1] for k in
-                     re.findall(r"gftd/[a-zA-Z0-9_.\-]+", new_text)}
+        # Live gftd/ pins only: a gftd/... mention inside a ;-comment or
+        # "..." string is not a pin the rewrite pass sees.
+        dual_arts = set()
+        for gm in re.finditer(r"gftd/[a-zA-Z0-9_.\-]+", new_text):
+            if _in_comment(new_text, gm.start()) or _in_string(new_text, gm.start()):
+                continue
+            dual_arts.add(gm.group(0).split("/", 1)[1])
         new_text, aliases = rewrite_aliases(new_text, tops, resolve,
                                             lib_deps, dual_arts, args.sha)
     except ValueError as e:
