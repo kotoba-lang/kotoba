@@ -271,6 +271,58 @@ def is_canonical(block, root, sha):
 
 LIB_KEY = re.compile(r"(?<![a-zA-Z0-9_.\-/])(" + GROUPS + r"/[a-zA-Z0-9_.\-]+)")
 
+def _in_comment(text, pos):
+    """True when pos lies inside a ;-comment (string-aware, same-line scan)."""
+    ls = text.rfind("\n", 0, pos) + 1
+    in_str, esc, i = False, False, ls
+    while i < pos:
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == ';':
+                return True
+        i += 1
+    return False
+
+
+def _strip_comments(text):
+    """Blank ;-comments (newlines kept, offsets stable); strings aware."""
+    out = []
+    i, n, in_str, esc = 0, len(text), False, False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+        else:
+            if c == '"':
+                in_str = True
+                out.append(c)
+                i += 1
+            elif c == ';':
+                while i < n and text[i] != '\n':
+                    out.append(' ')
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+    return "".join(out)
+
+
 def skip_gap(txt, i):
     """Skip whitespace and ;-comments; linear, no backtracking."""
     n = len(txt)
@@ -295,6 +347,8 @@ def iter_lib_maps(txt):
     on unbalanced braces via find_matching_brace.
     """
     for m in LIB_KEY.finditer(txt):
+        if _in_comment(txt, m.start()):
+            continue
         key = m.group(1)
         e = m.end()
         if e < len(txt) and (txt[e].isalnum() or txt[e] in "_.-/"):
@@ -307,6 +361,8 @@ def iter_lib_maps(txt):
 def iter_lib_spans(text):
     """Like iter_lib_maps but yields (key, start, end, block) with offsets."""
     for m in LIB_KEY.finditer(text):
+        if _in_comment(text, m.start()):
+            continue
         key = m.group(1)
         e = m.end()
         if e < len(text) and (text[e].isalnum() or text[e] in "_.-/"):
@@ -581,15 +637,17 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
 def check_file(path):
     """Exit 1 with a listing when dead pins remain; 0 when clean. No writes."""
     with open(path) as f:
-        lines = f.read().split("\n")
+        text = f.read()
+    # scan comment-stripped text so ;-comments never count and a :git/url
+    # value on the next line still matches; offsets map 1:1 to text.
+    stripped = _strip_comments(text)
     problems = []
-    for i, ln in enumerate(lines, 1):
-        for m in re.finditer(
-                r":git/url\s+\"(https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?)\"",
-                ln):
-            if m.group(2) not in ("kotoba", "amu"):
-                problems.append("%d: dead repo URL %s" % (i, m.group(1)))
-    text = "\n".join(lines)
+    for m in re.finditer(
+            r":git/url\s+\"(https://github\.com/kotoba-lang/([a-zA-Z0-9_.\-]+?)(\.git)?)\"",
+            stripped):
+        if m.group(2) not in ("kotoba", "amu"):
+            lineno = stripped.count("\n", 0, m.start()) + 1
+            problems.append("%d: dead repo URL %s" % (lineno, m.group(1)))
     try:
         lib_maps = list(iter_lib_maps(text))
     except ValueError as e:

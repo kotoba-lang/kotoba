@@ -70,8 +70,8 @@ echo "ok: 10-unknown-artifact (loud error, untouched)"
 # 11-extra-upgrade (extern-sha upgrade applies cleanly)
 cp "$HERE/cases/11-extra-upgrade/deps.edn" "$TMP/11.edn"
 python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/11.edn" \
-  > /tmp/x11 2>&1
-[ "$?" = 0 ] || { cat /tmp/x11; fail "11-extra-upgrade: want exit 0"; }
+  > "$TMP/11.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/11.stdout"; fail "11-extra-upgrade: want exit 0"; }
 diff -q "$HERE/cases/11-extra-upgrade/expected.edn" "$TMP/11.edn" > /dev/null \
   || fail "11-extra-upgrade: output differs from expected.edn"
 echo "ok: 11-extra-upgrade (extern upgrade applied)"
@@ -87,10 +87,30 @@ diff -q "$HERE/cases/12-extra-drift/deps.edn" "$TMP/12.edn" > /dev/null \
 echo "ok: 12-extra-drift (loud error, untouched)"
 
 # 8: --check mode (dirty -> 1, clean -> 0, never writes)
-python3 "$SCRIPT" --check "$HERE/cases/02-bare-sha/deps.edn" > /tmp/chk1 2>&1
+python3 "$SCRIPT" --check "$HERE/cases/02-bare-sha/deps.edn" > "$TMP/chk1" 2>&1
 [ "$?" = 1 ] || fail "08-check dirty: want exit 1"
-python3 "$SCRIPT" --check "$HERE/cases/01-direct/expected.edn" > /tmp/chk2 2>&1
-[ "$?" = 0 ] || { cat /tmp/chk2; fail "08-check clean: want exit 0"; }
+python3 "$SCRIPT" --check "$HERE/cases/01-direct/expected.edn" > "$TMP/chk2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/chk2"; fail "08-check clean: want exit 0"; }
 echo "ok: 08-check (dirty 1, clean 0)"
+
+# 13: --check flags a dead URL whose value starts on the next line
+python3 "$SCRIPT" --check "$HERE/cases/13-check-multiline/deps.edn" > "$TMP/13.stdout" 2>&1
+[ "$?" = 1 ] || fail "13-check-multiline: want exit 1"
+grep -q "dead repo URL" "$TMP/13.stdout" || fail "13-check-multiline: no dead-URL report"
+echo "ok: 13-check-multiline (exit 1)"
+
+# 14: --check ignores dead URLs that appear only in ;-comments
+python3 "$SCRIPT" --check "$HERE/cases/14-check-comment-url/deps.edn" > "$TMP/14.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/14.stdout"; fail "14-check-comment-url: want exit 0"; }
+echo "ok: 14-check-comment-url (exit 0)"
+
+# 15: comment-only :deps pins are left byte-identical by default mode
+cp "$HERE/cases/15-comment-only-deps/deps.edn" "$TMP/15.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/15.edn" \
+  > "$TMP/15.stdout" 2>&1
+[ "$?" = 2 ] || { cat "$TMP/15.stdout"; fail "15-comment-only-deps: want exit 2"; }
+cmp -s "$HERE/cases/15-comment-only-deps/deps.edn" "$TMP/15.edn" \
+  || fail "15-comment-only-deps: file was modified"
+echo "ok: 15-comment-only-deps (exit 2, byte-identical)"
 
 echo "ALL FIXTURE TESTS PASSED"
