@@ -101,9 +101,9 @@ def _read_tree_file(repo, sha, path):
             return None
         return r.stdout
     try:
-        with open(os.path.join(repo, path)) as f:
-            return f.read()
-    except OSError:
+        with open(os.path.join(repo, path), "rb") as f:
+            return f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -118,6 +118,11 @@ def _read_tree_file(repo, sha, path):
 # ---------------------------------------------------------------------------
 
 _TERM = set(" \t\r\n,{}[]()\";#^")
+
+# Terminators for the `#:ns` namespace token: `#` and `:` stay inside the
+# token (bb reads `#:a#:b{...}` with ns `a#:b`), everything else that ends
+# an EDN token ends it (`(`/`)`/`[`/`]`/quotes/comments/`^`/char-quote too).
+_NS_TERM = set(" \t\r\n,{}[]()\";^\\")
 
 
 class EdnParseError(ValueError):
@@ -166,11 +171,15 @@ class EdnAtom(EdnNode):
 
 
 class EdnMap(EdnNode):
-    __slots__ = ("entries",)
+    __slots__ = ("entries", "ns")
 
-    def __init__(self, entries, start, end):
+    def __init__(self, entries, start, end, ns=None):
         EdnNode.__init__(self, start, end)
         self.entries = entries  # list of (key, value) nodes
+        # Namespaced-map prefix from `#:ns{...}` (None for a plain map).
+        # Only this map's DIRECT keys are qualified by it; nested maps,
+        # sets, vectors and values never inherit it (matches bb/clojure.edn).
+        self.ns = ns
 
 
 class EdnVec(EdnNode):
@@ -340,8 +349,9 @@ class _Parser:
                 items.append(form)
 
     def read_set(self):
-        start = self.pos
-        self.pos += 2  # consume `#{`
+        # read_dispatch already consumed `#`; pos is at `{`.
+        start = self.pos - 1
+        self.pos += 1  # consume `{`
         items = []
         while True:
             self.skip_trivia()
@@ -362,11 +372,19 @@ class _Parser:
         c = self.text[self.pos]
         if c == "_":
             self.pos += 1
-            self.skip_trivia()
-            if self.pos >= self.n or self.text[self.pos] in "}])":
-                self.fail("orphan `#_`")
-            self.read_form()  # exactly one form is discarded
-            return _SKIPPED
+            # One `#_` discards the next live form; a nested `#_`-discard
+            # is consumed first, so N consecutive `#_` discard N forms
+            # (each `#_` re-invokes the form reader, matching bb/clojure.edn:
+            # `#_ #_ :a :b :c` keeps `:c`). A missing form (EOF or a
+            # closing bracket) is malformed.
+            while True:
+                self.skip_trivia()
+                if self.pos >= self.n or self.text[self.pos] in "}])":
+                    self.fail("orphan `#_`")
+                if self.read_form() is not _SKIPPED:
+                    return _SKIPPED
+        if c == ":":
+            return self.read_ns_map()
         if c == "{":
             return self.read_set()
         j = self.pos
@@ -383,6 +401,74 @@ class _Parser:
         if form is _SKIPPED:
             self.fail("orphan tag `#%s`" % tag)
         return EdnTagged(tag, form, start, self.pos)
+
+    def read_ns_map(self):
+        """Parse `#:ns{...}` into an EdnMap with ns set (span covers `#:`).
+
+        Matches bb/clojure.edn observably: between `#:` and the namespace,
+        whitespace, commas, `;`-comments and `#_`-discards are allowed; the
+        namespace runs to the next delimiter (`#` and `:` stay inside it, so
+        `#:a#:b{...}` binds ns `a#:b`); between the namespace and the map only
+        whitespace and commas are skipped (a comment or `#_` there is
+        malformed); the map itself must be a literal `{...}`. Direct keys are
+        qualified at lookup time via expand_key (values never are).
+        """
+        start = self.pos - 1  # include the leading `#`
+        self.pos += 1  # consume `:`
+        # Gap before the namespace: full trivia plus `#_`-discards.
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                self.fail("orphan `#:`")
+            if self.text.startswith("#_", self.pos):
+                # `#_` always opens a discard in dispatch position; consume
+                # the discarded form and keep skipping toward the namespace.
+                self.pos += 2
+                while True:
+                    self.skip_trivia()
+                    if self.pos >= self.n or self.text[self.pos] in "}])":
+                        self.fail("orphan `#_`")
+                    if self.read_form() is not _SKIPPED:
+                        break
+                continue
+            break
+        ns_start = self.pos
+        while self.pos < self.n and self.text[self.pos] not in _NS_TERM:
+            self.pos += 1
+        ns = self.text[ns_start:self.pos]
+        if (not ns or "/" in ns or ns.startswith(":")
+                or _is_number(ns) or _is_ns_number(ns)):
+            self.fail("namespaced map must specify a valid namespace")
+        # Gap before the map: whitespace and commas only (a `;`-comment or
+        # `#_` here is malformed, matching bb/clojure.edn).
+        while self.pos < self.n and self.text[self.pos] in " \t\r\n,":
+            self.pos += 1
+        if self.pos >= self.n or self.text[self.pos] != "{":
+            self.fail("namespaced map must specify a map")
+        # Parse the brace map inline so the span covers `#:ns{...}`.
+        self.pos += 1
+        entries = []
+        while True:
+            self.skip_trivia()
+            if self.pos >= self.n:
+                self.fail("unclosed `{`")
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                return EdnMap(entries, start, self.pos, ns)
+            key = self.read_form()
+            if key is _SKIPPED:
+                continue
+            while True:
+                self.skip_trivia()
+                if self.pos >= self.n:
+                    self.fail("unclosed `{`")
+                if self.text[self.pos] == "}":
+                    self.fail("map literal must contain an even number of forms")
+                val = self.read_form()
+                if val is _SKIPPED:
+                    continue
+                entries.append((key, val))
+                break
 
     def read_meta(self):
         start = self.pos
@@ -466,7 +552,135 @@ class _Parser:
 
 def parse_edn(text):
     """Parse EDN text into top-level forms; `#_`-discarded forms are dropped."""
-    return _Parser(text).read_forms()
+    forms = _Parser(text).read_forms()
+    _check_no_dups(forms)
+    return forms
+
+
+def _is_ns_number(ns):
+    """Reject numeric namespaces bb refuses (`#:123{...}`, `#:1e3{...}`)."""
+    if not ns:
+        return True
+    if ns[0].isdigit():
+        return True
+    if len(ns) > 1 and ns[0] in "+-" and ns[1].isdigit():
+        return True
+    return False
+
+
+def expand_key(name, ns):
+    """Expanded `:ns/k` or `ns/k` for a direct key of a `#:ns{...}` map.
+
+    Unqualified keys gain the namespace; `:_/k` and `_/k` stay unqualified
+    `:k`/`k`; already-qualified keys keep their namespace; map values are
+    never passed through here. Matches bb/clojure.edn observably.
+    """
+    if name.startswith(":"):
+        rest = name[1:]
+        if "/" in rest:
+            head = rest.split("/", 1)[0]
+            if head == "_":
+                return ":" + rest.split("/", 1)[1]
+            return name
+        return ":" + ns + "/" + rest if ns is not None else name
+    else:
+        if "/" in name:
+            head = name.split("/", 1)[0]
+            if head == "_":
+                return name.split("/", 1)[1]
+            return name
+        return ns + "/" + name if ns is not None else name
+
+
+def _atom_sort_key(text):
+    # Type-tagged so Python's `True == 1` / `1 == 1.0` never collapse
+    # distinct EDN keys (bb keeps `{1 1, 1.0 2}` and `{true 1, 1 2}`).
+    if text == "true":
+        return ("bool", True)
+    if text == "false":
+        return ("bool", False)
+    if text == "nil":
+        return ("nil", None)
+    if _is_number(text):
+        if "." in text:
+            return ("float", float(text))
+        return ("int", int(text))
+    return ("char", text)
+
+
+def _edn_sort_key(node, ns=None):
+    """Hashable structural key with type tags for duplicate detection."""
+    if isinstance(node, EdnKeyword):
+        return ("kw", expand_key(node.name, ns))
+    if isinstance(node, EdnSymbol):
+        return ("sym", expand_key(node.name, ns))
+    if isinstance(node, EdnString):
+        return ("str", node.value)
+    if isinstance(node, EdnAtom):
+        return _atom_sort_key(node.text)
+    if isinstance(node, EdnVec):
+        return ("vec", tuple(_edn_sort_key(i) for i in node.items))
+    if isinstance(node, EdnList):
+        return ("list", tuple(_edn_sort_key(i) for i in node.items))
+    if isinstance(node, EdnSet):
+        return ("set", frozenset(_edn_sort_key(i) for i in node.items))
+    if isinstance(node, EdnMap):
+        return ("map", frozenset((_edn_sort_key(k, node.ns),
+                                  _edn_sort_key(v))
+                                 for k, v in node.entries))
+    if isinstance(node, EdnTagged):
+        return ("tagged", node.tag, _edn_sort_key(node.form))
+    if isinstance(node, EdnMeta):
+        # Metadata does not affect equality; compare the bare form.
+        return _edn_sort_key(node.form)
+    raise EdnParseError("cannot compare key of unknown type")
+
+
+def _check_no_dups(forms):
+    """Reject duplicate map keys (namespace-expanded) and set elements.
+
+    Matches bb/clojure.edn: every map counts, `#_`-discarded forms are
+    already gone, and an odd form count already failed in the reader.
+    Raises EdnParseError before any write, so both --check and rewrite
+    leave the input file byte-identical.
+    """
+    def walk(node):
+        if isinstance(node, EdnMap):
+            seen = set()
+            for key, val in node.entries:
+                sort = _edn_sort_key(key, node.ns)
+                if sort in seen:
+                    raise EdnParseError("duplicate map key: %s" % key_text(key))
+                seen.add(sort)
+                walk(key)
+                walk(val)
+        elif isinstance(node, (EdnVec, EdnList, EdnSet)):
+            if isinstance(node, EdnSet):
+                seen = set()
+                for item in node.items:
+                    sort = _edn_sort_key(item)
+                    if sort in seen:
+                        raise EdnParseError("duplicate set element")
+                    seen.add(sort)
+            for item in node.items:
+                walk(item)
+        elif isinstance(node, EdnTagged):
+            walk(node.form)
+        elif isinstance(node, EdnMeta):
+            walk(node.meta)
+            walk(node.form)
+
+    def key_text(key):
+        if isinstance(key, (EdnKeyword, EdnSymbol)):
+            return key.name
+        if isinstance(key, EdnString):
+            return '"%s"' % key.value
+        if isinstance(key, EdnAtom):
+            return key.text
+        return "<composite>"
+
+    for form in forms:
+        walk(form)
 
 
 # ---------------------------------------------------------------------------
@@ -519,19 +733,26 @@ def iter_lib_pins(forms):
 
     Pins inside `;`-comments are trivia (never parsed); pins inside `#_`
     discards are dropped by the parser, so neither can be misdetected.
+    A lib key written bare inside a `#:io.github.kotoba-lang{...}` dependency
+    map is reported under its expanded name; the key node keeps its original
+    span for byte-exact rewrites.
     """
     for form in forms:
         for node in walk_edn(form):
             if isinstance(node, EdnMap):
                 for key, val in node.entries:
-                    if (isinstance(key, EdnSymbol) and isinstance(val, EdnMap)
-                            and _is_lib_key(key.name)):
-                        yield key, key.name, val
+                    if not (isinstance(key, EdnSymbol)
+                            and isinstance(val, EdnMap)):
+                        continue
+                    lib = expand_key(key.name, node.ns)
+                    if _is_lib_key(lib):
+                        yield key, lib, val
 
 
 def _map_str(coord, key_name):
     for key, val in coord.entries:
-        if (isinstance(key, EdnKeyword) and key.name == key_name
+        if (isinstance(key, EdnKeyword)
+                and expand_key(key.name, coord.ns) == key_name
                 and isinstance(val, EdnString)):
             return val.value
     return None
@@ -539,7 +760,8 @@ def _map_str(coord, key_name):
 
 def _map_has(coord, key_name):
     for key, _val in coord.entries:
-        if isinstance(key, EdnKeyword) and key.name == key_name:
+        if (isinstance(key, EdnKeyword)
+                and expand_key(key.name, coord.ns) == key_name):
             return True
     return False
 
@@ -766,14 +988,16 @@ def closure_libs(tops, resolve, lib_deps, sha, dual_arts, present_keys):
     return out
 
 
-def rewrite_direct(text, resolve, sha, rewrite_locals):
+def rewrite_direct(text, resolve, sha, rewrite_locals, nl="\n"):
     """Pass 1: rewrite dead pins. Returns (text, [rewritten artifacts]).
 
     Only io.github.kotoba-lang|kotoba-lang|gftd groups are scanned.
     cognitect test-runner's bare :git/tag+:git/sha uses another group
     and never reaches here, so every bare sha here defaults to a deleted
     kotoba-lang repo. One pin per iteration (re-parsed each time, so spans
-    stay exact); `#_`-discarded pins are invisible to the parser.
+    stay exact); `#_`-discarded pins are invisible to the parser. `#:ns{...}`
+    coordinate spans are replaced whole (never leaving a bare `#:ns` behind).
+    New lines use the file's own newline so CRLF outside spans is preserved.
     """
     changed = []
     guard = 0
@@ -794,9 +1018,9 @@ def rewrite_direct(text, resolve, sha, rewrite_locals):
         if target is None:
             return text, changed
         key, lib, coord, root = target
-        new = (text[key.start:key.end] + "\n        {:git/url \"%s\"\n"
-               "         :git/sha \"%s\"\n"
-               "         :deps/root \"%s\"}") % (MONO_URL, sha, root)
+        new = (text[key.start:key.end] + nl + "        {:git/url \"%s\"" + nl
+               + "         :git/sha \"%s\"" + nl
+               + "         :deps/root \"%s\"}") % (MONO_URL, sha, root)
         text = text[:key.start] + new + text[coord.end:]
         changed.append(lib.split("/", 1)[1])
     raise EdnParseError("rewrite did not converge")
@@ -857,17 +1081,18 @@ def _alias_has_amu(body):
         if isinstance(node, EdnMap):
             for key, val in node.entries:
                 if (isinstance(key, EdnSymbol) and isinstance(val, EdnMap)
-                        and key.name in ("io.github.kotoba-lang/amu", "kotoba-lang/amu")
+                        and expand_key(key.name, node.ns) in (
+                            "io.github.kotoba-lang/amu", "kotoba-lang/amu")
                         and (_map_has(val, ":git/url") or _map_has(val, ":git/sha"))):
                     return True
     return False
 
 
-def entry_text(lib, root, sha, indent):
-    return ("%s%s\n"
-            "%s{:git/url \"%s\"\n"
-            "%s :git/sha \"%s\"\n"
-            "%s :deps/root \"%s\"}") % (
+def entry_text(lib, root, sha, indent, nl="\n"):
+    return ("%s%s" + nl
+            + "%s{:git/url \"%s\"" + nl
+            + "%s :git/sha \"%s\"" + nl
+            + "%s :deps/root \"%s\"}") % (
         indent, lib, indent, MONO_URL, indent, sha, indent, root)
 
 
@@ -910,10 +1135,13 @@ def _body_key_indent(inner):
     return found if found is not None else " " * 14
 
 
-def ensure_override_in_alias(text, body, sha, want, resolve):
+def ensure_override_in_alias(text, body, sha, want, resolve, nl="\n"):
     """Merge :override-deps pins for want into this alias body.
 
     One edit per call (the caller re-parses); spans are absolute offsets.
+    A fully-qualified lib key is inserted even when the map is a `#:ns{...}`
+    (explicit qualification stays valid inside one); new lines use the
+    file's own newline so CRLF outside spans is preserved.
     """
     if not want:
         return text, False
@@ -929,7 +1157,8 @@ def ensure_override_in_alias(text, body, sha, want, resolve):
             root = resolve(lib)
             found = None
             for key, val in override.entries:
-                if (isinstance(key, EdnSymbol) and key.name == lib
+                if (isinstance(key, EdnSymbol)
+                        and expand_key(key.name, override.ns) == lib
                         and isinstance(val, EdnMap)):
                     found = (key, val)
                     break
@@ -938,11 +1167,11 @@ def ensure_override_in_alias(text, body, sha, want, resolve):
                 key, val = found
                 if is_canonical(val, root, sha):
                     continue
-                new_text = (text[:key.start] + entry_text(lib, root, sha, ins)
+                new_text = (text[:key.start] + entry_text(lib, root, sha, ins, nl)
                             + text[val.end:])
                 return new_text, True
-            entry = "\n" + entry_text(lib, root, sha, ins)
-            inner = text[o_open:o_close - 1].rstrip("\n")
+            entry = nl + entry_text(lib, root, sha, ins, nl)
+            inner = text[o_open:o_close - 1].rstrip("\r\n")
             return text[:o_open] + inner + entry + "}" + text[o_close:], True
         return text, False
     inner = text[body.start:body.end]
@@ -951,15 +1180,15 @@ def ensure_override_in_alias(text, body, sha, want, resolve):
     roots = {}
     for lib in want:
         roots[lib.split("/", 1)[1]] = resolve(lib)
-    lines = [entry_text(lib, roots[lib.split("/", 1)[1]], sha, mi)
+    lines = [entry_text(lib, roots[lib.split("/", 1)[1]], sha, mi, nl)
              for lib in sorted(want)]
-    block = "\n%s:override-deps {%s\n%s}" % (
-        key_indent, "".join("\n" + e for e in lines), key_indent)
-    head = text[:body.end - 1].rstrip("\n")
+    block = (nl + "%s:override-deps {%s" + nl + "%s}") % (
+        key_indent, "".join(nl + e for e in lines), key_indent)
+    head = text[:body.end - 1].rstrip("\r\n")
     return head + block + "}" + text[body.end:], True
 
 
-def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
+def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha, nl="\n"):
     present = present_groups(text)
     changed = []
     guard = 0
@@ -987,7 +1216,7 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
             subwant = closure_libs(sub, resolve, lib_deps, sha,
                                    dual_arts, present)
             new_text, did = ensure_override_in_alias(text, body, sha, subwant,
-                                                     resolve)
+                                                     resolve, nl)
             if did:
                 text = new_text
                 present = present_groups(text)
@@ -999,15 +1228,34 @@ def rewrite_aliases(text, tops, resolve, lib_deps, dual_arts, sha):
     return text, changed
 
 
+def _read_input_file(path):
+    """Read a deps.edn file as UTF-8 bytes without newline translation.
+
+    Plain text-mode `open()` would turn CRLF into LF on read; `read_bytes`
+    keeps every byte so spans outside the rewrite stay byte-identical.
+    """
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8")
+
+
+def _file_newline(text):
+    """The file's own newline: CRLF when it uses CRLF, else LF."""
+    return "\r\n" if "\r\n" in text else "\n"
+
+
 def check_file(path):
     """Exit 1 with a listing when dead pins remain; 0 when clean. No writes."""
-    with open(path) as f:
-        text = f.read()
+    try:
+        text = _read_input_file(path)
+    except (OSError, UnicodeDecodeError) as e:
+        print("check failed (%s):" % path)
+        print("  cannot read: %s" % e)
+        return 1
     try:
         forms = parse_edn(text)
     except EdnParseError as e:
         print("check failed (%s):" % path)
-        print("  unbalanced EDN: %s" % e)
+        print("  invalid EDN: %s" % e)
         return 1
     problems = []
     for key, lib, coord in iter_lib_pins(forms):
@@ -1032,10 +1280,11 @@ def check_file(path):
 
 
 def atomic_write(path, data):
-    tmp = tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path) or ".",
+    """Replace path atomically, writing UTF-8 bytes with no newline translation."""
+    tmp = tempfile.NamedTemporaryFile(mode="wb", dir=os.path.dirname(path) or ".",
                                       prefix=".oracle-deps-", delete=False)
     try:
-        tmp.write(data)
+        tmp.write(data.encode("utf-8"))
         tmp.close()
         os.replace(tmp.name, path)
     except BaseException:
@@ -1068,24 +1317,25 @@ def main(argv=None):
     if not args.kotoba_repo:
         ap.error("--kotoba-repo is required for rewrite mode")
     try:
-        with open(args.deps_edn) as f:
-            text = f.read()
-    except OSError as e:
+        text = _read_input_file(args.deps_edn)
+    except (OSError, UnicodeDecodeError) as e:
         print("error: cannot read %s: %s" % (args.deps_edn, e))
         return 3
+    nl = _file_newline(text)
     _alias_to_path, lib_deps, _lib_text, resolve = load_metadata(args.kotoba_repo,
                                                               args.sha)
     try:
         new_text, direct = rewrite_direct(text, resolve, args.sha,
                                           set(a for a in args.rewrite_local_roots.split(",")
-                                              if a))
+                                              if a),
+                                          nl)
         # tops after pass 1: freshly rewritten pins count too
         tops = current_tops(new_text, args.sha)
         # Live gftd/ pins only: a gftd/... mention inside a `;`-comment,
         # a "..." string or a `#_` discard is not a pin the rewrite pass sees.
         dual_arts = gftd_arts(new_text)
         new_text, aliases = rewrite_aliases(new_text, tops, resolve,
-                                            lib_deps, dual_arts, args.sha)
+                                            lib_deps, dual_arts, args.sha, nl)
     except EdnParseError as e:
         print("error: %s (input left untouched)" % e)
         return 3

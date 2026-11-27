@@ -328,4 +328,164 @@ python3 "$SCRIPT" --check "$HERE/cases/27-malformed-oddmap/deps.edn" > "$TMP/27c
 [ "$?" != 0 ] || fail "27-malformed-oddmap check: exit 0, want non-zero"
 echo "ok: 27-malformed-oddmap (rewrite and check both non-zero, untouched)"
 
+# 28: namespaced coordinate map (`#:git{:url ... :sha ...}`) is detected,
+# and the whole `#:git{...}` span is replaced (no bare `#:git` left behind).
+# --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/28-ns-coord/deps.edn" > "$TMP/28c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/28c1"; fail "28-ns-coord check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/28c1" || fail "28-ns-coord: no dead-URL report"
+cp "$HERE/cases/28-ns-coord/deps.edn" "$TMP/28.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/28.edn" \
+  > "$TMP/28.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/28.stdout"; fail "28-ns-coord: want exit 0"; }
+diff -u "$HERE/cases/28-ns-coord/expected.edn" "$TMP/28.edn" \
+  || fail "28-ns-coord: output differs from expected.edn"
+grep -q "#:git" "$TMP/28.edn" && fail "28-ns-coord: bare #:git left behind"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/28.edn" \
+  > "$TMP/28b.stdout" 2>&1
+[ "$?" = 2 ] || fail "28-ns-coord re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/28.edn" > "$TMP/28c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/28c2"; fail "28-ns-coord check clean: want exit 0"; }
+echo "ok: 28-ns-coord (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 29: namespaced dependency maps (`#:io.github.kotoba-lang{...}`) under
+# :deps, :override-deps and an alias :extra-deps are all detected and
+# rewritten (bare lib keys keep their enclosing namespace).
+# --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/29-ns-depmaps/deps.edn" > "$TMP/29c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/29c1"; fail "29-ns-depmaps check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/29c1" || fail "29-ns-depmaps: no dead-URL report"
+cp "$HERE/cases/29-ns-depmaps/deps.edn" "$TMP/29.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/29.edn" \
+  > "$TMP/29.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/29.stdout"; fail "29-ns-depmaps: want exit 0"; }
+diff -u "$HERE/cases/29-ns-depmaps/expected.edn" "$TMP/29.edn" \
+  || fail "29-ns-depmaps: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/29.edn" \
+  > "$TMP/29b.stdout" 2>&1
+[ "$?" = 2 ] || fail "29-ns-depmaps re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/29.edn" > "$TMP/29c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/29c2"; fail "29-ns-depmaps check clean: want exit 0"; }
+echo "ok: 29-ns-depmaps (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 30: duplicate :git/sha keys in one coordinate map: rewrite exits non-zero
+# without writing, and --check exits non-zero too.
+cp "$HERE/cases/30-dup-key/deps.edn" "$TMP/30.edn"
+md5_before=$(md5 -q "$TMP/30.edn" 2>/dev/null || md5sum "$TMP/30.edn" | cut -d' ' -f1)
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/30.edn" \
+  > "$TMP/30.stdout" 2>&1
+[ "$?" != 0 ] || fail "30-dup-key: exit 0, want non-zero"
+grep -q "duplicate map key" "$TMP/30.stdout" || fail "30-dup-key: no duplicate report"
+md5_after=$(md5 -q "$TMP/30.edn" 2>/dev/null || md5sum "$TMP/30.edn" | cut -d' ' -f1)
+[ "$md5_before" = "$md5_after" ] || fail "30-dup-key: file was modified"
+python3 "$SCRIPT" --check "$HERE/cases/30-dup-key/deps.edn" > "$TMP/30c" 2>&1
+[ "$?" != 0 ] || fail "30-dup-key check: exit 0, want non-zero"
+echo "ok: 30-dup-key (rewrite and check both non-zero, untouched)"
+
+# 31: duplicate keys via namespace expansion (`#:git{:sha "a" :git/sha "b"}`
+# both expand to :git/sha): rejected before any write in both modes.
+cp "$HERE/cases/31-dup-expanded/deps.edn" "$TMP/31.edn"
+md5_before=$(md5 -q "$TMP/31.edn" 2>/dev/null || md5sum "$TMP/31.edn" | cut -d' ' -f1)
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/31.edn" \
+  > "$TMP/31.stdout" 2>&1
+[ "$?" != 0 ] || fail "31-dup-expanded: exit 0, want non-zero"
+grep -q "duplicate map key" "$TMP/31.stdout" || fail "31-dup-expanded: no duplicate report"
+md5_after=$(md5 -q "$TMP/31.edn" 2>/dev/null || md5sum "$TMP/31.edn" | cut -d' ' -f1)
+[ "$md5_before" = "$md5_after" ] || fail "31-dup-expanded: file was modified"
+python3 "$SCRIPT" --check "$HERE/cases/31-dup-expanded/deps.edn" > "$TMP/31c" 2>&1
+[ "$?" != 0 ] || fail "31-dup-expanded check: exit 0, want non-zero"
+echo "ok: 31-dup-expanded (rewrite and check both non-zero, untouched)"
+
+# 32: duplicate set elements: rejected before any write in both modes.
+cp "$HERE/cases/32-dup-set/deps.edn" "$TMP/32.edn"
+md5_before=$(md5 -q "$TMP/32.edn" 2>/dev/null || md5sum "$TMP/32.edn" | cut -d' ' -f1)
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/32.edn" \
+  > "$TMP/32.stdout" 2>&1
+[ "$?" != 0 ] || fail "32-dup-set: exit 0, want non-zero"
+grep -q "duplicate set element" "$TMP/32.stdout" || fail "32-dup-set: no duplicate report"
+md5_after=$(md5 -q "$TMP/32.edn" 2>/dev/null || md5sum "$TMP/32.edn" | cut -d' ' -f1)
+[ "$md5_before" = "$md5_after" ] || fail "32-dup-set: file was modified"
+python3 "$SCRIPT" --check "$HERE/cases/32-dup-set/deps.edn" > "$TMP/32c" 2>&1
+[ "$?" != 0 ] || fail "32-dup-set check: exit 0, want non-zero"
+echo "ok: 32-dup-set (rewrite and check both non-zero, untouched)"
+
+# 33: `true`, `1` and `1.0` are distinct keys (no false duplicate), so the
+# dead pin is rewritten normally. --check 1 -> rewrite 0 -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/33-distinct-keys/deps.edn" > "$TMP/33c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/33c1"; fail "33-distinct-keys check dirty: want exit 1"; }
+cp "$HERE/cases/33-distinct-keys/deps.edn" "$TMP/33.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/33.edn" \
+  > "$TMP/33.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/33.stdout"; fail "33-distinct-keys: want exit 0"; }
+diff -u "$HERE/cases/33-distinct-keys/expected.edn" "$TMP/33.edn" \
+  || fail "33-distinct-keys: output differs from expected.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/33.edn" \
+  > "$TMP/33b.stdout" 2>&1
+[ "$?" = 2 ] || fail "33-distinct-keys re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/33.edn" > "$TMP/33c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/33c2"; fail "33-distinct-keys check clean: want exit 0"; }
+echo "ok: 33-distinct-keys (check 1, rewrite 0, idempotent 2, check 0)"
+
+# 34: chained `#_ #_` and `#_ #_ #_` discards (empty :deps map, bb reads it
+# as {:paths ["src"] :deps {}}): --check 0 and rewrite exit 2, byte-identical.
+python3 "$SCRIPT" --check "$HERE/cases/34-nested-discard/deps.edn" > "$TMP/34c" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/34c"; fail "34-nested-discard check: want exit 0"; }
+cp "$HERE/cases/34-nested-discard/deps.edn" "$TMP/34.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/34.edn" \
+  > "$TMP/34.stdout" 2>&1
+[ "$?" = 2 ] || { cat "$TMP/34.stdout"; fail "34-nested-discard: want exit 2"; }
+cmp -s "$HERE/cases/34-nested-discard/deps.edn" "$TMP/34.edn" \
+  || fail "34-nested-discard: file was modified"
+echo "ok: 34-nested-discard (check 0, rewrite exit 2, byte-identical)"
+
+# 35: CRLF input with surrounding comments: --check 1 -> rewrite 0 with
+# every out-of-span CRLF byte preserved (no bare LF) -> re-run 2 -> --check 0.
+python3 "$SCRIPT" --check "$HERE/cases/35-crlf/deps.edn" > "$TMP/35c1" 2>&1
+[ "$?" = 1 ] || { cat "$TMP/35c1"; fail "35-crlf check dirty: want exit 1"; }
+grep -q "dead repo URL" "$TMP/35c1" || fail "35-crlf: no dead-URL report"
+cp "$HERE/cases/35-crlf/deps.edn" "$TMP/35.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/35.edn" \
+  > "$TMP/35.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/35.stdout"; fail "35-crlf: want exit 0"; }
+diff -u "$HERE/cases/35-crlf/expected.edn" "$TMP/35.edn" \
+  || fail "35-crlf: output differs from expected.edn"
+python3 - "$TMP/35.edn" <<'PYEOF' || fail "35-crlf: CRLF bytes not preserved"
+import sys
+raw = open(sys.argv[1], 'rb').read()
+assert b'\r\n' in raw, "no CRLF left"
+for i, line in enumerate(raw.split(b'\n')):
+    if i < len(raw.split(b'\n')) - 1 and not line.endswith(b'\r'):
+        raise SystemExit("bare LF on line %d: %r" % (i + 1, line))
+for want in (b';; leading comment stays\r',
+             b'  ;; text pin comment\r',
+             b';; trailing comment\r'):
+    assert want in raw, "comment lost CRLF: %r" % want
+PYEOF
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/35.edn" \
+  > "$TMP/35b.stdout" 2>&1
+[ "$?" = 2 ] || fail "35-crlf re-run: want exit 2"
+python3 "$SCRIPT" --check "$TMP/35.edn" > "$TMP/35c2" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/35c2"; fail "35-crlf check clean: want exit 0"; }
+echo "ok: 35-crlf (check 1, rewrite 0, idempotent 2, check 0, CRLF kept)"
+
+# bb oracle: every new valid EDN file reads cleanly under Babashka.
+for f in 28-ns-coord/deps.edn 28-ns-coord/expected.edn \
+         29-ns-depmaps/deps.edn 29-ns-depmaps/expected.edn \
+         33-distinct-keys/deps.edn 33-distinct-keys/expected.edn \
+         34-nested-discard/deps.edn 35-crlf/deps.edn 35-crlf/expected.edn; do
+  bb -e "(clojure.edn/read-string (slurp \"$HERE/cases/$f\"))" \
+    > /dev/null 2>&1 || fail "bb cannot read new valid fixture $f"
+done
+echo "ok: bb reads all new valid fixtures"
+
+# bb oracle: duplicate keys, duplicate set elements, odd maps and broken
+# discards are rejected by Babashka too (exit non-zero, like the script).
+for f in 07-malformed/deps.edn 26-malformed-string/deps.edn \
+         27-malformed-oddmap/deps.edn 30-dup-key/deps.edn \
+         31-dup-expanded/deps.edn 32-dup-set/deps.edn; do
+  bb -e "(clojure.edn/read-string (slurp \"$HERE/cases/$f\"))" \
+    > /dev/null 2>&1 && fail "bb unexpectedly reads invalid fixture $f"
+done
+echo "ok: bb rejects all invalid fixtures"
+
 echo "ALL FIXTURE TESTS PASSED"
