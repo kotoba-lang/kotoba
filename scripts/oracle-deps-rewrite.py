@@ -513,8 +513,15 @@ def current_tops(text, sha):
 
 
 def find_entry(text, lib):
-    """(start, end) of `lib {...}` pin, or None; comment-tolerant gap."""
+    """(start, end) of `lib {...}` pin, or None; comment-tolerant gap.
+
+    A lib name occurring only inside a ;-comment is not a live pin, so
+    such matches are skipped; the caller then takes the add path, which
+    leaves the comment bytes untouched, instead of splicing into them.
+    """
     for m in re.finditer(re.escape(lib) + r"(?![a-zA-Z0-9_.\-/])", text):
+        if _in_comment(text, m.start()):
+            continue
         j = skip_gap(text, m.end())
         if j < len(text) and text[j] == "{":
             return m.start(), find_matching_brace(text, j)
@@ -546,7 +553,11 @@ def ensure_override_in_alias(text, name, b_open, b_close, sha, want, resolve):
     if not want:
         return text, False
     body = text[b_open:b_close]
-    om = re.search(r":override-deps\s*\{", body)
+    om = None
+    for cand in re.finditer(r":override-deps\s*\{", body):
+        if not _in_comment(body, cand.start()):
+            om = cand
+            break
     if om:
         o_open = b_open + om.end() - 1
         o_close = find_matching_brace(text, o_open)
@@ -656,8 +667,11 @@ def check_file(path):
     for key, block in lib_maps:
         if key in AMU_LIBS:
             continue
-        if ":git/url" not in block and re.search(
-                r":git/sha\s+\"[0-9a-f]+\"|:sha\s+\"[0-9a-f]+\"", block):
+        # Judge effective (non-comment) coordinates only: a :git/url that
+        # lives inside a ;-comment does not satisfy a live :git/sha.
+        eff = _strip_comments(block)
+        if ":git/url" not in eff and re.search(
+                r":git/sha\s+\"[0-9a-f]+\"|:sha\s+\"[0-9a-f]+\"", eff):
             lineno = text.find(key)
             lineno = text.count("\n", 0, lineno) + 1 if lineno >= 0 else 1
             problems.append("%d: bare git sha without :git/url: %s" % (lineno, key))

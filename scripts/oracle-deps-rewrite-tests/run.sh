@@ -113,4 +113,24 @@ cmp -s "$HERE/cases/15-comment-only-deps/deps.edn" "$TMP/15.edn" \
   || fail "15-comment-only-deps: file was modified"
 echo "ok: 15-comment-only-deps (exit 2, byte-identical)"
 
+# 16: comment-only :override-deps pin for a wanted lib is added as an
+# effective entry; ;-comment lines stay byte-identical
+cp "$HERE/cases/16-override-comment/deps.edn" "$TMP/16.edn"
+python3 "$SCRIPT" --sha "$SHA" --kotoba-repo "$KOTO" "$TMP/16.edn" \
+  > "$TMP/16.stdout" 2>&1
+[ "$?" = 0 ] || { cat "$TMP/16.stdout"; fail "16-override-comment: want exit 0"; }
+diff -u "$HERE/cases/16-override-comment/expected.edn" "$TMP/16.edn" \
+  || fail "16-override-comment: output differs from expected.edn"
+grep ';' "$HERE/cases/16-override-comment/deps.edn" > "$TMP/16.want-comments"
+grep ';' "$TMP/16.edn" > "$TMP/16.got-comments"
+diff -q "$TMP/16.want-comments" "$TMP/16.got-comments" > /dev/null \
+  || fail "16-override-comment: ;-comment lines not preserved"
+echo "ok: 16-override-comment (rewrote, comments byte-identical)"
+
+# 17: --check flags an effective :git/sha whose :git/url lives only in a ;-comment
+python3 "$SCRIPT" --check "$HERE/cases/17-check-comment-sha/deps.edn" > "$TMP/17.stdout" 2>&1
+[ "$?" = 1 ] || fail "17-check-comment-sha: want exit 1"
+grep -q "bare git sha" "$TMP/17.stdout" || fail "17-check-comment-sha: no bare-sha report"
+echo "ok: 17-check-comment-sha (exit 1)"
+
 echo "ALL FIXTURE TESTS PASSED"
