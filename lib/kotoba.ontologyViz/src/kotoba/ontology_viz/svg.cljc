@@ -45,11 +45,11 @@
          (or (contains? graph-or-input :schema/kind)
              (contains? graph-or-input :schema/version)))
     (do
-      (v/validate-graph! graph-or-input)
+      (v/validate-graph! graph-or-input {:verify-graph-cid-fn yv/verify-normalized-graph-cid!})
       (if (and (:layout graph-or-input)
                (every? :layout (:nodes graph-or-input)))
         graph-or-input
-        (g/layout-graph graph-or-input)))
+        (g/layout-graph graph-or-input {} {:verify-graph-cid-fn yv/verify-normalized-graph-cid!})))
 
     :else
     (g/project-graph graph-or-input)))

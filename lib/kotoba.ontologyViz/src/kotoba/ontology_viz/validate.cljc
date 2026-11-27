@@ -779,137 +779,147 @@
   map at render/layout/filter/dispatch boundaries. Enforces schema version,
   resource bounds, unique layer/node/edge IDs, declared node layers, non-dangling
   edge endpoints, finite layout dimensions (width/height/padding/gaps), CIDv1
-  structure, and strict `#RRGGBB` paint allowlist."
-  [graph]
-  (when-not (map? graph)
-    (fail! :invalid-graph "graph must be a map" {:type (str (type graph))}))
-  (when-not (= "ontology.graph" (:schema/kind graph))
-    (fail! :invalid-graph-schema
-           (str "expected :schema/kind \"ontology.graph\", got: " (pr-str (:schema/kind graph)))
-           {:schema/kind (:schema/kind graph)}))
-  (when-not (= "ontology.graph/v1" (:schema/version graph))
-    (fail! :invalid-graph-schema
-           (str "unsupported :schema/version: " (pr-str (:schema/version graph)))
-           {:schema/version (:schema/version graph)}))
-  (let [basis (:basis graph)]
-    (when-not (map? basis)
-      (fail! :invalid-basis "graph :basis must be a map" {:basis basis}))
-    (let [limits (resolve-limits (:bounds basis))
-          nodes (:nodes graph)
-          edges (:edges graph)
-          layers (:layers graph)
-          joins (:joins graph)]
-      (when-not (sequential? nodes)
-        (fail! :invalid-graph "graph :nodes must be sequential" {:nodes nodes}))
-      (when-not (sequential? edges)
-        (fail! :invalid-graph "graph :edges must be sequential" {:edges edges}))
-      (when-not (sequential? layers)
-        (fail! :invalid-graph "graph :layers must be sequential" {:layers layers}))
-      (when (and (some? joins) (not (sequential? joins)))
-        (fail! :invalid-graph "graph :joins must be sequential" {:joins joins}))
-      (bounded-count-or-fail! nodes (:max-nodes limits) :max-nodes-exceeded :nodes)
-      (bounded-count-or-fail! edges (:max-edges limits) :max-edges-exceeded :edges)
-      (bounded-count-or-fail! layers (:max-nodes limits) :max-nodes-exceeded :layers)
-      (when joins
-        (bounded-count-or-fail! joins (:max-joins limits) :max-joins-exceeded :joins))
-      (assert-bounded-and-no-remote-context! limits graph)
-      (when-let [rc (:root-cid basis)] (extract-cid rc))
-      (when-let [gc (:graph-cid basis)] (extract-cid gc))
-      (doseq [c (:cids basis)] (extract-cid c))
-      (validate-basis-verification! basis)
+  structure, strict `#RRGGBB` paint allowlist, and cryptographic digest
+  verification whenever `:graph-cid-verification :verified` is claimed."
+  ([graph] (validate-graph! graph {}))
+  ([graph {:keys [verify-graph-cid-fn]}]
+   (when-not (map? graph)
+     (fail! :invalid-graph "graph must be a map" {:type (str (type graph))}))
+   (when-not (= "ontology.graph" (:schema/kind graph))
+     (fail! :invalid-graph-schema
+            (str "expected :schema/kind \"ontology.graph\", got: " (pr-str (:schema/kind graph)))
+            {:schema/kind (:schema/kind graph)}))
+   (when-not (= "ontology.graph/v1" (:schema/version graph))
+     (fail! :invalid-graph-schema
+            (str "unsupported :schema/version: " (pr-str (:schema/version graph)))
+            {:schema/version (:schema/version graph)}))
+   (let [basis (:basis graph)]
+     (when-not (map? basis)
+       (fail! :invalid-basis "graph :basis must be a map" {:basis basis}))
+     (let [limits (resolve-limits (:bounds basis))
+           nodes (:nodes graph)
+           edges (:edges graph)
+           layers (:layers graph)
+           joins (:joins graph)]
+       (when-not (sequential? nodes)
+         (fail! :invalid-graph "graph :nodes must be sequential" {:nodes nodes}))
+       (when-not (sequential? edges)
+         (fail! :invalid-graph "graph :edges must be sequential" {:edges edges}))
+       (when-not (sequential? layers)
+         (fail! :invalid-graph "graph :layers must be sequential" {:layers layers}))
+       (when (and (some? joins) (not (sequential? joins)))
+         (fail! :invalid-graph "graph :joins must be sequential" {:joins joins}))
+       (bounded-count-or-fail! nodes (:max-nodes limits) :max-nodes-exceeded :nodes)
+       (bounded-count-or-fail! edges (:max-edges limits) :max-edges-exceeded :edges)
+       (bounded-count-or-fail! layers (:max-nodes limits) :max-nodes-exceeded :layers)
+       (when joins
+         (bounded-count-or-fail! joins (:max-joins limits) :max-joins-exceeded :joins))
+       (assert-bounded-and-no-remote-context! limits graph)
+       (when-let [rc (:root-cid basis)] (extract-cid rc))
+       (when-let [gc (:graph-cid basis)] (extract-cid gc))
+       (doseq [c (:cids basis)] (extract-cid c))
+       (validate-basis-verification! basis)
 
-      ;; Validate layers, strict paint hex, and unique layer IDs
-      (let [declared-layers
-            (reduce
-             (fn [seen l]
-               (when-not (and (map? l) (string? (:id l)) (not (str/blank? (:id l))))
-                 (fail! :invalid-layer "layer must be a map with non-empty string :id" {:layer l}))
-               (when (contains? seen (:id l))
-                 (fail! :duplicate-layer-id (str "duplicate layer id: " (:id l)) {:layer-id (:id l)}))
-               (assert-label-length! limits :layer/id (:id l))
-               (assert-label-length! limits :layer/label (:label l))
-               (assert-safe-hex-color! :layer/color (:color l))
-               (assert-safe-hex-color! :layer/bg (:bg l))
-               (when (contains? l :node-count)
-                 (when-not (and (integer? (:node-count l)) (not (neg? (:node-count l))))
-                   (fail! :invalid-layer "layer :node-count must be a non-negative integer" {:layer l})))
-               (conj seen (:id l)))
-             #{}
-             layers)
-            ;; Validate nodes, unique node IDs, and declared layer membership
-            node-ids
-            (reduce
-             (fn [seen n]
-               (when-not (and (map? n) (string? (:id n)) (not (str/blank? (:id n)))
-                              (string? (:layer n)) (not (str/blank? (:layer n))))
-                 (fail! :invalid-node "node must be a map with non-empty string :id and :layer" {:node n}))
-               (when (contains? seen (:id n))
-                 (fail! :duplicate-node-id (str "duplicate node id: " (:id n)) {:node-id (:id n)}))
-               (when-not (contains? declared-layers (:layer n))
-                 (fail! :undeclared-node-layer
-                        (str "node " (:id n) " belongs to undeclared layer " (pr-str (:layer n)))
-                        {:node-id (:id n) :layer (:layer n) :declared-layers (vec (sort declared-layers))}))
-               (assert-label-length! limits :node/id (:id n))
-               (assert-label-length! limits :node/label (:label n))
-               (assert-label-length! limits :node/layer (:layer n))
-               (when-let [k (:kind n)]
-                 (when-not (contains? valid-node-kinds k)
-                   (fail! :invalid-node (str "unsupported node :kind " (pr-str k)) {:node-id (:id n) :kind k})))
-               (when-let [c (:cid n)] (extract-cid c))
-               (when-let [attrs (:attributes n)]
-                 (when-not (map? attrs)
-                   (fail! :invalid-node "node :attributes must be a map" {:node-id (:id n)}))
-                 (assert-attributes-count! limits (:id n) (count attrs)))
-               (when-let [lay (:layout n)]
-                 (when-not (map? lay)
-                   (fail! :invalid-layout "node :layout must be a map" {:node-id (:id n)}))
-                 (assert-finite-nonneg! :layout/x (:x lay))
-                 (assert-finite-nonneg! :layout/y (:y lay))
-                 (assert-finite-pos! :layout/width (:width lay))
-                 (assert-finite-pos! :layout/height (:height lay)))
-               (conj seen (:id n)))
-             #{}
-             nodes)]
-        ;; Validate edges, unique edge IDs, and non-dangling source/target endpoints
-        (reduce
-         (fn [seen e]
-           (when-not (and (map? e) (string? (:id e)) (string? (:source e)) (string? (:target e)))
-             (fail! :invalid-edge "edge must be a map with string :id, :source, :target" {:edge e}))
-           (when (contains? seen (:id e))
-             (fail! :duplicate-edge-id (str "duplicate edge id: " (:id e)) {:edge-id (:id e)}))
-           (when-not (and (contains? node-ids (:source e)) (contains? node-ids (:target e)))
-             (fail! :dangling-edge-endpoint
-                    (str "edge " (:id e) " references missing endpoint(s): " (:source e) " -> " (:target e))
-                    {:edge-id (:id e) :source (:source e) :target (:target e)}))
-           (assert-label-length! limits :edge/id (:id e))
-           (assert-label-length! limits :edge/label (:label e))
-           (when-let [k (:kind e)]
-             (when-not (contains? valid-edge-kinds k)
-               (fail! :invalid-edge (str "unsupported edge :kind " (pr-str k)) {:edge-id (:id e) :kind k})))
-           (when-let [c (:cid e)] (extract-cid c))
-           (conj seen (:id e)))
-         #{}
-         edges))
+       ;; Validate layers, strict paint hex, and unique layer IDs
+       (let [declared-layers
+             (reduce
+              (fn [seen l]
+                (when-not (and (map? l) (string? (:id l)) (not (str/blank? (:id l))))
+                  (fail! :invalid-layer "layer must be a map with non-empty string :id" {:layer l}))
+                (when (contains? seen (:id l))
+                  (fail! :duplicate-layer-id (str "duplicate layer id: " (:id l)) {:layer-id (:id l)}))
+                (assert-label-length! limits :layer/id (:id l))
+                (assert-label-length! limits :layer/label (:label l))
+                (assert-safe-hex-color! :layer/color (:color l))
+                (assert-safe-hex-color! :layer/bg (:bg l))
+                (when (contains? l :node-count)
+                  (when-not (and (integer? (:node-count l)) (not (neg? (:node-count l))))
+                    (fail! :invalid-layer "layer :node-count must be a non-negative integer" {:layer l})))
+                (conj seen (:id l)))
+              #{}
+              layers)
+             ;; Validate nodes, unique node IDs, and declared layer membership
+             node-ids
+             (reduce
+              (fn [seen n]
+                (when-not (and (map? n) (string? (:id n)) (not (str/blank? (:id n)))
+                               (string? (:layer n)) (not (str/blank? (:layer n))))
+                  (fail! :invalid-node "node must be a map with non-empty string :id and :layer" {:node n}))
+                (when (contains? seen (:id n))
+                  (fail! :duplicate-node-id (str "duplicate node id: " (:id n)) {:node-id (:id n)}))
+                (when-not (contains? declared-layers (:layer n))
+                  (fail! :undeclared-node-layer
+                         (str "node " (:id n) " belongs to undeclared layer " (pr-str (:layer n)))
+                         {:node-id (:id n) :layer (:layer n) :declared-layers (vec (sort declared-layers))}))
+                (assert-label-length! limits :node/id (:id n))
+                (assert-label-length! limits :node/label (:label n))
+                (assert-label-length! limits :node/layer (:layer n))
+                (when-let [k (:kind n)]
+                  (when-not (contains? valid-node-kinds k)
+                    (fail! :invalid-node (str "unsupported node :kind " (pr-str k)) {:node-id (:id n) :kind k})))
+                (when-let [c (:cid n)] (extract-cid c))
+                (when-let [attrs (:attributes n)]
+                  (when-not (map? attrs)
+                    (fail! :invalid-node "node :attributes must be a map" {:node-id (:id n)}))
+                  (assert-attributes-count! limits (:id n) (count attrs)))
+                (when-let [lay (:layout n)]
+                  (when-not (map? lay)
+                    (fail! :invalid-layout "node :layout must be a map" {:node-id (:id n)}))
+                  (assert-finite-nonneg! :layout/x (:x lay))
+                  (assert-finite-nonneg! :layout/y (:y lay))
+                  (assert-finite-pos! :layout/width (:width lay))
+                  (assert-finite-pos! :layout/height (:height lay)))
+                (conj seen (:id n)))
+              #{}
+              nodes)]
+         ;; Validate edges, unique edge IDs, and non-dangling source/target endpoints
+         (reduce
+          (fn [seen e]
+            (when-not (and (map? e) (string? (:id e)) (string? (:source e)) (string? (:target e)))
+              (fail! :invalid-edge "edge must be a map with string :id, :source, :target" {:edge e}))
+            (when (contains? seen (:id e))
+              (fail! :duplicate-edge-id (str "duplicate edge id: " (:id e)) {:edge-id (:id e)}))
+            (when-not (and (contains? node-ids (:source e)) (contains? node-ids (:target e)))
+              (fail! :dangling-edge-endpoint
+                     (str "edge " (:id e) " references missing endpoint(s): " (:source e) " -> " (:target e))
+                     {:edge-id (:id e) :source (:source e) :target (:target e)}))
+            (assert-label-length! limits :edge/id (:id e))
+            (assert-label-length! limits :edge/label (:label e))
+            (when-let [k (:kind e)]
+              (when-not (contains? valid-edge-kinds k)
+                (fail! :invalid-edge (str "unsupported edge :kind " (pr-str k)) {:edge-id (:id e) :kind k})))
+            (when-let [c (:cid e)] (extract-cid c))
+            (conj seen (:id e)))
+          #{}
+          edges))
 
-      ;; Validate joins
-      (doseq [j joins]
-        (when-not (and (map? j) (string? (:id j)) (string? (:from-attr j)) (string? (:to-attr j)))
-          (fail! :invalid-join "normalized join must have string :id, :from-attr, :to-attr" {:join j}))
-        (assert-label-length! limits :join/id (:id j))
-        (assert-label-length! limits :join/description (:description j))
-        (doseq [ck [:matched-count :unmatched-count :excluded-count :total-source-count :eligible-count]]
-          (when (contains? j ck)
-            (let [cv (get j ck)]
-              (when-not (and (integer? cv) (not (neg? cv)))
-                (fail! :invalid-join (str "join " ck " must be a non-negative integer") {:join-id (:id j) :field ck :value cv})))))
-        (when (some? (:coverage j))
-          (let [cov (:coverage j)]
-            (when-not (and (esc/finite-number? cov) (<= 0.0 (double cov) 1.0))
-              (fail! :invalid-join "join :coverage must be finite in [0.0, 1.0]" {:join-id (:id j) :coverage cov})))))
+       ;; Validate joins
+       (doseq [j joins]
+         (when-not (and (map? j) (string? (:id j)) (string? (:from-attr j)) (string? (:to-attr j)))
+           (fail! :invalid-join "normalized join must have string :id, :from-attr, :to-attr" {:join j}))
+         (assert-label-length! limits :join/id (:id j))
+         (assert-label-length! limits :join/description (:description j))
+         (doseq [ck [:matched-count :unmatched-count :excluded-count :total-source-count :eligible-count]]
+           (when (contains? j ck)
+             (let [cv (get j ck)]
+               (when-not (and (integer? cv) (not (neg? cv)))
+                 (fail! :invalid-join (str "join " ck " must be a non-negative integer") {:join-id (:id j) :field ck :value cv})))))
+         (when (some? (:coverage j))
+           (let [cov (:coverage j)]
+             (when-not (and (esc/finite-number? cov) (<= 0.0 (double cov) 1.0))
+               (fail! :invalid-join "join :coverage must be finite in [0.0, 1.0]" {:join-id (:id j) :coverage cov})))))
 
-      ;; Validate ALL canvas layout numeric fields used in SVG coordinate math
-      (when-let [lay (:layout graph)]
-        (validate-layout-options! lay)
-        (assert-finite-pos! :canvas/width (:width lay))
-        (assert-finite-pos! :canvas/height (:height lay)))
-      limits)))
+       ;; Validate ALL canvas layout numeric fields used in SVG coordinate math
+       (when-let [lay (:layout graph)]
+         (validate-layout-options! lay)
+         (assert-finite-pos! :canvas/width (:width lay))
+         (assert-finite-pos! :canvas/height (:height lay)))
+
+       ;; Cryptographically verify `:graph-cid-verification :verified` claims against actual canonical DAG-CBOR bytes
+       (when (= :verified (:graph-cid-verification basis))
+         (if (fn? verify-graph-cid-fn)
+           (verify-graph-cid-fn graph)
+           (fail! :unverified-graph-cid-claim
+                  "cannot accept :graph-cid-verification :verified without canonical DAG-CBOR digest verification"
+                  {:graph-cid (:graph-cid basis)})))
+       limits))))

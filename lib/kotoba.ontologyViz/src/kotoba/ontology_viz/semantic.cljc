@@ -1362,15 +1362,23 @@
 
 (defn- apply-graph-filters
   "Apply `:includeRdfSubjects`, `:layers` / `:activeLayers` (explicit `[]` -> 0
-  nodes/0 edges, `nil` -> all layers), `:kinds`, `:query`, and optional `:maxNodes`."
+  nodes/0 edges/0 joins, `nil` -> all layers), `:kinds`, `:query`, and optional
+  `:maxNodes`, recomputing joins, edge metadata, and `truncated` consistently."
   [graph params map-yv-names?]
   (let [g0 (apply-include-rdf-param graph params)
         [has-layers? norm-layers] (resolve-layer-filter-param params map-yv-names?)
         has-kinds? (some? (:kinds params))
         has-query? (not (str/blank? (:query params)))
         filtered (if (or has-layers? has-kinds? has-query?)
-                   (g/filter-graph g0 (cond-> (select-keys params [:kinds :query])
-                                        has-layers? (assoc :layers norm-layers)))
+                   (let [f0 (g/filter-graph g0
+                                            (cond-> (select-keys params [:kinds :query])
+                                              has-layers? (assoc :layers norm-layers))
+                                            {:verify-graph-cid-fn yv/verify-normalized-graph-cid!})
+                         [kept-joins kept-edges] (recompute-visible-joins (:joins f0) (:nodes f0) (:edges f0))]
+                     (-> f0
+                         (assoc :joins kept-joins :edges kept-edges)
+                         (assoc-in [:basis :join-count] (count kept-joins))
+                         (assoc-in [:basis :edge-count] (count kept-edges))))
                    g0)]
     (apply-max-nodes-bound filtered params)))
 
@@ -1513,6 +1521,7 @@
            (if (or (:node-id params) (:cid params))
              (assoc (inspect-node graph params)
                     :basisCid basis-cid
+                    :schema yv/yataverse-graph-schema
                     :inspectionScope "graph-only"
                     :snapshotClosureVerified false
                     :blockCids (if (:graphCid yv-graph) {:graph (:graphCid yv-graph)} {}))

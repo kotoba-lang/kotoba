@@ -211,6 +211,8 @@
           "graph-only inspect must not fabricate snapshot block closure CIDs")
       (is (= {:graph "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"}
              (get-in i-node [:result :blockCids])))
+      (is (= "yataverse.ontology.graph/v1" (get-in i-node [:result :schema]))
+          "single-node ontology.inspect must include required schema field matching advertised outputSchema")
       (is (= "yataverse.ontology.operations/v1" (get-in v-res [:result :semanticSchema :schema])))
       (is (some? (get-in v-res [:result :viewModel])))
       (is (string? (get-in v-res [:result :svg])))
@@ -240,7 +242,13 @@
             "explicit activeLayers: null/nil must match omitted (all 9 nodes)")
         (is (= 0 (count (get-in empty-al-g [:result :nodes]))))
         (is (= 0 (count (get-in empty-al-g [:result :edges]))))
+        (is (= 0 (count (get-in empty-al-g [:result :joins])))
+            "activeLayers: [] (0 nodes) must not report stale joins")
+        (is (= 0 (get-in empty-al-g [:result :coverage :totalMatchedJoinRows])))
+        (is (true? (get-in empty-al-g [:result :truncated]))
+            "activeLayers: [] filtering out all 9 candidates must set truncated=true")
         (is (= 0 (count (get-in empty-al-v [:result :viewModel :graph :nodes]))))
+        (is (= 0 (count (get-in empty-al-v [:result :viewModel :graph :joins]))))
         (is (= 4 (count (get-in capped-g [:result :nodes]))))
         (is (true? (get-in capped-g [:result :truncated])))
         (is (= :invalid-limit (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 0}))))
@@ -487,6 +495,27 @@
                 {:from "entity:t-1" :to "connector:jp.kkj" :label "ontology/source" :kind "provenance"}]
                (mapv #(select-keys % [:from :to :label :kind]) fact-edges))
             "native fact edges must match Yataverse ontology-viz.mjs direction & order (fact->type immediately followed by fact->connector)")
+        ;; Multi-type native facts MUST sort by (ontology/type, fact ID) UTF-16 order:
+        ;; agency "z" MUST precede tender "a" in both nodes and fact edge pairs!
+        (let [multi-kg (ov/project-graph
+                        {:ontology {:object-types [{:id :agency :name "Agency"}
+                                                   {:id :tender :name "Tender"}]}
+                         :connectors {:connectors [{:id :jp.agencies :name "Agencies" :object-type :agency}
+                                                   {:id :jp.kkj :name "KKJ" :object-type :tender}]}
+                         :facts [{:id "a" :ontology/type :tender :ontology/source :jp.kkj}
+                                 {:id "z" :ontology/type :agency :ontology/source :jp.agencies}]
+                         :basis {:root-cid "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"}})
+              multi-yv (ov/->yataverse-graph multi-kg)
+              multi-fact-nodes (mapv :id (filter #(= "fact" (:layer %)) (:nodes multi-yv)))
+              multi-fact-edges (filterv #(#{"entity:z" "entity:a"} (:from %)) (:edges multi-yv))]
+          (is (= ["entity:z" "entity:a"] multi-fact-nodes)
+              "multi-type native facts must order by (type, fact ID): agency 'z' before tender 'a'")
+          (is (= [{:from "entity:z" :to "type:agency" :label "ontology/type"}
+                  {:from "entity:z" :to "connector:jp.agencies" :label "ontology/source"}
+                  {:from "entity:a" :to "type:tender" :label "ontology/type"}
+                  {:from "entity:a" :to "connector:jp.kkj" :label "ontology/source"}]
+                 (mapv #(select-keys % [:from :to :label]) multi-fact-edges))
+              "multi-type native fact edge pairs must order by (type, fact ID): agency 'z' pair before tender 'a' pair"))
         (is (str/includes? native-json "0.123456789")
             "json-encode must preserve full-precision decimals matching DAG-CBOR (no 4-decimal rounding)")
         ;; Injected verification keys in node meta or edge metadata fail closed

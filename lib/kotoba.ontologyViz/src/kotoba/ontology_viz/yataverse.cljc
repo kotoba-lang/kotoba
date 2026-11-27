@@ -329,7 +329,7 @@
                             ;; graphCid verification NEVER promotes snapshot basisCid to :verified.
                             :cid-verification :syntax-only
                             :basis-cid-verification :syntax-only
-                            :graph-cid-verification (if (some? graph-cid) :verified :absent)
+                            :graph-cid-verification (if (some? graph-cid) :syntax-only :absent)
                             :node-count (count nodes)
                             :edge-count (count edges)
                             :layer-count (count layers-with-preserved)
@@ -352,18 +352,18 @@
                     :layers layers-with-preserved
                     :nodes nodes
                     :edges edges
-                    :joins joins}]
-         (g/layout-graph graph (or layout {})))))))
+                    :joins joins}
+             laid (g/layout-graph graph (or layout {}))]
+         ;; Mark `:graph-cid-verification :verified` ONLY because `graphCid` was
+         ;; cryptographically verified above against canonical DAG-CBOR bytes.
+         (if (some? graph-cid)
+           (assoc-in laid [:basis :graph-cid-verification] :verified)
+           laid))))))
 
-(defn ->yataverse-graph
-  "Validate and convert a Kotoba `ontology.graph/v1` graph into Yataverse PR #83's
-  exact `yataverse.ontology.graph/v1` wire format.
-
-  Preserves exact `nodes`/`edges`/`joins`/`layers` order and ALWAYS freshly
-  computes `:graphCid` from the emitted canonical DAG-CBOR bytes (never
-  inheriting a potentially stale `graphCid` from input metadata)."
+(defn- build-yataverse-body
+  "Convert a structurally validated Kotoba `ontology.graph/v1` map into the
+  unsigned `yataverse.ontology.graph/v1` body map (excluding `:graphCid`)."
   [graph]
-  (v/validate-graph! graph)
   (let [basis (:basis graph)
         nodes (:nodes graph)
         edges (:edges graph)
@@ -394,15 +394,38 @@
               :meta meta-map}))
          nodes)
         ;; On newly projected Kotoba native graphs (no preserved :yataverse-layers),
-        ;; normalize native fact provenance edge direction to Yataverse ontology-viz.mjs
-        ;; convention (fact -> type "ontology/type" immediately followed by fact -> connector
-        ;; "ontology/source"), sort by generator phase order, and assign sequential e1..eN.
+        ;; sort multi-type facts and their fact->type / fact->connector edge pairs by
+        ;; `(ontology/type, fact ID)` UTF-16 code-unit order matching Yataverse ontology-viz.mjs.
         fact-source-by-id (into {}
                                 (keep (fn [n]
                                         (when-let [s (or (get-in n [:provenance :source])
                                                          (get-in n [:meta "ontology/source"]))]
                                           [(:id n) (str s)])))
                                 nodes)
+        fact-type-by-id (into {}
+                              (keep (fn [n]
+                                      (when-let [t (or (get-in n [:provenance :type])
+                                                       (get-in n [:meta "ontology/type"]))]
+                                        [(:id n) (str t)])))
+                              nodes)
+        fact-raw-id (fn [nid meta-map]
+                      (or (get meta-map "id")
+                          (get meta-map ":id")
+                          (cond
+                            (str/starts-with? nid "entity:") (subs nid 7)
+                            (str/starts-with? nid "fact:")
+                            (let [rest-s (subs nid 5)
+                                  colon (str/index-of rest-s ":")]
+                              (if colon (subs rest-s (inc colon)) rest-s))
+                            :else nid)))
+        fact-raw-id-by-id (into {}
+                                (map (fn [n]
+                                       [(:id n) (fact-raw-id (:id n) (or (:meta n) (:attributes n) {}))]))
+                                nodes)
+        fact-order-tuple (fn [nid]
+                           [(get fact-type-by-id nid "")
+                            (get fact-raw-id-by-id nid nid)
+                            nid])
         normalize-native-edge
         (fn [e]
           (let [k (:kind e)
@@ -422,7 +445,7 @@
                  :kind "provenance"
                  :meta (assoc base-meta "source" conn-id)
                  ::phase 2
-                 ::sort-primary tgt
+                 ::sort-primary (fact-order-tuple tgt)
                  ::sort-sub 1})
 
               ;; Native fact -> type (:instance-of); Yataverse emits fact -> type ("ontology/type", kind "instance").
@@ -436,7 +459,7 @@
                  :kind "instance"
                  :meta (cond-> base-meta fsrc (assoc "source" fsrc))
                  ::phase 2
-                 ::sort-primary src
+                 ::sort-primary (fact-order-tuple src)
                  ::sort-sub 0})
 
               (= k :produces)
@@ -448,7 +471,7 @@
                        (str/starts-with? src "connector:") (assoc "connectorId" (subs src 10))
                        (str/starts-with? tgt "type:") (assoc "objectType" (subs tgt 5)))
                ::phase 0
-               ::sort-primary src
+               ::sort-primary [src "" ""]
                ::sort-sub 0}
 
               (= k :join)
@@ -458,7 +481,7 @@
                :kind "join"
                :meta base-meta
                ::phase 1
-               ::sort-primary (or (:label e) "")
+               ::sort-primary [(or (:label e) "") "" ""]
                ::sort-sub 0}
 
               (= k :join-instance)
@@ -468,7 +491,7 @@
                :kind "join-instance"
                :meta base-meta
                ::phase 3
-               ::sort-primary (or (:label e) "")
+               ::sort-primary [(or (:label e) "") "" ""]
                ::sort-sub 0}
 
               :else
@@ -478,7 +501,7 @@
                :kind (get kotoba-edge-kind->yv-edge-kind k (name (or k :provenance)))
                :meta base-meta
                ::phase 4
-               ::sort-primary src
+               ::sort-primary [src "" ""]
                ::sort-sub 0})))
         yv-edges
         (if (:yataverse-layers basis)
@@ -541,8 +564,6 @@
               :coverageRatio ratio}))
          joins)
         layer-counts (frequencies (map :layer yv-nodes))
-        ;; KotobaSpec v1.0: ALWAYS preserve standard 3 layers (connector, object-type, fact)
-        ;; even when nodeCount is 0.
         yv-layers
         (if-let [preserved (:yataverse-layers basis)]
           (mapv (fn [l] (assoc l :nodeCount (get layer-counts (:id l) 0))) preserved)
@@ -563,12 +584,22 @@
                                  :order idx
                                  :nodeCount (get layer-counts lid 0)})
                               all-layers))))
-        ;; On newly projected graphs (no preserved :yataverse-layers), canonicalize
-        ;; node order by (layer order asc, id code-unit asc) and joins by name asc.
+        ;; On newly projected native graphs, sort nodes by:
+        ;; (layer order asc, fact ontology/type asc, fact raw ID asc, node ID asc) — UTF-16 code units.
         yv-layer-rank (into {} (map (juxt :id :order) yv-layers))
         final-nodes (if (:yataverse-layers basis)
                       yv-nodes
-                      (vec (sort-by (fn [n] [(get yv-layer-rank (:layer n) 999) (:id n)]) yv-nodes)))
+                      (vec (sort-by (fn [n]
+                                      (if (= "fact" (:layer n))
+                                        [(get yv-layer-rank (:layer n) 999)
+                                         (get-in n [:meta "ontology/type"] "")
+                                         (fact-raw-id (:id n) (:meta n))
+                                         (:id n)]
+                                        [(get yv-layer-rank (:layer n) 999)
+                                         ""
+                                         (:id n)
+                                         (:id n)]))
+                                    yv-nodes)))
         final-joins (if (:yataverse-layers basis)
                       yv-joins
                       (vec (sort-by :name yv-joins)))
@@ -603,21 +634,47 @@
                   :edgeCount edge-cnt
                   :layerCount layer-cnt
                   :truncated truncated?
-                  :edgesTruncated edges-truncated?}
-        body {:schema yataverse-graph-schema
-              :version 1
-              :basisCid (:root-cid basis)
-              :id graph-id
-              :stats stats
-              :nodeCount node-cnt
-              :meta top-meta
-              :layers yv-layers
-              :nodes final-nodes
-              :edges yv-edges
-              :joins final-joins
-              :coverage (or (:coverage basis) computed-coverage)
-              :truncated truncated?
-              :edgesTruncated edges-truncated?}
+                  :edgesTruncated edges-truncated?}]
+    {:schema yataverse-graph-schema
+     :version 1
+     :basisCid (:root-cid basis)
+     :id graph-id
+     :stats stats
+     :nodeCount node-cnt
+     :meta top-meta
+     :layers yv-layers
+     :nodes final-nodes
+     :edges yv-edges
+     :joins final-joins
+     :coverage (or (:coverage basis) computed-coverage)
+     :truncated truncated?
+     :edgesTruncated edges-truncated?}))
+
+(defn verify-normalized-graph-cid!
+  "Cryptographically verify that a normalized Kotoba `ontology.graph/v1` graph's
+  declared `:basis :graph-cid` matches the canonical DAG-CBOR SHA-256 CID of its
+  actual body. Fails closed with `:graph-cid-mismatch` on any tampering or forgery."
+  [graph]
+  (let [declared (get-in graph [:basis :graph-cid])
+        body (build-yataverse-body graph)
+        {computed :cid} (dcbor/encode-ontology-graph-dag-cbor body)]
+    (when-not (= declared computed)
+      (v/fail! :graph-cid-mismatch
+               (str "normalized graph :graph-cid (" declared ") does not match canonical DAG-CBOR CID (" computed ")")
+               {:declared declared :computed computed}))
+    :ok))
+
+(defn ->yataverse-graph
+  "Validate and convert a Kotoba `ontology.graph/v1` graph into Yataverse PR #83's
+  exact `yataverse.ontology.graph/v1` wire format.
+
+  Preserves exact `nodes`/`edges`/`joins`/`layers` order on round-trips, orders
+  native multi-type facts and fact edges by `(ontology/type, fact ID)` UTF-16
+  code units with sequential `e1..eN`, and ALWAYS freshly computes `:graphCid`
+  from the emitted canonical DAG-CBOR bytes."
+  [graph]
+  (v/validate-graph! graph {:verify-graph-cid-fn verify-normalized-graph-cid!})
+  (let [body (build-yataverse-body graph)
         _ (v/assert-no-forbidden-wire-keys! body)
         {computed-graph-cid :cid} (dcbor/encode-ontology-graph-dag-cbor body)]
     (assoc body :graphCid computed-graph-cid)))

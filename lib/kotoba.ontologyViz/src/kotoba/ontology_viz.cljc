@@ -24,7 +24,12 @@
 (def ipld-link v/ipld-link)
 (def ipld-link? v/ipld-link?)
 (def extract-cid v/extract-cid)
-(def validate-graph! v/validate-graph!)
+(defn validate-graph!
+  "Fail-closed validation of a normalized `ontology.graph/v1` map, including
+  cryptographic canonical DAG-CBOR digest verification whenever
+  `:graph-cid-verification :verified` is declared."
+  [graph]
+  (v/validate-graph! graph {:verify-graph-cid-fn yv/verify-normalized-graph-cid!}))
 
 ;; ── Escaping, Canonical Number Formatting & Deterministic JSON ───────────────
 
@@ -39,8 +44,16 @@
 (def schema-version g/schema-version)
 (def project-graph g/project-graph)
 (def evaluate-join g/evaluate-join)
-(def layout-graph g/layout-graph)
-(def filter-graph g/filter-graph)
+(defn layout-graph
+  "Assign deterministic layered coordinates to a validated `ontology.graph/v1` graph."
+  ([graph] (layout-graph graph {}))
+  ([graph opts]
+   (g/layout-graph graph opts {:verify-graph-cid-fn yv/verify-normalized-graph-cid!})))
+
+(defn filter-graph
+  "Validate and filter a normalized `ontology.graph/v1` graph by `:layers`, `:kinds`, and/or `:query`."
+  [graph params]
+  (g/filter-graph graph params {:verify-graph-cid-fn yv/verify-normalized-graph-cid!}))
 
 ;; ── Explicit Bidirectional Yataverse PR #83 Wire Adapters ────────────────────
 

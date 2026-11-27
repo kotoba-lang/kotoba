@@ -17,13 +17,14 @@
             [kotoba.ontology-viz.graph :as g]
             [kotoba.ontology-viz.semantic :as sem]
             [kotoba.ontology-viz.svg :as svg]
-            [kotoba.ontology-viz.validate :as v]))
+            [kotoba.ontology-viz.validate :as v]
+            [kotoba.ontology-viz.yataverse :as yv]))
 
 (defn initial-screen-state
   "Build the deterministic, machine-readable initial Semantic UI screen state
   for a validated `ontology.graph/v1` graph."
   [graph]
-  (v/validate-graph! graph)
+  (v/validate-graph! graph {:verify-graph-cid-fn yv/verify-normalized-graph-cid!})
   (let [nodes (:nodes graph)
         edges (:edges graph)
         layers (:layers graph)
@@ -148,6 +149,13 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   function publishScreenState(visibleNodeIds, visibleEdgeIds){
     var q = (searchInput && searchInput.value ? searchInput.value : '').trim();
     var enabledLayers = (graph.layers || []).map(function(l){ return l.id; }).filter(function(id){ return !!activeLayers[id]; });
+    var isFiltered = (visibleNodeIds.length !== (graph.nodes || []).length) ||
+                     (visibleEdgeIds.length !== (graph.edges || []).length);
+    var graphCidVer = isFiltered
+      ? 'absent'
+      : ((graph.basis && graph.basis['graph-cid-verification']) || 'absent');
+    var gcidPill = document.getElementById('ov-graph-cid-badge');
+    if(gcidPill){ gcidPill.style.display = (graphCidVer === 'absent') ? 'none' : ''; }
     var state = {
       'screen/id': 'kotoba.ontology-viewer',
       'screen/status': 'ready',
@@ -155,7 +163,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       'basis/cid': (graph.basis && graph.basis['root-cid']) || null,
       'basis/cid-verification': (graph.basis && (graph.basis['basis-cid-verification'] || graph.basis['cid-verification'])) || 'syntax-only',
       'basis/basis-cid-verification': (graph.basis && (graph.basis['basis-cid-verification'] || graph.basis['cid-verification'])) || 'syntax-only',
-      'basis/graph-cid-verification': (graph.basis && graph.basis['graph-cid-verification']) || 'absent',
+      'basis/graph-cid-verification': graphCidVer,
       activeTab: activeTab,
       selectedNodeId: selectedNodeId,
       activeLayers: enabledLayers,
@@ -366,6 +374,115 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       .replace(/'/g, '&#39;');
   }
 
+  function stripStaleGraphCidBasis(origBasis, changed){
+    var b = Object.assign({}, origBasis || {});
+    if(changed){
+      delete b['graph-cid'];
+      b['graph-cid-verification'] = 'absent';
+    }
+    return b;
+  }
+
+  function recomputeVisibleJoinsLocal(joins, keptNodes, keptEdges){
+    var keptIds = Object.create(null);
+    keptNodes.forEach(function(n){ keptIds[n.id] = true; });
+    var entities = keptNodes.filter(function(n){ return n.kind === 'entity'; });
+    var typeCounts = Object.create(null);
+    var obsTyped = Object.create(null);
+    var obsGlobal = Object.create(null);
+    entities.forEach(function(n){
+      var tp = (n.provenance && n.provenance.type) || (n.meta && n.meta['ontology/type']) || null;
+      if(tp) typeCounts[tp] = (typeCounts[tp] || 0) + 1;
+      var attrs = Object.assign({}, n.attributes || {}, n.meta || {});
+      Object.keys(attrs).forEach(function(k){
+        var raw = attrs[k];
+        if(raw === null || raw === undefined) return;
+        var vals = Array.isArray(raw) ? raw : [raw];
+        if(!obsGlobal[k]) obsGlobal[k] = [];
+        vals.forEach(function(v){ obsGlobal[k].push(String(v)); });
+        if(tp){
+          var tk = tp + '\\u0000' + k;
+          if(!obsTyped[tk]) obsTyped[tk] = [];
+          vals.forEach(function(v){ obsTyped[tk].push(String(v)); });
+        }
+      });
+    });
+    var joinInstEdges = keptEdges.filter(function(e){ return e.kind === 'join-instance'; });
+    var recomputed = [];
+    (joins || []).forEach(function(j){
+      var fn = j['from-node'], tn = j['to-node'];
+      if(!(keptIds[fn] && keptIds[tn])) return;
+      var jname = j.name || j.id;
+      var ltype = j['from-type'] || (fn && fn.indexOf('type:') === 0 ? fn.slice(5) : null);
+      var rtype = j['to-type'] || (tn && tn.indexOf('type:') === 0 ? tn.slice(5) : null);
+      var matchingEdges = joinInstEdges.filter(function(e){ return e.label === jname; });
+      var isNativeValue = !j['join-kind'] && typeof j['from-attr'] === 'string' && j['from-attr'].charAt(0) === ':' &&
+                          typeof j['to-attr'] === 'string' && j['to-attr'].charAt(0) === ':';
+      if(isNativeValue && matchingEdges.length === 0){
+        var srcVals = Array.from(new Set((ltype ? obsTyped[ltype + '\\u0000' + j['from-attr']] : obsGlobal[j['from-attr']]) || []));
+        var tgtVals = Array.from(new Set((rtype ? obsTyped[rtype + '\\u0000' + j['to-attr']] : obsGlobal[j['to-attr']]) || []));
+        var excl = Object.create(null);
+        (j.exclude || []).forEach(function(x){ excl[String(x)] = true; excl[String(x).toUpperCase()] = true; });
+        var rule = j['match-rule'] || 'exact';
+        var mapping = j.mapping || {};
+        var matched = 0, unmatched = 0, excluded = 0;
+        srcVals.forEach(function(sv){
+          if(excl[sv] || excl[sv.toUpperCase()]){ excluded++; return; }
+          var norm = rule === 'exact-uppercase' ? sv.toUpperCase()
+                   : rule === 'exact-lowercase' ? sv.toLowerCase()
+                   : rule === 'mapping' ? (mapping[sv] !== undefined ? String(mapping[sv]) : (mapping[sv.toUpperCase()] !== undefined ? String(mapping[sv.toUpperCase()]) : sv))
+                   : sv;
+          var hit = tgtVals.some(function(tv){
+            if(rule === 'prefix') return tv.indexOf(norm) === 0 || norm.indexOf(tv) === 0;
+            if(rule === 'exact-uppercase') return tv.toUpperCase() === norm;
+            if(rule === 'exact-lowercase') return tv.toLowerCase() === norm;
+            return tv === norm;
+          });
+          if(hit) matched++; else unmatched++;
+        });
+        var elig = srcVals.length - excluded;
+        var cov = elig > 0 ? Math.round((matched / elig) * 10000) / 10000 : null;
+        var st = srcVals.length === 0 ? 'schema-only' : elig === 0 ? 'all-excluded' : matched === elig ? 'full' : matched > 0 ? 'partial' : 'unmatched';
+        recomputed.push(Object.assign({}, j, {
+          'total-source-count': srcVals.length, 'eligible-count': elig, 'matched-count': matched,
+          'matched-rows': matched, 'unmatched-count': unmatched, 'excluded-count': excluded,
+          coverage: cov, status: st, 'matched-pairs': [], 'unmatched-values': [], 'excluded-values': []
+        }));
+      } else {
+        var lcnt = ltype ? (typeCounts[ltype] || 0) : 0;
+        var rcnt = rtype ? (typeCounts[rtype] || 0) : 0;
+        var srcSet = Object.create(null);
+        matchingEdges.forEach(function(e){ srcSet[e.source] = true; });
+        var mLeft = Object.keys(srcSet).length;
+        var mRows = matchingEdges.length;
+        var unm = Math.max(0, lcnt - mLeft);
+        var cov2 = lcnt > 0 ? mLeft / lcnt : null;
+        var st2 = lcnt === 0 ? 'schema-only' : mLeft === lcnt ? 'full' : mLeft > 0 ? 'partial' : 'unmatched';
+        recomputed.push(Object.assign({}, j, {
+          'total-source-count': lcnt, 'eligible-count': lcnt, 'right-count': rcnt,
+          'matched-count': mLeft, 'matched-rows': mRows, 'unmatched-count': unm, 'excluded-count': 0,
+          coverage: cov2, status: st2, 'matched-pairs': [], 'unmatched-values': [], 'excluded-values': []
+        }));
+      }
+    });
+    var jByName = Object.create(null);
+    recomputed.forEach(function(j){ jByName[j.name || j.id] = j; jByName[j.id] = j; });
+    var updatedEdges = keptEdges.map(function(e){
+      if(e.kind !== 'join') return e;
+      var m = e.metadata || {};
+      var j = jByName[m.joinName || m['join-id'] || e.id];
+      if(!j) return e;
+      var m2 = Object.assign({}, m);
+      var covR = j.coverage !== null && j.coverage !== undefined ? Math.round(Number(j.coverage) * 1000) / 1000 : 0;
+      if(Object.prototype.hasOwnProperty.call(m2, 'matchedRows')) m2.matchedRows = j['matched-rows'];
+      if(Object.prototype.hasOwnProperty.call(m2, 'coverageRatio')) m2.coverageRatio = covR;
+      if(Object.prototype.hasOwnProperty.call(m2, 'matched-count')) m2['matched-count'] = j['matched-count'];
+      if(Object.prototype.hasOwnProperty.call(m2, 'coverage')) m2.coverage = j.coverage;
+      return Object.assign({}, e, {metadata: m2});
+    });
+    return {joins: recomputed, edges: updatedEdges};
+  }
+
   function applyVisibilityLocal(params){
     var p = params || {};
     var basisObj = p.basis;
@@ -421,13 +538,20 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     });
     var keptIds = Object.create(null);
     keptNodes.forEach(function(n){ keptIds[n.id] = true; });
-    var keptEdges = (graph.edges || []).filter(function(e){ return !!(keptIds[e.source] && keptIds[e.target]); });
-    var keptJoins = (graph.joins || []).filter(function(j){ return !!(keptIds[j['from-node']] && keptIds[j['to-node']]); });
+    var rawKeptEdges = (graph.edges || []).filter(function(e){ return !!(keptIds[e.source] && keptIds[e.target]); });
+    var rec = recomputeVisibleJoinsLocal(graph.joins, keptNodes, rawKeptEdges);
     var layerCounts = Object.create(null);
     keptNodes.forEach(function(n){ layerCounts[n.layer] = (layerCounts[n.layer] || 0) + 1; });
     var keptLayers = (graph.layers || []).filter(function(l){ return (layerCounts[l.id] || 0) > 0; })
       .map(function(l){ return Object.assign({}, l, {'node-count': layerCounts[l.id]}); });
-    return Object.assign({}, graph, {nodes: keptNodes, edges: keptEdges, joins: keptJoins, layers: keptLayers});
+    var changed = keptNodes.length !== (graph.nodes || []).length || rec.edges.length !== (graph.edges || []).length;
+    return Object.assign({}, graph, {
+      nodes: keptNodes,
+      edges: rec.edges,
+      joins: rec.joins,
+      layers: keptLayers,
+      basis: stripStaleGraphCidBasis(graph.basis, changed)
+    });
   }
 
   function filterGraphLocal(params, srcGraph){
@@ -451,14 +575,52 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     });
     var keptIds = Object.create(null);
     keptNodes.forEach(function(n){ keptIds[n.id] = true; });
-    var keptEdges = (g.edges || []).filter(function(e){
+    var rawKeptEdges = (g.edges || []).filter(function(e){
       return !!(keptIds[e.source] && keptIds[e.target]);
     });
+    var changedFromOrig = keptNodes.length !== (graph.nodes || []).length || rawKeptEdges.length !== (graph.edges || []).length;
+    var rec = changedFromOrig ? recomputeVisibleJoinsLocal(g.joins, keptNodes, rawKeptEdges) : {joins: g.joins || [], edges: rawKeptEdges};
     var layerCounts = Object.create(null);
     keptNodes.forEach(function(n){ layerCounts[n.layer] = (layerCounts[n.layer] || 0) + 1; });
     var keptLayers = (g.layers || []).filter(function(l){ return (layerCounts[l.id] || 0) > 0; })
       .map(function(l){ return Object.assign({}, l, {'node-count': layerCounts[l.id]}); });
-    return {nodes: keptNodes, edges: keptEdges, layers: keptLayers, joins: g.joins || [], basis: g.basis || {}, layout: g.layout || {}};
+    return {
+      nodes: keptNodes,
+      edges: rec.edges,
+      layers: keptLayers,
+      joins: rec.joins,
+      basis: stripStaleGraphCidBasis(g.basis, changedFromOrig),
+      layout: g.layout || {}
+    };
+  }
+
+  var EDGE_STYLES_LOCAL = {
+    produces: {stroke:'#0f766e', dash:null, marker:'ov-arrow-teal'},
+    provenance: {stroke:'#0f766e', dash:'4 3', marker:'ov-arrow-teal'},
+    'has-attribute': {stroke:'#6d28d9', dash:null, marker:'ov-arrow-slate'},
+    'instance-of': {stroke:'#b45309', dash:'5 3', marker:'ov-arrow-amber'},
+    'datom-ref': {stroke:'#b45309', dash:null, marker:'ov-arrow-amber'},
+    'rdf-predicate': {stroke:'#0369a1', dash:null, marker:'ov-arrow-blue'},
+    join: {stroke:'#1d4ed8', dash:'6 4', marker:'ov-arrow-blue'},
+    'join-instance': {stroke:'#1d4ed8', dash:'3 3', marker:'ov-arrow-blue'},
+    'ipld-link': {stroke:'#be123c', dash:'2 3', marker:'ov-arrow-rose'}
+  };
+
+  function edgePathLocal(srcNode, tgtNode, direction){
+    var sl = srcNode.layout || {x:40, y:84, width:216, height:68};
+    var tl = tgtNode.layout || {x:40, y:84, width:216, height:68};
+    var sx = Number(sl.x) || 0, sy = Number(sl.y) || 0, sw = Number(sl.width) || 216, sh = Number(sl.height) || 68;
+    var tx = Number(tl.x) || 0, ty = Number(tl.y) || 0, tw = Number(tl.width) || 216, th = Number(tl.height) || 68;
+    if(srcNode.id === tgtNode.id){
+      var lx1 = sx + sw, ly1 = sy + sh * 0.3, lx2 = sx + sw, ly2 = sy + sh * 0.7;
+      return {d:'M ' + lx1 + ' ' + ly1 + ' C ' + (lx1 + 48) + ' ' + (ly1 - 24) + ', ' + (lx2 + 48) + ' ' + (ly2 + 24) + ', ' + lx2 + ' ' + ly2, mx:lx1 + 36, my:sy + sh / 2};
+    }
+    if(direction === 'vertical'){
+      var vx1 = sx + sw / 2, vy1 = sy + sh, vx2 = tx + tw / 2, vy2 = ty, vcy = (vy1 + vy2) / 2;
+      return {d:'M ' + vx1 + ' ' + vy1 + ' C ' + vx1 + ' ' + vcy + ', ' + vx2 + ' ' + vcy + ', ' + vx2 + ' ' + vy2, mx:(vx1 + vx2) / 2, my:vcy};
+    }
+    var hx1 = sx + sw, hy1 = sy + sh / 2, hx2 = tx, hy2 = ty + th / 2, hcx = (hx1 + hx2) / 2;
+    return {d:'M ' + hx1 + ' ' + hy1 + ' C ' + hcx + ' ' + hy1 + ', ' + hcx + ' ' + hy2 + ', ' + hx2 + ' ' + hy2, mx:hcx, my:(hy1 + hy2) / 2};
   }
 
   function renderFilteredSvgLocal(filtered, title){
@@ -466,6 +628,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     var nodes = filtered.nodes || [];
     var edges = filtered.edges || [];
     var lay = filtered.layout || {};
+    var direction = lay.direction || 'horizontal';
     var w = Math.max(420, Number(lay.width) || 640);
     var h = Math.max(240, Number(lay.height) || 360);
     var basis = filtered.basis || {};
@@ -474,13 +637,38 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     var desc = 'schema=ontology.graph/v1 | codec=' + (basis.codec || 'dag-cbor') + ' | cid=' + cidVer +
       (gVer && gVer !== 'absent' ? (' | graph-cid=' + gVer) : '') +
       ' | nodes=' + nodes.length + ' | edges=' + edges.length + ' | joins=' + (filtered.joins || []).length;
+    var nodeMap = Object.create(null);
+    nodes.forEach(function(n){ nodeMap[n.id] = n; });
     var parts = [
       '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ' + w + ' ' + h + '\" width=\"' + w + '\" height=\"' + h + '\" role=\"img\" aria-label=\"' + escapeXmlLocal(t) + '\">',
       '  <title>' + escapeXmlLocal(t) + '</title>',
-      '  <desc>' + escapeXmlLocal(desc) + '</desc>'
+      '  <desc>' + escapeXmlLocal(desc) + '</desc>',
+      '  <defs>',
+      '    <marker id=\"ov-arrow-slate\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#64748b\"/></marker>',
+      '    <marker id=\"ov-arrow-teal\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#0f766e\"/></marker>',
+      '    <marker id=\"ov-arrow-blue\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#1d4ed8\"/></marker>',
+      '    <marker id=\"ov-arrow-amber\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#b45309\"/></marker>',
+      '    <marker id=\"ov-arrow-rose\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto-start-reverse\"><path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#be123c\"/></marker>',
+      '  </defs>',
+      '  <rect x=\"0\" y=\"0\" width=\"' + w + '\" height=\"' + h + '\" fill=\"#ffffff\"/>'
     ];
     edges.forEach(function(e){
-      parts.push('  <g class=\"ov-edge\" data-edge-id=\"' + escapeXmlLocal(e.id) + '\" data-source=\"' + escapeXmlLocal(e.source) + '\" data-target=\"' + escapeXmlLocal(e.target) + '\"><title>' + escapeXmlLocal(e.label || '') + '</title></g>');
+      var src = nodeMap[e.source], tgt = nodeMap[e.target];
+      if(!src || !tgt) return;
+      var ep = edgePathLocal(src, tgt, direction);
+      var st = EDGE_STYLES_LOCAL[e.kind] || {stroke:'#64748b', dash:null, marker:'ov-arrow-slate'};
+      var isJoin = (e.kind === 'join' || e.kind === 'join-instance');
+      var lbl = String(e.label || '');
+      if(lbl.length > 26) lbl = lbl.slice(0, 23) + '...';
+      var lblW = 14 + 6.2 * lbl.length;
+      parts.push('  <g class=\"ov-edge\" data-edge-id=\"' + escapeXmlLocal(e.id) + '\" data-source=\"' + escapeXmlLocal(e.source) + '\" data-target=\"' + escapeXmlLocal(e.target) + '\" data-kind=\"' + escapeXmlLocal(e.kind || 'edge') + '\" data-layer=\"' + escapeXmlLocal(e.layer || 'ontology') + '\">');
+      parts.push('    <path d=\"' + ep.d + '\" fill=\"none\" stroke=\"' + st.stroke + '\" stroke-width=\"' + (isJoin ? '2.2' : '1.5') + '\"' + (st.dash ? (' stroke-dasharray=\"' + st.dash + '\"') : '') + ' marker-end=\"url(#' + st.marker + ')\"/>');
+      if(lbl){
+        parts.push('    <rect x=\"' + (ep.mx - lblW / 2) + '\" y=\"' + (ep.my - 9) + '\" width=\"' + lblW + '\" height=\"18\" rx=\"9\" fill=\"' + (isJoin ? '#dbeafe' : '#ffffff') + '\" stroke=\"' + st.stroke + '\" stroke-width=\"0.9\"/>');
+        parts.push('    <text x=\"' + ep.mx + '\" y=\"' + (ep.my + 3.5) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"#1e293b\">' + escapeXmlLocal(lbl) + '</text>');
+      }
+      parts.push('    <title>' + escapeXmlLocal(e.source + ' -> ' + e.target + ' (' + (e.label || '') + ')') + '</title>');
+      parts.push('  </g>');
     });
     nodes.forEach(function(n){
       var nl = n.layout || {};
@@ -939,7 +1127,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
           "      <span class=\"ov-pill\">codec: " (esc/escape-html (or (:codec basis) "dag-cbor")) "</span>\n"
           "      <span class=\"ov-pill\">basis-cid: " cid-ver "</span>\n"
           (when (and graph-cid-ver (not= graph-cid-ver "absent"))
-            (str "      <span class=\"ov-pill\">graph-cid: " (esc/escape-html graph-cid-ver) "</span>\n"))
+            (str "      <span id=\"ov-graph-cid-badge\" class=\"ov-pill\">graph-cid: " (esc/escape-html graph-cid-ver) "</span>\n"))
           (when-let [rc (:root-cid basis)]
             (str "      <span class=\"ov-pill\" title=\"" (esc/escape-attr rc) "\">root: "
                  (esc/escape-html (esc/short-cid rc)) "</span>\n"))

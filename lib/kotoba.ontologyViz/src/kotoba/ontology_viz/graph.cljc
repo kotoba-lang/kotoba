@@ -887,9 +887,10 @@
   "Validate input graph AND caller layout options, assign deterministic layered
   DAG coordinates preserving `(:nodes graph)` order, and validate the resulting
   graph before returning."
-  ([graph] (layout-graph graph {}))
-  ([graph opts]
-   (v/validate-graph! graph)
+  ([graph] (layout-graph graph {} {}))
+  ([graph opts] (layout-graph graph opts {}))
+  ([graph opts validate-opts]
+   (v/validate-graph! graph validate-opts)
    (v/validate-layout-options! opts)
    (let [{:keys [direction node-width node-height col-gap row-gap pad-x pad-y]
           :or {direction :horizontal
@@ -941,7 +942,7 @@
          result (assoc graph
                        :nodes positioned-nodes
                        :layout canvas)]
-     (v/validate-graph! result)
+     (v/validate-graph! result validate-opts)
      result)))
 
 ;; ── Public Projection Entry Point ────────────────────────────────────────────
@@ -1027,35 +1028,44 @@
   keywords, strictly validated against `valid-node-kinds`), and/or `:query`.
 
   Crucially distinguishes `nil` (no filter) from explicit empty `[]`: passing
-  `{:layers []}` or `{:kinds []}` returns 0 nodes and 0 edges, matching the
-  interactive HTML viewer when all layer checkboxes are unchecked."
-  [graph {:keys [layers kinds query]}]
-  (v/validate-graph! graph)
-  (let [layer-set (when (some? layers) (set (map id-str layers)))
-        kind-set (when (some? kinds) (set (map normalize-kind-filter kinds)))
-        q (when-not (str/blank? query) (str/lower-case (str/trim query)))
-        keep-node? (fn [n]
-                     (and (or (nil? layer-set) (contains? layer-set (:layer n)))
-                          (or (nil? kind-set) (contains? kind-set (:kind n)))
-                          (or (nil? q)
-                              (str/includes? (str/lower-case (str (:id n))) q)
-                              (str/includes? (str/lower-case (str (:label n))) q)
-                              (and (:cid n) (str/includes? (str/lower-case (str (:cid n))) q)))))
-        kept-nodes (vec (filter keep-node? (:nodes graph)))
-        kept-ids (set (map :id kept-nodes))
-        kept-edges (vec (filter #(and (contains? kept-ids (:source %))
-                                      (contains? kept-ids (:target %)))
-                                (:edges graph)))
-        kept-layers (build-layers kept-nodes)
-        updated (-> graph
-                    (assoc :nodes kept-nodes
-                           :edges kept-edges
-                           :layers kept-layers)
-                    (update :basis (fn [b]
-                                     (-> b
-                                         (dissoc :graph-cid :stats :coverage :yataverse-layers)
-                                         (assoc :graph-cid-verification :absent
-                                                :node-count (count kept-nodes)
-                                                :edge-count (count kept-edges)
-                                                :layer-count (count kept-layers))))))]
-    (layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y]))))
+  `{:layers []}` or `{:kinds []}` returns 0 nodes, 0 edges, and 0 joins,
+  matching the interactive HTML viewer when all layer checkboxes are unchecked."
+  ([graph params] (filter-graph graph params {}))
+  ([graph {:keys [layers kinds query]} validate-opts]
+   (v/validate-graph! graph validate-opts)
+   (let [layer-set (when (some? layers) (set (map id-str layers)))
+         kind-set (when (some? kinds) (set (map normalize-kind-filter kinds)))
+         q (when-not (str/blank? query) (str/lower-case (str/trim query)))
+         keep-node? (fn [n]
+                      (and (or (nil? layer-set) (contains? layer-set (:layer n)))
+                           (or (nil? kind-set) (contains? kind-set (:kind n)))
+                           (or (nil? q)
+                               (str/includes? (str/lower-case (str (:id n))) q)
+                               (str/includes? (str/lower-case (str (:label n))) q)
+                               (and (:cid n) (str/includes? (str/lower-case (str (:cid n))) q)))))
+         kept-nodes (vec (filter keep-node? (:nodes graph)))
+         kept-ids (set (map :id kept-nodes))
+         kept-edges (vec (filter #(and (contains? kept-ids (:source %))
+                                       (contains? kept-ids (:target %)))
+                                 (:edges graph)))
+         kept-joins (vec (filter #(and (contains? kept-ids (:from-node %))
+                                       (contains? kept-ids (:to-node %)))
+                                 (:joins graph)))
+         kept-layers (build-layers kept-nodes)
+         truncated? (or (boolean (get-in graph [:basis :truncated]))
+                        (< (count kept-nodes) (count (:nodes graph))))
+         updated (-> graph
+                     (assoc :nodes kept-nodes
+                            :edges kept-edges
+                            :joins kept-joins
+                            :layers kept-layers)
+                     (update :basis (fn [b]
+                                      (-> b
+                                          (dissoc :graph-cid :stats :coverage :yataverse-layers)
+                                          (assoc :graph-cid-verification :absent
+                                                 :truncated truncated?
+                                                 :node-count (count kept-nodes)
+                                                 :edge-count (count kept-edges)
+                                                 :layer-count (count kept-layers)
+                                                 :join-count (count kept-joins))))))]
+     (layout-graph updated (select-keys (:layout graph) [:direction :node-width :node-height :col-gap :row-gap :pad-x :pad-y])))))

@@ -23,9 +23,12 @@ AwaiFS, Drive, and Yataverse).
     layout dimensions, binary CIDv1 parsing).
   - Binary CIDv1 structure validation (`parse-cidv1`: canonical RFC4648 base32lower
     round-trip, shortest-form LEB128 varints, version=1, multicodec, recognized
-    multihash + exact digest length). Because this library performs no block
-    hashing on its own, `basis` explicitly records `:cid-verification :syntax-only`
-    unless a caller passes an already digest-verified basis (`:verified`).
+    multihash + exact digest length). Because this library performs no snapshot
+    CAR block-closure hashing on its own, `basis` records `:cid-verification :syntax-only`
+    and `:basis-cid-verification :syntax-only`, and refuses unbacked caller
+    `:verified` basis claims (`:unverified-basis-claim`). Independently,
+    `:graph-cid-verification :verified` is permitted only when the graph body's
+    canonical DAG-CBOR SHA-256 CID cryptographically matches `:graph-cid`.
 - **Semantic UI & Accessibility (G2)**:
   - Interactive HTML viewer exposes live machine-readable screen state via
     `data-screen-state` on `#kotoba-ontology-screen` and

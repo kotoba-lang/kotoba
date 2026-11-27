@@ -100,6 +100,21 @@
                                                       (assoc-in [:basis :cid-verification] :verified)
                                                       (assoc-in [:basis :basis-cid-verification] :verified)))))
           "claiming basis :verified without :root-cid must fail closed")
+      (is (= :graph-cid-mismatch
+             (refusal-reason #(ov/validate-graph! (-> valid-graph
+                                                      (assoc-in [:basis :graph-cid] gt/sample-root-cid)
+                                                      (assoc-in [:basis :graph-cid-verification] :verified)))))
+          "validate-graph! must cryptographically verify :graph-cid-verification :verified against canonical DAG-CBOR bytes")
+      (is (= :graph-cid-mismatch
+             (refusal-reason #(ov/render-svg (-> valid-graph
+                                                 (assoc-in [:basis :graph-cid] gt/sample-root-cid)
+                                                 (assoc-in [:basis :graph-cid-verification] :verified)))))
+          "render-svg must refuse forged :graph-cid-verification :verified on normalized graph")
+      (is (= :graph-cid-mismatch
+             (refusal-reason #(ov/render-html (-> valid-graph
+                                                  (assoc-in [:basis :graph-cid] gt/sample-root-cid)
+                                                  (assoc-in [:basis :graph-cid-verification] :verified)))))
+          "render-html must refuse forged :graph-cid-verification :verified on normalized graph")
       (is (= :unverified-basis-claim
              (refusal-reason #(ov/validate-graph! (-> valid-graph
                                                       (assoc-in [:basis :cid-verification] :verified)
