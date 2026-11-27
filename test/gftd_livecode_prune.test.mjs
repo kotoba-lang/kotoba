@@ -11,7 +11,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const TARGET_FILES = {
   b2Probe: path.join(
     REPO_ROOT,
-    "lib/kotoba.kotobaseStorage/providers/kotoba.kotobase.storage.s3/test/b2_range_probe.cljk",
+    "lib/kotoba.kotobaseStorage/providers/kotoba.kotobase.storage.s3/test/b2_range_probe.cljc",
   ),
   s3Readme: path.join(
     REPO_ROOT,
@@ -19,7 +19,7 @@ const TARGET_FILES = {
   ),
   ingestShiropico: path.join(
     REPO_ROOT,
-    "lib/kotoba.kuraNode/script/ingest_shiropico.cljk",
+    "lib/kotoba.kuraNode/script/ingest_shiropico.cljc",
   ),
 };
 
@@ -66,6 +66,22 @@ const INGEST_CP = [
   "lib/kotoba.json/src",
 ].map((p) => path.join(REPO_ROOT, p)).join(":");
 
+test("migrated scripts exist as .cljc and retired .cljk paths do not exist", () => {
+  for (const cljcPath of [TARGET_FILES.b2Probe, TARGET_FILES.ingestShiropico]) {
+    assert.equal(
+      fs.existsSync(cljcPath),
+      true,
+      `expected migrated .cljc file to exist: ${path.relative(REPO_ROOT, cljcPath)}`,
+    );
+    const retiredCljkPath = cljcPath.replace(/\.cljc$/, ".cljk");
+    assert.equal(
+      fs.existsSync(retiredCljkPath),
+      false,
+      `retired .cljk file must not exist: ${path.relative(REPO_ROOT, retiredCljkPath)}`,
+    );
+  }
+});
+
 test("target files contain zero occurrences of ai-gftd", () => {
   for (const [label, filePath] of Object.entries(TARGET_FILES)) {
     const content = fs.readFileSync(filePath, "utf8");
@@ -78,7 +94,7 @@ test("target files contain zero occurrences of ai-gftd", () => {
   }
 });
 
-test("static fail-closed contracts in b2_range_probe.cljk, README.md, and ingest_shiropico.cljk", () => {
+test("static fail-closed contracts in b2_range_probe.cljc, README.md, and ingest_shiropico.cljc", () => {
   const probe = fs.readFileSync(TARGET_FILES.b2Probe, "utf8");
   assert.match(probe, /B2_PROBE_KEYCHAIN_SERVICE/);
   assert.match(probe, /B2_PROBE_BUCKET/);
@@ -88,10 +104,12 @@ test("static fail-closed contracts in b2_range_probe.cljk, README.md, and ingest
     "require-config! must run before (keychain) in -main",
   );
   assert.match(probe, /\(js\/process\.exit 2\)/);
+  assert.match(probe, /b2_range_probe\.cljc/);
 
   const readme = fs.readFileSync(TARGET_FILES.s3Readme, "utf8");
   assert.match(readme, /B2_PROBE_KEYCHAIN_SERVICE/);
   assert.match(readme, /B2_PROBE_BUCKET/);
+  assert.match(readme, /test\/b2_range_probe\.cljc/);
 
   const ingest = fs.readFileSync(TARGET_FILES.ingestShiropico, "utf8");
   assert.match(ingest, /:bucket\s+\(env\s+"SRC_BUCKET"\)/);
@@ -99,7 +117,7 @@ test("static fail-closed contracts in b2_range_probe.cljk, README.md, and ingest
   assert.match(ingest, /SRC_BUCKET/);
 });
 
-test("b2_range_probe.cljk fails closed with exit 2 and never invokes security when env vars are missing/blank", (t) => {
+test("b2_range_probe.cljc fails closed with exit 2 and never invokes security when env vars are missing/blank", (t) => {
   if (!KBB_ENGINE) {
     t.skip("kbb SCI engine (org-babashka-nbb) not available in this environment");
     return;
@@ -183,7 +201,7 @@ test("b2_range_probe.cljk fails closed with exit 2 and never invokes security wh
   }
 });
 
-test("ingest_shiropico.cljk fails closed on SRC_BUCKET assertion before storage/network calls", (t) => {
+test("ingest_shiropico.cljc fails closed on SRC_BUCKET assertion before storage/network calls", (t) => {
   if (!KBB_ENGINE) {
     t.skip("kbb SCI engine (org-babashka-nbb) not available in this environment");
     return;

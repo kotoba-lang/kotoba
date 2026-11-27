@@ -38,7 +38,7 @@ among the signed headers is accepted at all rather than 403ing on
 canonicalisation, and whether the endpoint returns exactly the bytes asked
 for.
 
-`test/b2_range_probe.cljk` answers both. It packs a real CARv2, PUTs it,
+`test/b2_range_probe.cljc` answers both. It packs a real CARv2, PUTs it,
 ranges one frame back out, checks the returned bytes **parse as that frame**
 — a one-byte overshoot still parses, as the wrong block — and deletes the
 object.
@@ -61,7 +61,7 @@ same reason.
 ```bash
 B2_PROBE_KEYCHAIN_SERVICE=<keychain-service> \
 B2_PROBE_BUCKET=<bucket> \
-kbb --backend sci --classpath "src:<io-ipld-car>/src:$(kbb -Spath -M:cljs-test)" test/b2_range_probe.cljk
+kbb --backend sci --classpath "src:<io-ipld-car>/src:$(kbb -Spath -M:cljs-test)" test/b2_range_probe.cljc
 ```
 
 A `200` answer to a ranged GET means the endpoint **ignored** `Range` and is

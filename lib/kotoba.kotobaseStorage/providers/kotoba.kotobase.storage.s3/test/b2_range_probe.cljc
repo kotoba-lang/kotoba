@@ -1,5 +1,5 @@
 #!/usr/bin/env kbb
-;; b2_range_probe.cljs — the one claim miniflare cannot settle: does a REAL
+;; b2_range_probe.cljc — the one claim miniflare cannot settle: does a REAL
 ;; S3-compatible endpoint honour our Range header, byte for byte?
 ;;
 ;; `test/object_r2.cljk` in kotobase-storage-s3 checks the R2 conversion
@@ -21,7 +21,7 @@
 ;; Optional overrides: B2_PROBE_ENDPOINT, B2_PROBE_REGION.
 ;;
 ;;   B2_PROBE_KEYCHAIN_SERVICE=<service> B2_PROBE_BUCKET=<bucket> \
-;;     kbb --backend sci --classpath "<cp>" b2_range_probe.cljk [--keep]
+;;     kbb --backend sci --classpath "<cp>" b2_range_probe.cljc [--keep]
 
 (ns b2-range-probe
   (:require ["node:child_process" :as cp]
@@ -58,7 +58,7 @@
        (str "FAIL: missing required environment variable(s): "
             (str/join ", " missing)
             "\nUsage: B2_PROBE_KEYCHAIN_SERVICE=<service> B2_PROBE_BUCKET=<bucket> "
-            "kbb --backend sci --classpath \"<cp>\" b2_range_probe.cljk [--keep]"))
+            "kbb --backend sci --classpath \"<cp>\" b2_range_probe.cljc [--keep]"))
       (js/process.exit 2))))
 
 (def failures (atom 0))
