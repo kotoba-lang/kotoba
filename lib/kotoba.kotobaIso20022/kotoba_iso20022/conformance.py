@@ -25,6 +25,11 @@ CBPR+ Usage Guidelines for ``pacs.008.001.08`` and the BAH:
 This is a *non-adjudicating* deterministic checker: it reports findings, it
 does not move money, sign, or transact (kawase G2/G13 stay with the gated
 ingress cell). No proprietary SWIFT validator is used.
+
+Rule source/version pins are recorded in
+``lib/kotoba.swift/conformance/cbpr-guideline-pins.edn`` with
+``:version = "unknown"`` until O3 resolves; rule IDs CBPR-001..011 are fixed
+(next new rule CBPR-012).
 """
 
 from __future__ import annotations
