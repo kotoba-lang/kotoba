@@ -1,5 +1,5 @@
 #!/usr/bin/env kbb
-;; b2_range_probe.cljs — the one claim miniflare cannot settle: does a REAL
+;; b2_range_probe.cljc — the one claim miniflare cannot settle: does a REAL
 ;; S3-compatible endpoint honour our Range header, byte for byte?
 ;;
 ;; `test/object_r2.cljk` in kotobase-storage-s3 checks the R2 conversion
@@ -14,11 +14,14 @@
 ;;      accepted at all, or 403s on canonicalisation.
 ;;
 ;; It packs a real CARv2, PUTs it, ranges one frame back out, verifies the
-;; frame's CID, and deletes the object. Credentials come from the Keychain
-;; item named in the secrets map (service `b2:ai-gftd-datasets`,
-;; account = key id, password = app key) and are never printed.
+;; frame's CID, and deletes the object. Required environment variables:
+;;   B2_PROBE_KEYCHAIN_SERVICE  exact Keychain service name (account = key id,
+;;                              password = app key; never enumerated or printed)
+;;   B2_PROBE_BUCKET            target B2 bucket name
+;; Optional overrides: B2_PROBE_ENDPOINT, B2_PROBE_REGION.
 ;;
-;;   kbb --backend sci --classpath "<cp>" b2_range_probe.cljs [--keep]
+;;   B2_PROBE_KEYCHAIN_SERVICE=<service> B2_PROBE_BUCKET=<bucket> \
+;;     kbb --backend sci --classpath "<cp>" b2_range_probe.cljc [--keep]
 
 (ns b2-range-probe
   (:require ["node:child_process" :as cp]
@@ -31,12 +34,32 @@
             [kotobase.storage.s3 :as s3]
             [multiformats.core :as mf]))
 
+(defn- env [k]
+  (let [v (aget (.-env js/process) k)]
+    (when (and (string? v) (not (str/blank? v)))
+      v)))
+
 (def args (vec *command-line-args*))
 (def keep? (some #{"--keep"} args))
-(def service "b2:ai-gftd-datasets")
-(def bucket "ai-gftd-datasets")
-(def endpoint "https://s3.us-west-004.backblazeb2.com")
-(def region "us-west-004")
+(def service (env "B2_PROBE_KEYCHAIN_SERVICE"))
+(def bucket (env "B2_PROBE_BUCKET"))
+(def endpoint (or (env "B2_PROBE_ENDPOINT") "https://s3.us-west-004.backblazeb2.com"))
+(def region (or (env "B2_PROBE_REGION") "us-west-004"))
+
+(defn- require-config!
+  "Fail closed before any Keychain lookup or network request when required
+  environment variables are unset or blank."
+  []
+  (let [missing (cond-> []
+                  (str/blank? service) (conj "B2_PROBE_KEYCHAIN_SERVICE")
+                  (str/blank? bucket)  (conj "B2_PROBE_BUCKET"))]
+    (when (seq missing)
+      (js/console.error
+       (str "FAIL: missing required environment variable(s): "
+            (str/join ", " missing)
+            "\nUsage: B2_PROBE_KEYCHAIN_SERVICE=<service> B2_PROBE_BUCKET=<bucket> "
+            "kbb --backend sci --classpath \"<cp>\" b2_range_probe.cljc [--keep]"))
+      (js/process.exit 2))))
 
 (def failures (atom 0))
 (defn check! [ok? label]
@@ -58,6 +81,7 @@
     {:access-key acct :secret-key pw}))
 
 (defn -main [& _]
+  (require-config!)
   (let [{:keys [access-key secret-key]} (keychain)
         client (s3/signed-client {:endpoint endpoint :bucket bucket :region region
                                   :access-key access-key :secret-key secret-key})
