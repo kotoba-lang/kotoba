@@ -1,11 +1,16 @@
 (ns kotoba.ontology-viz.html
   "Self-contained, offline-only interactive HTML5 Viewer generator for
-  `ontology.graph/v1` graphs.
+  `ontology.graph/v1` and Yataverse `yataverse.ontology.graph/v1` graphs.
 
-  Security & policy invariants:
+  Security, G2, and G3 invariants:
+  - Always validates caller-supplied graphs via `svg/normalize-and-validate-graph` (no unchecked bypass).
   - Strict offline Content-Security-Policy (no external scripts, fonts, styles, or fetches).
   - Self-contained `ov-*` CSS classes only (zero external design-system tokens or dependencies).
-  - All embedded JSON escaped via `json-for-script` (no `</script>` breakout).
+  - Strict `#RRGGBB` hex validation for CSS paint values and full HTML escaping for all text & counts.
+  - Machine-readable live screen state (`data-screen-state` + `window.__KOTOBA_ONTOLOGY_SCREEN__`)
+    synchronized with UI controls, matching agent `filter-graph` and `inspect-node` semantics.
+  - WAI-ARIA `tablist`/`tab`/`tabpanel` with `aria-selected`, `aria-controls`, `aria-labelledby`,
+    roving `tabindex`, and `ArrowLeft`/`ArrowRight`/`Home`/`End` keyboard navigation.
   - Client-side DOM updates use `textContent` / `createElement` only (never `innerHTML` with graph data)."
   (:require [clojure.string :as str]
             [kotoba.ontology-viz.escape :as esc]
@@ -14,10 +19,33 @@
             [kotoba.ontology-viz.svg :as svg]
             [kotoba.ontology-viz.validate :as v]))
 
-(defn- normalize-graph [graph-or-input]
-  (if (= g/schema-kind (:schema/kind graph-or-input))
-    (if (:layout graph-or-input) graph-or-input (g/layout-graph graph-or-input))
-    (g/project-graph graph-or-input)))
+(defn initial-screen-state
+  "Build the deterministic, machine-readable initial Semantic UI screen state
+  for a validated `ontology.graph/v1` graph."
+  [graph]
+  (v/validate-graph! graph)
+  (let [nodes (:nodes graph)
+        edges (:edges graph)
+        layers (:layers graph)
+        first-id (some-> (first nodes) :id)]
+    {:screen/id "kotoba.ontology-viewer"
+     :screen/status "ready"
+     :schema/version sem/contract-version
+     :basis/cid (get-in graph [:basis :root-cid])
+     :basis/cid-verification (name (or (get-in graph [:basis :cid-verification]) :syntax-only))
+     :activeTab "inspect"
+     :selectedNodeId first-id
+     :activeLayers (mapv :id layers)
+     :activeKinds []
+     :query ""
+     :zoom 1
+     :visibleNodeIds (mapv :id nodes)
+     :visibleEdgeIds (mapv :id edges)
+     :controls {:zoomIn {:enabled true}
+                :zoomOut {:enabled true}
+                :zoomReset {:enabled false}
+                :clearSearch {:enabled false}}
+     :ops sem/operation-names}))
 
 (def ^:private viewer-css
   "*,*::before,*::after{box-sizing:border-box}
@@ -34,14 +62,14 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
 .ov-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .ov-search{padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;min-width:210px}
 .ov-btn{padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;background:#ffffff;color:#0f172a;font-size:12px;font-weight:600;cursor:pointer}
-.ov-btn:hover{background:#f1f5f9}
-.ov-main{display:grid;grid-template-columns:minmax(0,1fr) 370px;min-height:0}
+.ov-btn:hover:not(:disabled){background:#f1f5f9}
+.ov-btn:disabled{opacity:0.45;cursor:not-allowed}
+.ov-main{display:grid;grid-template-columns:minmax(0,1fr) 380px;min-height:0}
 @media(max-width:960px){.ov-main{grid-template-columns:1fr}}
 .ov-canvas-pane{overflow:auto;padding:16px;background:#f1f5f9;position:relative}
 .ov-svg-stage{display:inline-block;transform-origin:0 0;background:#ffffff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 1px 3px rgba(15,23,42,0.08)}
 .ov-node{cursor:pointer}
 .ov-node:hover .ov-node-card,.ov-node.ov-selected .ov-node-card{stroke-width:3;filter:drop-shadow(0 2px 6px rgba(15,23,42,0.18))}
-.ov-dimmed{opacity:0.14}
 .ov-hidden{display:none}
 .ov-sidebar{border-left:1px solid #e2e8f0;background:#ffffff;display:flex;flex-direction:column;min-height:0}
 .ov-tabs{display:flex;border-bottom:1px solid #e2e8f0;background:#f8fafc}
@@ -67,17 +95,25 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   'use strict';
   var graphEl = document.getElementById('kotoba-ontology-graph');
   var schemaEl = document.getElementById('kotoba-semantic-ui-schema');
-  if(!graphEl || !schemaEl) return;
+  var screenEl = document.getElementById('kotoba-ontology-screen');
+  if(!graphEl || !schemaEl || !screenEl) return;
   var graph = JSON.parse(graphEl.textContent);
   var semSchema = JSON.parse(schemaEl.textContent);
   var nodesById = Object.create(null);
   (graph.nodes || []).forEach(function(n){ nodesById[n.id] = n; });
   var activeLayers = Object.create(null);
   (graph.layers || []).forEach(function(l){ activeLayers[l.id] = true; });
+  var activeTab = 'inspect';
+  var selectedNodeId = (graph.nodes && graph.nodes.length) ? graph.nodes[0].id : null;
   var zoom = 1.0;
   var stage = document.getElementById('ov-svg-stage');
   var searchInput = document.getElementById('ov-search');
+  var clearBtn = document.getElementById('ov-clear-search');
+  var zin = document.getElementById('ov-zoom-in');
+  var zout = document.getElementById('ov-zoom-out');
+  var zrst = document.getElementById('ov-zoom-reset');
   var inspectBox = document.getElementById('ov-inspector-body');
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.ov-tab'));
 
   function el(tag, cls, text){
     var node = document.createElement(tag);
@@ -86,9 +122,56 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     return node;
   }
 
+  function inspectPayload(nodeId){
+    var n = nodeId ? nodesById[nodeId] : null;
+    if(!n) return {found:false, node:null, incoming:[], outgoing:[], joins:[]};
+    var incoming = (graph.edges || []).filter(function(e){ return e.target === nodeId; });
+    var outgoing = (graph.edges || []).filter(function(e){ return e.source === nodeId; });
+    var joins = (graph.joins || []).filter(function(j){
+      return j['from-node'] === nodeId || j['to-node'] === nodeId;
+    });
+    return {found:true, node:n, incoming:incoming, outgoing:outgoing, joins:joins};
+  }
+
+  function publishScreenState(visibleNodeIds, visibleEdgeIds){
+    var q = (searchInput && searchInput.value ? searchInput.value : '').trim();
+    var enabledLayers = (graph.layers || []).map(function(l){ return l.id; }).filter(function(id){ return !!activeLayers[id]; });
+    var state = {
+      'screen/id': 'kotoba.ontology-viewer',
+      'screen/status': 'ready',
+      'schema/version': semSchema['schema/version'] || 'kotoba.semantic-ui/v1',
+      'basis/cid': (graph.basis && graph.basis['root-cid']) || null,
+      'basis/cid-verification': (graph.basis && graph.basis['cid-verification']) || 'syntax-only',
+      activeTab: activeTab,
+      selectedNodeId: selectedNodeId,
+      activeLayers: enabledLayers,
+      activeKinds: [],
+      query: q,
+      zoom: Number(zoom.toFixed(2)),
+      visibleNodeIds: visibleNodeIds,
+      visibleEdgeIds: visibleEdgeIds,
+      controls: {
+        zoomIn: {enabled: zoom < 2.5},
+        zoomOut: {enabled: zoom > 0.35},
+        zoomReset: {enabled: Math.abs(zoom - 1.0) > 0.001},
+        clearSearch: {enabled: q.length > 0}
+      },
+      ops: (semSchema.operations || []).map(function(o){ return o.name; })
+    };
+    if(zin) zin.disabled = !state.controls.zoomIn.enabled;
+    if(zout) zout.disabled = !state.controls.zoomOut.enabled;
+    if(zrst) zrst.disabled = !state.controls.zoomReset.enabled;
+    if(clearBtn) clearBtn.disabled = !state.controls.clearSearch.enabled;
+    screenEl.setAttribute('data-screen-state', JSON.stringify(state));
+    window.__KOTOBA_ONTOLOGY_SCREEN__ = state;
+    return state;
+  }
+
   function applyFilters(){
     var q = (searchInput && searchInput.value ? searchInput.value : '').trim().toLowerCase();
     var visible = Object.create(null);
+    var visibleNodeIds = [];
+    var visibleEdgeIds = [];
     document.querySelectorAll('.ov-layer-band').forEach(function(b){
       var lid = b.getAttribute('data-layer');
       b.classList.toggle('ov-hidden', !activeLayers[lid]);
@@ -103,19 +186,22 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
         String(n.label || '').toLowerCase().indexOf(q) !== -1 ||
         String(n.cid || '').toLowerCase().indexOf(q) !== -1
       ));
-      gEl.classList.toggle('ov-hidden', !inLayer);
-      gEl.classList.toggle('ov-dimmed', inLayer && !match);
-      if(inLayer && match) visible[id] = true;
+      var show = inLayer && match;
+      gEl.classList.toggle('ov-hidden', !show);
+      if(show){
+        visible[id] = true;
+        visibleNodeIds.push(id);
+      }
     });
     document.querySelectorAll('.ov-edge').forEach(function(eEl){
+      var eid = eEl.getAttribute('data-edge-id');
       var s = eEl.getAttribute('data-source');
       var t = eEl.getAttribute('data-target');
-      var sn = nodesById[s];
-      var tn = nodesById[t];
-      var bothLayer = sn && tn && activeLayers[sn.layer] && activeLayers[tn.layer];
-      eEl.classList.toggle('ov-hidden', !bothLayer);
-      eEl.classList.toggle('ov-dimmed', bothLayer && !(visible[s] || visible[t]));
+      var showEdge = !!(visible[s] && visible[t]);
+      eEl.classList.toggle('ov-hidden', !showEdge);
+      if(showEdge) visibleEdgeIds.push(eid);
     });
+    publishScreenState(visibleNodeIds, visibleEdgeIds);
   }
 
   function renderKvTable(rows){
@@ -134,44 +220,91 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   }
 
   function selectNode(nodeId){
+    selectedNodeId = nodeId || null;
     document.querySelectorAll('.ov-node.ov-selected').forEach(function(x){ x.classList.remove('ov-selected'); });
-    var targetEl = document.querySelector('.ov-node[data-node-id=\"' + CSS.escape(nodeId) + '\"]');
-    if(targetEl) targetEl.classList.add('ov-selected');
-    var n = nodesById[nodeId];
-    if(!inspectBox) return;
-    while(inspectBox.firstChild) inspectBox.removeChild(inspectBox.firstChild);
-    if(!n){
-      inspectBox.appendChild(el('p', null, 'Select a node to inspect its ontology properties, IPLD CID, edges, and joins.'));
-      return;
+    if(nodeId){
+      var targetEl = document.querySelector('.ov-node[data-node-id=\"' + CSS.escape(nodeId) + '\"]');
+      if(targetEl) targetEl.classList.add('ov-selected');
     }
-    inspectBox.appendChild(el('h2', null, n.label || n.id));
-    var baseRows = [['ID', n.id], ['Kind', n.kind], ['Layer', n.layer]];
-    if(n.cid) baseRows.push(['IPLD CID', n.cid]);
-    if(n.keys && n.keys.length) baseRows.push(['Keys', n.keys.join(', ')]);
-    inspectBox.appendChild(renderKvTable(baseRows));
+    var payload = inspectPayload(nodeId);
+    if(inspectBox){
+      while(inspectBox.firstChild) inspectBox.removeChild(inspectBox.firstChild);
+      if(!payload.found){
+        inspectBox.appendChild(el('p', null, 'Select a node to inspect its ontology properties, IPLD CID, edges, and joins.'));
+      } else {
+        var n = payload.node;
+        inspectBox.appendChild(el('h2', null, n.label || n.id));
+        var baseRows = [['ID', n.id], ['Kind', n.kind], ['Layer', n.layer]];
+        if(n.cid) baseRows.push(['IPLD CID', n.cid]);
+        if(n.keys && n.keys.length) baseRows.push(['Keys', n.keys.join(', ')]);
+        inspectBox.appendChild(renderKvTable(baseRows));
 
-    if(n.attributes && Object.keys(n.attributes).length){
-      inspectBox.appendChild(el('div', 'ov-section-title', 'Attributes'));
-      var attrRows = Object.keys(n.attributes).sort().map(function(k){ return [k, n.attributes[k]]; });
-      inspectBox.appendChild(renderKvTable(attrRows));
+        if(n.attributes && Object.keys(n.attributes).length){
+          inspectBox.appendChild(el('div', 'ov-section-title', 'Attributes'));
+          var attrRows = Object.keys(n.attributes).sort().map(function(k){
+            var v = n.attributes[k];
+            return [k, Array.isArray(v) ? v.join(', ') : v];
+          });
+          inspectBox.appendChild(renderKvTable(attrRows));
+        }
+        if(n.provenance && Object.keys(n.provenance).length){
+          inspectBox.appendChild(el('div', 'ov-section-title', 'Provenance'));
+          var provRows = Object.keys(n.provenance).sort().map(function(k){
+            var v = n.provenance[k];
+            return [k, Array.isArray(v) ? v.join(', ') : v];
+          });
+          inspectBox.appendChild(renderKvTable(provRows));
+        }
+        var relEdges = payload.incoming.concat(payload.outgoing);
+        if(relEdges.length){
+          inspectBox.appendChild(el('div', 'ov-section-title', 'Edges (' + relEdges.length + ')'));
+          var edgeRows = relEdges.map(function(e){
+            var dir = e.source === nodeId ? '-> ' + e.target : '<- ' + e.source;
+            return [e.label || e.kind, dir];
+          });
+          inspectBox.appendChild(renderKvTable(edgeRows));
+        }
+        if(payload.joins.length){
+          inspectBox.appendChild(el('div', 'ov-section-title', 'Joins (' + payload.joins.length + ')'));
+          var joinRows = payload.joins.map(function(j){
+            return [j.id, j['from-attr'] + ' <-> ' + j['to-attr'] + ' (' + j.status + ')'];
+          });
+          inspectBox.appendChild(renderKvTable(joinRows));
+        }
+        inspectBox.appendChild(el('div', 'ov-section-title', 'ontology.inspect'));
+        inspectBox.appendChild(el('pre', 'ov-pre', JSON.stringify(payload, null, 2)));
+      }
     }
-    if(n.provenance && Object.keys(n.provenance).length){
-      inspectBox.appendChild(el('div', 'ov-section-title', 'Provenance'));
-      var provRows = Object.keys(n.provenance).sort().map(function(k){ return [k, n.provenance[k]]; });
-      inspectBox.appendChild(renderKvTable(provRows));
-    }
-    var relEdges = (graph.edges || []).filter(function(e){ return e.source === nodeId || e.target === nodeId; });
-    if(relEdges.length){
-      inspectBox.appendChild(el('div', 'ov-section-title', 'Edges (' + relEdges.length + ')'));
-      var edgeRows = relEdges.map(function(e){
-        var dir = e.source === nodeId ? '-> ' + e.target : '<- ' + e.source;
-        return [e.label || e.kind, dir];
-      });
-      inspectBox.appendChild(renderKvTable(edgeRows));
-    }
-    inspectBox.appendChild(el('div', 'ov-section-title', 'Semantic UI Request (ontology.inspect)'));
-    inspectBox.appendChild(el('pre', 'ov-pre', JSON.stringify({op:'ontology.inspect', params:{'node-id': n.id}}, null, 2)));
+    applyFilters();
   }
+
+  function activateTab(tab, moveFocus){
+    var target = tab.getAttribute('aria-controls');
+    activeTab = tab.getAttribute('data-tab-key') || 'inspect';
+    tabs.forEach(function(t){
+      var sel = (t === tab);
+      t.setAttribute('aria-selected', String(sel));
+      t.setAttribute('tabindex', sel ? '0' : '-1');
+    });
+    document.querySelectorAll('.ov-panel').forEach(function(p){ p.hidden = (p.id !== target); });
+    if(moveFocus) tab.focus();
+    applyFilters();
+  }
+
+  tabs.forEach(function(tab, idx){
+    tab.addEventListener('click', function(){ activateTab(tab, false); });
+    tab.addEventListener('keydown', function(ev){
+      var nextIdx = null;
+      if(ev.key === 'ArrowRight') nextIdx = (idx + 1) % tabs.length;
+      else if(ev.key === 'ArrowLeft') nextIdx = (idx - 1 + tabs.length) % tabs.length;
+      else if(ev.key === 'Home') nextIdx = 0;
+      else if(ev.key === 'End') nextIdx = tabs.length - 1;
+      if(nextIdx !== null){
+        ev.preventDefault();
+        activateTab(tabs[nextIdx], true);
+      }
+    });
+  });
 
   document.querySelectorAll('.ov-layer-checkbox').forEach(function(cb){
     cb.addEventListener('change', function(){
@@ -180,6 +313,10 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     });
   });
   if(searchInput) searchInput.addEventListener('input', applyFilters);
+  if(clearBtn) clearBtn.addEventListener('click', function(){
+    if(searchInput) searchInput.value = '';
+    applyFilters();
+  });
   document.querySelectorAll('.ov-node').forEach(function(gEl){
     gEl.addEventListener('click', function(){ selectNode(gEl.getAttribute('data-node-id')); });
     gEl.addEventListener('keydown', function(ev){
@@ -193,24 +330,22 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   function setZoom(next){
     zoom = Math.max(0.35, Math.min(2.5, next));
     if(stage) stage.style.transform = 'scale(' + zoom.toFixed(2) + ')';
+    applyFilters();
   }
-  var zin = document.getElementById('ov-zoom-in');
-  var zout = document.getElementById('ov-zoom-out');
-  var zrst = document.getElementById('ov-zoom-reset');
   if(zin) zin.addEventListener('click', function(){ setZoom(zoom + 0.15); });
   if(zout) zout.addEventListener('click', function(){ setZoom(zoom - 0.15); });
   if(zrst) zrst.addEventListener('click', function(){ setZoom(1.0); });
 
-  document.querySelectorAll('.ov-tab').forEach(function(tab){
-    tab.addEventListener('click', function(){
-      var target = tab.getAttribute('data-panel');
-      document.querySelectorAll('.ov-tab').forEach(function(t){ t.setAttribute('aria-selected', String(t === tab)); });
-      document.querySelectorAll('.ov-panel').forEach(function(p){ p.hidden = (p.id !== target); });
-    });
-  });
+  window.kotobaOntologyViewer = {
+    getState: function(){ return window.__KOTOBA_ONTOLOGY_SCREEN__; },
+    selectNode: selectNode,
+    inspectNode: inspectPayload
+  };
 
-  if(graph.nodes && graph.nodes.length){
-    selectNode(graph.nodes[0].id);
+  if(selectedNodeId){
+    selectNode(selectedNodeId);
+  } else {
+    applyFilters();
   }
 })();")
 
@@ -219,11 +354,13 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
    "\n"
    (map
     (fn [l]
-      (str "      <label class=\"ov-layer-toggle\">"
-           "<input type=\"checkbox\" class=\"ov-layer-checkbox\" value=\"" (esc/escape-attr (:id l)) "\" checked>"
-           "<span class=\"ov-layer-dot\" style=\"background:" (esc/escape-attr (or (:color l) "#475569")) "\"></span>"
-           "<span>" (esc/escape-html (:label l)) " (" (or (:node-count l) 0) ")</span>"
-           "</label>"))
+      (let [color (if (v/safe-hex-color? (:color l)) (:color l) "#475569")
+            cnt (esc/escape-html (esc/fmt-num (or (:node-count l) 0)))]
+        (str "      <label class=\"ov-layer-toggle\">"
+             "<input type=\"checkbox\" class=\"ov-layer-checkbox\" value=\"" (esc/escape-attr (:id l)) "\" checked>"
+             "<span class=\"ov-layer-dot\" style=\"background:" color "\"></span>"
+             "<span>" (esc/escape-html (:label l)) " (" cnt ")</span>"
+             "</label>")))
     layers)))
 
 (defn- render-joins-panel [joins]
@@ -233,11 +370,14 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
      "\n"
      (map
       (fn [j]
-        (let [pct (if (some? (:coverage j))
-                    #?(:clj (Math/round (* 100.0 (double (:coverage j))))
-                       :cljs (js/Math.round (* 100.0 (double (:coverage j)))))
-                    0)
-              cov-label (if (some? (:coverage j)) (str pct "%") "schema-only")]
+        (let [pct-raw (if (some? (:coverage j))
+                        (esc/round-int (* 100.0 (double (:coverage j))))
+                        0)
+              pct (max 0 (min 100 pct-raw))
+              cov-label (if (some? (:coverage j)) (str pct "%") "schema-only")
+              matched-s (esc/escape-html (esc/fmt-num (or (:matched-count j) 0)))
+              unmatched-s (esc/escape-html (esc/fmt-num (or (:unmatched-count j) 0)))
+              excluded-s (esc/escape-html (esc/fmt-num (or (:excluded-count j) 0)))]
           (str "      <div class=\"ov-join-card\" data-join-id=\"" (esc/escape-attr (:id j)) "\">\n"
                "        <div><strong>" (esc/escape-html (:from-attr j)) "</strong> &harr; <strong>"
                (esc/escape-html (:to-attr j)) "</strong></div>\n"
@@ -246,13 +386,20 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
                       (esc/escape-html (:description j)) "</div>\n"))
                "        <div class=\"ov-bar-track\"><div class=\"ov-bar-fill\" style=\"width:" pct "%\"></div></div>\n"
                "        <table class=\"ov-kv\"><tbody>\n"
-               "          <tr><th>Rule</th><td><span class=\"ov-code\">" (esc/escape-html (name (or (:match-rule j) :exact))) "</span> (" (esc/escape-html (name (or (:cardinality j) :many-to-one))) ")</td></tr>\n"
-               "          <tr><th>Coverage</th><td><span class=\"ov-code\">" cov-label "</span> [" (esc/escape-html (name (or (:status j) :schema-only))) "]</td></tr>\n"
-               "          <tr><th>Counts</th><td>matched=" (:matched-count j) ", unmatched=" (:unmatched-count j) ", excluded=" (:excluded-count j) "</td></tr>\n"
+               "          <tr><th>Rule</th><td><span class=\"ov-code\">"
+               (esc/escape-html (name (or (:match-rule j) :exact)))
+               "</span> (" (esc/escape-html (name (or (:cardinality j) :many-to-one))) ")</td></tr>\n"
+               "          <tr><th>Coverage</th><td><span class=\"ov-code\">"
+               (esc/escape-html cov-label) "</span> ["
+               (esc/escape-html (name (or (:status j) :schema-only))) "]</td></tr>\n"
+               "          <tr><th>Counts</th><td>matched=" matched-s
+               ", unmatched=" unmatched-s ", excluded=" excluded-s "</td></tr>\n"
                (when (seq (:exclude j))
-                 (str "          <tr><th>Exclude</th><td><span class=\"ov-code\">" (esc/escape-html (str/join ", " (:exclude j))) "</span></td></tr>\n"))
+                 (str "          <tr><th>Exclude</th><td><span class=\"ov-code\">"
+                      (esc/escape-html (str/join ", " (:exclude j))) "</span></td></tr>\n"))
                (when (seq (:unmatched-values j))
-                 (str "          <tr><th>Unmatched</th><td><span class=\"ov-code\">" (esc/escape-html (str/join ", " (:unmatched-values j))) "</span></td></tr>\n"))
+                 (str "          <tr><th>Unmatched</th><td><span class=\"ov-code\">"
+                      (esc/escape-html (str/join ", " (:unmatched-values j))) "</span></td></tr>\n"))
                "        </tbody></table>\n"
                "      </div>")))
       joins))))
@@ -270,19 +417,26 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     (:operations sem/schema))))
 
 (defn render-html
-  "Render a normalized `ontology.graph/v1` (or raw projection input map) as a
-  self-contained, zero-network interactive HTML5 Viewer document."
+  "Render a validated `ontology.graph/v1`, Yataverse `yataverse.ontology.graph/v1`,
+  or raw projection input map as a self-contained, zero-network interactive
+  HTML5 Viewer document."
   ([graph-or-input] (render-html graph-or-input {}))
   ([graph-or-input {:keys [title] :or {title "Kotoba IPLD Ontology Viewer"}}]
-   (let [graph (normalize-graph graph-or-input)
+   (let [graph (svg/normalize-and-validate-graph graph-or-input)
          limits (or (get-in graph [:basis :bounds]) v/default-limits)
          _ (v/assert-label-length! limits :html/title title)
-         svg-markup (svg/render-svg graph {:title title})
+         svg-markup (str/trimr (svg/render-svg graph {:title title :interactive? true}))
          basis (:basis graph)
          layers (:layers graph)
          joins (:joins graph)
+         screen-state (initial-screen-state graph)
          graph-json (esc/json-for-script graph)
-         schema-json (esc/json-for-script sem/schema)]
+         schema-json (esc/json-for-script sem/schema)
+         screen-state-attr (esc/escape-attr (esc/json-encode screen-state))
+         node-cnt-s (esc/escape-html (esc/fmt-num (count (:nodes graph))))
+         edge-cnt-s (esc/escape-html (esc/fmt-num (count (:edges graph))))
+         join-cnt-s (esc/escape-html (esc/fmt-num (count joins)))
+         cid-ver (esc/escape-html (name (or (:cid-verification basis) :syntax-only)))]
      (str "<!DOCTYPE html>\n"
           "<html lang=\"en\">\n"
           "<head>\n"
@@ -293,18 +447,19 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
           "  <style>\n" viewer-css "\n  </style>\n"
           "</head>\n"
           "<body>\n"
-          "<div class=\"ov-shell\">\n"
+          "<div id=\"kotoba-ontology-screen\" class=\"ov-shell\" data-screen-id=\"kotoba.ontology-viewer\" data-screen-state=\"" screen-state-attr "\">\n"
           "  <header class=\"ov-header\">\n"
           "    <h1>" (esc/escape-html title) "</h1>\n"
           "    <div class=\"ov-basis-badges\">\n"
           "      <span class=\"ov-pill\">" (esc/escape-html g/schema-version) "</span>\n"
           "      <span class=\"ov-pill\">codec: " (esc/escape-html (or (:codec basis) "dag-cbor")) "</span>\n"
+          "      <span class=\"ov-pill\">cid: " cid-ver "</span>\n"
           (when-let [rc (:root-cid basis)]
             (str "      <span class=\"ov-pill\" title=\"" (esc/escape-attr rc) "\">root: "
                  (esc/escape-html (esc/short-cid rc)) "</span>\n"))
-          "      <span class=\"ov-pill\">nodes: " (count (:nodes graph)) "</span>\n"
-          "      <span class=\"ov-pill\">edges: " (count (:edges graph)) "</span>\n"
-          "      <span class=\"ov-pill\">joins: " (count joins) "</span>\n"
+          "      <span class=\"ov-pill\">nodes: " node-cnt-s "</span>\n"
+          "      <span class=\"ov-pill\">edges: " edge-cnt-s "</span>\n"
+          "      <span class=\"ov-pill\">joins: " join-cnt-s "</span>\n"
           "    </div>\n"
           "  </header>\n"
           "  <section class=\"ov-toolbar\" aria-label=\"Graph controls\">\n"
@@ -313,8 +468,9 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
           "    </div>\n"
           "    <div class=\"ov-controls\">\n"
           "      <input id=\"ov-search\" class=\"ov-search\" type=\"search\" placeholder=\"Filter nodes by ID, label, CID...\" aria-label=\"Filter nodes\">\n"
+          "      <button id=\"ov-clear-search\" class=\"ov-btn\" type=\"button\" disabled>Clear</button>\n"
           "      <button id=\"ov-zoom-out\" class=\"ov-btn\" type=\"button\">-</button>\n"
-          "      <button id=\"ov-zoom-reset\" class=\"ov-btn\" type=\"button\">100%</button>\n"
+          "      <button id=\"ov-zoom-reset\" class=\"ov-btn\" type=\"button\" disabled>100%</button>\n"
           "      <button id=\"ov-zoom-in\" class=\"ov-btn\" type=\"button\">+</button>\n"
           "    </div>\n"
           "  </section>\n"
@@ -325,18 +481,18 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
           "      </div>\n"
           "    </div>\n"
           "    <aside class=\"ov-sidebar\" aria-label=\"Ontology inspector\">\n"
-          "      <div class=\"ov-tabs\" role=\"tablist\">\n"
-          "        <button class=\"ov-tab\" role=\"tab\" aria-selected=\"true\" data-panel=\"ov-panel-inspect\" type=\"button\">Inspect</button>\n"
-          "        <button class=\"ov-tab\" role=\"tab\" aria-selected=\"false\" data-panel=\"ov-panel-joins\" type=\"button\">Joins (" (count joins) ")</button>\n"
-          "        <button class=\"ov-tab\" role=\"tab\" aria-selected=\"false\" data-panel=\"ov-panel-semantic\" type=\"button\">Semantic UI</button>\n"
+          "      <div class=\"ov-tabs\" role=\"tablist\" aria-label=\"Inspector panels\">\n"
+          "        <button id=\"ov-tab-inspect\" class=\"ov-tab\" role=\"tab\" aria-selected=\"true\" aria-controls=\"ov-panel-inspect\" data-tab-key=\"inspect\" tabindex=\"0\" type=\"button\">Inspect</button>\n"
+          "        <button id=\"ov-tab-joins\" class=\"ov-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"ov-panel-joins\" data-tab-key=\"joins\" tabindex=\"-1\" type=\"button\">Joins (" join-cnt-s ")</button>\n"
+          "        <button id=\"ov-tab-semantic\" class=\"ov-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"ov-panel-semantic\" data-tab-key=\"semantic\" tabindex=\"-1\" type=\"button\">Semantic UI</button>\n"
           "      </div>\n"
-          "      <div id=\"ov-panel-inspect\" class=\"ov-panel\" role=\"tabpanel\">\n"
+          "      <div id=\"ov-panel-inspect\" class=\"ov-panel\" role=\"tabpanel\" aria-labelledby=\"ov-tab-inspect\" tabindex=\"0\">\n"
           "        <div id=\"ov-inspector-body\"><p>Click any node in the graph to inspect details.</p></div>\n"
           "      </div>\n"
-          "      <div id=\"ov-panel-joins\" class=\"ov-panel\" role=\"tabpanel\" hidden>\n"
+          "      <div id=\"ov-panel-joins\" class=\"ov-panel\" role=\"tabpanel\" aria-labelledby=\"ov-tab-joins\" tabindex=\"0\" hidden>\n"
           (render-joins-panel joins) "\n"
           "      </div>\n"
-          "      <div id=\"ov-panel-semantic\" class=\"ov-panel\" role=\"tabpanel\" hidden>\n"
+          "      <div id=\"ov-panel-semantic\" class=\"ov-panel\" role=\"tabpanel\" aria-labelledby=\"ov-tab-semantic\" tabindex=\"0\" hidden>\n"
           "        <div class=\"ov-section-title\">noun.verb Operations (" (esc/escape-html sem/contract-version) ")</div>\n"
           (render-semantic-panel) "\n"
           "        <div class=\"ov-section-title\">Sample Read-Only Queries</div>\n"

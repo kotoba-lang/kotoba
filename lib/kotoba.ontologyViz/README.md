@@ -10,17 +10,56 @@ AwaiFS, Drive, and Yataverse).
   conditionals throughout.
 - **Zero external dependencies / offline-only**: No remote `@context` resolution,
   no external URL fetches, no external fonts or third-party CSS frameworks.
-- **Fail-closed safety bounds**: Explicit default limits and hard ceilings on
-  node count, edge count, label length, nesting depth, join count, and
-  attributes per node. Malformed inputs and bound violations throw structured
-  `ex-info` with an explicit `:reason`.
-- **XSS-safe output**: Strict XML/HTML attribute & text escaping, control-char
-  stripping, `<script type="application/json">` safe encoding, offline CSP, and
-  `textContent`/`createElement`-only client-side DOM rendering.
-- **Yataverse compatibility**: Emits the canonical `ontology.graph/v1` model
-  (`nodes`, `edges`, `layers`, `joins`, `basis`, `layout`) and declares the
-  Semantic UI `noun.verb` contract (`ontology.inspect`, `ontology.graph`,
-  `ontology.view`, `ontology.query_sql`, `ontology.query_sparql`).
+- **Byte-identical across runtimes**: Canonical number formatting (`fmt-num`)
+  and sorted-key JSON ensure identical JSON, SVG, and HTML bytes across JVM
+  Clojure, Babashka, and nbb.
+- **Fail-closed safety bounds (enforced at every boundary)**:
+  - Pre-count bounded checks (`bounded-count`) before realizing collections,
+    plus explicit default limits and hard ceilings on nodes, edges, label length,
+    scalar value length, nesting depth, collection width, joins, and attributes.
+  - Caller-supplied normalized graphs are always re-validated (`validate-graph!`)
+    by `render-svg`, `render-html`, `layout-graph`, `filter-graph`, `invoke`,
+    and `->yataverse-graph` (strict `#RRGGBB` paint allowlist, finite positive
+    layout dimensions, binary CIDv1 parsing).
+  - Binary CIDv1 structure validation (`parse-cidv1`: canonical RFC4648 base32lower
+    round-trip, shortest-form LEB128 varints, version=1, multicodec, recognized
+    multihash + exact digest length). Because this library performs no block
+    hashing on its own, `basis` explicitly records `:cid-verification :syntax-only`
+    unless a caller passes an already digest-verified basis (`:verified`).
+- **Semantic UI & Accessibility (G2)**:
+  - Interactive HTML viewer exposes live machine-readable screen state via
+    `data-screen-state` on `#kotoba-ontology-screen` and
+    `window.__KOTOBA_ONTOLOGY_SCREEN__`, synchronized with browser controls and
+    matching agent `filter-graph` / `inspect-node` semantics.
+  - Full WAI-ARIA `tablist`/`tab`/`tabpanel` wiring (`aria-selected`,
+    `aria-controls`, `aria-labelledby`, roving `tabindex`, and
+    `ArrowLeft`/`ArrowRight`/`Home`/`End` navigation).
+  - Standalone SVGs (`:interactive? false`, default) omit focusable
+    `role="button"` on non-actionable graphics.
+
+## Interoperability with Yataverse PR #83 (`yataverse.ontology.graph/v1`)
+
+Kotoba's internal canonical model uses `ontology.graph/v1` (`:schema/version`,
+`:schema/kind`, `:basis`, `:nodes`, `:edges` with `:source`/`:target`, `:layers`
+with `:node-count`, `:joins`). Yataverse PR #83 uses the camelCase wire format
+`yataverse.ontology.graph/v1` (`schema`, numeric `version`, `basisCid`, `layers`
+with `nodeCount`, `nodes` with `meta`, `edges` with `from`/`to`/`meta`, `joins`,
+`coverage`, `truncated`) and operation envelope `yataverse.ontology.operations/v1`.
+
+Explicit bidirectional adapters bridge the two contracts without conflating them:
+
+- `(ov/<-yataverse-graph yv-graph)` — validates and converts a Yataverse PR #83
+  graph (keyword- or string-keyed) into a laid-out Kotoba `ontology.graph/v1`.
+  `render-svg`, `render-html`, `invoke`, and `build-artifact` also accept a
+  `yataverse.ontology.graph/v1` map directly via this adapter.
+- `(ov/->yataverse-graph kotoba-graph)` — validates and converts a Kotoba
+  `ontology.graph/v1` graph into Yataverse PR #83's exact `yataverse.ontology.graph/v1`
+  wire format.
+- `(ov/invoke-yataverse graph-or-yv op params)` — dispatches `ontology.graph`,
+  `ontology.inspect`, `ontology.view` (`json|svg|html|all` -> `basisCid`,
+  `semanticSchema`, `viewModel`, optional `svg`/`html`), `ontology.query_sql`
+  (accepting `:query` or `:sql`), and `ontology.query_sparql` (accepting
+  `:query` or `:sparql`) in the `yataverse.ontology.operations/v1` envelope.
 
 ## Usage
 
@@ -47,8 +86,8 @@ AwaiFS, Drive, and Yataverse).
                    :object-type :tender
                    :repo "https://github.com/kotoba-lang/goyoukiki"
                    :status :implemented}]}
-    :datoms [[:tender/t-1 :jurisdiction/code "JP" 1001]
-             [:country/jpn :country/iso3 "JPN" 1001]]
+    :datoms [[:tender/t-1 :jurisdiction/code "JP" 1001 true]
+             [:country/jpn :country/iso3 "JPN" 1001 true]]
     :joins [{:from-type :tender
              :from-attr :jurisdiction/code
              :to-type :country
@@ -61,28 +100,22 @@ AwaiFS, Drive, and Yataverse).
             :source "kotoba.ontology"}}
    {:title "Procurement Ontology"}))
 
-(:graph artifact)           ;; normalized ontology.graph/v1 map
+(:graph artifact)           ;; normalized ontology.graph/v1
+(:yataverse-graph artifact) ;; Yataverse PR #83 yataverse.ontology.graph/v1
 (:svg artifact)             ;; standalone offline SVG string
 (:html artifact)            ;; self-contained interactive HTML5 viewer
+(:screen-state artifact)    ;; initial Semantic UI screen state
 (:semantic-schema artifact) ;; Semantic UI noun.verb contract
-
-;; Local Semantic UI dispatch:
-(ov/invoke (:graph artifact) "ontology.inspect" {:node-id "type:tender"})
-(ov/invoke (:graph artifact) "ontology.query_sql" {:sql "SELECT id, kind FROM nodes"})
-(ov/invoke (:graph artifact) "ontology.query_sparql" {:sparql "SELECT ?s ?o WHERE { ?s rdf:type ?o }"})
 ```
 
 ## Public API (`kotoba.ontology-viz`)
 
-- `project-graph` — normalize registries, Kotoba schemas, facts, EAVT datoms, RDF quads, joins, and IPLD nodes into `ontology.graph/v1`
-- `evaluate-join` — pure external join coverage evaluator (`:exact`, `:exact-uppercase`, `:exact-lowercase`, `:prefix`, `:mapping`, `:exclude`)
-- `layout-graph` — deterministic layered DAG layout (`:horizontal` / `:vertical`)
-- `filter-graph` — pure layer / kind / substring filtering with re-layout
-- `render-svg` — standalone zero-dependency SVG generator
-- `render-html` — self-contained interactive HTML viewer generator
-- `semantic-schema` / `operation-names` / `invoke` — Semantic UI `noun.verb` contract & local read-only dispatcher
-- `build-artifact` — one-shot `{:graph :svg :html :semantic-schema}` builder
-- `ipld-link`, `ipld-link?`, `extract-cid`, `valid-cid?`, `default-limits`, `hard-limits`, `resolve-limits`
+- `project-graph`, `evaluate-join`, `layout-graph`, `filter-graph`
+- `yataverse-graph?`, `<-yataverse-graph`, `->yataverse-graph`, `invoke-yataverse`
+- `render-svg`, `render-html`, `initial-screen-state`
+- `semantic-schema`, `operation-names`, `invoke`, `build-artifact`
+- `parse-cidv1`, `valid-cid?`, `ipld-link`, `ipld-link?`, `extract-cid`, `validate-graph!`
+- `default-limits`, `hard-limits`, `resolve-limits`, `fmt-num`, `json-encode`, `json-for-script`
 
 ## Running Tests
 

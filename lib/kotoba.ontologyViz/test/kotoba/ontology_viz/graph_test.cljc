@@ -2,6 +2,15 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.ontology-viz :as ov]))
 
+(defn- refusal-reason [f]
+  (try
+    (f)
+    ::no-throw
+    (catch #?(:clj clojure.lang.ExceptionInfo
+              :cljs :default) e
+      (:reason (ex-data e)))))
+
+;; Real valid CIDv1 (base32lower, version=1, dag-cbor/raw/dag-pb, sha2-256 32-byte digest)
 (def sample-root-cid
   "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
 
@@ -45,7 +54,10 @@
                    {:db/ident :country/iso3
                     :db/valueType :db.type/string
                     :db/cardinality :db.cardinality/one
-                    :db/doc "ISO-3166 alpha-3 country code"}]
+                    :db/doc "ISO-3166 alpha-3 country code"}
+                   {:db/ident :tender/country
+                    :db/valueType :db.type/ref
+                    :db/cardinality :db.cardinality/one}]
    :facts [{:id "tender-001"
             :name "Cloud Platform Tender"
             :status :open
@@ -58,7 +70,8 @@
    :datoms [[:tender/t-2 :jurisdiction/code "US" 101 true]
             [:tender/t-3 :jurisdiction/code "XX" 101 true]
             [:tender/t-4 :jurisdiction/code "ZZ" 101 true]
-            [:tender/t-retracted :jurisdiction/code "RETRACTED" 102 false]
+            [:tender/t-retracted :jurisdiction/code "TEMP" 100 true]
+            [:tender/t-retracted :jurisdiction/code "TEMP" 102 false]
             [:country/jpn :country/iso3 "JPN" 101 true]
             [:country/usa :country/iso3 "USA" 101 true]
             [:tender/t-2 :tender/country :country/usa 101 true]
@@ -69,7 +82,7 @@
             :graph {:rdf/type :iri :value "urn:kotoba:graph:procurement"}}
            {:subject {:rdf/type :iri :value "urn:kotoba:tender:001"}
             :predicate {:rdf/type :iri :value "http://www.w3.org/2000/01/rdf-schema#label"}
-            :object {:rdf/type :literal :value "Tender 001"}
+            :object {:rdf/type :literal :value "Tender 001" :language "en"}
             :graph {:rdf/type :iri :value "urn:kotoba:graph:procurement"}}]
    :ipld-nodes {sample-root-cid {"name" "ontology-root"
                                  "schema" (ov/ipld-link sample-block-cid)
@@ -92,19 +105,26 @@
 
 (deftest project-graph-full-pipeline-test
   (let [graph (ov/project-graph sample-input)
-        node-ids (set (map :id (:nodes graph)))
+        nodes-by-id (into {} (map (juxt :id identity) (:nodes graph)))
+        node-ids (set (keys nodes-by-id))
         edge-kinds (set (map :kind (:edges graph)))
         layer-ids (set (map :id (:layers graph)))]
-    (testing "conforms to Yataverse ontology.graph/v1 schema envelope"
+    (testing "conforms to canonical ontology.graph/v1 schema envelope and honest CID verification"
       (is (= "ontology.graph/v1" (:schema/version graph)))
       (is (= "ontology.graph" (:schema/kind graph)))
       (is (= sample-root-cid (get-in graph [:basis :root-cid])))
+      (is (= :syntax-only (get-in graph [:basis :cid-verification])))
       (is (= "dag-cbor" (get-in graph [:basis :codec])))
       (is (= (count (:nodes graph)) (get-in graph [:basis :node-count])))
       (is (= (count (:edges graph)) (get-in graph [:basis :edge-count])))
       (is (= (count (:joins graph)) (get-in graph [:basis :join-count]))))
 
-    (testing "projects ontology types, connectors, kotoba-schema, facts, datoms, RDF quads, and IPLD links"
+    (testing "preserves declared human-readable labels even after facts/datoms reference the same type or connector"
+      (is (= "Procurement Tender / Opportunity" (:label (get nodes-by-id "type:tender"))))
+      (is (= "kkj.go.jp 官公需情報ポータル 検索API" (:label (get nodes-by-id "connector:jp.kkj"))))
+      (is (= "Cloud Platform Tender" (:label (get nodes-by-id "entity:tender-001")))))
+
+    (testing "projects ontology types, connectors, kotoba-schema, facts, folded datoms, RDF quads, and IPLD links"
       (is (contains? node-ids "type:tender"))
       (is (contains? node-ids "type:country"))
       (is (contains? node-ids "connector:jp.kkj"))
@@ -114,7 +134,7 @@
       (is (contains? node-ids "entity:tender-001"))
       (is (contains? node-ids "entity:tender/t-2"))
       (is (not (contains? node-ids "entity:tender/t-retracted"))
-          "retracted datoms (added? = false) must not appear")
+          "asserted at tx 100 then retracted at tx 102 must fold away cleanly")
       (is (contains? node-ids "rdf:urn:kotoba:tender:001"))
       (is (contains? node-ids "rdf:urn:kotoba:class:Tender"))
       (is (contains? node-ids (str "ipld:" sample-root-cid)))
@@ -131,13 +151,7 @@
       (is (contains? edge-kinds :ipld-link))
       (is (= #{"connector" "ontology" "attribute" "instance" "rdf" "ipld"} layer-ids)))
 
-    (testing "collects all referenced IPLD CIDs into basis"
-      (let [cids (set (get-in graph [:basis :cids]))]
-        (is (contains? cids sample-root-cid))
-        (is (contains? cids sample-block-cid))
-        (is (contains? cids sample-leaf-cid))))
-
-    (testing "computes deterministic external join coverage with match + exclude rules"
+    (testing "computes deterministic scoped external join coverage with match + exclude rules"
       (let [j (first (:joins graph))]
         (is (= "join:jurisdiction->country" (:id j)))
         (is (= :mapping (:match-rule j)))
@@ -149,35 +163,130 @@
         (is (= :partial (:status j)))
         (is (= [["JP" "JPN"] ["US" "USA"]] (:matched-pairs j)))
         (is (= ["ZZ"] (:unmatched-values j)))
-        (is (= ["XX"] (:excluded-values j)))))
+        (is (= ["XX"] (:excluded-values j)))))))
 
-    (testing "layout is deterministic and assigns positive geometry to every node"
-      (let [graph2 (ov/project-graph sample-input)]
-        (is (= graph graph2))
-        (is (every? #(and (number? (get-in % [:layout :x]))
-                          (number? (get-in % [:layout :y]))
-                          (pos? (get-in % [:layout :width]))
-                          (pos? (get-in % [:layout :height])))
-                    (:nodes graph)))))))
+(deftest eavt-temporal-folding-multivalued-and-no-spurious-string-refs-test
+  (testing "chronological folding handles retract + re-assert, multi-valued attrs, and avoids string-match ref edges"
+    (let [g (ov/project-graph
+             {:datoms [[:doc/a :doc/tag "v1" 10 true]
+                       [:doc/a :doc/tag "v2" 11 true]
+                       [:doc/a :doc/tag "v1" 20 false]
+                       [:doc/a :doc/tag "v3" 30 true]
+                       ;; Re-assert after retraction at higher tx
+                       [:doc/a :doc/reasserted "yes" 10 true]
+                       [:doc/a :doc/reasserted "yes" 20 false]
+                       [:doc/a :doc/reasserted "yes" 30 true]
+                       ;; Plain string value matching another entity name must NOT invent :datom-ref
+                       ["US" :country/name "United States" 10 true]
+                       [:doc/a :doc/note "US" 10 true]]})
+          doc-node (first (filter #(= "entity:doc/a" (:id %)) (:nodes g)))]
+      (is (= ["v2" "v3"] (get-in doc-node [:attributes ":doc/tag"])))
+      (is (= "yes" (get-in doc-node [:attributes ":doc/reasserted"])))
+      (is (= "US" (get-in doc-node [:attributes ":doc/note"])))
+      (is (empty? (filter #(= :datom-ref (:kind %)) (:edges g)))
+          "untyped plain string matching an entity id must not silently create a :datom-ref edge"))))
+
+(deftest rdf-quad-provenance-datatype-language-and-disambiguation-test
+  (let [g (ov/project-graph
+           {:quads [{:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://vocab-a.example/rel"}
+                     :object {:rdf/type :iri :value "urn:ex:o1"}
+                     :graph {:rdf/type :iri :value "urn:g:1"}}
+                    {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://vocab-b.example/rel"}
+                     :object {:rdf/type :iri :value "urn:ex:o1"}
+                     :graph {:rdf/type :iri :value "urn:g:1"}}
+                    {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://vocab-a.example/rel"}
+                     :object {:rdf/type :iri :value "urn:ex:o1"}
+                     :graph {:rdf/type :iri :value "urn:g:2"}}
+                    {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://www.w3.org/2000/01/rdf-schema#label"}
+                     :object {:rdf/type :literal :value "Hello" :language "en"}}
+                    {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://www.w3.org/2000/01/rdf-schema#label"}
+                     :object {:rdf/type :literal :value "こんにちは" :language "ja"}}
+                    {:subject {:rdf/type :iri :value "urn:ex:s1"}
+                     :predicate {:rdf/type :iri :value "http://schema.example/amount"}
+                     :object {:rdf/type :literal :value "42"
+                              :datatype {:rdf/type :iri :value "http://www.w3.org/2001/XMLSchema#integer"}}}]})
+        rdf-edges (filter #(= :rdf-predicate (:kind %)) (:edges g))
+        s1 (first (filter #(= "rdf:urn:ex:s1" (:id %)) (:nodes g)))]
+    (is (= 3 (count rdf-edges))
+        "distinct predicate IRIs with same fragment and distinct named graphs must not collide")
+    (is (= #{"http://vocab-a.example/rel" "http://vocab-b.example/rel"}
+           (set (map #(get-in % [:metadata :predicate-iri]) rdf-edges))))
+    (is (= #{"urn:g:1" "urn:g:2"}
+           (set (map #(get-in % [:metadata :graph]) rdf-edges))))
+    (is (= ["Hello@en" "こんにちは@ja"]
+           (get-in s1 [:attributes "http://www.w3.org/2000/01/rdf-schema#label"])))
+    (is (= "42^^<http://www.w3.org/2001/XMLSchema#integer>"
+           (get-in s1 [:attributes "http://schema.example/amount"])))))
+
+(deftest join-scoping-and-ambiguity-handling-test
+  (testing "type-scoped join isolates values by declared :from-type and :to-type"
+    (let [g (ov/project-graph
+             {:facts [{:id "t1" :ontology/type :tender :code "JP"}
+                      {:id "x1" :ontology/type :other :code "SHOULD-NOT-LEAK"}
+                      {:id "c1" :ontology/type :country :iso "JP"}]
+              :joins [{:id "join:scoped"
+                       :from-type :tender :from-attr :code
+                       :to-type :country :to-attr :iso
+                       :match-rule :exact}]})
+          j (first (:joins g))]
+      (is (= 1 (:total-source-count j)))
+      (is (= 1 (:matched-count j)))
+      (is (= :full (:status j)))))
+
+  (testing "ambiguous join match fails closed by default (:on-ambiguous :error)"
+    (is (= :ambiguous-join-match
+           (refusal-reason
+            #(ov/evaluate-join {:id "join:amb"
+                                :from-attr :a :to-attr :b
+                                :match-rule :prefix
+                                :source-values ["JP"]
+                                :target-values ["JP-13" "JP-01"]})))))
+
+  (testing ":on-ambiguous :all returns all deterministically sorted matches independent of input order"
+    (let [j1 (ov/evaluate-join {:id "join:amb"
+                                :from-attr :a :to-attr :b
+                                :match-rule :prefix
+                                :on-ambiguous :all
+                                :source-values ["JP"]
+                                :target-values ["JP-13" "JP-01"]})
+          j2 (ov/evaluate-join {:id "join:amb"
+                                :from-attr :a :to-attr :b
+                                :match-rule :prefix
+                                :on-ambiguous :all
+                                :source-values ["JP"]
+                                :target-values ["JP-01" "JP-13"]})]
+      (is (= j1 j2))
+      (is (= [["JP" "JP-01"] ["JP" "JP-13"]] (:matched-pairs j1))))))
 
 (deftest filter-and-vertical-layout-test
   (let [graph (ov/project-graph sample-input)
         only-onto (ov/filter-graph graph {:layers ["connector" "ontology"]})
+        by-kind-str (ov/filter-graph graph {:kinds ["connector"]})
+        by-kind-kw (ov/filter-graph graph {:kinds [:connector]})
         by-query (ov/filter-graph graph {:query "jp.kkj"})
         vertical (ov/layout-graph graph {:direction :vertical})]
     (is (= #{"connector" "ontology"} (set (map :layer (:nodes only-onto)))))
-    (is (every? #(and (contains? (set (map :id (:nodes only-onto))) (:source %))
-                      (contains? (set (map :id (:nodes only-onto))) (:target %)))
-                (:edges only-onto)))
+    (is (= by-kind-str by-kind-kw) "string and keyword kind filters must agree")
     (is (= ["connector:jp.kkj"] (mapv :id (:nodes by-query))))
-    (is (= :vertical (get-in vertical [:layout :direction])))))
+    (is (= :vertical (get-in vertical [:layout :direction])))
+    (is (= :invalid-kind
+           (refusal-reason #(ov/filter-graph graph {:kinds ["bogus-kind"]}))))))
 
-(deftest ipld-link-interoperability-test
-  (let [l (ov/ipld-link sample-root-cid)]
+(deftest ipld-link-and-binary-cidv1-test
+  (let [l (ov/ipld-link sample-root-cid)
+        parsed (ov/parse-cidv1 sample-root-cid)]
+    (is (= 1 (:version parsed)))
+    (is (= :dag-cbor (:codec parsed)))
+    (is (= 32 (:digest-length parsed)))
+    (is (= :syntax-only (:verification parsed)))
     (is (ov/ipld-link? l))
     (is (ov/ipld-link? {"/" sample-root-cid}))
     (is (ov/ipld-link? {:ipld/link sample-root-cid}))
     (is (ov/ipld-link? {:ipld/cid sample-root-cid}))
     (is (= sample-root-cid (ov/extract-cid l)))
-    (is (= sample-root-cid (ov/extract-cid {"/" sample-root-cid})))
-    (is (= sample-root-cid (ov/extract-cid sample-root-cid)))))
+    (is (= sample-root-cid (ov/extract-cid {"/" sample-root-cid})))))

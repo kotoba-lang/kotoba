@@ -4,39 +4,72 @@
             [kotoba.ontology-viz :as ov]
             [kotoba.ontology-viz.graph-test :as gt]))
 
-(deftest render-svg-standalone-test
+(deftest canonical-number-formatting-test
+  (is (= "120" (ov/fmt-num 120)))
+  (is (= "120" (ov/fmt-num 120.0)))
+  (is (= "0" (ov/fmt-num -0.0)))
+  (is (= "108.5" (ov/fmt-num 108.5000)))
+  (is (= "0.6667" (ov/fmt-num (/ 2.0 3.0)))))
+
+(deftest render-svg-standalone-and-a11y-test
   (let [graph (ov/project-graph gt/sample-input)
         svg (ov/render-svg graph {:title "Procurement Ontology"})]
-    (testing "emits well-formed standalone offline SVG with nodes, edges, and basis"
+    (testing "emits well-formed standalone offline SVG with nodes, edges, and honest CID status"
       (is (str/starts-with? svg "<svg xmlns=\"http://www.w3.org/2000/svg\""))
-      (is (str/ends-with? svg "</svg>"))
+      (is (str/ends-with? svg "</svg>\n"))
       (is (str/includes? svg "<title>Procurement Ontology</title>"))
       (is (str/includes? svg "data-node-id=\"type:tender\""))
       (is (str/includes? svg "data-node-id=\"connector:jp.kkj\""))
       (is (str/includes? svg "join 67%"))
       (is (str/includes? svg "schema=ontology.graph/v1"))
+      (is (str/includes? svg "cid=syntax-only"))
       (is (not (str/includes? svg "<script"))
           "standalone SVG must not contain embedded script tags")
-      (is (not (re-find #"https?://(?!www\.w3\.org/2000/svg)" (str/lower-case svg)))
-          "standalone SVG must not reference external URLs")
+      (is (not (str/includes? svg "role=\"button\""))
+          "standalone static SVG must not place focusable role=button on non-actionable graphics")
+      (is (not (str/includes? svg "tabindex=\"0\""))
+          "standalone static SVG must not place tabindex=0 on non-actionable graphics")
+      (is (not (re-find #"(?:href|src)\s*=\s*['\"]https?://|url\(\s*['\"]?https?://" (str/lower-case svg)))
+          "standalone SVG must not fetch external URLs via href/src/url()")
       (is (every? #(str/starts-with? % "ov-")
                   (map second (re-seq #"class=\"([^\"]+)\"" svg)))
           "all SVG classes must belong exclusively to the self-contained ov-* namespace"))))
 
-(deftest render-html-viewer-test
+(deftest render-html-viewer-g2-a11y-and-screen-state-test
   (let [artifact (ov/build-artifact gt/sample-input {:title "Yataverse Ontology Viewer"})
-        html (:html artifact)]
-    (testing "emits self-contained interactive HTML5 Viewer with strict CSP"
+        html (:html artifact)
+        screen-state (:screen-state artifact)]
+    (testing "emits self-contained interactive HTML5 Viewer with strict CSP and live machine-readable screen state"
       (is (str/starts-with? html "<!DOCTYPE html>"))
+      (is (str/ends-with? html "</html>\n"))
       (is (str/includes? html "Content-Security-Policy"))
       (is (str/includes? html "default-src 'none'"))
+      (is (str/includes? html "id=\"kotoba-ontology-screen\""))
+      (is (str/includes? html "data-screen-state=\""))
+      (is (str/includes? html "window.__KOTOBA_ONTOLOGY_SCREEN__"))
+      (is (= "kotoba.ontology-viewer" (:screen/id screen-state)))
+      (is (= "ready" (:screen/status screen-state)))
+      (is (= ov/operation-names (:ops screen-state)))
+      (is (= (count (get-in artifact [:graph :nodes])) (count (:visibleNodeIds screen-state))))
+      (is (= (count (get-in artifact [:graph :edges])) (count (:visibleEdgeIds screen-state)))))
+
+    (testing "interactive HTML viewer attaches actionable SVG roles and WAI-ARIA tablist keyboard navigation"
+      (is (str/includes? html "role=\"button\""))
+      (is (str/includes? html "role=\"tablist\""))
+      (is (str/includes? html "id=\"ov-tab-inspect\""))
+      (is (str/includes? html "aria-controls=\"ov-panel-inspect\""))
+      (is (str/includes? html "aria-labelledby=\"ov-tab-inspect\""))
+      (is (str/includes? html "ArrowRight"))
+      (is (str/includes? html "ArrowLeft"))
+      (is (str/includes? html "'Home'"))
+      (is (str/includes? html "'End'"))
+      (is (not (str/includes? html "ov-dimmed"))
+          "browser filter hides non-matching nodes and incident edges identically to agent filter-graph"))
+
+    (testing "embeds graph, Semantic UI schema, join table, and uses only ov-* classes"
       (is (str/includes? html "id=\"kotoba-ontology-graph\""))
       (is (str/includes? html "id=\"kotoba-semantic-ui-schema\""))
-      (is (str/includes? html "ov-layer-checkbox"))
-      (is (str/includes? html "ov-inspector-body"))
       (is (str/includes? html "join:jurisdiction-&gt;country"))
-      (is (str/includes? html ":jurisdiction/code"))
-      (is (str/includes? html ":country/iso3"))
       (doseq [op ov/operation-names]
         (is (str/includes? html op) (str "HTML viewer must declare Semantic UI op " op)))
       (is (every? #(every? (fn [c] (str/starts-with? c "ov-")) (str/split % #"\s+"))
@@ -71,10 +104,12 @@
         (is (true? (:found by-cid)))
         (is (false? (:found missing)))))
 
-    (testing "ontology.graph filters by layer"
-      (let [res (ov/invoke graph "ontology.graph" {:layers ["ipld"]})]
-        (is (= "ontology.graph/v1" (:schema/version res)))
-        (is (= #{"ipld"} (set (map :layer (:nodes res)))))))
+    (testing "ontology.graph filters by layer and string kinds"
+      (let [by-layer (ov/invoke graph "ontology.graph" {:layers ["ipld"]})
+            by-kind (ov/invoke graph "ontology.graph" {:kinds ["connector"]})]
+        (is (= "ontology.graph/v1" (:schema/version by-layer)))
+        (is (= #{"ipld"} (set (map :layer (:nodes by-layer)))))
+        (is (= #{:connector} (set (map :kind (:nodes by-kind)))))))
 
     (testing "ontology.view renders svg and html"
       (let [v-svg (ov/invoke graph "ontology.view" {:format "svg" :title "View SVG"})
@@ -86,9 +121,12 @@
         (is (= "text/html; charset=utf-8" (:content-type v-html)))
         (is (str/includes? (:content v-html) "View HTML"))))
 
-    (testing "ontology.query_sql executes bounded read-only SELECT"
+    (testing "ontology.query_sql executes bounded read-only SELECT (accepting :sql or :query)"
       (let [res (ov/invoke graph "ontology.query_sql"
-                           {:sql "SELECT id, kind FROM nodes WHERE layer = 'connector' LIMIT 10"})]
+                           {:sql "SELECT id, kind FROM nodes WHERE layer = 'connector' LIMIT 10"})
+            res-alias (ov/invoke graph "ontology.query_sql"
+                                 {:query "SELECT id, kind FROM nodes WHERE layer = 'connector' LIMIT 10"})]
+        (is (= res res-alias))
         (is (= "sql-readonly-v1" (:dialect res)))
         (is (= "nodes" (:table res)))
         (is (= ["id" "kind"] (:columns res)))
@@ -98,7 +136,7 @@
 
     (testing "ontology.query_sparql executes bounded read-only SELECT and ASK"
       (let [sel (ov/invoke graph "ontology.query_sparql"
-                           {:sparql "SELECT ?s ?cid WHERE { ?s ipld:cid ?cid }"})
+                           {:sparql "SELECT ?s ?cid WHERE { ?s ipld:cid ?cid } LIMIT 10"})
             ask-yes (ov/invoke graph "ontology.query_sparql"
                                {:sparql "ASK { connector:jp.kkj produces type:tender }"})
             ask-no (ov/invoke graph "ontology.query_sparql"

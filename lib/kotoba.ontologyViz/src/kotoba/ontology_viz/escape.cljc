@@ -1,7 +1,9 @@
 (ns kotoba.ontology-viz.escape
-  "Pure .cljc escaping, ID sanitization, and deterministic JSON encoding.
-  Zero external dependencies; safe across JVM Clojure, Babashka, nbb, and
-  ClojureScript."
+  "Pure .cljc escaping, ID sanitization, cross-runtime canonical number
+  formatting, and deterministic JSON encoding.
+
+  Zero external dependencies; guarantees byte-identical outputs across JVM
+  Clojure, Babashka, nbb, and ClojureScript."
   (:require [clojure.string :as str]))
 
 (defn strip-control-chars
@@ -59,6 +61,45 @@
       text
       (str (subs text 0 10) "..." (subs text (- n 6))))))
 
+;; ── Cross-runtime canonical number formatting ────────────────────────────────
+
+(defn finite-number?
+  "True when `x` is a finite number (not NaN or +/-Infinity)."
+  [x]
+  (and (number? x)
+       #?(:clj (not (or (Double/isNaN (double x))
+                        (Double/isInfinite (double x))))
+          :cljs (js/Number.isFinite x))))
+
+(defn round-int
+  "Portable nearest-integer rounding across JVM Clojure, Babashka, and CLJS/nbb."
+  [x]
+  #?(:clj (Math/round (double x))
+     :cljs (js/Math.round x)))
+
+(defn fmt-num
+  "Format a finite number identically across JVM, Babashka, and CLJS/nbb.
+  Integers and integer-valued floats (e.g. `120.0`) always render without `.0`
+  (`\"120\"`). Non-integer floats round to at most 4 decimal places with
+  trailing fractional zeros stripped (e.g. `108.5`, `0.6667`)."
+  [x]
+  (when-not (finite-number? x)
+    (throw (ex-info (str "non-finite number cannot be formatted: " (pr-str x))
+                    {:reason :invalid-number :value x})))
+  (if (integer? x)
+    (str x)
+    (let [scaled (round-int (* (double x) 10000.0))
+          neg? (neg? scaled)
+          abs-scaled (if neg? (- scaled) scaled)
+          whole (quot abs-scaled 10000)
+          frac (rem abs-scaled 10000)]
+      (if (zero? frac)
+        (if (and neg? (pos? whole)) (str "-" whole) (str whole))
+        (let [frac-raw (str frac)
+              padded (str (apply str (repeat (- 4 (count frac-raw)) "0")) frac-raw)
+              trimmed (str/replace padded #"0+$" "")]
+          (str (when neg? "-") whole "." trimmed))))))
+
 ;; ── Pure deterministic JSON encoder ──────────────────────────────────────────
 
 (defn- hex4 [code]
@@ -99,22 +140,16 @@
     (symbol? k) (str k)
     :else (str k)))
 
-(defn- finite-number? [x]
-  (and (number? x)
-       #?(:clj (not (or (Double/isNaN (double x))
-                        (Double/isInfinite (double x))))
-          :cljs (js/Number.isFinite x))))
-
 (defn json-encode
   "Deterministically encode Clojure/ClojureScript data to compact JSON.
-  Map keys are sorted lexicographically so outputs are reproducible across
-  JVM, Babashka, nbb, and ClojureScript."
+  Map keys are sorted lexicographically and numbers use `fmt-num`, so outputs
+  are byte-identical across JVM, Babashka, nbb, and ClojureScript."
   [v]
   (cond
     (nil? v) "null"
     (true? v) "true"
     (false? v) "false"
-    (number? v) (if (finite-number? v) (str v) "null")
+    (number? v) (if (finite-number? v) (fmt-num v) "null")
     (string? v) (escape-json-string v)
     (keyword? v) (escape-json-string (json-key-str v))
     (symbol? v) (escape-json-string (str v))

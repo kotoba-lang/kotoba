@@ -2,7 +2,8 @@
   (:require [clojure.test :as t]
             [kotoba.ontology-viz.graph-test]
             [kotoba.ontology-viz.render-test]
-            [kotoba.ontology-viz.security-test]))
+            [kotoba.ontology-viz.security-test]
+            [kotoba.ontology-viz.yataverse-test]))
 
 (defmethod t/report #?(:clj :summary :cljs [:cljs.test/default :summary]) [m]
   (println "ONTOLOGY-VIZ ASSERTIONS"
@@ -17,4 +18,5 @@
 
 (t/run-tests 'kotoba.ontology-viz.graph-test
              'kotoba.ontology-viz.render-test
-             'kotoba.ontology-viz.security-test)
+             'kotoba.ontology-viz.security-test
+             'kotoba.ontology-viz.yataverse-test)
