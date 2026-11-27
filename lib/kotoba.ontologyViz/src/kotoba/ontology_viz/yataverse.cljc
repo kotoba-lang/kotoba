@@ -394,29 +394,92 @@
               :meta meta-map}))
          nodes)
         ;; On newly projected Kotoba native graphs (no preserved :yataverse-layers),
-        ;; sort edges by Yataverse generator phase order (produces -> join ->
-        ;; fact instance/source -> join-instance -> other Kotoba edges) and assign
-        ;; sequential numeric IDs e1..eN per KotobaSpec v1.0.1.
-        native-phase-key (fn [e]
-                           (let [k (:kind e)
-                                 phase (case k
-                                         :produces 0
-                                         :join 1
-                                         :instance-of 2
-                                         :provenance 2
-                                         :join-instance 3
-                                         4)
-                                 sub-phase (case k
-                                             :instance-of 0
-                                             :provenance 1
-                                             0)]
-                             [phase
-                              (if (#{1 3} phase) (:label e) (:source e))
-                              sub-phase
-                              (:source e)
-                              (:target e)
-                              (:label e)
-                              (:id e)]))
+        ;; normalize native fact provenance edge direction to Yataverse ontology-viz.mjs
+        ;; convention (fact -> type "ontology/type" immediately followed by fact -> connector
+        ;; "ontology/source"), sort by generator phase order, and assign sequential e1..eN.
+        fact-source-by-id (into {}
+                                (keep (fn [n]
+                                        (when-let [s (or (get-in n [:provenance :source])
+                                                         (get-in n [:meta "ontology/source"]))]
+                                          [(:id n) (str s)])))
+                                nodes)
+        normalize-native-edge
+        (fn [e]
+          (let [k (:kind e)
+                src (:source e)
+                tgt (:target e)
+                base-meta (stringify-map-keys (:metadata e))]
+            (cond
+              ;; Native project-facts emits connector -> entity (:provenance "ingested");
+              ;; Yataverse ontology-viz.mjs emits fact -> connector ("ontology/source", kind "provenance").
+              (and (= k :provenance)
+                   (str/starts-with? src "connector:")
+                   (or (str/starts-with? tgt "entity:") (str/starts-with? tgt "fact:")))
+              (let [conn-id (subs src 10)]
+                {:from tgt
+                 :to src
+                 :label "ontology/source"
+                 :kind "provenance"
+                 :meta (assoc base-meta "source" conn-id)
+                 ::phase 2
+                 ::sort-primary tgt
+                 ::sort-sub 1})
+
+              ;; Native fact -> type (:instance-of); Yataverse emits fact -> type ("ontology/type", kind "instance").
+              (and (= k :instance-of)
+                   (or (str/starts-with? src "entity:") (str/starts-with? src "fact:"))
+                   (str/starts-with? tgt "type:"))
+              (let [fsrc (get fact-source-by-id src)]
+                {:from src
+                 :to tgt
+                 :label "ontology/type"
+                 :kind "instance"
+                 :meta (cond-> base-meta fsrc (assoc "source" fsrc))
+                 ::phase 2
+                 ::sort-primary src
+                 ::sort-sub 0})
+
+              (= k :produces)
+              {:from src
+               :to tgt
+               :label (or (:label e) "produces")
+               :kind "provenance"
+               :meta (cond-> base-meta
+                       (str/starts-with? src "connector:") (assoc "connectorId" (subs src 10))
+                       (str/starts-with? tgt "type:") (assoc "objectType" (subs tgt 5)))
+               ::phase 0
+               ::sort-primary src
+               ::sort-sub 0}
+
+              (= k :join)
+              {:from src
+               :to tgt
+               :label (or (:label e) "")
+               :kind "join"
+               :meta base-meta
+               ::phase 1
+               ::sort-primary (or (:label e) "")
+               ::sort-sub 0}
+
+              (= k :join-instance)
+              {:from src
+               :to tgt
+               :label (or (:label e) "")
+               :kind "join-instance"
+               :meta base-meta
+               ::phase 3
+               ::sort-primary (or (:label e) "")
+               ::sort-sub 0}
+
+              :else
+              {:from src
+               :to tgt
+               :label (or (:label e) "")
+               :kind (get kotoba-edge-kind->yv-edge-kind k (name (or k :provenance)))
+               :meta base-meta
+               ::phase 4
+               ::sort-primary src
+               ::sort-sub 0})))
         yv-edges
         (if (:yataverse-layers basis)
           (mapv
@@ -430,14 +493,21 @@
            edges)
           (vec
            (map-indexed
-            (fn [idx e]
+            (fn [idx ne]
               {:id (str "e" (inc idx))
-               :from (:source e)
-               :to (:target e)
-               :label (or (:label e) "")
-               :kind (get kotoba-edge-kind->yv-edge-kind (:kind e) (name (or (:kind e) :provenance)))
-               :meta (stringify-map-keys (:metadata e))})
-            (sort-by native-phase-key edges))))
+               :from (:from ne)
+               :to (:to ne)
+               :label (:label ne)
+               :kind (:kind ne)
+               :meta (:meta ne)})
+            (sort-by (fn [ne]
+                       [(::phase ne)
+                        (::sort-primary ne)
+                        (::sort-sub ne)
+                        (:from ne)
+                        (:to ne)
+                        (:label ne)])
+                     (map normalize-native-edge edges)))))
         yv-joins
         (mapv
          (fn [j]

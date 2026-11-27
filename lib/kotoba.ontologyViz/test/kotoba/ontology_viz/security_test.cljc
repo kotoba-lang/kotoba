@@ -101,6 +101,16 @@
                                                       (assoc-in [:basis :basis-cid-verification] :verified)))))
           "claiming basis :verified without :root-cid must fail closed")
       (is (= :unverified-basis-claim
+             (refusal-reason #(ov/validate-graph! (-> valid-graph
+                                                      (assoc-in [:basis :cid-verification] :verified)
+                                                      (assoc-in [:basis :basis-cid-verification] :verified)))))
+          "validate-graph! must reject unbacked caller :verified basis claim even on normalized graphs")
+      (is (= :unverified-basis-claim
+             (refusal-reason #(ov/render-svg (-> valid-graph
+                                                 (assoc-in [:basis :cid-verification] :verified)
+                                                 (assoc-in [:basis :basis-cid-verification] :verified)))))
+          "render-svg must not render unbacked :verified basis claim")
+      (is (= :unverified-basis-claim
              (refusal-reason #(ov/project-graph {:basis {:root-cid gt/sample-root-cid
                                                          :cid-verification :verified}})))
           "project-graph must refuse unbacked caller :verified basis claim")
@@ -232,6 +242,17 @@
            (refusal-reason
             #(ov/encode-dag-cbor {"big" (apply str (repeat 200 "a"))} {:max-bytes 64})))
         "encode-dag-cbor must enforce explicit byte budget")
+    (is (= :dag-cbor-byte-limit-exceeded
+           (refusal-reason
+            #(ov/decode-dag-cbor (repeat 0) {:max-bytes 32})))
+        "decode-dag-cbor must enforce pre-realization byte limit on infinite/oversized sequences")
+    (is (= :dag-cbor-byte-limit-exceeded
+           (ov/validate-dag-cbor (repeat 0) {:max-bytes 32}))
+        "validate-dag-cbor must enforce pre-realization byte limit without hanging")
+    (let [many-ints (ov/encode-dag-cbor (vec (range 30)))]
+      (is (= :dag-cbor-item-limit-exceeded
+             (refusal-reason #(ov/decode-dag-cbor many-ints {:max-items 10})))
+          "decode-dag-cbor must enforce item-count budget during decoding"))
     (let [wide-g (ov/project-graph
                   {:ontology {:object-types
                               (vec (for [i (range 35)]

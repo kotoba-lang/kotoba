@@ -519,9 +519,16 @@
       :else
       (v/fail! :dag-cbor-invalid-additional-info "invalid CBOR additional info" {:offset offset :ai ai}))))
 
-(defn- decode-cbor-item [bs offset depth]
-  (when (> depth 64)
-    (v/fail! :max-depth-exceeded "DAG-CBOR decoding depth exceeded 64" {:depth depth}))
+(defn- decode-cbor-item [bs offset depth limits items-vol]
+  (let [visited (vswap! items-vol inc)]
+    (when (> visited (:max-items limits))
+      (v/fail! :dag-cbor-item-limit-exceeded
+               (str "DAG-CBOR decoding exceeded max-items (" (:max-items limits) ")")
+               {:limit (:max-items limits) :visited visited})))
+  (when (> depth (:max-depth limits))
+    (v/fail! :max-depth-exceeded
+             (str "DAG-CBOR decoding depth exceeded " (:max-depth limits))
+             {:depth depth :limit (:max-depth limits)}))
   (when (>= offset (count bs))
     (v/fail! :dag-cbor-truncated "unexpected end of DAG-CBOR input" {:offset offset}))
   (let [head (nth bs offset)
@@ -558,17 +565,25 @@
       ;; 4: array
       4
       (let [[len next-off] (read-cbor-arg bs pos ai)]
+        (when (> len (:max-items limits))
+          (v/fail! :dag-cbor-item-limit-exceeded
+                   (str "DAG-CBOR array length (" len ") exceeds max-items (" (:max-items limits) ")")
+                   {:limit (:max-items limits) :length len}))
         (loop [i 0
                off next-off
                acc (transient [])]
           (if (= i len)
             [(persistent! acc) off nil]
-            (let [[item n-off _] (decode-cbor-item bs off (inc depth))]
+            (let [[item n-off _] (decode-cbor-item bs off (inc depth) limits items-vol)]
               (recur (inc i) n-off (conj! acc item))))))
 
       ;; 5: map (strict canonical UTF-8 byte-length then unsigned bytewise key ordering)
       5
       (let [[len next-off] (read-cbor-arg bs pos ai)]
+        (when (> len (:max-items limits))
+          (v/fail! :dag-cbor-item-limit-exceeded
+                   (str "DAG-CBOR map length (" len ") exceeds max-items (" (:max-items limits) ")")
+                   {:limit (:max-items limits) :length len}))
         (loop [i 0
                off next-off
                prev-key-bytes nil
@@ -592,6 +607,10 @@
                     (v/fail! :dag-cbor-truncated "truncated CBOR map key bytes" {:offset koff :length klen}))
                   (let [kbytes (subvec bs koff kend)
                         kstr (utf8-decode kbytes)]
+                    (when (contains? v/forbidden-object-keys kstr)
+                      (v/fail! :forbidden-wire-key
+                               (str "forbidden DAG-CBOR map key: " kstr)
+                               {:key kstr :offset off}))
                     (when prev-key-bytes
                       (let [cmp (compare-byte-vecs prev-key-bytes kbytes)]
                         (cond
@@ -604,7 +623,7 @@
                           (v/fail! :map-keys-not-sorted
                                    (str "DAG-CBOR map keys not in canonical UTF-8 byte-length/bytewise order at key: " (pr-str kstr))
                                    {:key kstr :offset off}))))
-                    (let [[vval voff _] (decode-cbor-item bs kend (inc depth))]
+                    (let [[vval voff _] (decode-cbor-item bs kend (inc depth) limits items-vol)]
                       (recur (inc i) voff kbytes (conj! key-order kstr) (conj! entries [kstr vval]))))))))))
 
       ;; 6: tag (only tag 42 for IPLD CIDv1 link)
@@ -612,7 +631,7 @@
       (let [[tag next-off] (read-cbor-arg bs pos ai)]
         (when-not (= tag 42)
           (v/fail! :dag-cbor-unsupported-tag (str "DAG-CBOR only permits tag 42, got: " tag) {:tag tag}))
-        (let [[payload end _] (decode-cbor-item bs next-off (inc depth))]
+        (let [[payload end _] (decode-cbor-item bs next-off (inc depth) limits items-vol)]
           (when-not (and (vector? payload) (pos? (count payload)) (= 0 (first payload)))
             (v/fail! :dag-cbor-invalid-link "tag 42 payload must be a byte string prefixed with 0x00" {}))
           (let [cid-str (str "b" (v/base32-encode (subvec payload 1)))]
@@ -629,36 +648,57 @@
                  {:ai ai :offset offset})))))
 
 (defn decode-dag-cbor
-  "Strictly validate and decode canonical DAG-CBOR unsigned byte vector `cbor-bytes`.
-  Enforces canonical minimal integer encoding, valid UTF-8, and canonical DAG-CBOR
-  map key order (UTF-8 byte length ascending, then unsigned UTF-8 bytewise ascending;
-  rejects non-canonical UTF-16 order with `:map-keys-not-sorted`).
+  "Strictly validate and decode canonical DAG-CBOR unsigned byte sequence `cbor-bytes`.
+  Enforces byte-length bound BEFORE realizing or scanning the full input (stopping
+  infinite/oversized lazy sequences immediately), plus explicit item-count and
+  depth budgets, canonical minimal integer encoding, valid UTF-8, and canonical
+  DAG-CBOR map key order (`:map-keys-not-sorted` on non-canonical UTF-16 order).
   Returns `{:value <decoded> :root-keys <vec-or-nil>}`."
-  [cbor-bytes]
-  (when-not (and (sequential? cbor-bytes) (every? #(and (integer? %) (<= 0 % 255)) cbor-bytes))
-    (v/fail! :dag-cbor-invalid-bytes "expected sequence of unsigned bytes (0..255)" {}))
-  (let [bs (vec cbor-bytes)
-        [val end-off root-keys] (decode-cbor-item bs 0 0)]
-    (when-not (= end-off (count bs))
-      (v/fail! :dag-cbor-trailing-bytes
-               (str "trailing bytes after DAG-CBOR root item: " (- (count bs) end-off))
-               {:consumed end-off :total (count bs)}))
-    {:value val
-     :root-keys root-keys}))
+  ([cbor-bytes] (decode-dag-cbor cbor-bytes {}))
+  ([cbor-bytes opts]
+   (when-not (sequential? cbor-bytes)
+     (v/fail! :dag-cbor-invalid-bytes "expected sequence of unsigned bytes (0..255)" {}))
+   (let [limits (resolve-cbor-limits (or opts {}))
+         max-bytes (:max-bytes limits)
+         observed-len (bounded-count (inc max-bytes) cbor-bytes)]
+     (when (> observed-len max-bytes)
+       (v/fail! :dag-cbor-byte-limit-exceeded
+                (str "DAG-CBOR input exceeded max-bytes (" max-bytes ")")
+                {:limit max-bytes :observed-at-least observed-len}))
+     (let [bs (persistent!
+               (reduce (fn [acc b]
+                         (when-not (and (integer? b) (<= 0 b 255))
+                           (v/fail! :dag-cbor-invalid-bytes
+                                    "expected sequence of unsigned bytes (0..255)"
+                                    {:byte b}))
+                         (conj! acc b))
+                       (transient [])
+                       cbor-bytes))
+           items-vol (volatile! 0)
+           [val end-off root-keys] (decode-cbor-item bs 0 0 limits items-vol)]
+       (when-not (= end-off (count bs))
+         (v/fail! :dag-cbor-trailing-bytes
+                  (str "trailing bytes after DAG-CBOR root item: " (- (count bs) end-off))
+                  {:consumed end-off :total (count bs)}))
+       {:value val
+        :root-keys root-keys}))))
 
 (defn validate-dag-cbor!
-  "Strictly validate canonical DAG-CBOR byte vector `cbor-bytes`. Returns `:ok`
-  when canonical; throws `ex-info` (e.g. `:reason :map-keys-not-sorted`) on violation."
-  [cbor-bytes]
-  (decode-dag-cbor cbor-bytes)
-  :ok)
+  "Strictly validate canonical DAG-CBOR byte sequence `cbor-bytes` with pre-realization
+  byte, item, and depth bounds. Returns `:ok` when canonical; throws `ex-info`
+  (e.g. `:reason :map-keys-not-sorted`, `:dag-cbor-byte-limit-exceeded`) on violation."
+  ([cbor-bytes] (validate-dag-cbor! cbor-bytes {}))
+  ([cbor-bytes opts]
+   (decode-dag-cbor cbor-bytes opts)
+   :ok))
 
 (defn validate-dag-cbor
-  "Validate canonical DAG-CBOR byte vector `cbor-bytes`. Returns `nil` when valid,
+  "Validate canonical DAG-CBOR byte sequence `cbor-bytes`. Returns `nil` when valid,
   or the failure reason keyword (e.g. `:map-keys-not-sorted`) when invalid."
-  [cbor-bytes]
-  (try
-    (validate-dag-cbor! cbor-bytes)
-    nil
-    (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
-      (:reason (ex-data e)))))
+  ([cbor-bytes] (validate-dag-cbor cbor-bytes {}))
+  ([cbor-bytes opts]
+   (try
+     (validate-dag-cbor! cbor-bytes opts)
+     nil
+     (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+       (:reason (ex-data e))))))

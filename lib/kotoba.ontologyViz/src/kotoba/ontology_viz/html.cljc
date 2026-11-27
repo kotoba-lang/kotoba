@@ -357,7 +357,81 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   if(zout) zout.addEventListener('click', function(){ setZoom(zoom - 0.15); });
   if(zrst) zrst.addEventListener('click', function(){ setZoom(1.0); });
 
-  function filterGraphLocal(params){
+  function escapeXmlLocal(s){
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function applyVisibilityLocal(params){
+    var p = params || {};
+    var basisObj = p.basis;
+    var expCid = p.basisCid || (basisObj && (basisObj.basisCid || basisObj['root-cid'] || basisObj.cid)) || null;
+    if(expCid){
+      var actCid = (graph.basis && graph.basis['root-cid']) || null;
+      if(expCid !== actCid) throw new Error('basis-cid-mismatch');
+    }
+    var vis = (p.visibility && typeof p.visibility === 'object') ? p.visibility : {};
+    var hasSrc = Object.prototype.hasOwnProperty.call(p, 'allowedSources') || Object.prototype.hasOwnProperty.call(vis, 'allowedSources');
+    var hasJur = Object.prototype.hasOwnProperty.call(p, 'jurisdiction') || Object.prototype.hasOwnProperty.call(vis, 'jurisdiction');
+    if(!hasSrc && !hasJur) return graph;
+    var rawSrc = Object.prototype.hasOwnProperty.call(p, 'allowedSources') ? p.allowedSources : vis.allowedSources;
+    var rawJur = Object.prototype.hasOwnProperty.call(p, 'jurisdiction') ? p.jurisdiction : vis.jurisdiction;
+    var allowedSrc = null;
+    if(hasSrc){
+      if(!Array.isArray(rawSrc)) throw new Error('invalid-visibility');
+      allowedSrc = Object.create(null);
+      rawSrc.forEach(function(x){ allowedSrc[String(x)] = true; });
+    }
+    var allowedJur = null;
+    if(hasJur){
+      allowedJur = Object.create(null);
+      if(typeof rawJur === 'string') allowedJur[rawJur] = true;
+      else if(Array.isArray(rawJur)) rawJur.forEach(function(x){ allowedJur[String(x)] = true; });
+      else throw new Error('invalid-visibility');
+    }
+    function nodeSrc(n){
+      if(n.provenance && n.provenance.source) return String(n.provenance.source);
+      if(n.meta && n.meta['ontology/source']) return String(n.meta['ontology/source']);
+      if(n.kind === 'connector') return String(n.id || '').indexOf('connector:') === 0 ? String(n.id).slice(10) : String(n.id);
+      return null;
+    }
+    function nodeJur(n){
+      if(n.meta && n.meta.jurisdiction) return String(n.meta.jurisdiction);
+      if(n.attributes && n.attributes.jurisdiction) return String(n.attributes.jurisdiction);
+      if(n.attributes && n.attributes[':jurisdiction/code']) return String(n.attributes[':jurisdiction/code']);
+      return null;
+    }
+    var keptNodes = (graph.nodes || []).filter(function(n){
+      if(hasSrc){
+        if(rawSrc.length === 0) return false;
+        var ns = nodeSrc(n);
+        if(ns !== null && !allowedSrc[ns]) return false;
+      }
+      if(hasJur){
+        if(Array.isArray(rawJur) && rawJur.length === 0) return false;
+        var nj = nodeJur(n);
+        if(nj !== null){ if(!allowedJur[nj]) return false; }
+        else if(n.kind === 'entity') return false;
+      }
+      return true;
+    });
+    var keptIds = Object.create(null);
+    keptNodes.forEach(function(n){ keptIds[n.id] = true; });
+    var keptEdges = (graph.edges || []).filter(function(e){ return !!(keptIds[e.source] && keptIds[e.target]); });
+    var keptJoins = (graph.joins || []).filter(function(j){ return !!(keptIds[j['from-node']] && keptIds[j['to-node']]); });
+    var layerCounts = Object.create(null);
+    keptNodes.forEach(function(n){ layerCounts[n.layer] = (layerCounts[n.layer] || 0) + 1; });
+    var keptLayers = (graph.layers || []).filter(function(l){ return (layerCounts[l.id] || 0) > 0; })
+      .map(function(l){ return Object.assign({}, l, {'node-count': layerCounts[l.id]}); });
+    return Object.assign({}, graph, {nodes: keptNodes, edges: keptEdges, joins: keptJoins, layers: keptLayers});
+  }
+
+  function filterGraphLocal(params, srcGraph){
+    var g = srcGraph || applyVisibilityLocal(params);
     var p = params || {};
     var rawLayers = (p.activeLayers !== undefined && p.activeLayers !== null) ? p.activeLayers : p.layers;
     var hasLayers = rawLayers !== undefined && rawLayers !== null;
@@ -367,7 +441,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     var kindSet = hasKinds ? Object.create(null) : null;
     if(hasKinds){ p.kinds.forEach(function(k){ kindSet[String(k)] = true; }); }
     var q = (p.query ? String(p.query) : '').trim().toLowerCase();
-    var keptNodes = (graph.nodes || []).filter(function(n){
+    var keptNodes = (g.nodes || []).filter(function(n){
       if(layerSet && !layerSet[n.layer]) return false;
       if(kindSet && !kindSet[n.kind]) return false;
       if(q && String(n.id || '').toLowerCase().indexOf(q) === -1 &&
@@ -377,10 +451,44 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     });
     var keptIds = Object.create(null);
     keptNodes.forEach(function(n){ keptIds[n.id] = true; });
-    var keptEdges = (graph.edges || []).filter(function(e){
+    var keptEdges = (g.edges || []).filter(function(e){
       return !!(keptIds[e.source] && keptIds[e.target]);
     });
-    return {nodes: keptNodes, edges: keptEdges};
+    var layerCounts = Object.create(null);
+    keptNodes.forEach(function(n){ layerCounts[n.layer] = (layerCounts[n.layer] || 0) + 1; });
+    var keptLayers = (g.layers || []).filter(function(l){ return (layerCounts[l.id] || 0) > 0; })
+      .map(function(l){ return Object.assign({}, l, {'node-count': layerCounts[l.id]}); });
+    return {nodes: keptNodes, edges: keptEdges, layers: keptLayers, joins: g.joins || [], basis: g.basis || {}, layout: g.layout || {}};
+  }
+
+  function renderFilteredSvgLocal(filtered, title){
+    var t = title !== undefined && title !== null ? String(title) : (document.title || 'Kotoba Ontology Graph');
+    var nodes = filtered.nodes || [];
+    var edges = filtered.edges || [];
+    var lay = filtered.layout || {};
+    var w = Math.max(420, Number(lay.width) || 640);
+    var h = Math.max(240, Number(lay.height) || 360);
+    var basis = filtered.basis || {};
+    var cidVer = basis['basis-cid-verification'] || basis['cid-verification'] || 'syntax-only';
+    var gVer = basis['graph-cid-verification'];
+    var desc = 'schema=ontology.graph/v1 | codec=' + (basis.codec || 'dag-cbor') + ' | cid=' + cidVer +
+      (gVer && gVer !== 'absent' ? (' | graph-cid=' + gVer) : '') +
+      ' | nodes=' + nodes.length + ' | edges=' + edges.length + ' | joins=' + (filtered.joins || []).length;
+    var parts = [
+      '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ' + w + ' ' + h + '\" width=\"' + w + '\" height=\"' + h + '\" role=\"img\" aria-label=\"' + escapeXmlLocal(t) + '\">',
+      '  <title>' + escapeXmlLocal(t) + '</title>',
+      '  <desc>' + escapeXmlLocal(desc) + '</desc>'
+    ];
+    edges.forEach(function(e){
+      parts.push('  <g class=\"ov-edge\" data-edge-id=\"' + escapeXmlLocal(e.id) + '\" data-source=\"' + escapeXmlLocal(e.source) + '\" data-target=\"' + escapeXmlLocal(e.target) + '\"><title>' + escapeXmlLocal(e.label || '') + '</title></g>');
+    });
+    nodes.forEach(function(n){
+      var nl = n.layout || {};
+      var nx = Number(nl.x) || 24, ny = Number(nl.y) || 24, nw = Number(nl.width) || 180, nh = Number(nl.height) || 54;
+      parts.push('  <g class=\"ov-node\" data-node-id=\"' + escapeXmlLocal(n.id) + '\" data-layer=\"' + escapeXmlLocal(n.layer) + '\" data-kind=\"' + escapeXmlLocal(n.kind) + '\"><rect x=\"' + nx + '\" y=\"' + ny + '\" width=\"' + nw + '\" height=\"' + nh + '\"/><text x=\"' + (nx + 10) + '\" y=\"' + (ny + 22) + '\">' + escapeXmlLocal(n.label || n.id) + '</text></g>');
+    });
+    parts.push('</svg>\\n');
+    return parts.join('\\n');
   }
 
   var SQL_TABLE_SCHEMAS = {
@@ -390,19 +498,19 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     layers: ['id', 'label', 'node_count', 'order']
   };
 
-  function sqlTableRows(tbl){
+  function sqlTableRows(g, tbl){
     if(tbl === 'nodes'){
-      return (graph.nodes || []).map(function(n){
+      return (g.nodes || []).map(function(n){
         return {id:n.id, label:n.label, kind:String(n.kind || ''), layer:n.layer, cid:n.cid !== undefined ? n.cid : null};
       });
     }
     if(tbl === 'edges'){
-      return (graph.edges || []).map(function(e){
+      return (g.edges || []).map(function(e){
         return {id:e.id, source:e.source, target:e.target, label:e.label, kind:String(e.kind || ''), layer:e.layer, cid:e.cid !== undefined ? e.cid : null};
       });
     }
     if(tbl === 'joins'){
-      return (graph.joins || []).map(function(j){
+      return (g.joins || []).map(function(j){
         return {
           id:j.id, from_node:j['from-node'], from_attr:j['from-attr'], to_node:j['to-node'], to_attr:j['to-attr'],
           match_rule:String(j['match-rule'] || ''), cardinality:String(j.cardinality || ''),
@@ -412,7 +520,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       });
     }
     if(tbl === 'layers'){
-      return (graph.layers || []).map(function(l){
+      return (g.layers || []).map(function(l){
         return {id:l.id, label:l.label, order:l.order, node_count:l['node-count']};
       });
     }
@@ -420,6 +528,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   }
 
   function querySqlLocal(sql, opts){
+    var g = applyVisibilityLocal(opts);
     var s = String(sql || '').trim().replace(/;\\s*$/, '');
     if(!s || s.length > 2048) throw new Error('invalid-sql');
     if(/;|--|\\/\\*/.test(s) || /\\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|PRAGMA|ATTACH|DETACH|REPLACE|MERGE|EXEC|EXECUTE|CALL|GRANT|REVOKE|COPY|VACUUM)\\b/i.test(s)){
@@ -442,7 +551,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
         return lc;
       });
     }
-    var rows = sqlTableRows(tbl);
+    var rows = sqlTableRows(g, tbl);
     var scanned = rows.length;
     if(m[3]){
       var wc = m[3].toLowerCase();
@@ -484,28 +593,48 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     return s.indexOf('rdf:') === 0 ? s.slice(4) : s;
   }
 
-  function expandSparqlTerm(tok, pmap){
-    if(tok.indexOf('?') === 0) return tok;
-    if(tok.length >= 2 && tok.charAt(0) === '<' && tok.charAt(tok.length - 1) === '>') return tok.slice(1, -1);
+  function parseSparqlTermInfo(tok, pmap){
+    if(tok.indexOf('?') === 0) return {kind:'var', value:tok, match:tok};
+    if(tok.length >= 2 && tok.charAt(0) === '<' && tok.charAt(tok.length - 1) === '>'){
+      var iri = tok.slice(1, -1);
+      return {kind:'iri', value:iri, match:iri};
+    }
+    if(tok.indexOf('_:') === 0) return {kind:'bnode', value:tok, match:tok};
     if(tok.charAt(0) === '\"'){
       var lm = tok.match(/^\"([^\"]*)\"(.*)$/);
       if(lm){
         var lex = lm[1], suf = lm[2];
-        if(!suf) return lex;
-        if(suf.charAt(0) === '@') return lex + suf;
-        if(suf.indexOf('^^') === 0) return lex + '^^<' + expandSparqlTerm(suf.slice(2), pmap) + '>';
+        if(!suf) return {kind:'literal', value:lex, match:lex};
+        if(suf.charAt(0) === '@') return {kind:'literal', value:lex, language:suf.slice(1), match:lex + suf};
+        if(suf.indexOf('^^') === 0){
+          var dtInfo = parseSparqlTermInfo(suf.slice(2), pmap);
+          return {kind:'literal', value:lex, datatype:dtInfo.value, match:lex + '^^<' + dtInfo.value + '>'};
+        }
       }
-      return tok;
+      return {kind:'literal', value:tok, match:tok};
     }
     var ci = tok.indexOf(':');
     if(ci !== -1){
       var pfx = tok.slice(0, ci), loc = tok.slice(ci + 1);
-      if(Object.prototype.hasOwnProperty.call(pmap, pfx)) return pmap[pfx] + loc;
+      if(Object.prototype.hasOwnProperty.call(pmap, pfx)){
+        var exp = pmap[pfx] + loc;
+        return {kind:'iri', value:exp, match:exp};
+      }
     }
-    return tok;
+    return {kind:'iri', value:tok, match:tok};
   }
 
-  function buildLocalTriples(){
+  function ednTermInfo(ti){
+    if(ti.kind === 'var') return ti.value;
+    if(ti.kind === 'iri') return '{:rdf/type :iri :value ' + JSON.stringify(ti.value) + '}';
+    if(ti.kind === 'bnode') return '{:rdf/type :bnode :value ' + JSON.stringify(ti.value) + '}';
+    var parts = [':rdf/type :literal', ':value ' + JSON.stringify(ti.value)];
+    if(ti.datatype) parts.push(':datatype ' + JSON.stringify(ti.datatype));
+    if(ti.language) parts.push(':language ' + JSON.stringify(ti.language));
+    return '{' + parts.join(' ') + '}';
+  }
+
+  function buildLocalTriples(g){
     var rdfType = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
     var rdfsLabel = 'http://www.w3.org/2000/01/rdf-schema#label';
     var seen = Object.create(null);
@@ -514,7 +643,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       var k = s + '\\u0000' + p + '\\u0000' + o;
       if(!seen[k]){ seen[k] = true; out.push([s, p, o]); }
     }
-    (graph.nodes || []).forEach(function(n){
+    (g.nodes || []).forEach(function(n){
       var s = (n.attributes && n.attributes.iri) ? String(n.attributes.iri) : canonicalNodeTerm(n.id);
       pushT(s, rdfType, String(n.kind || 'node'));
       pushT(s, rdfsLabel, String(n.label || ''));
@@ -531,7 +660,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
         });
       }
     });
-    (graph.edges || []).forEach(function(e){
+    (g.edges || []).forEach(function(e){
       var s = canonicalNodeTerm(e.source);
       var o = canonicalNodeTerm(e.target);
       var p = (e.metadata && e.metadata['predicate-iri']) ? String(e.metadata['predicate-iri']) : String(e.label || '');
@@ -541,6 +670,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
   }
 
   function querySparqlLocal(sparql, opts){
+    var g = applyVisibilityLocal(opts);
     var s = String(sparql || '').trim();
     if(!s || s.length > 2048) throw new Error('invalid-sparql');
     if(/\\b(SERVICE|LOAD|INSERT|DELETE|DROP|CLEAR|CREATE|ADD|MOVE|COPY|SILENT)\\b|\\bFROM\\s+NAMED\\b|\\bFROM\\s+<https?:/i.test(s)){
@@ -570,11 +700,12 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
     });
     if(cur.length) clauses.push(cur);
     if(!clauses.length) throw new Error('invalid-sparql');
-    var patterns = clauses.map(function(c){
+    var termPatterns = clauses.map(function(c){
       if(c.length !== 3) throw new Error('invalid-sparql');
-      return c.map(function(t){ return expandSparqlTerm(t, pmap); });
+      return c.map(function(t){ return parseSparqlTermInfo(t, pmap); });
     });
-    var triples = buildLocalTriples();
+    var patterns = termPatterns.map(function(tp){ return tp.map(function(x){ return x.match; }); });
+    var triples = buildLocalTriples(g);
     var steps = 0;
     var solutions = [{}];
     patterns.forEach(function(pat){
@@ -602,8 +733,7 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       }
       solutions = next;
     });
-    function ednTerm(x){ return x.charAt(0) === '?' ? x : JSON.stringify(x); }
-    var bgpEdn = '{:sparql/op :bgp, :patterns [' + patterns.map(function(p){ return '[' + p.map(ednTerm).join(' ') + ']'; }).join(' ') + ']}';
+    var bgpEdn = '{:sparql/op :bgp :patterns [' + termPatterns.map(function(p){ return '[' + p.map(ednTermInfo).join(' ') + ']'; }).join(' ') + ']}';
     if(askM){
       var hit = solutions.length > 0;
       return {
@@ -639,8 +769,8 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
       projVars.forEach(function(v){ if(Object.prototype.hasOwnProperty.call(sol, v)) row[v] = sol[v]; });
       return row;
     });
-    var projEdn = '{:sparql/op :project, :vars [' + projVars.join(' ') + '], :pattern ' + bgpEdn + '}';
-    var sliceEdn = '{:sparql/op :slice, :offset 0, :limit ' + lim + ', :pattern ' + projEdn + '}';
+    var projEdn = '{:sparql/op :project :vars [' + projVars.join(' ') + '] :pattern ' + bgpEdn + '}';
+    var sliceEdn = '{:sparql/op :slice :offset 0 :limit ' + lim + ' :pattern ' + projEdn + '}';
     return {
       dialect: 'sparql-readonly-v1',
       form: 'select',
@@ -654,17 +784,31 @@ body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',
 
   function invokeLocal(op, params){
     var p = params || {};
-    if(op === 'ontology.inspect') return inspectPayload(p['node-id'] || selectedNodeId);
+    if(op === 'ontology.inspect'){
+      var vg = applyVisibilityLocal(p);
+      var nid = p['node-id'] || selectedNodeId;
+      var foundNode = (vg.nodes || []).find(function(n){ return n.id === nid; }) || null;
+      if(!foundNode) return {found:false, node:null, incoming:[], outgoing:[], joins:[]};
+      return {
+        found: true,
+        node: foundNode,
+        incoming: (vg.edges || []).filter(function(e){ return e.target === nid; }),
+        outgoing: (vg.edges || []).filter(function(e){ return e.source === nid; }),
+        joins: (vg.joins || []).filter(function(j){ return j['from-node'] === nid || j['to-node'] === nid; })
+      };
+    }
     if(op === 'ontology.graph') return filterGraphLocal(p);
     if(op === 'ontology.view'){
       var fmt = String(p.format || 'svg').toLowerCase();
       if(fmt !== 'svg' && fmt !== 'html') throw new Error('invalid-format');
-      var svgEl = stage ? stage.querySelector('svg') : null;
-      return {
-        format: fmt,
-        'content-type': fmt === 'html' ? 'text/html; charset=utf-8' : 'image/svg+xml',
-        content: fmt === 'html' ? ('<!DOCTYPE html>' + document.documentElement.outerHTML) : (svgEl ? svgEl.outerHTML : '')
-      };
+      var filtered = filterGraphLocal(p);
+      var svgStr = renderFilteredSvgLocal(filtered, p.title);
+      if(fmt === 'svg'){
+        return {format: 'svg', 'content-type': 'image/svg+xml', content: svgStr};
+      }
+      var ttl = p.title !== undefined && p.title !== null ? String(p.title) : (document.title || 'Kotoba Ontology Graph');
+      var htmlOut = '<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>' + escapeXmlLocal(ttl) + '</title></head><body><h1>' + escapeXmlLocal(ttl) + '</h1>' + svgStr + '</body></html>\\n';
+      return {format: 'html', 'content-type': 'text/html; charset=utf-8', content: htmlOut};
     }
     if(op === 'ontology.query_sql') return querySqlLocal(p.sql || p.query, p);
     if(op === 'ontology.query_sparql') return querySparqlLocal(p.sparql || p.query, p);

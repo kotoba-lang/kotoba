@@ -221,19 +221,23 @@
       (is (= 5 (get-in q-res [:result :rowCount])))
       (is (string? (get-in q-res [:result :algebraEdn])))
       (is (str/includes? (get-in q-res [:result :algebraEdn]) ":pattern"))
+      (is (str/includes? (get-in q-res [:result :algebraEdn]) "{:rdf/type :iri :value \"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\"}"))
       ;; Yataverse PR #83 ASK shape (form: "ask", boolean: true/false) + algebraEdn input
       (let [ask-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sparql"
                                          {:query "ASK { connector:jp.kkj produces type:tender }"})
             edn-res (ov/invoke-yataverse yataverse-pr83-fixture "ontology.query_sparql"
-                                         {:algebraEdn "{:sparql/op :project :vars [?s] :pattern {:sparql/op :bgp :patterns [[?s \"produces\" \"type:tender\"]]}}"})]
+                                         {:algebraEdn "{:sparql/op :project :vars [?s] :pattern {:sparql/op :bgp :patterns [[?s {:rdf/type :iri :value \"produces\"} {:rdf/type :iri :value \"type:tender\"}]]}}"})]
         (is (= "ask" (get-in ask-res [:result :form])))
         (is (true? (get-in ask-res [:result :boolean])))
         (is (not (contains? (:result ask-res) :ask)))
         (is (= 2 (get-in edn-res [:result :rowCount]))))
-      ;; activeLayers: [] and maxNodes enforcement + unsupported carBase64 refusal
-      (let [empty-al-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:activeLayers []})
+      ;; activeLayers: null (all 9 nodes) vs activeLayers: [] (0 nodes) + maxNodes + unsupported params
+      (let [null-al-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:activeLayers nil})
+            empty-al-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:activeLayers []})
             empty-al-v (ov/invoke-yataverse yataverse-pr83-fixture "ontology.view" {:format "json" :activeLayers []})
             capped-g (ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 4})]
+        (is (= 9 (count (get-in null-al-g [:result :nodes])))
+            "explicit activeLayers: null/nil must match omitted (all 9 nodes)")
         (is (= 0 (count (get-in empty-al-g [:result :nodes]))))
         (is (= 0 (count (get-in empty-al-g [:result :edges]))))
         (is (= 0 (count (get-in empty-al-v [:result :viewModel :graph :nodes]))))
@@ -241,7 +245,8 @@
         (is (true? (get-in capped-g [:result :truncated])))
         (is (= :invalid-limit (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 0}))))
         (is (= :invalid-limit (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.graph" {:maxNodes 501}))))
-        (is (= :unsupported-operation-param (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.inspect" {:carBase64 "AAAA"})))))))
+        (is (= :unsupported-operation-param (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.inspect" {:carBase64 "AAAA"}))))
+        (is (= :unsupported-operation-param (refusal-reason #(ov/invoke-yataverse yataverse-pr83-fixture "ontology.view" {:apiBase "/x"})))))))
 
   (testing "KotobaSpec v1.0: basisCid pin and visibility (allowedSources / jurisdiction) fail closed AND recompute joins/coverage"
     (let [wrong-cid "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
@@ -277,6 +282,29 @@
           "jurisdiction: jp-tokyo must keep only jp-tokyo facts")
       (is (= 1 (get-in only-tokyo [:result :joins 0 :matchedRows]))
           "jurisdiction: jp-tokyo must recompute join matchedRows to 1 (not leak 2 from jp-national)")
+      (let [tokyo-join-edge (first (filter #(= "join" (:kind %)) (get-in only-tokyo [:result :edges])))
+            kkj-join-edge (first (filter #(= "join" (:kind %)) (get-in only-kkj [:result :edges])))]
+        (is (= 1 (get-in tokyo-join-edge [:meta "matchedRows"]))
+            "type-level join edge metadata matchedRows must also recompute to 1 under jurisdiction filter")
+        (is (= 0 (get-in kkj-join-edge [:meta "matchedRows"]))
+            "type-level join edge metadata matchedRows must recompute to 0 when right-hand facts are hidden")
+        (is (= 0 (get-in kkj-join-edge [:meta "coverageRatio"]))))
+      ;; Native value-matching join must re-evaluate over visible facts (NOT collapse to 0!)
+      (let [native-vis (ov/invoke
+                        (ov/project-graph
+                         {:ontology {:object-types [{:id :tender :name "Tender"}
+                                                    {:id :country :name "Country"}]}
+                          :facts [{:id "t1" :ontology/type :tender :ontology/source :jp.kkj :code "JP" :jurisdiction "jp-national"}
+                                  {:id "t2" :ontology/type :tender :ontology/source :jp.geps :code "US" :jurisdiction "us-fed"}
+                                  {:id "c1" :ontology/type :country :iso "JP" :jurisdiction "jp-national"}
+                                  {:id "c2" :ontology/type :country :iso "US" :jurisdiction "us-fed"}]
+                          :joins [{:id "join:native" :from-type :tender :from-attr :code
+                                   :to-type :country :to-attr :iso :match-rule :exact}]})
+                        "ontology.graph"
+                        {:jurisdiction "jp-national"})]
+        (is (= 1 (get-in native-vis [:joins 0 :matched-count]))
+            "native value-matching join must re-evaluate on visible facts (not collapse to 0)")
+        (is (= 1 (get-in native-vis [:joins 0 :total-source-count]))))
       (is (= 0 (count (filter #(= "fact" (:kind %)) (get-in deny-jur [:result :nodes]))))
           "empty jurisdiction: [] must fail closed")))
 
@@ -440,7 +468,7 @@
           (is (not (contains? yv internal-k))
               (str "wire yataverse.ontology.graph/v1 must NEVER contain internal verification key " internal-k)))))
 
-    (testing "Native Kotoba graph -> Yataverse uses sequential e1..eN phase-ordered edges, full-precision decimal JSON, and refuses injected verification/proto keys"
+    (testing "Native Kotoba graph -> Yataverse uses Yataverse edge direction (fact->type then fact->connector) & sequential e1..eN, full-precision decimal JSON, and refuses injected verification/proto keys"
       (let [native-kg (ov/project-graph
                        {:ontology {:object-types [{:id :agency :name "Agency"}
                                                   {:id :tender :name "Tender"}]}
@@ -450,10 +478,15 @@
                                  :ontology/confidence 0.123456789}]
                         :basis {:root-cid "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em"}})
             native-yv (ov/->yataverse-graph native-kg)
-            native-json (ov/json-encode native-yv)]
+            native-json (ov/json-encode native-yv)
+            fact-edges (filterv #(= "entity:t-1" (:from %)) (:edges native-yv))]
         (is (= (mapv #(str "e" (inc %)) (range (count (:edges native-yv))))
                (mapv :id (:edges native-yv)))
             "native Kotoba graph exported to Yataverse must number edges sequentially e1..eN")
+        (is (= [{:from "entity:t-1" :to "type:tender" :label "ontology/type" :kind "instance"}
+                {:from "entity:t-1" :to "connector:jp.kkj" :label "ontology/source" :kind "provenance"}]
+               (mapv #(select-keys % [:from :to :label :kind]) fact-edges))
+            "native fact edges must match Yataverse ontology-viz.mjs direction & order (fact->type immediately followed by fact->connector)")
         (is (str/includes? native-json "0.123456789")
             "json-encode must preserve full-precision decimals matching DAG-CBOR (no 4-decimal rounding)")
         ;; Injected verification keys in node meta or edge metadata fail closed

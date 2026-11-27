@@ -608,6 +608,12 @@
       (fail! :invalid-basis
              "basis verification cannot be :verified when :root-cid is absent"
              {:cid-verification cid-ver :basis-cid-verification basis-ver}))
+    ;; Reject unbacked :verified snapshot basis claims on ANY boundary (input or normalized graph)
+    ;; because this visualization library performs no cryptographic snapshot block-closure verification.
+    (when (= :verified (or basis-ver cid-ver))
+      (fail! :unverified-basis-claim
+             "cannot claim :verified basisCid without cryptographic snapshot block-closure verification"
+             {:cid-verification cid-ver :basis-cid-verification basis-ver}))
     (when (some? graph-ver)
       (when-not (contains? valid-graph-cid-verification-states graph-ver)
         (fail! :invalid-basis
